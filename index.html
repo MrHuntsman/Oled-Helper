@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OLED Helper</title>
+    <style>
+      html, body { margin: 0; padding: 0; background: #0D0D0F; color: #ccc; font: 14px/1.5 system-ui, sans-serif; }
+    </style>
+  </head>
+  <body>
+    <!-- Fallback: if JS never loads, this stays visible -->
+    <div id="preboot" style="padding:20px;color:#8A8A94;">Loading...</div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+    <!-- Inline error trap - catches errors before module resolution -->
+    <script>
+      function showFatal(title, msg) {
+        var el = document.getElementById('app') || document.body;
+        el.innerHTML = '<div style="color:#E05555;padding:20px;font:13px monospace;background:#0D0D0F;min-height:100vh;">' +
+          '<h2 style="color:#E05555;">' + title + '</h2>' +
+          '<pre>' + msg + '</pre>' +
+          '</div>';
+        document.getElementById('preboot') && (document.getElementById('preboot').style.display = 'none');
+      }
+      window.addEventListener('error', function(e) {
+        showFatal('Uncaught Error', (e.message || '') + '\n' + ((e.error && e.error.stack) || e.filename + ':' + e.lineno));
+      });
+      window.addEventListener('unhandledrejection', function(e) {
+        var reason = e.reason;
+        var msg = (reason && (reason.stack || reason.message)) || String(reason);
+        showFatal('Unhandled Promise Rejection', msg);
+      });
+    </script>
+  </body>
+</html>
