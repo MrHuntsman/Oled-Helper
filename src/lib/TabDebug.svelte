@@ -112,7 +112,6 @@
     <h2>Debug</h2>
     <span class="subtitle">— Runtime, GPU & HDR diagnostics</span>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={() => { runtimeLogSettings.verbosePeriodic = false; setVerbosePeriodicLogging(false); }}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -142,7 +141,7 @@
         <h3>Runtime Log</h3>
         <label class="diag-verbose-toggle">
           <input type="checkbox" checked={runtimeLogSettings.verbosePeriodic} onchange={(e) => setVerbosePeriodicLogging(e.currentTarget.checked)} />
-          <span>Verbose periodic logs</span>
+          <span>Detailed logging</span>
         </label>
       </div>
       <div style="display:flex; gap:6px;">

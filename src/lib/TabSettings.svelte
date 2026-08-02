@@ -1,7 +1,7 @@
 <script>
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
-  import { traySettings, setTrayEnabled } from './stores.svelte.js';
+  import { traySettings, setTrayEnabled, configLoaded, app } from './stores.svelte.js';
 
   let startOnBoot = $state(false);
   let ready = $state(false);
@@ -47,7 +47,7 @@
 
 <div class="tab-body">
   <div class="tab-heading">
-    <img class="tab-icon" src="/icons/tab_settings.png" alt="" />
+    <img class="tab-icon" src="/icons/tab_system.png" alt="" />
     <h2>Settings</h2>
     <div class="tab-heading-spacer"></div>
     <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore defaults</button>
@@ -60,7 +60,9 @@
       <span class="settings-row-desc">Launch OLED Helper automatically when Windows starts.</span>
     </div>
     <div class="pill-wrap">
-      <span class={`pill${startOnBoot ? '' : ' off'}`} aria-hidden="true"></span>
+      {#if ready}
+        <span class={`pill${startOnBoot ? '' : ' off'}`} aria-hidden="true"></span>
+      {/if}
     </div>
   </button>
 
@@ -70,7 +72,15 @@
       <span class="settings-row-desc">Keep the app available in the system tray and close the window to the tray.</span>
     </div>
     <div class="pill-wrap">
-      <span class={`pill${traySettings.enabled ? '' : ' off'}`} aria-hidden="true"></span>
+      {#if configLoaded.v}
+        <span class={`pill${traySettings.enabled ? '' : ' off'}`} aria-hidden="true"></span>
+      {/if}
     </div>
   </button>
+
+  <div class="settings-footer">
+    <button class="restore-defaults-btn" onclick={() => app.activeTab = 'debug'}>
+      <img class="top-btn-icon" src="/icons/tab_debug.png" alt="" /> Debug
+    </button>
+  </div>
 </div>

@@ -137,7 +137,7 @@ button {
 .top-bar .title { font-size: 15px; font-weight: 700; letter-spacing: -0.3px; color: #fff; }
 .top-bar .version { font-size: 10px; color: var(--text-weak); }
 .top-bar .spacer { flex: 1; }
-.top-bar .top-btn-icon { width: 16px; height: 16px; opacity: 0.7; }
+.top-bar .top-btn-icon { width: 16px; height: 16px; opacity: 0.95; }
 .top-bar .top-btn {
   display: flex;
   align-items: center;
@@ -194,7 +194,7 @@ button {
   border-radius: 2px;
   background: var(--accent);
 }
-.nav-icon { width: 16px; height: 16px; opacity: 0.7; flex-shrink: 0; }
+.nav-icon { width: 16px; height: 16px; opacity: 0.95; flex-shrink: 0; }
 .nav-btn.active .nav-icon { opacity: 1; }
 
 /* ── Content / Tab heading ────────────────────────────────────────── */
@@ -462,6 +462,8 @@ button {
   background: #fff;
   transition: left 0.12s;
 }
+.pill.no-anim { transition: none; }
+.pill.no-anim::after { transition: none; }
 .pill.off::after { left: 2px; }
 
 /* Spacer utility */
@@ -469,9 +471,11 @@ button {
 
 /* ── Taskbar dimmer ───────────────────────────────────────────────── */
 .dimmer-toggle-row { margin-top: 4px; }
-.dimmer-control {
-  max-width: 560px;
+.dimmer-control-group {
   margin-top: 8px;
+  transition: opacity 0.12s;
+}
+.dimmer-control {
   padding: 10px 12px;
   border: 1px solid var(--divider);
   border-radius: 8px;
@@ -500,7 +504,7 @@ button {
 .crush-slider-group.disabled {
   opacity: 0.5;
 }
-.dimmer-control.disabled { opacity: 0.5; }
+.dimmer-control-group.disabled { opacity: 0.5; }
 .dimmer-control-heading {
   display: flex;
   align-items: center;
@@ -546,6 +550,19 @@ button {
     ),
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
+/* Fade sliders use half the tick density of the opacity slider (4 ticks at
+   20/40/60/80% instead of 9 at 10–90%) — same valid calc() pattern as
+   .has-ticks-dimmer above. */
+.dimmer-slider-track input[type=range].has-ticks-dimmer-fade {
+  background:
+    linear-gradient(to right,
+      transparent calc((100% - 18px) * 0.2 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.2 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.2 + 9px + 0.75px), transparent calc((100% - 18px) * 0.2 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.4 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.4 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.4 + 9px + 0.75px), transparent calc((100% - 18px) * 0.4 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.6 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.6 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.6 + 9px + 0.75px), transparent calc((100% - 18px) * 0.6 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.8 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.8 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.8 + 9px + 0.75px), transparent calc((100% - 18px) * 0.8 + 9px + 0.75px)
+    ),
+    linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
+}
 .dimmer-scale {
   display: flex;
   justify-content: space-between;
@@ -554,7 +571,58 @@ button {
   font-size: 11px;
 }
 
+/* Chain-link toggle button sitting centered in the gap between the two
+   fade-duration boxes. Standard link glyph: gray/outline when unlinked,
+   accent-colored when linked — same visual language as the pill toggles
+   elsewhere in the app. */
+.dimmer-chain-btn-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  align-self: stretch;
+}
+.dimmer-chain-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: var(--text-weak);
+  transition: color 0.15s, background 0.15s;
+}
+.dimmer-chain-btn:hover { color: var(--text); background: var(--hover); }
+.dimmer-chain-btn.linked { color: var(--accent); }
+.dimmer-chain-btn svg { width: 20px; height: 20px; }
+
+.dimmer-fade-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  margin-top: 16px;
+}
+.dimmer-fade-col {
+  position: relative;
+  flex: 1 1 50%;
+  min-width: 0;
+  overflow: visible;
+}
+
 /* ── Settings tab rows ────────────────────────────────────────────── */
+.settings-footer {
+  flex: 1;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding-top: 12px;
+}
+.settings-footer .restore-defaults-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.settings-footer .top-btn-icon { width: 16px; height: 16px; opacity: 0.85; }
 .settings-row {
   display: flex;
   align-items: center;
@@ -686,6 +754,29 @@ button {
   color: var(--accent);
   margin-bottom: 2px;
 }
+.fs-controls-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.fs-controls-block .fs-hint-row {
+  width: 200px;
+}
+.fs-controls-block .fs-hint-title { text-align: center; color: #fff; }
+.fs-controls-headers {
+  display: flex;
+  justify-content: space-between;
+  width: 200px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+.fs-controls-headers span:first-child { text-align: left; }
+.fs-controls-headers span:last-child { text-align: right; }
 .fs-hint-sep {
   height: 1px;
   background: rgba(255,255,255,0.1);
@@ -699,8 +790,25 @@ button {
   font-size: 12px;
   white-space: nowrap;
 }
+.fs-hint-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.fs-hint-sep-dash { color: rgba(255,255,255,0.3); }
 .fs-hint-key {
   color: rgba(255,255,255,0.45);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.fs-hint-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  opacity: 0.7;
 }
 .fs-hint-val {
   color: rgba(255,255,255,0.85);
@@ -807,9 +915,11 @@ button {
 /* Match the compact size of the other tooltips outside fullscreen. */
 .fs-help-tip { font-size: 12px; }
 .strip-wrap.inapp-fullscreen .fs-help-tip,
-.strip-wrap.monitor-fullscreen .fs-help-tip { font-size: 14px; }
+.strip-wrap.monitor-fullscreen .fs-help-tip { font-size: 14px; min-width: 320px; }
 .strip-wrap.inapp-fullscreen .fs-hint-row,
-.strip-wrap.monitor-fullscreen .fs-hint-row { font-size: 14px; }
+.strip-wrap.monitor-fullscreen .fs-hint-row,
+.strip-wrap.inapp-fullscreen .fs-hint-line,
+.strip-wrap.monitor-fullscreen .fs-hint-line { font-size: 14px; }
 .strip-wrap.monitor-fullscreen .fs-help-btn { font-size: 13px; padding: 4px 16px; }
 .strip-wrap.monitor-fullscreen .fs-help-wrap { top: 24px; left: 24px; }
 
@@ -888,7 +998,7 @@ button {
   border: 1px solid var(--divider);
   border-radius: 6px;
   padding: 8px;
-  max-height: 200px;
+  height: 200px;
   overflow-y: auto;
   font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
   font-size: 12px;
@@ -925,6 +1035,23 @@ button {
 .diag-warn .diag-level { color: var(--accent-hdr); }
 .diag-msg { color: var(--text); word-break: break-all; }
 .diag-section { margin-top: 8px; }
+.diag-section:last-child {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.diag-section:last-child .diag-log-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.diag-section:last-child .diag-log {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
 .diag-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .diag-runtime-heading { display: flex; align-items: center; gap: 12px; }
 .diag-verbose-toggle {
@@ -936,7 +1063,37 @@ button {
   user-select: none;
   cursor: pointer;
 }
-.diag-verbose-toggle input { accent-color: var(--accent); margin: 0; }
+.diag-verbose-toggle input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  background: var(--hover);
+  border: 1px solid var(--divider);
+  border-radius: 3px;
+  position: relative;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.diag-verbose-toggle input:hover, .diag-verbose-toggle input:focus-visible {
+  background: var(--hover);
+  border-color: var(--accent);
+  outline: none;
+}
+.diag-verbose-toggle input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.diag-verbose-toggle input:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px; top: 1px;
+  width: 4px; height: 7px;
+  border: solid var(--bg);
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(45deg);
+}
 .diag-section h3 { font-size: 13px; font-weight: 600; }
 .copy-btn {
   display: flex;
@@ -946,11 +1103,17 @@ button {
   height: 26px;
   color: var(--text-weak);
   background: var(--hover);
+  border: 1px solid transparent;
   border-radius: 5px;
-  transition: color 0.12s, background 0.12s;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
 }
 .copy-btn svg { width: 15px; height: 15px; }
-.copy-btn:hover { color: var(--text); background: #2d2d34; }
+.copy-btn:hover, .copy-btn:focus-visible {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--accent);
+  outline: none;
+}
 .copy-btn.success { color: #4CD964; }
 .copy-btn.error { color: #E05555; }
 .diag-rows { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }

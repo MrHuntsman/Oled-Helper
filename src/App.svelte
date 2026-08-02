@@ -4,7 +4,6 @@
   import { app, crush, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig, setDimmerSuspendedForFullscreen } from './lib/stores.svelte.js';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
-  import TabSystem from './lib/TabSystem.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
   import TabDebug from './lib/TabDebug.svelte';
   import TabSettings from './lib/TabSettings.svelte';
@@ -77,7 +76,7 @@
     </div>
     <div class="spacer"></div>
     <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
-      <img class="top-btn-icon" src="/icons/tab_settings.png" alt="" /> Settings
+      <img class="top-btn-icon" src="/icons/tab_system.png" alt="" /> Settings
     </button>
     <button class="top-btn" class:active={app.activeTab === 'about'} onclick={() => app.activeTab = 'about'}>
       <img class="top-btn-icon" src="/icons/tab_about.png" alt="" /> About
@@ -91,14 +90,8 @@
     <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
       <img class="nav-icon" src="/icons/tab_dimmer.png" alt="" /> Taskbar Dimmer
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'system'} onclick={() => app.activeTab = 'system'}>
-      <img class="nav-icon" src="/icons/tab_system.png" alt="" /> System
-    </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src="/icons/tab_hotkeys.png" alt="" /> Hotkeys
-    </button>
-    <button class="nav-btn" class:active={app.activeTab === 'debug'} onclick={() => app.activeTab = 'debug'}>
-      <img class="nav-icon" src="/icons/tab_debug.png" alt="" /> Debug
     </button>
   </nav>
 
@@ -108,8 +101,6 @@
         <TabCrush />
       {:else if app.activeTab === 'dimmer'}
         <TabDimmer />
-      {:else if app.activeTab === 'system'}
-        <TabSystem />
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
       {:else if app.activeTab === 'debug'}

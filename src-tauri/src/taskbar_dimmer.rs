@@ -11,7 +11,8 @@ pub struct RuntimeLogEvent {
 pub struct TaskbarDimmerState {
     pub enabled: Mutex<bool>,
     pub opacity: Mutex<f64>,
-    pub ease_duration_ms: Mutex<u64>,
+    pub fade_in_duration_ms: Mutex<u64>,
+    pub fade_out_duration_ms: Mutex<u64>,
     // Store the native HWND directly. A separate WebView2 window can exist
     // without having a usable HWND during startup, which made the old overlay
     // fail when the user enabled the dimmer.
@@ -23,7 +24,8 @@ impl Default for TaskbarDimmerState {
         Self {
             enabled: Mutex::new(false),
             opacity: Mutex::new(0.95),
-            ease_duration_ms: Mutex::new(250),
+            fade_in_duration_ms: Mutex::new(250),
+            fade_out_duration_ms: Mutex::new(250),
             overlay: Mutex::new(None),
         }
     }
@@ -33,7 +35,8 @@ impl Default for TaskbarDimmerState {
 pub struct TaskbarDimmerStatus {
     pub enabled: bool,
     pub opacity: f64,
-    pub ease_duration_ms: u64,
+    pub fade_in_duration_ms: u64,
+    pub fade_out_duration_ms: u64,
     pub available: bool,
 }
 
@@ -62,9 +65,15 @@ mod platform {
     use windows::core::PCWSTR;
 
     const TIMER_ID: usize = 1;
-    // 30 Hz is enough for a smooth short fade while keeping cursor polling
-    // and layered-window updates well below the rendering path's workload.
+    // Poll timer: hover/fullscreen detection and z-order repair. Its interval
+    // can be raised (e.g. 100 ms) to cut idle work — the fade is NOT affected
+    // because it runs on its own dedicated timer below.
     const TIMER_INTERVAL_MS: u32 = 33;
+    // Dedicated fade timer: animates the overlay alpha at a fixed fast rate so
+    // the easing stays smooth regardless of TIMER_INTERVAL_MS. Only runs while
+    // a fade is actually in progress.
+    const FADE_TIMER_ID: usize = 2;
+    const FADE_INTERVAL_MS: u32 = 16;
     const DEFAULT_EASE_DURATION_MS: u64 = 250;
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
@@ -72,11 +81,13 @@ mod platform {
     struct FadeState {
         enabled: bool,
         base_alpha: f64,
-        ease_duration_ms: u64,
+        fade_in_duration_ms: u64,
+        fade_out_duration_ms: u64,
         current_alpha: f64,
         target_alpha: f64,
         last_tick: Instant,
         timer_started: bool,
+        fade_timer_started: bool,
         last_hovered: Option<bool>,
         last_diagnostic: Instant,
     }
@@ -139,7 +150,14 @@ mod platform {
         match message {
             WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
             WM_TIMER => {
-                update_fade(hwnd);
+                // Two independent timers share the window, distinguished by
+                // wParam: the configurable poll timer (hover/fullscreen/z-order)
+                // and the fixed-rate fade timer (alpha animation).
+                if wparam.0 == FADE_TIMER_ID {
+                    advance_fade(hwnd);
+                } else {
+                    update_fade(hwnd);
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -307,18 +325,85 @@ mod platform {
         }
     }
 
+    // Fade-timer callback (FADE_TIMER_ID, fixed fast rate): advances the alpha
+    // toward target_alpha using the real elapsed time, so the easing duration
+    // stays accurate regardless of the poll timer's interval. Stops itself as
+    // soon as the fade completes (or the dimmer is disabled).
+    fn advance_fade(hwnd: HWND) {
+        let Some(state) = FADE_STATE.get() else { return; };
+        let mut alpha_to_apply = None;
+        let done = {
+            let mut fade = state.lock().unwrap();
+            if fade.enabled {
+                let now = Instant::now();
+                let elapsed = now.duration_since(fade.last_tick);
+                fade.last_tick = now;
+                let distance = fade.target_alpha - fade.current_alpha;
+                if distance.abs() > 0.01 {
+                    // Fading in (alpha increasing) uses fade_in_duration_ms;
+                    // fading out (alpha decreasing, e.g. on hover or disable)
+                    // uses fade_out_duration_ms.
+                    let active_duration_ms = if distance > 0.0 {
+                        fade.fade_in_duration_ms
+                    } else {
+                        fade.fade_out_duration_ms
+                    };
+                    let progress = if active_duration_ms == 0 {
+                        1.0
+                    } else {
+                        let duration = Duration::from_millis(active_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS));
+                        (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
+                    };
+                    // Fast ease-out: move quickly at the beginning, then settle
+                    // smoothly over the final few alpha levels. This only
+                    // updates the native layered window, never the frontend.
+                    let eased = 1.0 - (1.0 - progress).powi(3);
+                    fade.current_alpha += distance * eased;
+                    if distance.abs() < 0.5 || progress >= 1.0 {
+                        fade.current_alpha = fade.target_alpha;
+                    }
+                    alpha_to_apply = Some(fade.current_alpha.round().clamp(0.0, 255.0) as u8);
+                }
+                (fade.target_alpha - fade.current_alpha).abs() <= 0.01
+            } else {
+                // Dimmer disabled mid-fade.
+                true
+            }
+        };
+        if done {
+            if let Some(state) = FADE_STATE.get() {
+                let mut fade = state.lock().unwrap();
+                if fade.fade_timer_started {
+                    unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
+                    fade.fade_timer_started = false;
+                }
+            }
+        }
+        if let Some(alpha) = alpha_to_apply {
+            unsafe {
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+            }
+        }
+    }
+
     fn update_fade(hwnd: HWND) {
         let Some(state) = FADE_STATE.get() else { return; };
         // A foreground fullscreen app (game, video, …) or the app's own
         // monitor-fullscreen calibration strip (SUSPENDED, set by the
-        // frontend) must get the whole monitor. The overlay is normally faded
-        // to alpha 0 in that case, but a still-visible always-on-top window
-        // over the taskbar stops Explorer from auto-hiding the taskbar, so the
-        // taskbar can render on top of the fullscreen app. Hide the window
-        // entirely and skip the per-tick z-order churn; the timer keeps
-        // running so the overlay reappears as soon as the fullscreen ends.
+        // frontend) must get the whole monitor. A still-visible always-on-top
+        // window over the taskbar stops Explorer from auto-hiding the taskbar,
+        // so the taskbar can render on top of the fullscreen app. Hide the
+        // window entirely and stop any in-flight fade; the poll timer keeps
+        // running so the overlay reappears as soon as fullscreen ends.
         let fullscreen = fullscreen_app_active(hwnd) || SUSPENDED.load(Ordering::Relaxed);
         if fullscreen {
+            if let Some(state) = FADE_STATE.get() {
+                let mut fade = state.lock().unwrap();
+                if fade.fade_timer_started {
+                    unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
+                    fade.fade_timer_started = false;
+                }
+            }
             unsafe {
                 if IsWindowVisible(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -331,51 +416,47 @@ mod platform {
         let taskbar_rect = taskbar.map(|(_, rect)| rect);
         let (hovered, cursor) = taskbar_rect.map(cursor_over_rect).unwrap_or((false, windows::Win32::Foundation::POINT::default()));
         let now = Instant::now();
-        let mut alpha_to_apply = None;
 
         let mut diagnostic = None;
         {
             let mut fade = state.lock().unwrap();
-            fade.target_alpha = if fade.enabled && !hovered {
+            let new_target = if fade.enabled && !hovered {
                 fade.base_alpha
             } else {
                 0.0
             };
+            let target_changed = (fade.target_alpha - new_target).abs() > 0.01;
+            fade.target_alpha = new_target;
             if fade.last_hovered != Some(hovered) || (VERBOSE_LOGGING.load(Ordering::Relaxed) && now.duration_since(fade.last_diagnostic) >= Duration::from_secs(1)) {
                 fade.last_hovered = Some(hovered);
                 fade.last_diagnostic = now;
                 diagnostic = Some((fade.current_alpha, fade.target_alpha, fade.enabled));
             }
-            let elapsed = now.duration_since(fade.last_tick);
-            fade.last_tick = now;
-            let distance = fade.target_alpha - fade.current_alpha;
-            if distance.abs() > 0.01 {
-                let progress = if fade.ease_duration_ms == 0 {
-                    1.0
-                } else {
-                    let duration = Duration::from_millis(fade.ease_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS));
-                    (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
-                };
-                // Fast ease-out: move quickly at the beginning, then settle
-                // smoothly over the final few alpha levels. This only updates
-                // the native layered window and never touches the frontend.
-                let eased = 1.0 - (1.0 - progress).powi(3);
-                fade.current_alpha += distance * eased;
-                if distance.abs() < 0.5 || progress >= 1.0 {
-                    fade.current_alpha = fade.target_alpha;
+
+            // The actual easing runs on its own fixed-rate timer (advance_fade)
+            // so it stays smooth no matter how low TIMER_INTERVAL_MS is set.
+            // Here we only (re)start that timer when a fade is needed and stop
+            // it once the alpha has settled.
+            let fading = fade.enabled && (fade.target_alpha - fade.current_alpha).abs() > 0.01;
+            if fading && !fade.fade_timer_started {
+                let timer = unsafe { SetTimer(Some(hwnd), FADE_TIMER_ID, FADE_INTERVAL_MS, None) };
+                if timer != 0 {
+                    fade.fade_timer_started = true;
+                    fade.last_tick = now;
                 }
-                alpha_to_apply = Some(fade.current_alpha.round().clamp(0.0, 255.0) as u8);
+            } else if !fading && fade.fade_timer_started {
+                unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
+                fade.fade_timer_started = false;
+            } else if target_changed && fade.fade_timer_started {
+                // Target changed mid-fade: restart the easing clock so the new
+                // fade takes the full ease duration.
+                fade.last_tick = now;
             }
         }
 
-        if let Some(alpha) = alpha_to_apply {
-            unsafe {
-                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-            }
-        }
-        // Do the z-order repair after changing alpha as well as on steady
-        // ticks, so the shell cannot leave the newly visible overlay behind
-        // the taskbar during the same transition.
+        // Z-order repair stays on the poll rate; the fade timer only touches
+        // the layered alpha, so the shell cannot disturb the freshly shown
+        // overlay during a transition.
         maintain_overlay_zorder(hwnd, taskbar);
 
         if let Some((current, target, enabled)) = diagnostic {
@@ -427,11 +508,13 @@ mod platform {
         let _ = FADE_STATE.set(Mutex::new(FadeState {
             enabled: false,
             base_alpha: 0.0,
-            ease_duration_ms: DEFAULT_EASE_DURATION_MS,
+            fade_in_duration_ms: DEFAULT_EASE_DURATION_MS,
+            fade_out_duration_ms: DEFAULT_EASE_DURATION_MS,
             current_alpha: 0.0,
             target_alpha: 0.0,
             last_tick: Instant::now(),
             timer_started: false,
+            fade_timer_started: false,
             last_hovered: None,
             last_diagnostic: Instant::now(),
         }));
@@ -442,7 +525,7 @@ mod platform {
         Ok(hwnd.0 as isize)
     }
 
-    pub fn apply(raw: isize, enabled: bool, opacity: f64, ease_duration_ms: u64, immediate: bool) -> Result<(), String> {
+    pub fn apply(raw: isize, enabled: bool, opacity: f64, fade_in_duration_ms: u64, fade_out_duration_ms: u64, immediate: bool) -> Result<(), String> {
         let taskbar = taskbar_info().ok_or_else(|| "Windows taskbar was not found".to_string())?;
         let rect = taskbar.1;
         let hwnd = HWND(raw as *mut c_void);
@@ -454,7 +537,8 @@ mod platform {
             let mut fade = state.lock().unwrap();
             fade.enabled = enabled;
             fade.base_alpha = alpha;
-            fade.ease_duration_ms = ease_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
+            fade.fade_in_duration_ms = fade_in_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
+            fade.fade_out_duration_ms = fade_out_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
             fade.target_alpha = if enabled && !hovered { alpha } else { 0.0 };
             if immediate {
                 fade.current_alpha = fade.target_alpha;
@@ -473,6 +557,10 @@ mod platform {
             } else if !enabled && fade.timer_started {
                 unsafe { let _ = KillTimer(Some(hwnd), TIMER_ID); }
                 fade.timer_started = false;
+                if fade.fade_timer_started {
+                    unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
+                    fade.fade_timer_started = false;
+                }
             }
         }
 
@@ -526,7 +614,7 @@ mod platform {
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
-    pub fn apply(_raw: isize, _enabled: bool, _opacity: f64, _ease_duration_ms: u64, _immediate: bool) -> Result<(), String> {
+    pub fn apply(_raw: isize, _enabled: bool, _opacity: f64, _fade_in_duration_ms: u64, _fade_out_duration_ms: u64, _immediate: bool) -> Result<(), String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
 }
@@ -536,17 +624,20 @@ pub fn set_taskbar_dimmer(
     state: State<TaskbarDimmerState>,
     enabled: bool,
     opacity: f64,
-    ease_duration_ms: u64,
+    fade_in_duration_ms: u64,
+    fade_out_duration_ms: u64,
     immediate: bool,
 ) -> Result<(), String> {
     let raw = state.overlay.lock().unwrap().ok_or_else(|| {
         "taskbar dimmer native overlay is not initialized".to_string()
     })?;
-    let ease_duration_ms = ease_duration_ms.clamp(0, 1000);
-    platform::apply(raw, enabled, opacity, ease_duration_ms, immediate)?;
+    let fade_in_duration_ms = fade_in_duration_ms.clamp(0, 1000);
+    let fade_out_duration_ms = fade_out_duration_ms.clamp(0, 1000);
+    platform::apply(raw, enabled, opacity, fade_in_duration_ms, fade_out_duration_ms, immediate)?;
     *state.enabled.lock().unwrap() = enabled;
     *state.opacity.lock().unwrap() = opacity.clamp(0.0, 1.0);
-    *state.ease_duration_ms.lock().unwrap() = ease_duration_ms;
+    *state.fade_in_duration_ms.lock().unwrap() = fade_in_duration_ms;
+    *state.fade_out_duration_ms.lock().unwrap() = fade_out_duration_ms;
     Ok(())
 }
 
@@ -565,7 +656,8 @@ pub fn get_taskbar_dimmer_status(state: State<TaskbarDimmerState>) -> TaskbarDim
     TaskbarDimmerStatus {
         enabled: *state.enabled.lock().unwrap(),
         opacity: *state.opacity.lock().unwrap(),
-        ease_duration_ms: *state.ease_duration_ms.lock().unwrap(),
+        fade_in_duration_ms: *state.fade_in_duration_ms.lock().unwrap(),
+        fade_out_duration_ms: *state.fade_out_duration_ms.lock().unwrap(),
         available: platform::available() && state.overlay.lock().unwrap().is_some(),
     }
 }

@@ -18,8 +18,12 @@ pub struct AppConfig {
     pub taskbar_dimmer_enabled: bool,
     #[serde(default = "default_dimmer_opacity")]
     pub taskbar_dimmer_opacity: f64,
-    #[serde(default = "default_dimmer_ease_duration")]
-    pub taskbar_dimmer_ease_duration_ms: u64,
+    // alias handles config files written before fade-in/out were split into
+    // separate durations, so existing users don't silently lose their setting.
+    #[serde(default = "default_dimmer_ease_duration", alias = "taskbar_dimmer_ease_duration_ms")]
+    pub taskbar_dimmer_fade_in_duration_ms: u64,
+    #[serde(default = "default_dimmer_ease_duration", alias = "taskbar_dimmer_ease_duration_ms")]
+    pub taskbar_dimmer_fade_out_duration_ms: u64,
     #[serde(default = "default_true")]
     pub tray_enabled: bool,
 }
@@ -43,7 +47,8 @@ impl Default for AppConfig {
             black_enabled: true,
             taskbar_dimmer_enabled: false,
             taskbar_dimmer_opacity: default_dimmer_opacity(),
-            taskbar_dimmer_ease_duration_ms: default_dimmer_ease_duration(),
+            taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),
+            taskbar_dimmer_fade_out_duration_ms: default_dimmer_ease_duration(),
             tray_enabled: true,
         }
     }

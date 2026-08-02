@@ -17,7 +17,8 @@ export const crush = $state({
 export const taskbarDimmer = $state({
   enabled: false,
   opacity: 0.95,
-  easeDurationMs: 250,
+  fadeInDurationMs: 250,
+  fadeOutDurationMs: 250,
   available: true,
 });
 
@@ -57,8 +58,11 @@ export async function loadConfig() {
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') {
       taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     }
-    if (cfg && typeof cfg.taskbar_dimmer_ease_duration_ms === 'number') {
-      taskbarDimmer.easeDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_ease_duration_ms)));
+    if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') {
+      taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
+    }
+    if (cfg && typeof cfg.taskbar_dimmer_fade_out_duration_ms === 'number') {
+      taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_out_duration_ms)));
     }
     if (cfg && typeof cfg.tray_enabled === 'boolean') {
       traySettings.enabled = cfg.tray_enabled;
@@ -73,7 +77,8 @@ export async function loadConfig() {
       await invoke('set_taskbar_dimmer', {
         enabled: taskbarDimmer.enabled,
         opacity: taskbarDimmer.opacity,
-        easeDurationMs: taskbarDimmer.easeDurationMs,
+        fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
+        fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs,
         immediate: true,
       });
     } catch (e) {
@@ -100,7 +105,8 @@ export function saveConfig() {
     black_enabled: crush.blackEnabled,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
-    taskbar_dimmer_ease_duration_ms: taskbarDimmer.easeDurationMs,
+    taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
+    taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,
     tray_enabled: traySettings.enabled,
   } }).catch((e) => {
     console.warn('[config] save failed', e);
@@ -131,7 +137,8 @@ function flushTaskbarDimmerUpdate() {
   invoke('set_taskbar_dimmer', {
     enabled: update.enabled,
     opacity: update.opacity,
-    easeDurationMs: update.easeDurationMs,
+    fadeInDurationMs: update.fadeInDurationMs,
+    fadeOutDurationMs: update.fadeOutDurationMs,
     immediate: update.immediate,
   }).then(() => {
     if (update.persist && update.version === taskbarDimmerUpdateVersion) saveConfig();
@@ -144,15 +151,17 @@ function flushTaskbarDimmerUpdate() {
   });
 }
 
-export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = taskbarDimmer.opacity, easeDurationMs = taskbarDimmer.easeDurationMs, persist = true, immediate = false) {
+export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = taskbarDimmer.opacity, fadeInDurationMs = taskbarDimmer.fadeInDurationMs, fadeOutDurationMs = taskbarDimmer.fadeOutDurationMs, persist = true, immediate = false) {
   taskbarDimmer.enabled = enabled;
   taskbarDimmer.opacity = Math.max(0, Math.min(1, opacity));
-  taskbarDimmer.easeDurationMs = Math.max(0, Math.min(1000, Math.round(easeDurationMs)));
+  taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(fadeInDurationMs)));
+  taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(fadeOutDurationMs)));
   taskbarDimmerUpdateVersion++;
   pendingTaskbarDimmerUpdate = {
     enabled: taskbarDimmer.enabled,
     opacity: taskbarDimmer.opacity,
-    easeDurationMs: taskbarDimmer.easeDurationMs,
+    fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
+    fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs,
     persist,
     immediate,
     version: taskbarDimmerUpdateVersion,
@@ -161,7 +170,7 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
 }
 
 export function restoreTaskbarDimmerDefaults() {
-  setTaskbarDimmer(false, 0.95, 250, true, true);
+  setTaskbarDimmer(false, 0.95, 250, 250, true, true);
 }
 
 // The taskbar dimmer overlay is an always-on-top native window over the

@@ -566,16 +566,17 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span>
     </span>
     <div class="fs-hint-sep"></div>
-    <div class="fs-hint-title">Controls</div>
-    {#if crush.fullscreen !== 'normal'}
-      <div class="fs-hint-row"><span class="fs-hint-key">Esc</span><span class="fs-hint-val">Exit</span></div>
-    {/if}
-    <div class="fs-hint-row"><span class="fs-hint-key">Left / Right</span><span class="fs-hint-val">±1</span></div>
-    <div class="fs-hint-row"><span class="fs-hint-key">Up / Down</span><span class="fs-hint-val">±0.1</span></div>
-    <div class="fs-hint-sep"></div>
-    <div class="fs-hint-row"><span class="fs-hint-key">Double-click</span><span class="fs-hint-val">Cycle mode</span></div>
-    <div class="fs-hint-row"><span class="fs-hint-key">Right-click</span><span class="fs-hint-val">Menu</span></div>
-    <div class="fs-hint-row"><span class="fs-hint-key">Scroll</span><span class="fs-hint-val">Zoom</span></div>
+    <div class="fs-controls-block">
+      <div class="fs-controls-headers"><span>Action</span><span>Controls</span></div>
+      {#if crush.fullscreen !== 'normal'}
+        <div class="fs-hint-row"><span class="fs-hint-val">Exit</span><span class="fs-hint-key">Esc<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="2.5" y="2.5" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 5.5L10.5 10.5M10.5 5.5L5.5 10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span></div>
+      {/if}
+      <div class="fs-hint-row"><span class="fs-hint-val">±1</span><span class="fs-hint-key">Left / Right<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><path d="M6 4L2.5 8L6 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 4L13.5 8L10 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
+      <div class="fs-hint-row"><span class="fs-hint-val">±0.1</span><span class="fs-hint-key">Up / Down<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><path d="M4 6L8 2.5L12 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 10L8 13.5L12 10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
+      <div class="fs-hint-row"><span class="fs-hint-val">Cycle mode</span><span class="fs-hint-key">Double-click<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2.5V7" stroke="currentColor" stroke-width="1.2"/><path d="M8 7H3.5V6.5A3.5 3.5 0 0 1 7 3H8V7Z" fill="currentColor" fill-opacity="0.65" stroke="none"/></svg></span></div>
+      <div class="fs-hint-row"><span class="fs-hint-val">Menu</span><span class="fs-hint-key">Right-click<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2.5V7" stroke="currentColor" stroke-width="1.2"/><path d="M8 7H12.5V6.5A3.5 3.5 0 0 0 9 3H8V7Z" fill="currentColor" fill-opacity="0.65" stroke="none"/></svg></span></div>
+      <div class="fs-hint-row"><span class="fs-hint-val">Zoom</span><span class="fs-hint-key">Scroll<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 5.5V8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span></div>
+    </div>
   {/snippet}
 
   <div class="calibration-strip-panel">

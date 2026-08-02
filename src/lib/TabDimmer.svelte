@@ -5,14 +5,17 @@
     setTaskbarDimmer(!taskbarDimmer.enabled);
   }
 
+  let fadeLinked = $state(false);
   let opacityDragging = $state(false);
   let opacityHovering = $state(false);
-  let easeDragging = $state(false);
-  let easeHovering = $state(false);
+  let fadeInDragging = $state(false);
+  let fadeInHovering = $state(false);
+  let fadeOutDragging = $state(false);
+  let fadeOutHovering = $state(false);
 
   $effect(() => {
-    if (!opacityDragging && !easeDragging) return;
-    function onUp() { opacityDragging = false; easeDragging = false; }
+    if (!opacityDragging && !fadeInDragging && !fadeOutDragging) return;
+    function onUp() { opacityDragging = false; fadeInDragging = false; fadeOutDragging = false; }
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
     return () => {
@@ -38,17 +41,41 @@
     const raw = +event.currentTarget.value;
     const normalized = normalizeOpacityValue(raw);
     if (raw !== normalized) event.currentTarget.value = normalized;
-    setTaskbarDimmer(taskbarDimmer.enabled, normalized / 100, taskbarDimmer.easeDurationMs, true, true);
+    setTaskbarDimmer(taskbarDimmer.enabled, normalized / 100, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeOutDurationMs, true, true);
   }
 
-  function handleEaseDurationInput(event) {
+  function handleFadeInInput(event) {
     const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
-    setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, duration, false);
+    const fadeOut = fadeLinked ? duration : taskbarDimmer.fadeOutDurationMs;
+    setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, duration, fadeOut, false);
   }
 
-  function commitEaseDuration(event) {
+  function commitFadeIn(event) {
     const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
-    setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, duration);
+    const fadeOut = fadeLinked ? duration : taskbarDimmer.fadeOutDurationMs;
+    setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, duration, fadeOut);
+  }
+
+  function handleFadeOutInput(event) {
+    const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
+    const fadeIn = fadeLinked ? duration : taskbarDimmer.fadeInDurationMs;
+    setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, fadeIn, duration, false);
+  }
+
+  function commitFadeOut(event) {
+    const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
+    const fadeIn = fadeLinked ? duration : taskbarDimmer.fadeInDurationMs;
+    setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, fadeIn, duration);
+  }
+
+  // Toggling the chain link on immediately syncs fade-out to match fade-in,
+  // so the two sliders visually agree the moment they're linked rather than
+  // waiting for the next drag.
+  function toggleFadeLinked() {
+    fadeLinked = !fadeLinked;
+    if (fadeLinked && taskbarDimmer.fadeOutDurationMs !== taskbarDimmer.fadeInDurationMs) {
+      setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeInDurationMs);
+    }
   }
 </script>
 
@@ -75,53 +102,95 @@
     </div>
   </button>
 
-  <div class="dimmer-control" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
-    <div class="dimmer-control-heading">
-      <span class="settings-row-label">Overlay opacity</span>
-      <span class="slider-val">{Math.round(taskbarDimmer.opacity * 100)}%</span>
+  <div class="dimmer-control-group" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
+    <div class="dimmer-control">
+      <div class="dimmer-control-heading">
+        <span class="settings-row-label">Overlay opacity</span>
+        <span class="slider-val">{Math.round(taskbarDimmer.opacity * 100)}%</span>
+      </div>
+      <div class="slider-track-wrap dimmer-slider-track">
+        <input
+          class="dimmer-opacity has-ticks-dimmer"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value={Math.round(taskbarDimmer.opacity * 100)}
+          style="--fill:{taskbarDimmer.opacity * 100}%"
+          disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+          oninput={handleOpacityInput}
+          onpointerdown={() => opacityDragging = true}
+          onpointerup={() => opacityDragging = false}
+          onpointerenter={() => opacityHovering = true}
+          onpointerleave={() => opacityHovering = false} />
+        <div class="slider-tooltip" class:visible={opacityDragging || opacityHovering} style="left:calc(9px + ({taskbarDimmer.opacity} * (100% - 18px)))">{Math.round(taskbarDimmer.opacity * 100)}%</div>
+      </div>
+      <div class="dimmer-scale"><span>Subtle</span><span>Dark</span></div>
     </div>
-    <div class="slider-track-wrap dimmer-slider-track">
-      <input
-        class="dimmer-opacity has-ticks-dimmer"
-        type="range"
-        min="0"
-        max="100"
-        step="1"
-        value={Math.round(taskbarDimmer.opacity * 100)}
-        style="--fill:{taskbarDimmer.opacity * 100}%"
-        disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
-        oninput={handleOpacityInput}
-        onpointerdown={() => opacityDragging = true}
-        onpointerup={() => opacityDragging = false}
-        onpointerenter={() => opacityHovering = true}
-        onpointerleave={() => opacityHovering = false} />
-      <div class="slider-tooltip" class:visible={opacityDragging || opacityHovering} style="left:calc(9px + ({taskbarDimmer.opacity} * (100% - 18px)))">{Math.round(taskbarDimmer.opacity * 100)}%</div>
-    </div>
-    <div class="dimmer-scale"><span>Subtle</span><span>Dark</span></div>
 
-    <div class="dimmer-control-heading dimmer-duration-heading">
-      <span class="settings-row-label">Ease duration</span>
-      <span class="slider-val">{taskbarDimmer.easeDurationMs === 0 ? 'OFF' : `${taskbarDimmer.easeDurationMs} ms`}</span>
+    <div class="dimmer-fade-row">
+      <div class="dimmer-control dimmer-fade-col">
+        <div class="dimmer-control-heading">
+          <span class="settings-row-label">Fade in duration</span>
+          <span class="slider-val">{taskbarDimmer.fadeInDurationMs === 0 ? 'OFF' : `${taskbarDimmer.fadeInDurationMs} ms`}</span>
+        </div>
+        <div class="slider-track-wrap dimmer-slider-track">
+          <input
+            class="dimmer-opacity has-ticks-dimmer-fade"
+            type="range"
+            min="0"
+            max="1000"
+            step="10"
+            value={taskbarDimmer.fadeInDurationMs}
+            style="--fill:{(taskbarDimmer.fadeInDurationMs / 1000) * 100}%"
+            disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+            oninput={handleFadeInInput}
+            onchange={commitFadeIn}
+            onpointerdown={() => fadeInDragging = true}
+            onpointerup={() => fadeInDragging = false}
+            onpointerenter={() => fadeInHovering = true}
+            onpointerleave={() => fadeInHovering = false} />
+          <div class="slider-tooltip" class:visible={fadeInDragging || fadeInHovering} style="left:calc(9px + ({taskbarDimmer.fadeInDurationMs / 1000} * (100% - 18px)))">{taskbarDimmer.fadeInDurationMs === 0 ? 'OFF' : `${taskbarDimmer.fadeInDurationMs} ms`}</div>
+        </div>
+        <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
+      </div>
+
+      <div class="dimmer-chain-btn-wrap">
+        <button class="dimmer-chain-btn" class:linked={fadeLinked} onclick={toggleFadeLinked} title={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={fadeLinked}>
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M11 6.5L12.5 5C14.4 3.1 17.5 3.1 19.4 5C21.3 6.9 21.3 10 19.4 11.9L17.9 13.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M13 17.5L11.5 19C9.6 20.9 6.5 20.9 4.6 19C2.7 17.1 2.7 14 4.6 12.1L6.1 10.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="dimmer-control dimmer-fade-col">
+        <div class="dimmer-control-heading">
+          <span class="settings-row-label">Fade out duration</span>
+          <span class="slider-val">{taskbarDimmer.fadeOutDurationMs === 0 ? 'OFF' : `${taskbarDimmer.fadeOutDurationMs} ms`}</span>
+        </div>
+        <div class="slider-track-wrap dimmer-slider-track">
+          <input
+            class="dimmer-opacity has-ticks-dimmer-fade"
+            type="range"
+            min="0"
+            max="1000"
+            step="10"
+            value={taskbarDimmer.fadeOutDurationMs}
+            style="--fill:{(taskbarDimmer.fadeOutDurationMs / 1000) * 100}%"
+            disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+            oninput={handleFadeOutInput}
+            onchange={commitFadeOut}
+            onpointerdown={() => fadeOutDragging = true}
+            onpointerup={() => fadeOutDragging = false}
+            onpointerenter={() => fadeOutHovering = true}
+            onpointerleave={() => fadeOutHovering = false} />
+          <div class="slider-tooltip" class:visible={fadeOutDragging || fadeOutHovering} style="left:calc(9px + ({taskbarDimmer.fadeOutDurationMs / 1000} * (100% - 18px)))">{taskbarDimmer.fadeOutDurationMs === 0 ? 'OFF' : `${taskbarDimmer.fadeOutDurationMs} ms`}</div>
+        </div>
+        <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
+      </div>
     </div>
-    <div class="slider-track-wrap dimmer-slider-track">
-      <input
-        class="dimmer-opacity has-ticks-dimmer"
-        type="range"
-        min="0"
-        max="1000"
-        step="10"
-        value={taskbarDimmer.easeDurationMs}
-        style="--fill:{(taskbarDimmer.easeDurationMs / 1000) * 100}%"
-        disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
-        oninput={handleEaseDurationInput}
-        onchange={commitEaseDuration}
-        onpointerdown={() => easeDragging = true}
-        onpointerup={() => easeDragging = false}
-        onpointerenter={() => easeHovering = true}
-        onpointerleave={() => easeHovering = false} />
-      <div class="slider-tooltip" class:visible={easeDragging || easeHovering} style="left:calc(9px + ({taskbarDimmer.easeDurationMs / 1000} * (100% - 18px)))">{taskbarDimmer.easeDurationMs === 0 ? 'OFF' : `${taskbarDimmer.easeDurationMs} ms`}</div>
-    </div>
-    <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
   </div>
 
   {#if !taskbarDimmer.available}
