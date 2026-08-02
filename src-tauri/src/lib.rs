@@ -1,6 +1,7 @@
 mod gamma_ramp;
 mod window_icon;
 mod display_info;
+mod config;
 
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -44,7 +45,11 @@ pub fn run() {
         .manage(AppState {
             black_lift: Mutex::new(0),
         })
-        .invoke_handler(tauri::generate_handler![apply_gamma_ramp, log_frontend, get_display_info])
+        .invoke_handler(tauri::generate_handler![apply_gamma_ramp, log_frontend, get_display_info, config::load_config, config::save_config])
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             // Always-on rotating file log (not just debug builds) — GPU-init
             // hangs/crashes can happen in release builds too, and without a

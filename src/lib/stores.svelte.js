@@ -22,6 +22,41 @@ export function adjustmentDisplay() {
 export function blackLift() {
   return crush.blackEnabled ? crush.adjustment : 0;
 }
+
+export const configLoaded = $state({ v: false });
+
+// Load persisted config (black_lift in tenths-display units, e.g. 9 means
+// +0.9, matching what's shown in the UI/slider) once at startup and apply
+// it to the crush store before the UI reacts to it.
+export async function loadConfig() {
+  try {
+    const cfg = await invoke('load_config');
+    if (cfg && typeof cfg.black_lift === 'number') {
+      crush.adjustment = Math.round(cfg.black_lift * 10);
+    }
+    if (cfg && typeof cfg.black_enabled === 'boolean') {
+      crush.blackEnabled = cfg.black_enabled;
+    }
+  } catch (e) {
+    console.warn('[config] load failed', e);
+  } finally {
+    // Gate saveConfig() until after the initial load resolves, so TabCrush's
+    // mount-time effect (which fires with the default adjustment=0 before
+    // this async load completes) doesn't immediately overwrite the file
+    // we just read from.
+    configLoaded.v = true;
+  }
+}
+
+// Fire-and-forget save, called whenever the black level or enabled state
+// changes. black_lift is written in the same units shown in the UI (tenths
+// of crush.adjustment), so the config file reads e.g. 9 instead of 90.
+export function saveConfig() {
+  if (!configLoaded.v) return;
+  invoke('save_config', { config: { black_lift: crush.adjustment / 10, black_enabled: crush.blackEnabled } }).catch((e) => {
+    console.warn('[config] save failed', e);
+  });
+}
 export function accentColor() {
   return app.hdrStatus === 'hdr' ? '#FFCC00' : '#4CA6FF';
 }

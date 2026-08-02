@@ -1,5 +1,5 @@
 <script>
-  import { app, crush, adjustmentDisplay, blackLift, pushGpuLog } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, pushGpuLog, saveConfig } from './stores.svelte.js';
   // dlog/dwarn/derr write to gpuLogVersion ($state) via pushGpuLog — see the
   // footgun warning in stores.svelte.js. Do NOT call these synchronously inside
   // an $effect body (caused a real effect_update_depth_exceeded crash here).
@@ -47,14 +47,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let g=col/4;return vec4f(cb.values[g][col%4]);
 }`;
 
-  let overlayTimer = $state(null);
-  let lastAdjustment = $state('');
   let sliderDragging = $state(false);
   let sliderHovering = $state(false);
+  let fsSliderDragging = $state(false);
+  let fsSliderHovering = $state(false);
+  let mainSliderInput = $state(null);
 
   $effect(() => {
-    if (!sliderDragging) return;
-    function onUp() { sliderDragging = false; }
+    if (!sliderDragging && !fsSliderDragging) return;
+    function onUp() { sliderDragging = false; fsSliderDragging = false; }
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
     return () => {
@@ -62,12 +63,6 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       window.removeEventListener('pointercancel', onUp);
     };
   });
-
-  function showOverlay() {
-    lastAdjustment = adjustmentDisplay();
-    if (overlayTimer) clearTimeout(overlayTimer);
-    overlayTimer = setTimeout(() => { lastAdjustment = ''; }, 1200);
-  }
 
   let initStarted = false;
 
@@ -287,7 +282,40 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   $effect(() => {
     void crush.adjustment; void crush.blackEnabled;
     invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch(() => {});
+    saveConfig();
   });
+
+  // Lets a drag start anywhere in the slider's expanded vertical buffer zone
+  // (see .slider-track-wrap-half::before), not just on the thin native input.
+  // Can't hand this off to the native input via a synthetic pointerdown —
+  // browsers only start native thumb-drag tracking from a trusted event, so a
+  // dispatched PointerEvent starts the drag visually but doesn't continue
+  // tracking subsequent moves. Instead we drive the whole drag manually here:
+  // compute value from cursor X on down and on every move, write it directly
+  // to crush.adjustment, and stop on pointerup/cancel.
+  function handleTrackWrapPointerdown(e, inputEl) {
+    if (e.target === inputEl) return; // already on the real input, let it handle itself
+    e.preventDefault();
+    const min = +inputEl.min, max = +inputEl.max;
+    const applyFromClientX = (clientX) => {
+      const rect = inputEl.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      const raw = Math.round(min + frac * (max - min));
+      crush.adjustment = (raw !== 0 && Math.abs(raw) <= 4) ? 0 : raw;
+    };
+    applyFromClientX(e.clientX);
+    inputEl.focus();
+    sliderDragging = true;
+    function onMove(ev) { applyFromClientX(ev.clientX); }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
 
   function cycleFullscreen() {
     if (crush.fullscreen === 'normal') crush.fullscreen = 'inApp';
@@ -321,11 +349,20 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     crush.showHint = !crush.showHint;
   }
 
+  // Mouse wheel over the strip changes the zoom (square count). Wheeling up
+  // (negative deltaY) increases zoom, down decreases — matches typical
+  // scroll-to-zoom conventions (maps, image viewers).
+  function handleStripWheel(e) {
+    e.preventDefault();
+    const dir = e.deltaY < 0 ? 1 : -1;
+    crush.squareCount = Math.min(MAX_SQUARES, Math.max(2, crush.squareCount + dir));
+  }
+
   // ── Right-click context menu on the strip ──────────────────────────
   let ctxMenu = $state({ open: false, x: 0, y: 0 });
   function openContextMenu(e) {
     e.preventDefault();
-    const menuW = 200, menuH = 210;
+    const menuW = 260, menuH = 210;
     const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
     const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
     ctxMenu = { open: true, x, y };
@@ -396,10 +433,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     if (!crush.blackEnabled) return;
     // crush.adjustment is stored in tenths (adjustmentDisplay() divides by 10),
     // so Left/Right move a whole point (10) and Up/Down move 0.1 (1).
-    if (e.key === 'ArrowRight') { crush.adjustment = Math.min(150, crush.adjustment + 10); showOverlay(); }
-    if (e.key === 'ArrowLeft') { crush.adjustment = Math.max(-150, crush.adjustment - 10); showOverlay(); }
-    if (e.key === 'ArrowUp') { e.preventDefault(); crush.adjustment = Math.min(150, crush.adjustment + 1); showOverlay(); }
-    if (e.key === 'ArrowDown') { e.preventDefault(); crush.adjustment = Math.max(-150, crush.adjustment - 1); showOverlay(); }
+    if (e.key === 'ArrowRight') { crush.adjustment = Math.min(150, crush.adjustment + 10); }
+    if (e.key === 'ArrowLeft') { crush.adjustment = Math.max(-150, crush.adjustment - 10); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); crush.adjustment = Math.min(150, crush.adjustment + 1); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); crush.adjustment = Math.max(-150, crush.adjustment - 1); }
   }
 </script>
 
@@ -416,13 +453,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   </div>
   <div class="separator"></div>
 
-  <div class="slider-row">
+  <button class="slider-row slider-row-clickable" onclick={(e) => { if (e.target.closest('.slider-track-wrap')) return; crush.blackEnabled = !crush.blackEnabled; }}>
     <span class="slider-label">Black Level:</span>
-    <div class="slider-track-wrap">
-      <input type="range" min="-150" max="150" value={crush.adjustment}
+    <div class="slider-track-wrap slider-track-wrap-half" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
+      <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={mainSliderInput}
         class="has-ticks"
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
-        oninput={(e) => { const v = +e.target.value; const snapped = (v !== 0 && Math.abs(v) <= 4) ? 0 : v; crush.adjustment = snapped; if (+e.target.value !== snapped) e.target.value = snapped; showOverlay(); }}
+        oninput={(e) => { const v = +e.target.value; const snapped = (v !== 0 && Math.abs(v) <= 4) ? 0 : v; crush.adjustment = snapped; if (+e.target.value !== snapped) e.target.value = snapped; }}
         onpointerdown={() => sliderDragging = true}
         onpointerup={() => sliderDragging = false}
         onpointerenter={() => sliderHovering = true}
@@ -431,12 +468,11 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <div class="slider-tooltip" class:visible={sliderDragging || sliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
     </div>
     <span class="slider-val">{adjustmentDisplay()}</span>
+    <div class="spacer"></div>
     <div class="pill-wrap">
-      <button class={`pill${crush.blackEnabled ? '' : ' off'}`}
-        onclick={() => crush.blackEnabled = !crush.blackEnabled}
-        aria-label="Toggle black level"></button>
+      <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
-  </div>
+  </button>
 
   <div class="separator"></div>
 
@@ -457,7 +493,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   {/if}
 
   <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
-    onclick={handleStripClick} oncontextmenu={openContextMenu} role="button" tabindex="0">
+    onclick={handleStripClick} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0">
     <canvas bind:this={canvas}></canvas>
     {#if app.hdrStatus !== 'unknown'}
       <div class="square-labels" style="--sq-count:{crush.squareCount}">
@@ -473,28 +509,45 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         {/each}
       </div>
     {/if}
-    {#if crush.fullscreen !== 'normal'}
-      {#if crush.showHint}
-        <div class="fs-hint">
-          <div class="fs-hint-row"><span class="fs-hint-key">Esc</span><span class="fs-hint-val">Exit</span></div>
+    {#if crush.showHint}
+      <div class="fs-help-wrap">
+        <button class="fs-help-btn" aria-label="Calibration strip controls" tabindex="0">?</button>
+        <div class="fs-help-tip">
+          <div class="fs-hint-title">Controls</div>
+          {#if crush.fullscreen !== 'normal'}
+            <div class="fs-hint-row"><span class="fs-hint-key">Esc</span><span class="fs-hint-val">Exit</span></div>
+          {/if}
           <div class="fs-hint-row"><span class="fs-hint-key">Left / Right</span><span class="fs-hint-val">±1</span></div>
           <div class="fs-hint-row"><span class="fs-hint-key">Up / Down</span><span class="fs-hint-val">±0.1</span></div>
+          <div class="fs-hint-sep"></div>
+          <div class="fs-hint-row"><span class="fs-hint-key">Double-click</span><span class="fs-hint-val">Cycle mode</span></div>
+          <div class="fs-hint-row"><span class="fs-hint-key">Right-click</span><span class="fs-hint-val">Menu</span></div>
+          <div class="fs-hint-row"><span class="fs-hint-key">Scroll</span><span class="fs-hint-val">Zoom</span></div>
         </div>
-      {/if}
-      {#if lastAdjustment}
-        <div class="fs-value">{lastAdjustment}</div>
-      {/if}
+      </div>
+    {/if}
+    {#if crush.fullscreen !== 'normal'}
+      <div class="fs-black-slider">
+        <div class="slider-track-wrap">
+          <input type="range" min="-150" max="150" bind:value={crush.adjustment}
+            class="has-ticks"
+            style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
+            oninput={(e) => { const v = +e.target.value; const snapped = (v !== 0 && Math.abs(v) <= 4) ? 0 : v; crush.adjustment = snapped; if (+e.target.value !== snapped) e.target.value = snapped; }}
+            onpointerdown={() => fsSliderDragging = true}
+            onpointerup={() => fsSliderDragging = false}
+            onpointerenter={() => fsSliderHovering = true}
+            onpointerleave={() => fsSliderHovering = false}
+            disabled={!crush.blackEnabled} />
+          <div class="slider-tooltip" class:visible={fsSliderDragging || fsSliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
+        </div>
+        <span class="slider-val">{adjustmentDisplay()}</span>
+      </div>
     {/if}
   </div>
 
   {#if ctxMenu.open}
     <div class="ctx-menu" style="left:{ctxMenu.x}px; top:{ctxMenu.y}px;" onclick={(e) => e.stopPropagation()} oncontextmenu={(e) => e.preventDefault()}>
       <div class="ctx-menu-label">
-        <svg class="ctx-menu-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <rect x="1.5" y="2.5" width="13" height="9" rx="1.2" stroke="currentColor" stroke-width="1.3"/>
-          <path d="M5.5 14H10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-          <path d="M8 11.5V14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-        </svg>
         Calibration Display Mode
       </div>
       <button class="ctx-item" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}>In-App Fullscreen</button>
@@ -504,16 +557,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         <span class="ctx-check" class:checked={crush.showHint}></span> Controls Tooltip
       </button>
       <div class="ctx-menu-sep"></div>
-      <button class="ctx-item ctx-item-exit" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
+      <button class="ctx-item" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
     </div>
   {/if}
 
-  <div class="separator"></div>
-
   <div class="slider-row">
-    <span class="slider-label">Zoom:</span>
-    <div class="slider-track-wrap">
+    <img class="slider-label-icon" src="/icons/zoom.png" alt="Zoom" />
+    <div class="slider-track-wrap slider-track-wrap-sm">
       <input type="range" min="2" max={MAX_SQUARES} value={crush.squareCount}
+        class="slider-sm"
         style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%"
         oninput={(e) => crush.squareCount = +e.target.value} />
     </div>

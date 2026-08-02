@@ -6,7 +6,8 @@
     "main"
   ],
   "permissions": [
-    "core:default"
+    "core:default",
+    "autostart:default"
   ],
   "dangerousRemoteDomainIpcAccess": [
     { "domain": "localhost", "enableTauriAPI": true }

@@ -1,5 +1,5 @@
 <script>
-  import { app, pollDisplayInfo, pollHDRStatus, bumpEnvTick } from './lib/stores.svelte.js';
+  import { app, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig } from './lib/stores.svelte.js';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabSystem from './lib/TabSystem.svelte';
@@ -10,6 +10,11 @@
 
   $effect(() => {
     document.documentElement.setAttribute('data-hdr', app.hdrStatus === 'hdr' ? 'true' : 'false');
+  });
+
+  // Load persisted config (black level) once on startup.
+  $effect(() => {
+    loadConfig();
   });
 
   // Poll display info and HDR status every 1s.
