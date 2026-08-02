@@ -17,8 +17,10 @@ pub struct DisplayInfo {
 
 pub fn query_current_display() -> Option<DisplayInfo> {
     unsafe {
-        let mut devmode = DEVMODEW::default();
-        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        let mut devmode = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
         // PCWSTR::null() targets the primary/default display device, matching
         // what window.screen reports in the frontend for the common single- or
         // primary-monitor case.

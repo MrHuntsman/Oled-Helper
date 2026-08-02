@@ -46,16 +46,18 @@ mod platform {
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, FillRect, GetStockObject, HBRUSH, PAINTSTRUCT, BLACK_BRUSH,
+        BeginPaint, EndPaint, FillRect, GetStockObject, GetMonitorInfoW, HBRUSH, MONITORINFO,
+        MonitorFromWindow, BLACK_BRUSH, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect,
         RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-        GetCursorPos, GetForegroundWindow, IsWindowVisible, SetTimer,
-        KillTimer, ShowWindow, GWLP_HWNDPARENT, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SW_HIDE,
+        GetCursorPos, GetForegroundWindow, IsIconic, IsWindowVisible, SetTimer,
+        KillTimer, ShowWindow, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, LWA_ALPHA, SW_HIDE,
         SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_SHOWWINDOW, SW_SHOW,
-        WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_EX_TRANSPARENT, WS_POPUP, WNDCLASSW, HTTRANSPARENT,
+        WS_MAXIMIZE, WM_NCHITTEST, WM_PAINT, WM_TIMER, WS_CAPTION, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
+        WNDCLASSW, HTTRANSPARENT,
     };
     use windows::core::PCWSTR;
 
@@ -172,6 +174,60 @@ mod platform {
         taskbar_info().is_some()
     }
 
+    // Returns true when another application occupies the entire monitor in
+    // exclusive fullscreen or borderless fullscreen mode. Normal maximized
+    // windows retain caption/frame styles and are intentionally excluded.
+    fn fullscreen_app_active(overlay: HWND) -> bool {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() || foreground == overlay {
+                return false;
+            }
+
+            let mut process_id = 0u32;
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                foreground,
+                Some(&mut process_id),
+            );
+            if process_id == std::process::id() || process_id == 0 || IsIconic(foreground).as_bool() {
+                return false;
+            }
+
+            let mut window_rect = RECT::default();
+            if GetWindowRect(foreground, &mut window_rect).is_err() {
+                return false;
+            }
+            let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+            if monitor.0.is_null() {
+                return false;
+            }
+            let mut monitor_info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+                return false;
+            }
+
+            let covers_monitor = window_rect.left <= monitor_info.rcMonitor.left
+                && window_rect.top <= monitor_info.rcMonitor.top
+                && window_rect.right >= monitor_info.rcMonitor.right
+                && window_rect.bottom >= monitor_info.rcMonitor.bottom;
+            if !covers_monitor {
+                return false;
+            }
+
+            let style = GetWindowLongPtrW(foreground, GWL_STYLE) as u32;
+            let has_window_chrome = (style & (WS_CAPTION.0 | WS_THICKFRAME.0)) != 0;
+            let exact_monitor = window_rect.left == monitor_info.rcMonitor.left
+                && window_rect.top == monitor_info.rcMonitor.top
+                && window_rect.right == monitor_info.rcMonitor.right
+                && window_rect.bottom == monitor_info.rcMonitor.bottom;
+            let is_maximized = (style & WS_MAXIMIZE.0) != 0;
+            !has_window_chrome || (exact_monitor && !is_maximized)
+        }
+    }
+
     fn cursor_over_rect(rect: RECT) -> (bool, windows::Win32::Foundation::POINT) {
         let mut point = windows::Win32::Foundation::POINT::default();
         unsafe {
@@ -239,12 +295,17 @@ mod platform {
         let taskbar_rect = taskbar.map(|(_, rect)| rect);
         let (hovered, cursor) = taskbar_rect.map(cursor_over_rect).unwrap_or((false, windows::Win32::Foundation::POINT::default()));
         let now = Instant::now();
+        let fullscreen = fullscreen_app_active(hwnd);
         let mut alpha_to_apply = None;
 
         let mut diagnostic = None;
         {
             let mut fade = state.lock().unwrap();
-            fade.target_alpha = if fade.enabled && !hovered { fade.base_alpha } else { 0.0 };
+            fade.target_alpha = if fade.enabled && !hovered && !fullscreen {
+                fade.base_alpha
+            } else {
+                0.0
+            };
             if fade.last_hovered != Some(hovered) || (VERBOSE_LOGGING.load(Ordering::Relaxed) && now.duration_since(fade.last_diagnostic) >= Duration::from_secs(1)) {
                 fade.last_hovered = Some(hovered);
                 fade.last_diagnostic = now;

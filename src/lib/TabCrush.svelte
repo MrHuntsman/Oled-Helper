@@ -8,7 +8,7 @@
   const derr = (msg) => { console.error('[gpu]', msg); };
   import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, computeHdrValues, computeSdrValues } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
 
   let canvas = $state(null);
   let device = $state(null);
@@ -65,10 +65,36 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   });
 
   let initStarted = false;
+  let gpuGeneration = 0;
+
+  function releaseGpuResources() {
+    gpuGeneration++;
+    initStarted = true;
+
+    if (resizeRaf) {
+      cancelAnimationFrame(resizeRaf);
+      resizeRaf = 0;
+    }
+    resizeObs?.disconnect();
+    resizeObs = null;
+    device?.destroy();
+    device = null;
+    ctx = null;
+    ub = null;
+    bg = null;
+    pipe = null;
+    pipelineLayout = null;
+    shaderModule = null;
+    currentFormat = null;
+    ready = false;
+  }
+
+  onDestroy(releaseGpuResources);
 
   async function initGPU() {
     if (initStarted) { dwarn('initGPU called again while already running/ran — skipping'); return; }
     initStarted = true;
+    const generation = gpuGeneration;
     try {
       dlog(`navigator.gpu present: ${!!navigator.gpu}`);
       if (!navigator.gpu) { gpuError = 'WebGPU not available'; derr('FAIL: WebGPU not available'); return; }
@@ -82,6 +108,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
       dlog('requesting GPU adapter...');
       const adapter = await navigator.gpu.requestAdapter();
+      if (generation !== gpuGeneration) return;
       if (!adapter) { gpuError = 'No GPU adapter'; derr('FAIL: No GPU adapter returned'); return; }
       dlog('GPU adapter acquired');
 
@@ -109,6 +136,11 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
       dlog('requesting device...');
       device = await adapter.requestDevice();
+      if (generation !== gpuGeneration) {
+        device.destroy();
+        device = null;
+        return;
+      }
       dlog('GPU device created');
 
       ctx = canvas.getContext('webgpu');
@@ -160,6 +192,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         primitive: { topology: 'triangle-list' },
       });
       dlog(`pipeline created with target format: ${format}`);
+      if (generation !== gpuGeneration) {
+        releaseGpuResources();
+        return;
+      }
       ready = true;
       gpuError = '';
       dlog('GPU init complete — calling first render');

@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -47,7 +47,7 @@ fn materialize_icon_file() -> Option<PathBuf> {
     Some(path)
 }
 
-unsafe fn load_icon(path: &PathBuf, cx: i32, cy: i32) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+unsafe fn load_icon(path: &Path, cx: i32, cy: i32) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     let wide = to_wide(path.to_str()?);
     let handle = LoadImageW(
         None,
@@ -156,7 +156,7 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
         if !alpha_has_content {
             let mask_width = bitmap_width;
             let mask_height = (bitmap_height / 2).max(1);
-            let mask_row_bytes = ((mask_width + 31) / 32) * 4;
+            let mask_row_bytes = mask_width.div_ceil(32) * 4;
             let mut mask_info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,

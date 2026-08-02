@@ -1,4 +1,6 @@
 <script>
+  import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import { app, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig } from './lib/stores.svelte.js';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
@@ -7,6 +9,16 @@
   import TabDebug from './lib/TabDebug.svelte';
   import TabSettings from './lib/TabSettings.svelte';
   import TabAbout from './lib/TabAbout.svelte';
+
+  let windowVisible = $state(true);
+
+  onMount(() => {
+    let unlisten;
+    listen('window-visibility', (event) => {
+      windowVisible = event.payload !== false;
+    }).then((stop) => { unlisten = stop; }).catch(() => {});
+    return () => unlisten?.();
+  });
 
   $effect(() => {
     document.documentElement.setAttribute('data-hdr', app.hdrStatus === 'hdr' ? 'true' : 'false');
@@ -27,6 +39,7 @@
   // Deferring the first call with setTimeout(...,0) keeps it out of the
   // effect's synchronous execution while still firing immediately on mount.
   $effect(() => {
+    if (!windowVisible) return;
     const initial = setTimeout(() => { pollDisplayInfo(); pollHDRStatus(); }, 0);
     const timer = setInterval(() => { pollDisplayInfo(); pollHDRStatus(); }, 1000);
     return () => { clearTimeout(initial); clearInterval(timer); };
@@ -40,6 +53,7 @@
   // effect_update_depth_exceeded loop guard, even though none of them read
   // back their own state. See stores.svelte.js footgun comment near envTick.
   $effect(() => {
+    if (!windowVisible) return;
     const timer = setInterval(() => { bumpEnvTick(); }, 1000);
     return () => clearInterval(timer);
   });
@@ -82,20 +96,22 @@
   </nav>
 
   <main class="content">
-    {#if app.activeTab === 'crush'}
-      <TabCrush />
-    {:else if app.activeTab === 'dimmer'}
-      <TabDimmer />
-    {:else if app.activeTab === 'system'}
-      <TabSystem />
-    {:else if app.activeTab === 'hotkeys'}
-      <TabHotkeys />
-    {:else if app.activeTab === 'debug'}
-      <TabDebug />
-    {:else if app.activeTab === 'settings'}
-      <TabSettings />
-    {:else if app.activeTab === 'about'}
-      <TabAbout />
+    {#if windowVisible}
+      {#if app.activeTab === 'crush'}
+        <TabCrush />
+      {:else if app.activeTab === 'dimmer'}
+        <TabDimmer />
+      {:else if app.activeTab === 'system'}
+        <TabSystem />
+      {:else if app.activeTab === 'hotkeys'}
+        <TabHotkeys />
+      {:else if app.activeTab === 'debug'}
+        <TabDebug />
+      {:else if app.activeTab === 'settings'}
+        <TabSettings />
+      {:else if app.activeTab === 'about'}
+        <TabAbout />
+      {/if}
     {/if}
   </main>
 

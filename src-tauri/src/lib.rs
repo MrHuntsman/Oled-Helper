@@ -8,7 +8,7 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 
 struct AppState {
@@ -46,6 +46,15 @@ fn log_frontend(level: String, message: String) {
 #[tauri::command]
 fn get_display_info() -> Option<display_info::DisplayInfo> {
     display_info::query_current_display()
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.show().is_ok() {
+            let _ = window.set_focus();
+            let _ = app.emit("window-visibility", true);
+        }
+    }
 }
 
 #[tauri::command]
@@ -118,12 +127,7 @@ pub fn run() {
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -133,10 +137,7 @@ pub fn run() {
                         button_state: MouseButtonState::Up,
                         ..
                     } = event {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        show_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -178,7 +179,9 @@ pub fn run() {
                         .load(Ordering::Relaxed);
                     if tray_enabled {
                         api.prevent_close();
-                        let _ = window.hide();
+                        if window.hide().is_ok() {
+                            let _ = window.app_handle().emit("window-visibility", false);
+                        }
                     }
                 }
                 tauri::WindowEvent::Destroyed => unsafe {
