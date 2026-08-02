@@ -3,29 +3,27 @@
 // running) is blurry because Tauri sets HICON from raw RGBA data instead of letting
 // Windows pick the correctly-sized frame out of the .ico the way Explorer does.
 //
-// Fix: embed icon.ico at compile time, write it to a temp file once, then load it
-// with LoadImageW (the same code path Explorer uses — picks the best frame per size
-// and handles both legacy BMP and modern PNG-encoded ico frames correctly) and post
-// WM_SETICON so the running window's titlebar/taskbar icon is crisp, not just the
-// pinned-shortcut icon.
-//
-// Sizes are queried from the system (SM_CXSMICON / SM_CXICON) rather than hardcoded,
-// since these scale with the display's DPI setting — a hardcoded 16px icon gets
-// stretched (and looks blurry again) on any display above 100% scaling.
+// The same native ICO loading path is also used for the tray icon. Tauri's public
+// TrayIcon API accepts an RGBA Image rather than an HICON, so the DPI-sized native
+// HICON is converted to RGBA only after Windows has selected the correct ICO frame.
 
 use std::fs;
+use std::mem::size_of;
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{HWND, WPARAM, LPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    SendMessageW, LoadImageW, IMAGE_ICON, LR_LOADFROMFILE, WM_SETICON,
-    ICON_SMALL, ICON_BIG, HICON, GetSystemMetrics,
-    SM_CXSMICON, SM_CYSMICON, SM_CXICON, SM_CYICON,
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDIBits, GetDC,
+    GetObjectW, HGDIOBJ, ReleaseDC, RGBQUAD,
 };
-use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, GetIconInfo, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL,
+    ICONINFO, IMAGE_ICON, LR_LOADFROMFILE, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+    WM_SETICON,
+};
 use windows::core::PCWSTR;
 
-const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
+pub const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -49,7 +47,7 @@ fn materialize_icon_file() -> Option<PathBuf> {
     Some(path)
 }
 
-unsafe fn load_icon(path: &PathBuf, cx: i32, cy: i32) -> Option<HICON> {
+unsafe fn load_icon(path: &PathBuf, cx: i32, cy: i32) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     let wide = to_wide(path.to_str()?);
     let handle = LoadImageW(
         None,
@@ -59,7 +57,155 @@ unsafe fn load_icon(path: &PathBuf, cx: i32, cy: i32) -> Option<HICON> {
         cy,
         LR_LOADFROMFILE,
     ).ok()?;
-    Some(HICON(handle.0))
+    Some(windows::Win32::UI::WindowsAndMessaging::HICON(handle.0))
+}
+
+/// Loads the system-DPI-sized small ICO frame through Win32 and converts that
+/// already-selected native frame into the RGBA Image required by Tauri's tray API.
+/// This avoids decoding the ICO through a single arbitrary frame and then scaling
+/// it in the tray implementation.
+#[cfg(target_os = "windows")]
+pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
+    let icon_path = materialize_icon_file()?;
+
+    unsafe {
+        let width = GetSystemMetrics(SM_CXSMICON).max(1) as u32;
+        let height = GetSystemMetrics(SM_CYSMICON).max(1) as u32;
+        let hicon = load_icon(&icon_path, width as i32, height as i32)?;
+
+        let mut icon_info: ICONINFO = std::mem::zeroed();
+        if GetIconInfo(hicon, &mut icon_info).is_err() {
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+
+        let hdc = GetDC(None);
+        if hdc.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+
+        let mut bitmap: BITMAP = std::mem::zeroed();
+        let bitmap_size = size_of::<BITMAP>() as i32;
+        let got_bitmap = GetObjectW(
+            HGDIOBJ(icon_info.hbmColor.0),
+            bitmap_size,
+            Some((&mut bitmap as *mut BITMAP).cast()),
+        );
+
+        let bitmap_width = bitmap.bmWidth.max(1) as u32;
+        let bitmap_height = bitmap.bmHeight.max(1) as u32;
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: bitmap_width as i32,
+                // Negative height requests top-down rows, matching RGBA order.
+                biHeight: -(bitmap_height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [RGBQUAD::default()],
+        };
+
+        let mut bgra = vec![0u8; bitmap_width as usize * bitmap_height as usize * 4];
+        let copied = if got_bitmap > 0 {
+            GetDIBits(
+                hdc,
+                icon_info.hbmColor,
+                0,
+                bitmap_height,
+                Some(bgra.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        let _ = ReleaseDC(None, hdc);
+        let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
+        let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
+        let _ = DestroyIcon(hicon);
+
+        if copied <= 0 {
+            return None;
+        }
+
+        let mut alpha_has_content = false;
+        let mut rgba = vec![0u8; bgra.len()];
+        for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = src[3];
+            alpha_has_content |= src[3] != 0;
+        }
+
+        // Legacy ICO frames can carry transparency in the 1-bit mask instead
+        // of the color bitmap's alpha channel. Read that mask and use it only
+        // when the color alpha is entirely empty, preserving transparent edges
+        // instead of turning the whole icon into an opaque square.
+        if !alpha_has_content {
+            let mask_width = bitmap_width;
+            let mask_height = (bitmap_height / 2).max(1);
+            let mask_row_bytes = ((mask_width + 31) / 32) * 4;
+            let mut mask_info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: mask_width as i32,
+                    biHeight: -(mask_height as i32),
+                    biPlanes: 1,
+                    biBitCount: 1,
+                    biCompression: 0,
+                    biSizeImage: 0,
+                    biXPelsPerMeter: 0,
+                    biYPelsPerMeter: 0,
+                    biClrUsed: 0,
+                    biClrImportant: 0,
+                },
+                bmiColors: [RGBQUAD::default()],
+            };
+            let mut mask_bits = vec![0u8; mask_row_bytes as usize * mask_height as usize];
+            let mask_copied = GetDIBits(
+                hdc,
+                icon_info.hbmMask,
+                0,
+                mask_height,
+                Some(mask_bits.as_mut_ptr().cast()),
+                &mut mask_info,
+                DIB_RGB_COLORS,
+            );
+            if mask_copied > 0 {
+                for y in 0..bitmap_height as usize {
+                    let mask_y = y.min(mask_height as usize - 1);
+                    let row = &mask_bits[mask_y * mask_row_bytes as usize..];
+                    for x in 0..bitmap_width as usize {
+                        let bit = (row[x / 8] >> (7 - (x % 8))) & 1;
+                        rgba[(y * bitmap_width as usize + x) * 4 + 3] = if bit == 0 { 255 } else { 0 };
+                    }
+                }
+            } else {
+                for pixel in rgba.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
+            }
+        }
+
+        Some(tauri::image::Image::new_owned(rgba, bitmap_width, bitmap_height))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
+    tauri::image::Image::from_bytes(ICON_BYTES).ok()
 }
 
 /// Applies crisp small (titlebar/taskbar) and large (alt-tab) icons to the given
@@ -98,11 +244,13 @@ pub fn apply_crisp_window_icon(hwnd_raw: isize) {
 
         // Force the non-client area (titlebar) to repaint immediately with the
         // new icon instead of waiting for the next natural redraw.
-        let _ = RedrawWindow(
+        let _ = windows::Win32::Graphics::Gdi::RedrawWindow(
             Some(hwnd),
             None,
             None,
-            RDW_FRAME | RDW_INVALIDATE | RDW_UPDATENOW,
+            windows::Win32::Graphics::Gdi::RDW_FRAME
+                | windows::Win32::Graphics::Gdi::RDW_INVALIDATE
+                | windows::Win32::Graphics::Gdi::RDW_UPDATENOW,
         );
     }
 }

@@ -1,5 +1,5 @@
 <script>
-  import { app, gpuLogEntries, gpuLogVersion, clearGpuLog, envTick } from './stores.svelte.js';
+  import { app, gpuLogEntries, gpuLogVersion, clearGpuLog, envTick, runtimeLogSettings, setVerbosePeriodicLogging } from './stores.svelte.js';
 
   let copied = $state(false);
   let copyFailed = $state(false);
@@ -40,12 +40,36 @@
   let logEntries = $derived.by(() => { void gpuLogVersion.n; return [...gpuLogEntries]; });
 
   let logEl = $state(null);
-  // Auto-scroll to bottom whenever new entries arrive, so the latest line is
-  // always visible. Only writes DOM scrollTop (not $state), so this is safe
-  // to run every time logEntries changes — no read/write-same-state risk.
+  let logAtBottom = $state(true);
+  let showNewLogs = $state(false);
+
+  function handleLogScroll() {
+    if (!logEl) return;
+    const distanceFromBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight;
+    logAtBottom = distanceFromBottom <= 8;
+    if (logAtBottom) showNewLogs = false;
+  }
+
+  function jumpToLatest() {
+    if (!logEl) return;
+    logEl.scrollTop = logEl.scrollHeight;
+    logAtBottom = true;
+    showNewLogs = false;
+  }
+
+  // Keep following new entries only while the user is already at the bottom.
+  // Once they scroll upward, preserve their position and offer a jump button
+  // instead of repeatedly pulling the viewport away from the lines they are
+  // reading.
   $effect(() => {
     void logEntries.length;
-    if (logEl) logEl.scrollTop = logEl.scrollHeight;
+    if (!logEl) return;
+    if (logAtBottom) {
+      logEl.scrollTop = logEl.scrollHeight;
+      showNewLogs = false;
+    } else {
+      showNewLogs = true;
+    }
   });
 
   function formatTs(ts) {
@@ -70,7 +94,7 @@
 
   async function copyGpuLog() {
     const lines = logEntries.map(e => `[${formatTs(e.ts)}] [${e.level.toUpperCase()}] ${e.message}`).join('\n');
-    const text = `OLED Helper — Diagnostics Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
+    const text = `OLED Helper — Runtime Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
     try {
       await navigator.clipboard.writeText(text);
       logCopied = true;
@@ -86,7 +110,9 @@
 <div class="tab-body">
   <div class="tab-heading">
     <h2>Debug</h2>
-    <span class="subtitle">— GPU init & HDR diagnostics</span>
+    <span class="subtitle">— Runtime, GPU & HDR diagnostics</span>
+    <div class="tab-heading-spacer"></div>
+    <button class="restore-defaults-btn" onclick={() => { runtimeLogSettings.verbosePeriodic = false; setVerbosePeriodicLogging(false); }}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -112,9 +138,15 @@
 
   <div class="diag-section">
     <div class="diag-section-header">
-      <h3>Diagnostics Log</h3>
+      <div class="diag-runtime-heading">
+        <h3>Runtime Log</h3>
+        <label class="diag-verbose-toggle">
+          <input type="checkbox" checked={runtimeLogSettings.verbosePeriodic} onchange={(e) => setVerbosePeriodicLogging(e.currentTarget.checked)} />
+          <span>Verbose periodic logs</span>
+        </label>
+      </div>
       <div style="display:flex; gap:6px;">
-        <button class="copy-btn" class:success={logCopied} class:error={logCopyFailed} onclick={copyGpuLog} title={logCopied ? 'Copied!' : logCopyFailed ? 'Copy failed' : 'Copy diagnostics log'} aria-label="Copy diagnostics log">
+        <button class="copy-btn" class:success={logCopied} class:error={logCopyFailed} onclick={copyGpuLog} title={logCopied ? 'Copied!' : logCopyFailed ? 'Copy failed' : 'Copy runtime log'} aria-label="Copy runtime log">
           {#if logCopied}
             <svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           {:else}
@@ -126,18 +158,21 @@
         </button>
       </div>
     </div>
-    <div class="diag-log" bind:this={logEl}>
-      {#if logEntries.length === 0}
-        <p class="gpu-status" style="margin:0;">No log entries yet.</p>
-      {:else}
-        {#each logEntries as entry}
-          <div class="diag-entry" class:diag-error={entry.level === 'error'} class:diag-warn={entry.level === 'warn'}>
-            <span class="diag-ts">{formatTs(entry.ts)}</span>
-            <span class="diag-level">{entry.level}</span>
-            <span class="diag-msg">{entry.message}</span>
-          </div>
-        {/each}
-      {/if}
+    <div class="diag-log-wrap">
+      <div class="diag-log" bind:this={logEl} onscroll={handleLogScroll}>
+        {#if logEntries.length === 0}
+          <p class="gpu-status" style="margin:0;">No log entries yet.</p>
+        {:else}
+          {#each logEntries as entry}
+            <div class="diag-entry" class:diag-error={entry.level === 'error'} class:diag-warn={entry.level === 'warn'}>
+              <span class="diag-ts">{formatTs(entry.ts)}</span>
+              <span class="diag-level">{entry.level}</span>
+              <span class="diag-msg">{entry.message}</span>
+            </div>
+          {/each}
+        {/if}
+      </div>
+      <button class="diag-log-new" class:visible={showNewLogs} onclick={jumpToLatest} aria-label="Jump to latest runtime logs">New logs ↓</button>
     </div>
   </div>
 </div>

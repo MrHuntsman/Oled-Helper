@@ -1,13 +1,11 @@
 <script>
-  import { app, crush, adjustmentDisplay, blackLift, pushGpuLog, saveConfig } from './stores.svelte.js';
-  // dlog/dwarn/derr write to gpuLogVersion ($state) via pushGpuLog — see the
-  // footgun warning in stores.svelte.js. Do NOT call these synchronously inside
-  // an $effect body (caused a real effect_update_depth_exceeded crash here).
-  // Only call from async code after an await, event handlers, or timers.
-  // Use plain console.log/console.warn for anything logged directly in an $effect.
-  const dlog = (msg) => { console.log('[gpu]', msg); pushGpuLog('info', msg); };
-  const dwarn = (msg) => { console.warn('[gpu]', msg); pushGpuLog('warn', msg); };
-  const derr = (msg) => { console.error('[gpu]', msg); pushGpuLog('error', msg); };
+  import { app, crush, adjustmentDisplay, blackLift, saveConfig } from './stores.svelte.js';
+  // Runtime console output is mirrored to the in-app Debug log and Rust file
+  // log by main.js. Keep GPU messages on that single path so they are not
+  // duplicated in either destination.
+  const dlog = (msg) => { console.log('[gpu]', msg); };
+  const dwarn = (msg) => { console.warn('[gpu]', msg); };
+  const derr = (msg) => { console.error('[gpu]', msg); };
   import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, computeHdrValues, computeSdrValues } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
   import { untrack } from 'svelte';
@@ -52,6 +50,8 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let fsSliderDragging = $state(false);
   let fsSliderHovering = $state(false);
   let mainSliderInput = $state(null);
+  let fsSliderInput = $state(null);
+  let zoomSliderInput = $state(null);
 
   $effect(() => {
     if (!sliderDragging && !fsSliderDragging) return;
@@ -209,14 +209,17 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   }
 
   function render() {
-    if (!ready || !device || !canvas || canvas.width < 1 || canvas.height < 1) {
-      dwarn(`render skipped — ready=${ready} device=${!!device} canvas=${!!canvas} size=${canvas?.width}x${canvas?.height}`);
-      return;
-    }
+    if (!ready || !device || !canvas) return;
     try {
       const dpr = devicePixelRatio || 1;
-      const w = Math.round(canvas.clientWidth * dpr);
-      const h = Math.round(canvas.clientHeight * dpr);
+      const clientWidth = canvas.clientWidth;
+      const clientHeight = canvas.clientHeight;
+      // The strip can briefly be zero-sized while its flex layout is settling
+      // or while the tab is being switched. Never ask WebGPU for a 0x0 texture.
+      if (clientWidth < 1 || clientHeight < 1) return;
+      const w = Math.round(clientWidth * dpr);
+      const h = Math.round(clientHeight * dpr);
+      if (w < 1 || h < 1) return;
       if (w !== canvas.width || h !== canvas.height) { canvas.width = w; canvas.height = h; }
       const sq = crush.squareCount;
       const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
@@ -269,9 +272,6 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       resizeRaf = requestAnimationFrame(() => {
         resizeRaf = 0;
-        if (canvas.clientWidth < 1 || canvas.clientHeight < 1) {
-          dwarn(`resize observed but canvas has zero size: ${canvas.clientWidth}x${canvas.clientHeight}`);
-        }
         render();
       });
     });
@@ -293,6 +293,41 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   // tracking subsequent moves. Instead we drive the whole drag manually here:
   // compute value from cursor X on down and on every move, write it directly
   // to crush.adjustment, and stop on pointerup/cancel.
+  function normalizeBlackLevel(value) {
+    return (value !== 0 && Math.abs(value) <= 4) ? 0 : value;
+  }
+
+  function setBlackLevel(value) {
+    crush.adjustment = normalizeBlackLevel(value);
+  }
+
+  function handleBlackLevelInput(e) {
+    const value = +e.target.value;
+    const normalized = normalizeBlackLevel(value);
+    crush.adjustment = normalized;
+    if (value !== normalized) e.target.value = normalized;
+  }
+
+  // Change a range by one native step for each wheel event while the pointer
+  // is anywhere over its row. Use the sign only so mouse wheels and trackpads
+  // both produce predictable one-step adjustments, then clamp to the range.
+  function handleSliderWheel(e, inputEl, setValue, stepOverride = null) {
+    if (!inputEl || inputEl.disabled || e.deltaY === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const min = +inputEl.min;
+    const max = +inputEl.max;
+    const step = stepOverride ?? +(inputEl.step || 1);
+    const current = +inputEl.value;
+    const direction = e.deltaY < 0 ? 1 : -1;
+    const rawNext = Math.min(max, Math.max(min, current + direction * step));
+    let next = setValue === setBlackLevel ? normalizeBlackLevel(rawNext) : rawNext;
+    // The black-level slider intentionally snaps values from -4..4 to zero.
+    // Jump across that dead zone so the first wheel tick always changes it.
+    if (next === current && current === 0) next = direction > 0 ? 5 : -5;
+    setValue(next);
+  }
+
   function handleTrackWrapPointerdown(e, inputEl) {
     if (e.target === inputEl) return; // already on the real input, let it handle itself
     e.preventDefault();
@@ -427,6 +462,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     };
   });
 
+  function restoreDefaults() {
+    crush.adjustment = 0;
+    crush.blackEnabled = true;
+    crush.squareCount = 12;
+    crush.fullscreen = 'normal';
+    crush.showHint = true;
+    saveConfig();
+  }
+
   function onKeydown(e) {
     if (app.activeTab !== 'crush') return;
     if (e.key === 'Escape') { if (crush.fullscreen !== 'normal') { exitFullscreen(); return; } }
@@ -450,16 +494,18 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <button class="info-tip-btn" aria-label="About Black Crush Tweak" tabindex="0">?</button>
       <div class="info-tip">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</div>
     </div>
+    <div class="tab-heading-spacer"></div>
+    <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
 
-  <button class="slider-row slider-row-clickable" onclick={(e) => { if (e.target.closest('.slider-track-wrap')) return; crush.blackEnabled = !crush.blackEnabled; }}>
+  <button class="slider-row slider-row-clickable" onclick={(e) => { if (e.target.closest('.slider-track-wrap')) return; crush.blackEnabled = !crush.blackEnabled; }} onwheel={(e) => handleSliderWheel(e, mainSliderInput, setBlackLevel, 5)}>
     <span class="slider-label">Black Level:</span>
     <div class="slider-track-wrap slider-track-wrap-half" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
       <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={mainSliderInput}
         class="has-ticks"
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
-        oninput={(e) => { const v = +e.target.value; const snapped = (v !== 0 && Math.abs(v) <= 4) ? 0 : v; crush.adjustment = snapped; if (+e.target.value !== snapped) e.target.value = snapped; }}
+        oninput={handleBlackLevelInput}
         onpointerdown={() => sliderDragging = true}
         onpointerup={() => sliderDragging = false}
         onpointerenter={() => sliderHovering = true}
@@ -527,12 +573,12 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       </div>
     {/if}
     {#if crush.fullscreen !== 'normal'}
-      <div class="fs-black-slider">
+      <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, fsSliderInput, setBlackLevel, 5)}>
         <div class="slider-track-wrap">
-          <input type="range" min="-150" max="150" bind:value={crush.adjustment}
+          <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
             class="has-ticks"
             style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
-            oninput={(e) => { const v = +e.target.value; const snapped = (v !== 0 && Math.abs(v) <= 4) ? 0 : v; crush.adjustment = snapped; if (+e.target.value !== snapped) e.target.value = snapped; }}
+            oninput={handleBlackLevelInput}
             onpointerdown={() => fsSliderDragging = true}
             onpointerup={() => fsSliderDragging = false}
             onpointerenter={() => fsSliderHovering = true}
@@ -561,13 +607,12 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     </div>
   {/if}
 
-  <div class="slider-row">
+  <div class="slider-row" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCount = value)}>
     <img class="slider-label-icon" src="/icons/zoom.png" alt="Zoom" />
     <div class="slider-track-wrap slider-track-wrap-sm">
-      <input type="range" min="2" max={MAX_SQUARES} value={crush.squareCount}
+      <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCount} bind:this={zoomSliderInput}
         class="slider-sm"
-        style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%"
-        oninput={(e) => crush.squareCount = +e.target.value} />
+        style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%" />
     </div>
     <span class="slider-val zoom-val">{crush.squareCount}</span>
   </div>

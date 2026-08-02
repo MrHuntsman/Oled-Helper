@@ -2,6 +2,8 @@ import { mount } from 'svelte'
 import './app.css'
 import App from './App.svelte'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { pushGpuLog } from './lib/stores.svelte.js'
 
 // ── Forward uncaught errors / console output to the Rust-side file log ─────
 // This runs before App mounts, so it catches crashes that happen during
@@ -12,22 +14,52 @@ function logToFile(level, message) {
   try { invoke('log_frontend', { level, message }).catch(() => {}); } catch (_) {}
 }
 
+// Rust-native diagnostics (such as the taskbar overlay timer) use the same
+// runtime buffer as browser logs. They are already written to the Rust file
+// logger, so do not send them back through logToFile or they would duplicate.
+listen('runtime-log', (event) => {
+  const entry = event.payload;
+  if (!entry || typeof entry.message !== 'string') return;
+  const level = entry.level === 'error' || entry.level === 'warn' ? entry.level : 'info';
+  setTimeout(() => pushGpuLog(level, entry.message, { persist: false }), 0);
+}).catch(() => {});
+
+function formatLogArg(value) {
+  if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); } catch (_) { return String(value); }
+}
+
+function mirrorRuntimeLog(level, args) {
+  const message = args.map(formatLogArg).join(' ');
+  // Defer the reactive-buffer write. Console calls can happen while a Svelte
+  // effect is executing; mutating gpuLogVersion synchronously there causes
+  // effect_update_depth_exceeded. The Rust file log remains immediate.
+  setTimeout(() => pushGpuLog(level, message, { persist: false }), 0);
+  logToFile(level, message);
+}
+
 window.addEventListener('error', (e) => {
-  logToFile('error', `Uncaught error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}\n${e.error?.stack || ''}`);
+  const message = `Uncaught error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}\n${e.error?.stack || ''}`;
+  setTimeout(() => pushGpuLog('error', message, { persist: false }), 0);
+  logToFile('error', message);
 });
 window.addEventListener('unhandledrejection', (e) => {
-  logToFile('error', `Unhandled promise rejection: ${e.reason?.message || e.reason}\n${e.reason?.stack || ''}`);
+  const message = `Unhandled promise rejection: ${formatLogArg(e.reason)}`;
+  setTimeout(() => pushGpuLog('error', message, { persist: false }), 0);
+  logToFile('error', message);
 });
 
-// Mirror console.error/warn to the file log too. Deliberately NOT mirroring
-// console.log (too noisy/high-frequency — e.g. render loops — and console.log
-// call sites should route through dlog/pushGpuLog in stores.svelte.js if the
-// message is worth persisting). This mirror is synchronous-looking but the
-// actual invoke() is fire-and-forget async, so it never blocks the caller.
+// Mirror all browser console levels to both the in-app Debug log and the
+// Rust-side file/terminal log. GPU call sites use these same console methods,
+// so they are included exactly once alongside Taskbar Dimmer and Settings
+// warnings/errors.
+const _consoleLog = console.log.bind(console);
+console.log = (...args) => { _consoleLog(...args); mirrorRuntimeLog('info', args); };
 const _consoleError = console.error.bind(console);
-console.error = (...args) => { _consoleError(...args); logToFile('error', args.map(String).join(' ')); };
+console.error = (...args) => { _consoleError(...args); mirrorRuntimeLog('error', args); };
 const _consoleWarn = console.warn.bind(console);
-console.warn = (...args) => { _consoleWarn(...args); logToFile('warn', args.map(String).join(' ')); };
+console.warn = (...args) => { _consoleWarn(...args); mirrorRuntimeLog('warn', args); };
 
 // Visible canary — proves the script even runs
 document.title = 'OLED Helper';

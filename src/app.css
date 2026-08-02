@@ -72,8 +72,9 @@ button {
 .app-shell {
   display: grid;
   grid-template-rows: 64px 1fr 28px;
-  grid-template-columns: 190px 1fr;
+  grid-template-columns: 190px minmax(0, 1fr);
   height: 100%;
+  min-width: 0;
 }
 
 .top-bar {
@@ -105,7 +106,9 @@ button {
   grid-column: 2;
   grid-row: 2;
   background: var(--panel);
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -195,7 +198,7 @@ button {
 .nav-btn.active .nav-icon { opacity: 1; }
 
 /* ── Content / Tab heading ────────────────────────────────────────── */
-.tab-body { padding: 16px; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.tab-body { padding: 16px; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
 .tab-heading {
   display: flex;
   align-items: center;
@@ -205,6 +208,26 @@ button {
 .tab-heading .tab-icon { width: 32px; height: 32px; opacity: 1; }
 .tab-heading h2 { font-size: 18px; font-weight: 700; }
 .tab-heading .subtitle { color: var(--text-weak); font-size: 13px; }
+.tab-heading-spacer { flex: 1; }
+.restore-defaults-btn {
+  flex-shrink: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 5px;
+  color: var(--text-weak);
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.restore-defaults-btn:hover,
+.restore-defaults-btn:focus-visible {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--accent);
+  outline: none;
+}
+
 .separator { height: 1px; background: var(--divider); margin: 12px 0; }
 
 /* ── Info tooltip (? icon) ─────────────────────────────────── */
@@ -408,6 +431,71 @@ button {
 /* Spacer utility */
 .spacer { flex: 1; }
 
+/* ── Taskbar dimmer ───────────────────────────────────────────────── */
+.dimmer-toggle-row { margin-top: 4px; }
+.dimmer-control {
+  max-width: 560px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.12);
+  transition: opacity 0.12s, border-color 0.12s;
+}
+.dimmer-control.disabled { opacity: 0.5; }
+.dimmer-control-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.dimmer-control .slider-val { font-size: 13px; min-width: 42px; text-align: right; }
+.dimmer-duration-heading { margin-top: 16px; }
+.dimmer-slider-track {
+  width: 100%;
+  height: 24px;
+}
+.dimmer-opacity {
+  width: 100%;
+  accent-color: var(--accent);
+  background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
+}
+/* Matches the proven pattern from .slider-track-wrap input[type=range].has-ticks
+   (used by the Black Level slider), extended with thumb-radius compensation.
+   The thumb's travel range is [9px, 100% - 9px], not [0%, 100%], so a plain
+   10%/20%/...90% position doesn't align with where the thumb actually sits at
+   those values. calc((100% - 18px) * 0.1 + 9px) IS valid CSS — multiplying
+   a single length-percentage value by a unitless number is allowed; an
+   earlier attempt (calc(25% * (100% - 18px))) was invalid because it tried
+   to multiply two percentage/length values together, which silently drops
+   the whole background. Selector needs input[type=range] to match the base
+   .slider-track-wrap input[type=range] rule's specificity (both have it),
+   otherwise a plain 2-class selector loses to that 1-class+type+attribute
+   rule regardless of declaration order. */
+.dimmer-slider-track input[type=range].has-ticks-dimmer {
+  background:
+    linear-gradient(to right,
+      transparent calc((100% - 18px) * 0.1 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.1 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.1 + 9px + 0.75px), transparent calc((100% - 18px) * 0.1 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.2 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.2 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.2 + 9px + 0.75px), transparent calc((100% - 18px) * 0.2 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.3 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.3 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.3 + 9px + 0.75px), transparent calc((100% - 18px) * 0.3 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.4 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.4 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.4 + 9px + 0.75px), transparent calc((100% - 18px) * 0.4 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.5 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.5 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.5 + 9px + 0.75px), transparent calc((100% - 18px) * 0.5 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.6 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.6 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.6 + 9px + 0.75px), transparent calc((100% - 18px) * 0.6 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.7 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.7 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.7 + 9px + 0.75px), transparent calc((100% - 18px) * 0.7 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.8 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.8 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.8 + 9px + 0.75px), transparent calc((100% - 18px) * 0.8 + 9px + 0.75px),
+      transparent calc((100% - 18px) * 0.9 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.9 + 9px - 0.75px), rgba(255,255,255,0.45) calc((100% - 18px) * 0.9 + 9px + 0.75px), transparent calc((100% - 18px) * 0.9 + 9px + 0.75px)
+    ),
+    linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
+}
+.dimmer-scale {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 3px;
+  color: var(--text-weak);
+  font-size: 11px;
+}
+
 /* ── Settings tab rows ────────────────────────────────────────────── */
 .settings-row {
   display: flex;
@@ -430,6 +518,7 @@ button {
 .strip-wrap {
   position: relative;
   flex: 1;
+  min-width: 0;
   min-height: 240px;
   background: #000;
   border-radius: 6px;
@@ -539,7 +628,7 @@ button {
   align-items: baseline;
   justify-content: space-between;
   gap: 20px;
-  font-size: 14px;
+  font-size: 12px;
 }
 .fs-hint-key {
   color: rgba(255,255,255,0.45);
@@ -646,7 +735,12 @@ button {
 }
 .square-unit { font-size: 0.85em; color: var(--text-weak); }
 
-.fs-help-tip { font-size: clamp(12px, 1.6cqw, 24px); }
+/* Match the compact size of the other tooltips outside fullscreen. */
+.fs-help-tip { font-size: 12px; }
+.strip-wrap.inapp-fullscreen .fs-help-tip,
+.strip-wrap.monitor-fullscreen .fs-help-tip { font-size: 14px; }
+.strip-wrap.inapp-fullscreen .fs-hint-row,
+.strip-wrap.monitor-fullscreen .fs-hint-row { font-size: 14px; }
 .strip-wrap.monitor-fullscreen .fs-help-btn { width: 44px; height: 44px; font-size: 22px; }
 .strip-wrap.monitor-fullscreen .fs-help-wrap { top: 24px; left: 24px; }
 
@@ -740,6 +834,9 @@ button {
 /* ── Debug tab diagnostics ────────────────────────────────────────── */
 .diag-summary { display: flex; gap: 16px; margin-bottom: 8px; }
 .diag-badge { font-size: 12px; color: var(--text-weak); }
+.diag-log-wrap {
+  position: relative;
+}
 .diag-log {
   background: #0A0A0D;
   border: 1px solid var(--divider);
@@ -752,6 +849,28 @@ button {
   line-height: 1.6;
 }
 .diag-entry { padding: 1px 4px; border-radius: 2px; }
+.diag-log-new {
+  position: absolute;
+  right: 28px;
+  bottom: 10px;
+  padding: 5px 9px;
+  border: 1px solid var(--divider);
+  border-radius: 5px;
+  background: var(--hover);
+  color: var(--text);
+  font-size: 11px;
+  box-shadow: 0 3px 10px rgba(0,0,0,0.35);
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.diag-log-new.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.diag-log-new:hover { background: #303038; }
 .diag-entry.diag-error { background: rgba(224, 85, 85, 0.12); }
 .diag-entry.diag-warn { background: rgba(255, 204, 0, 0.08); }
 .diag-ts { color: #555; margin-right: 8px; min-width: 55px; display: inline-block; text-align: right; }
@@ -761,6 +880,17 @@ button {
 .diag-msg { color: var(--text); word-break: break-all; }
 .diag-section { margin-top: 8px; }
 .diag-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.diag-runtime-heading { display: flex; align-items: center; gap: 12px; }
+.diag-verbose-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-weak);
+  font-size: 11px;
+  user-select: none;
+  cursor: pointer;
+}
+.diag-verbose-toggle input { accent-color: var(--accent); margin: 0; }
 .diag-section h3 { font-size: 13px; font-weight: 600; }
 .copy-btn {
   display: flex;

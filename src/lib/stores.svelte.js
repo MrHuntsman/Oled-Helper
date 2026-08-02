@@ -15,6 +15,21 @@ export const crush = $state({
   showHint: true,
 });
 
+export const taskbarDimmer = $state({
+  enabled: false,
+  opacity: 0.95,
+  easeDurationMs: 250,
+  available: true,
+});
+
+export const traySettings = $state({
+  enabled: true,
+});
+
+export const runtimeLogSettings = $state({
+  verbosePeriodic: false,
+});
+
 export function adjustmentDisplay() {
   if (!crush.blackEnabled) return 'OFF';
   return `${crush.adjustment > 0 ? '+' : ''}${(crush.adjustment / 10).toFixed(1)}`;
@@ -37,6 +52,34 @@ export async function loadConfig() {
     if (cfg && typeof cfg.black_enabled === 'boolean') {
       crush.blackEnabled = cfg.black_enabled;
     }
+    if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') {
+      taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
+    }
+    if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') {
+      taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
+    }
+    if (cfg && typeof cfg.taskbar_dimmer_ease_duration_ms === 'number') {
+      taskbarDimmer.easeDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_ease_duration_ms)));
+    }
+    if (cfg && typeof cfg.tray_enabled === 'boolean') {
+      traySettings.enabled = cfg.tray_enabled;
+    }
+    try {
+      const status = await invoke('get_taskbar_dimmer_status');
+      if (status) taskbarDimmer.available = status.available !== false;
+    } catch (e) {
+      taskbarDimmer.available = false;
+    }
+    try {
+      await invoke('set_taskbar_dimmer', {
+        enabled: taskbarDimmer.enabled,
+        opacity: taskbarDimmer.opacity,
+        easeDurationMs: taskbarDimmer.easeDurationMs,
+        immediate: true,
+      });
+    } catch (e) {
+      taskbarDimmer.enabled = false;
+    }
   } catch (e) {
     console.warn('[config] load failed', e);
   } finally {
@@ -53,10 +96,82 @@ export async function loadConfig() {
 // of crush.adjustment), so the config file reads e.g. 9 instead of 90.
 export function saveConfig() {
   if (!configLoaded.v) return;
-  invoke('save_config', { config: { black_lift: crush.adjustment / 10, black_enabled: crush.blackEnabled } }).catch((e) => {
+  invoke('save_config', { config: {
+    black_lift: crush.adjustment / 10,
+    black_enabled: crush.blackEnabled,
+    taskbar_dimmer_enabled: taskbarDimmer.enabled,
+    taskbar_dimmer_opacity: taskbarDimmer.opacity,
+    taskbar_dimmer_ease_duration_ms: taskbarDimmer.easeDurationMs,
+    tray_enabled: traySettings.enabled,
+  } }).catch((e) => {
     console.warn('[config] save failed', e);
   });
 }
+export async function setTrayEnabled(enabled) {
+  const previous = traySettings.enabled;
+  traySettings.enabled = enabled;
+  try {
+    await invoke('set_tray_enabled', { enabled });
+    saveConfig();
+  } catch (e) {
+    console.warn('[tray] update failed', e);
+    traySettings.enabled = previous;
+  }
+}
+
+let pendingTaskbarDimmerUpdate = null;
+let taskbarDimmerUpdateInFlight = false;
+let taskbarDimmerUpdateVersion = 0;
+
+function flushTaskbarDimmerUpdate() {
+  if (taskbarDimmerUpdateInFlight || !pendingTaskbarDimmerUpdate) return;
+  const update = pendingTaskbarDimmerUpdate;
+  pendingTaskbarDimmerUpdate = null;
+  taskbarDimmerUpdateInFlight = true;
+
+  invoke('set_taskbar_dimmer', {
+    enabled: update.enabled,
+    opacity: update.opacity,
+    easeDurationMs: update.easeDurationMs,
+    immediate: update.immediate,
+  }).then(() => {
+    if (update.persist && update.version === taskbarDimmerUpdateVersion) saveConfig();
+  }).catch((e) => {
+    console.warn('[taskbar-dimmer] update failed', e);
+    if (update.version === taskbarDimmerUpdateVersion) taskbarDimmer.enabled = false;
+  }).finally(() => {
+    taskbarDimmerUpdateInFlight = false;
+    flushTaskbarDimmerUpdate();
+  });
+}
+
+export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = taskbarDimmer.opacity, easeDurationMs = taskbarDimmer.easeDurationMs, persist = true, immediate = false) {
+  taskbarDimmer.enabled = enabled;
+  taskbarDimmer.opacity = Math.max(0, Math.min(1, opacity));
+  taskbarDimmer.easeDurationMs = Math.max(0, Math.min(1000, Math.round(easeDurationMs)));
+  taskbarDimmerUpdateVersion++;
+  pendingTaskbarDimmerUpdate = {
+    enabled: taskbarDimmer.enabled,
+    opacity: taskbarDimmer.opacity,
+    easeDurationMs: taskbarDimmer.easeDurationMs,
+    persist,
+    immediate,
+    version: taskbarDimmerUpdateVersion,
+  };
+  flushTaskbarDimmerUpdate();
+}
+
+export function restoreTaskbarDimmerDefaults() {
+  setTaskbarDimmer(false, 0.95, 250, true, true);
+}
+
+export function setVerbosePeriodicLogging(enabled) {
+  runtimeLogSettings.verbosePeriodic = enabled;
+  invoke('set_taskbar_dimmer_verbose_logging', { enabled }).catch((e) => {
+    console.warn('[runtime-log] verbose logging update failed', e);
+  });
+}
+
 export function accentColor() {
   return app.hdrStatus === 'hdr' ? '#FFCC00' : '#4CA6FF';
 }
@@ -101,11 +216,10 @@ export function bumpEnvTick() {
   envTick.n++;
 }
 
-// ── GPU init log — plain (non-reactive) ring buffer + a reactive version counter.
-// Writes just push to a plain array and bump a $state number; the Debug tab reads
-// the array but only re-renders when the counter changes. This avoids Svelte 5
-// deep-reactivity overhead/cascades from many rapid mutations to a $state array,
-// which caused the app to hang on startup when GPU init logged in a tight loop.
+// ── Runtime log — plain (non-reactive) ring buffer + a reactive version counter.
+// Entries are retained independently of the Debug tab. The reactive version
+// only changes while Debug is open, so logging continues in the background
+// without causing UI work or rerenders in other tabs.
 //
 // ⚠️ KNOWN FOOTGUN (caused a real effect_update_depth_exceeded crash — see git
 // history / TabCrush.svelte around initGPU): pushGpuLog() writes gpuLogVersion.n,
@@ -121,22 +235,30 @@ export function bumpEnvTick() {
 // Unsafe: calling these as the first synchronous statement in an $effect(() => {...}).
 // If you need to log effect-fire diagnostics for debugging, use plain
 // console.log/console.warn there instead — they don't touch reactive state.
-const GPU_LOG_MAX = 300;
+// 5,000 entries is a bounded history large enough for long debugging sessions
+// without allowing an unattended app to grow memory forever. Since the array
+// is plain and the reactive version is gated below, inactive tabs pay only the
+// small cost of storing each compact log record.
+const GPU_LOG_MAX = 5000;
 export const gpuLogEntries = [];
 export const gpuLogVersion = $state({ n: 0 });
 
-export function pushGpuLog(level, message) {
+export function pushGpuLog(level, message, { persist = true } = {}) {
   gpuLogEntries.push({ level, message, ts: Date.now() });
   if (gpuLogEntries.length > GPU_LOG_MAX) gpuLogEntries.shift();
-  gpuLogVersion.n++;
+  // Only invalidate the Debug tab while it is mounted/open. In other tabs the
+  // plain buffer still retains the entry, but Svelte does no log-list work.
+  if (app.activeTab === 'debug') gpuLogVersion.n++;
   // Best-effort mirror to the on-disk log (see src-tauri log_frontend command)
-  // so the GPU init sequence survives even if the app hangs/crashes before
-  // the user can copy the in-app log. Fire-and-forget; never awaited, never
-  // throws synchronously — safe to call from anywhere pushGpuLog is called.
-  try { invoke('log_frontend', { level, message: `[gpu] ${message}` }).catch(() => {}); } catch (_) {}
+  // so the runtime sequence survives even if the app hangs/crashes before
+  // the user can open the in-app Debug tab. Set persist=false when the caller
+  // is already being mirrored by main.js to avoid duplicate file entries.
+  if (persist) {
+    try { invoke('log_frontend', { level, message }).catch(() => {}); } catch (_) {}
+  }
 }
 
 export function clearGpuLog() {
   gpuLogEntries.length = 0;
-  gpuLogVersion.n++;
+  if (app.activeTab === 'debug') gpuLogVersion.n++;
 }

@@ -1,6 +1,6 @@
 // Simple JSON config file persisted in the app's config dir (same appdata
 // root as the log files, e.g. %APPDATA%/OledHelper on Windows). Currently
-// only stores the Black Crush black_lift value so it survives restarts.
+// stores Black Crush and Taskbar Dimmer settings so they survive restarts.
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -14,15 +14,38 @@ pub struct AppConfig {
     pub black_lift: f64,
     #[serde(default = "default_true")]
     pub black_enabled: bool,
+    #[serde(default)]
+    pub taskbar_dimmer_enabled: bool,
+    #[serde(default = "default_dimmer_opacity")]
+    pub taskbar_dimmer_opacity: f64,
+    #[serde(default = "default_dimmer_ease_duration")]
+    pub taskbar_dimmer_ease_duration_ms: u64,
+    #[serde(default = "default_true")]
+    pub tray_enabled: bool,
 }
 
 fn default_true() -> bool {
     true
 }
 
+fn default_dimmer_opacity() -> f64 {
+    0.95
+}
+
+fn default_dimmer_ease_duration() -> u64 {
+    250
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { black_lift: 0.0, black_enabled: true }
+        Self {
+            black_lift: 0.0,
+            black_enabled: true,
+            taskbar_dimmer_enabled: false,
+            taskbar_dimmer_opacity: default_dimmer_opacity(),
+            taskbar_dimmer_ease_duration_ms: default_dimmer_ease_duration(),
+            tray_enabled: true,
+        }
     }
 }
 
