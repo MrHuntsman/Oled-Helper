@@ -90,6 +90,7 @@ pub fn run() {
             config::save_config,
             taskbar_dimmer::set_taskbar_dimmer,
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
+            taskbar_dimmer::set_taskbar_dimmer_suspended,
             taskbar_dimmer::get_taskbar_dimmer_status,
         ])
         .plugin(tauri_plugin_autostart::init(

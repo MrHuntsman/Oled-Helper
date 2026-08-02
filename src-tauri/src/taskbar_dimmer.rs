@@ -84,9 +84,20 @@ mod platform {
     static FADE_STATE: OnceLock<Mutex<FadeState>> = OnceLock::new();
     static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
+    // Set by the frontend while the app's own window is in monitor fullscreen
+    // (the calibration strip). fullscreen_app_active() can't detect that case
+    // — it intentionally ignores the app's own window so the dimmer keeps
+    // working when the app is merely maximized — so the frontend suspends the
+    // overlay explicitly. The dimmer settings are untouched; the overlay just
+    // leaves the screen until fullscreen ends.
+    static SUSPENDED: AtomicBool = AtomicBool::new(false);
 
     pub fn set_verbose_logging(enabled: bool) {
         VERBOSE_LOGGING.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_suspended(enabled: bool) {
+        SUSPENDED.store(enabled, Ordering::Relaxed);
     }
 
     fn emit_runtime(level: &str, message: String) {
@@ -298,17 +309,34 @@ mod platform {
 
     fn update_fade(hwnd: HWND) {
         let Some(state) = FADE_STATE.get() else { return; };
+        // A foreground fullscreen app (game, video, …) or the app's own
+        // monitor-fullscreen calibration strip (SUSPENDED, set by the
+        // frontend) must get the whole monitor. The overlay is normally faded
+        // to alpha 0 in that case, but a still-visible always-on-top window
+        // over the taskbar stops Explorer from auto-hiding the taskbar, so the
+        // taskbar can render on top of the fullscreen app. Hide the window
+        // entirely and skip the per-tick z-order churn; the timer keeps
+        // running so the overlay reappears as soon as the fullscreen ends.
+        let fullscreen = fullscreen_app_active(hwnd) || SUSPENDED.load(Ordering::Relaxed);
+        if fullscreen {
+            unsafe {
+                if IsWindowVisible(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
+
         let taskbar = taskbar_info();
         let taskbar_rect = taskbar.map(|(_, rect)| rect);
         let (hovered, cursor) = taskbar_rect.map(cursor_over_rect).unwrap_or((false, windows::Win32::Foundation::POINT::default()));
         let now = Instant::now();
-        let fullscreen = fullscreen_app_active(hwnd);
         let mut alpha_to_apply = None;
 
         let mut diagnostic = None;
         {
             let mut fade = state.lock().unwrap();
-            fade.target_alpha = if fade.enabled && !hovered && !fullscreen {
+            fade.target_alpha = if fade.enabled && !hovered {
                 fade.base_alpha
             } else {
                 0.0
@@ -494,6 +522,7 @@ mod platform {
 mod platform {
     pub fn available() -> bool { false }
     pub fn set_verbose_logging(_enabled: bool) {}
+    pub fn set_suspended(_enabled: bool) {}
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
@@ -524,6 +553,11 @@ pub fn set_taskbar_dimmer(
 #[tauri::command]
 pub fn set_taskbar_dimmer_verbose_logging(enabled: bool) {
     platform::set_verbose_logging(enabled);
+}
+
+#[tauri::command]
+pub fn set_taskbar_dimmer_suspended(suspended: bool) {
+    platform::set_suspended(suspended);
 }
 
 #[tauri::command]

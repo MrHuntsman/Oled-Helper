@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig } from './lib/stores.svelte.js';
+  import { app, crush, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig, setDimmerSuspendedForFullscreen } from './lib/stores.svelte.js';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabSystem from './lib/TabSystem.svelte';
@@ -56,6 +56,13 @@
     if (!windowVisible) return;
     const timer = setInterval(() => { bumpEnvTick(); }, 1000);
     return () => clearInterval(timer);
+  });
+
+  // Monitor fullscreen of the calibration strip: suspend the taskbar dimmer
+  // so Windows auto-hides the taskbar. The dimmer's always-on-top overlay
+  // would otherwise keep the taskbar visible on top of the fullscreen strip.
+  $effect(() => {
+    setDimmerSuspendedForFullscreen(crush.fullscreen === 'monitor');
   });
 </script>
 

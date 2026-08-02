@@ -164,6 +164,18 @@ export function restoreTaskbarDimmerDefaults() {
   setTaskbarDimmer(false, 0.95, 250, true, true);
 }
 
+// The taskbar dimmer overlay is an always-on-top native window over the
+// taskbar. While the calibration strip is in monitor fullscreen that overlay
+// keeps sitting on top of the taskbar, and Windows won't auto-hide the
+// taskbar while a visible topmost window covers it — so the taskbar stays
+// rendered on top of the fullscreen strip. Ask the Rust overlay to hide
+// itself for the duration (dimmer settings stay untouched); it reappears on
+// its own once fullscreen ends. Only 'monitor' fullscreen needs this: in-app
+// fullscreen keeps the OS window/taskbar intact.
+export function setDimmerSuspendedForFullscreen(suspended) {
+  invoke('set_taskbar_dimmer_suspended', { suspended }).catch(() => {});
+}
+
 export function setVerbosePeriodicLogging(enabled) {
   runtimeLogSettings.verbosePeriodic = enabled;
   invoke('set_taskbar_dimmer_verbose_logging', { enabled }).catch((e) => {
