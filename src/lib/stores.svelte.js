@@ -12,7 +12,6 @@ export const crush = $state({
   blackEnabled: true,
   squareCount: 12,
   fullscreen: 'normal',
-  showHint: true,
 });
 
 export const taskbarDimmer = $state({

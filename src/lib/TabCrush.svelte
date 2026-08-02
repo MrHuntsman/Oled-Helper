@@ -416,9 +416,6 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     crush.fullscreen = mode;
     closeContextMenu();
   }
-  function toggleHint() {
-    crush.showHint = !crush.showHint;
-  }
 
   // Mouse wheel over the strip changes the zoom (square count). Wheeling up
   // (negative deltaY) increases zoom, down decreases — matches typical
@@ -503,7 +500,6 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     crush.blackEnabled = true;
     crush.squareCount = 12;
     crush.fullscreen = 'normal';
-    crush.showHint = true;
     saveConfig();
   }
 
@@ -526,18 +522,27 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   <div class="tab-heading">
 <img class="tab-icon" src="/icons/tab_crush.png" alt="" />
     <h2>Black Crush Tweak</h2>
-    <div class="info-tip-wrap">
-      <button class="info-tip-btn" aria-label="About Black Crush Tweak" tabindex="0">?</button>
-      <div class="info-tip">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</div>
-    </div>
     <div class="tab-heading-spacer"></div>
     <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
 
-  <button class="slider-row slider-row-clickable" onclick={(e) => { if (e.target.closest('.slider-track-wrap')) return; crush.blackEnabled = !crush.blackEnabled; }} onwheel={(e) => handleSliderWheel(e, mainSliderInput, setBlackLevel, 5)}>
-    <span class="slider-label">Black Level:</span>
-    <div class="slider-track-wrap slider-track-wrap-half" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
+  <div class="settings-row dimmer-toggle-row" role="button" tabindex="0" onclick={() => crush.blackEnabled = !crush.blackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); crush.blackEnabled = !crush.blackEnabled; } }}>
+    <div class="settings-row-text">
+      <span class="settings-row-label">Enable Black Level</span>
+      <span class="settings-row-desc">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</span>
+    </div>
+    <div class="pill-wrap">
+      <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
+    </div>
+  </div>
+
+  <div class="dimmer-control" class:disabled={!crush.blackEnabled} onwheel={(e) => handleSliderWheel(e, mainSliderInput, setBlackLevel, 5)}>
+    <div class="dimmer-control-heading">
+      <span class="settings-row-label">Black Level</span>
+      <span class="slider-val">{adjustmentDisplay()}</span>
+    </div>
+    <div class="slider-track-wrap dimmer-slider-track" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
       <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={mainSliderInput}
         class="has-ticks"
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
@@ -549,82 +554,97 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         disabled={!crush.blackEnabled} />
       <div class="slider-tooltip" class:visible={sliderDragging || sliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
     </div>
-    <span class="slider-val">{adjustmentDisplay()}</span>
-    <div class="spacer"></div>
-    <div class="pill-wrap">
-      <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
-    </div>
-  </button>
+    <div class="dimmer-scale"><span>Darker</span><span>Brighter</span></div>
+  </div>
 
   <div class="separator"></div>
 
-  {#if app.hdrStatus === 'unknown'}
-    <p class="gpu-status">Detecting HDR status...</p>
-  {:else}
-    <p class="strip-heading">
-      <strong>{app.hdrStatus === 'hdr' ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)'}</strong>
-      <span class="info-tip-wrap">
-        <button class="info-tip-btn" aria-label="About black calibration" tabindex="0">?</button>
-         <span class="info-tip">Adjust black level until you can start to see the lower columns and still have a smooth gradient.<br><br><span class="info-tip-note"><svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg><span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span></span></span>
-      </span>
-    </p>
-  {/if}
-
-  {#if gpuError}
-    <p class="gpu-error">{gpuError}</p>
-  {/if}
-
-  <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
-    onclick={handleStripClick} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0">
-    <canvas bind:this={canvas}></canvas>
-    {#if app.hdrStatus !== 'unknown'}
-      <div class="square-labels" style="--sq-count:{crush.squareCount}">
-        {#each Array(crush.squareCount) as _, i}
-          {@const code = app.hdrStatus === 'hdr'
-            ? (i === 0 ? '64' : String(ALL_PQ_CODES[i]))
-            : (i === 0 ? '0' : String(ALL_SDR_CODES[i]))}
-          {@const unit = i === 0 ? 'Black' : (app.hdrStatus === 'hdr' ? 'PQ' : 'RGB')}
-          <div class="square-label">
-            <div>{code}</div>
-            <div class="square-unit">{unit}</div>
-          </div>
-        {/each}
-      </div>
-    {/if}
-    {#if crush.showHint}
-      <div class="fs-help-wrap">
-        <button class="fs-help-btn" aria-label="Calibration strip controls" tabindex="0">?</button>
-        <div class="fs-help-tip">
-          <div class="fs-hint-title">Controls</div>
-          {#if crush.fullscreen !== 'normal'}
-            <div class="fs-hint-row"><span class="fs-hint-key">Esc</span><span class="fs-hint-val">Exit</span></div>
-          {/if}
-          <div class="fs-hint-row"><span class="fs-hint-key">Left / Right</span><span class="fs-hint-val">±1</span></div>
-          <div class="fs-hint-row"><span class="fs-hint-key">Up / Down</span><span class="fs-hint-val">±0.1</span></div>
-          <div class="fs-hint-sep"></div>
-          <div class="fs-hint-row"><span class="fs-hint-key">Double-click</span><span class="fs-hint-val">Cycle mode</span></div>
-          <div class="fs-hint-row"><span class="fs-hint-key">Right-click</span><span class="fs-hint-val">Menu</span></div>
-          <div class="fs-hint-row"><span class="fs-hint-key">Scroll</span><span class="fs-hint-val">Zoom</span></div>
-        </div>
-      </div>
-    {/if}
+  {#snippet calibrationTip()}
+    <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
+    <span class="info-tip-note">
+      <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
+      <span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span>
+    </span>
+    <div class="fs-hint-sep"></div>
+    <div class="fs-hint-title">Controls</div>
     {#if crush.fullscreen !== 'normal'}
-      <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, fsSliderInput, setBlackLevel, 5)}>
-        <div class="slider-track-wrap">
-          <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
-            class="has-ticks"
-            style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
-            oninput={handleBlackLevelInput}
-            onpointerdown={() => fsSliderDragging = true}
-            onpointerup={() => fsSliderDragging = false}
-            onpointerenter={() => fsSliderHovering = true}
-            onpointerleave={() => fsSliderHovering = false}
-            disabled={!crush.blackEnabled} />
-          <div class="slider-tooltip" class:visible={fsSliderDragging || fsSliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
-        </div>
-        <span class="slider-val">{adjustmentDisplay()}</span>
-      </div>
+      <div class="fs-hint-row"><span class="fs-hint-key">Esc</span><span class="fs-hint-val">Exit</span></div>
     {/if}
+    <div class="fs-hint-row"><span class="fs-hint-key">Left / Right</span><span class="fs-hint-val">±1</span></div>
+    <div class="fs-hint-row"><span class="fs-hint-key">Up / Down</span><span class="fs-hint-val">±0.1</span></div>
+    <div class="fs-hint-sep"></div>
+    <div class="fs-hint-row"><span class="fs-hint-key">Double-click</span><span class="fs-hint-val">Cycle mode</span></div>
+    <div class="fs-hint-row"><span class="fs-hint-key">Right-click</span><span class="fs-hint-val">Menu</span></div>
+    <div class="fs-hint-row"><span class="fs-hint-key">Scroll</span><span class="fs-hint-val">Zoom</span></div>
+  {/snippet}
+
+  <div class="calibration-strip-panel">
+    {#if app.hdrStatus === 'unknown'}
+      <p class="gpu-status">Detecting HDR status...</p>
+    {:else}
+      <p class="strip-heading">
+        <strong>{app.hdrStatus === 'hdr' ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)'}</strong>
+        <span class="info-tip-wrap">
+          <button class="info-tip-btn" aria-label="About black calibration and strip controls" tabindex="0">Info</button>
+          <span class="info-tip">{@render calibrationTip()}</span>
+        </span>
+      </p>
+    {/if}
+
+    {#if gpuError}
+      <p class="gpu-error">{gpuError}</p>
+    {/if}
+
+    <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
+      onclick={handleStripClick} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0">
+      <canvas bind:this={canvas}></canvas>
+      {#if app.hdrStatus !== 'unknown'}
+        <div class="square-labels" style="--sq-count:{crush.squareCount}">
+          {#each Array(crush.squareCount) as _, i}
+            {@const code = app.hdrStatus === 'hdr'
+              ? (i === 0 ? '64' : String(ALL_PQ_CODES[i]))
+              : (i === 0 ? '0' : String(ALL_SDR_CODES[i]))}
+            {@const unit = i === 0 ? 'Black' : (app.hdrStatus === 'hdr' ? 'PQ' : 'RGB')}
+            <div class="square-label">
+              <div>{code}</div>
+              <div class="square-unit">{unit}</div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+      {#if crush.fullscreen !== 'normal'}
+        <div class="fs-help-wrap">
+          <button class="fs-help-btn" aria-label="About black calibration and strip controls" tabindex="0">Info</button>
+          <div class="fs-help-tip">{@render calibrationTip()}</div>
+        </div>
+      {/if}
+      {#if crush.fullscreen !== 'normal'}
+        <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, fsSliderInput, setBlackLevel, 5)}>
+          <div class="slider-track-wrap">
+            <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
+              class="has-ticks"
+              style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
+              oninput={handleBlackLevelInput}
+              onpointerdown={() => fsSliderDragging = true}
+              onpointerup={() => fsSliderDragging = false}
+              onpointerenter={() => fsSliderHovering = true}
+              onpointerleave={() => fsSliderHovering = false}
+              disabled={!crush.blackEnabled} />
+            <div class="slider-tooltip" class:visible={fsSliderDragging || fsSliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
+          </div>
+          <span class="slider-val">{adjustmentDisplay()}</span>
+        </div>
+      {/if}
+    </div>
+
+    <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCount = value)}>
+      <img class="slider-label-icon" src="/icons/zoom.png" alt="Zoom" />
+      <div class="slider-track-wrap zoom-track-compact">
+        <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCount} bind:this={zoomSliderInput}
+          style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%" />
+      </div>
+      <span class="slider-val zoom-val-compact">{crush.squareCount}</span>
+    </div>
   </div>
 
   {#if ctxMenu.open}
@@ -635,21 +655,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <button class="ctx-item" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}>In-App Fullscreen</button>
       <button class="ctx-item" class:active={crush.fullscreen === 'monitor'} onclick={() => setMode('monitor')}>Monitor Fullscreen</button>
       <div class="ctx-menu-sep"></div>
-      <button class="ctx-item ctx-item-check" onclick={toggleHint}>
-        <span class="ctx-check" class:checked={crush.showHint}></span> Controls Tooltip
-      </button>
-      <div class="ctx-menu-sep"></div>
       <button class="ctx-item" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
     </div>
   {/if}
-
-  <div class="slider-row" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCount = value)}>
-    <img class="slider-label-icon" src="/icons/zoom.png" alt="Zoom" />
-    <div class="slider-track-wrap slider-track-wrap-sm">
-      <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCount} bind:this={zoomSliderInput}
-        class="slider-sm"
-        style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%" />
-    </div>
-    <span class="slider-val zoom-val">{crush.squareCount}</span>
-  </div>
 </div>

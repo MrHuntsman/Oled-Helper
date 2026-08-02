@@ -5,6 +5,22 @@
     setTaskbarDimmer(!taskbarDimmer.enabled);
   }
 
+  let opacityDragging = $state(false);
+  let opacityHovering = $state(false);
+  let easeDragging = $state(false);
+  let easeHovering = $state(false);
+
+  $effect(() => {
+    if (!opacityDragging && !easeDragging) return;
+    function onUp() { opacityDragging = false; easeDragging = false; }
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  });
+
   // Snap to the nearest tick (every 10, 10–90) when the raw value lands
   // within a few points of one, mirroring the Black Level slider's
   // snap-to-zero (normalizeBlackLevel in TabCrush.svelte). 0 and 100 aren't
@@ -41,7 +57,7 @@
     <img class="tab-icon" src="/icons/tab_dimmer.png" alt="" />
     <h2>Taskbar Dimmer</h2>
     <div class="info-tip-wrap">
-      <button class="info-tip-btn" aria-label="About Taskbar Dimmer" tabindex="0">?</button>
+      <button class="info-tip-btn" aria-label="About Taskbar Dimmer" tabindex="0">Info</button>
       <div class="info-tip">Darkens the Windows taskbar without blocking clicks or changing the rest of the display.</div>
     </div>
     <div class="tab-heading-spacer"></div>
@@ -74,7 +90,12 @@
         value={Math.round(taskbarDimmer.opacity * 100)}
         style="--fill:{taskbarDimmer.opacity * 100}%"
         disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
-        oninput={handleOpacityInput} />
+        oninput={handleOpacityInput}
+        onpointerdown={() => opacityDragging = true}
+        onpointerup={() => opacityDragging = false}
+        onpointerenter={() => opacityHovering = true}
+        onpointerleave={() => opacityHovering = false} />
+      <div class="slider-tooltip" class:visible={opacityDragging || opacityHovering} style="left:calc(9px + ({taskbarDimmer.opacity} * (100% - 18px)))">{Math.round(taskbarDimmer.opacity * 100)}%</div>
     </div>
     <div class="dimmer-scale"><span>Subtle</span><span>Dark</span></div>
 
@@ -93,7 +114,12 @@
         style="--fill:{(taskbarDimmer.easeDurationMs / 1000) * 100}%"
         disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
         oninput={handleEaseDurationInput}
-        onchange={commitEaseDuration} />
+        onchange={commitEaseDuration}
+        onpointerdown={() => easeDragging = true}
+        onpointerup={() => easeDragging = false}
+        onpointerenter={() => easeHovering = true}
+        onpointerleave={() => easeHovering = false} />
+      <div class="slider-tooltip" class:visible={easeDragging || easeHovering} style="left:calc(9px + ({taskbarDimmer.easeDurationMs / 1000} * (100% - 18px)))">{taskbarDimmer.easeDurationMs === 0 ? 'OFF' : `${taskbarDimmer.easeDurationMs} ms`}</div>
     </div>
     <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
   </div>

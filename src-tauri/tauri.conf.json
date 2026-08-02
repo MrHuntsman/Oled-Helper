@@ -14,7 +14,7 @@
       {
         "title": "OLED Helper",
         "width": 900,
-        "height": 650,
+        "height": 700,
         "minWidth": 600,
         "minHeight": 400,
         "resizable": true,

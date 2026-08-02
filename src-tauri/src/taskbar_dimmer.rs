@@ -90,6 +90,13 @@ mod platform {
     }
 
     fn emit_runtime(level: &str, message: String) {
+        // Taskbar-dimmer logging is disabled by default: the hover/periodic
+        // tick diagnostics can fill the on-disk log while the app idles. The
+        // code stays in place — the Debug tab's "Verbose periodic logs" toggle
+        // flips VERBOSE_LOGGING to re-enable all of it for debugging.
+        if !VERBOSE_LOGGING.load(Ordering::Relaxed) {
+            return;
+        }
         match level {
             "warn" => log::warn!("{message}"),
             "error" => log::error!("{message}"),
