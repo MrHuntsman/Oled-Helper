@@ -4,7 +4,9 @@ import { invoke } from '@tauri-apps/api/core';
 export const app = $state({
   activeTab: 'crush',
   hdrStatus: 'unknown',  // set by pollHDRStatus via matchMedia
-  displayInfo: { width: 0, height: 0, refreshRateHz: null },
+  displayInfo: { width: 0, height: 0, refreshRateHz: null, refreshRates: [], resolutions: [] },
+  refreshRateBusy: false,
+  displayModeBusy: false,
 });
 
 export const crush = $state({
@@ -205,7 +207,10 @@ export function pollHDRStatus() {
   }
 }
 
+let displayPollSequence = 0;
+
 export function pollDisplayInfo() {
+  const requestSequence = ++displayPollSequence;
   const s = window.screen;
   if (!s) return;
   const dpr = window.devicePixelRatio || 1;
@@ -215,15 +220,26 @@ export function pollDisplayInfo() {
     width: Math.round(s.width * dpr),
     height: Math.round(s.height * dpr),
     refreshRateHz: app.displayInfo.refreshRateHz ?? null,
+    refreshRates: app.displayInfo.refreshRates,
+    resolutions: app.displayInfo.resolutions,
   };
   // Browsers don't expose real refresh rate, so ask the Tauri backend
   // (Win32 EnumDisplaySettingsW) for accurate resolution + Hz.
   invoke('get_display_info').then((info) => {
-    if (!info) return;
+    // Polls can overlap while Windows is changing display modes. Only let
+    // the newest request update the dropdown, otherwise a slower old result
+    // could snap the selection back after a successful change.
+    if (requestSequence !== displayPollSequence || !info) return;
     app.displayInfo = {
-      width: info.width,
-      height: info.height,
-      refreshRateHz: info.refresh_hz || null,
+      // Keep the user's pending choice visible until Windows finishes the
+      // mode switch and the next poll confirms the actual value.
+      width: app.displayModeBusy ? app.displayInfo.width : info.width,
+      height: app.displayModeBusy ? app.displayInfo.height : info.height,
+      refreshRateHz: app.displayModeBusy
+        ? app.displayInfo.refreshRateHz
+        : (info.refresh_hz || null),
+      refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [],
+      resolutions: Array.isArray(info.resolutions) ? info.resolutions : [],
     };
   }).catch(() => {});
 }

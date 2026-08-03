@@ -408,6 +408,34 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       lastClickTime = now;
     }
   }
+  function handleStripKeydown(e) {
+    // Only the strip itself owns this shortcut. Do not cycle fullscreen when
+    // Enter/Space is used on a nested slider or help button.
+    if (e.target !== e.currentTarget) return;
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      cycleFullscreen();
+    }
+  }
+
+  function handleContextMenuKeydown(e) {
+    const items = [...e.currentTarget.querySelectorAll('[role="menuitem"]:not(:disabled)')];
+    const currentIndex = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const direction = e.key === 'ArrowDown' ? 1 : -1;
+      const nextIndex = (currentIndex + direction + items.length) % items.length;
+      items[nextIndex]?.focus();
+    } else if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      (e.key === 'Home' ? items[0] : items[items.length - 1])?.focus();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeContextMenu();
+    }
+    e.stopPropagation();
+  }
+
   function exitFullscreen() {
     crush.fullscreen = 'normal';
     if (document.fullscreenElement) document.exitFullscreen();
@@ -428,6 +456,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   // ── Right-click context menu on the strip ──────────────────────────
   let ctxMenu = $state({ open: false, x: 0, y: 0 });
+  let ctxMenuElement = $state(null);
   function openContextMenu(e) {
     e.preventDefault();
     const menuW = 260, menuH = 210;
@@ -479,6 +508,11 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   $effect(() => {
     if (!ctxMenu.open) return;
+    // Move focus into the menu after it mounts so keyboard users can reach
+    // the mode choices immediately after opening it with the mouse.
+    const focusId = setTimeout(() => {
+      ctxMenuElement?.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
+    }, 0);
     function onDocClick() { closeContextMenu(); }
     function onDocKey(e) { if (e.key === 'Escape') closeContextMenu(); }
     // Listen on capture + next tick so the opening right-click doesn't immediately close it.
@@ -488,6 +522,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       document.addEventListener('keydown', onDocKey);
     }, 0);
     return () => {
+      clearTimeout(focusId);
       clearTimeout(id);
       document.removeEventListener('click', onDocClick);
       document.removeEventListener('contextmenu', onDocClick);
@@ -542,7 +577,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <span class="settings-row-label">Black Level</span>
       <span class="slider-val">{adjustmentDisplay()}</span>
     </div>
-    <div class="slider-track-wrap dimmer-slider-track" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
+    <div class="slider-track-wrap dimmer-slider-track" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
       <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={mainSliderInput}
         class="has-ticks"
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
@@ -597,7 +632,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     {/if}
 
     <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
-      onclick={handleStripClick} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0">
+      onclick={handleStripClick} onkeydown={handleStripKeydown} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0" aria-label="Calibration strip. Double-click or press Enter or Space to cycle fullscreen mode.">
       <canvas bind:this={canvas}></canvas>
       {#if app.hdrStatus !== 'unknown'}
         <div class="square-labels" style="--sq-count:{crush.squareCount}">
@@ -649,14 +684,14 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   </div>
 
   {#if ctxMenu.open}
-    <div class="ctx-menu" style="left:{ctxMenu.x}px; top:{ctxMenu.y}px;" onclick={(e) => e.stopPropagation()} oncontextmenu={(e) => e.preventDefault()}>
+    <div class="ctx-menu" bind:this={ctxMenuElement} style="left:{ctxMenu.x}px; top:{ctxMenu.y}px;" role="menu" aria-label="Calibration display mode" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleContextMenuKeydown} oncontextmenu={(e) => e.preventDefault()}>
       <div class="ctx-menu-label">
         Calibration Display Mode
       </div>
-      <button class="ctx-item" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}>In-App Fullscreen</button>
-      <button class="ctx-item" class:active={crush.fullscreen === 'monitor'} onclick={() => setMode('monitor')}>Monitor Fullscreen</button>
+      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}>In-App Fullscreen</button>
+      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'monitor'} onclick={() => setMode('monitor')}>Monitor Fullscreen</button>
       <div class="ctx-menu-sep"></div>
-      <button class="ctx-item" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
+      <button class="ctx-item" role="menuitem" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
     </div>
   {/if}
 </div>

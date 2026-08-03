@@ -49,6 +49,16 @@ fn get_display_info() -> Option<display_info::DisplayInfo> {
     display_info::query_current_display()
 }
 
+#[tauri::command]
+fn set_refresh_rate(hz: u32) -> Result<(), String> {
+    display_info::set_refresh_rate(hz)
+}
+
+#[tauri::command]
+fn set_resolution(width: u32, height: u32, preferred_hz: u32) -> Result<(), String> {
+    display_info::set_resolution(width, height, preferred_hz)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if window.show().is_ok() {
@@ -86,6 +96,8 @@ pub fn run() {
             apply_gamma_ramp,
             log_frontend,
             get_display_info,
+            set_refresh_rate,
+            set_resolution,
             set_tray_enabled,
             config::load_config,
             config::save_config,
