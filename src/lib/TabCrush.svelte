@@ -207,11 +207,19 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       gpuError = '';
       dlog('GPU init complete — calling first render');
       render();
+      device.lost.then((info) => {
+        if (generation !== gpuGeneration) return;
+        const reason = info?.message || 'GPU device was lost';
+        gpuError = `GPU device lost: ${reason}`;
+        derr(`GPU device lost: ${reason}`);
+        releaseGpuResources();
+      }).catch(() => {});
     } catch (e) {
-      gpuError = 'GPU init failed: ' + e.message;
+      gpuError = 'GPU init failed: ' + (e?.message || String(e));
       forceSdrRender = true;
-      derr(`UNHANDLED ERROR in initGPU: ${e.message}`);
+      derr(`UNHANDLED ERROR in initGPU: ${e?.message || String(e)}`);
       console.error('WebGPU init error:', e);
+      releaseGpuResources();
     }
   }
 
@@ -241,14 +249,20 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         return;
       }
     }
-    pipe = device.createRenderPipeline({
-      layout: pipelineLayout,
-      vertex: { module: shaderModule, entryPoint: 'vs' },
-      fragment: { module: shaderModule, entryPoint: 'fs', targets: [{ format }] },
-      primitive: { topology: 'triangle-list' },
-    });
-    currentFormat = format;
-    dlog(`pipeline rebuilt with target format: ${format}`);
+    try {
+      pipe = device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: { module: shaderModule, entryPoint: 'vs' },
+        fragment: { module: shaderModule, entryPoint: 'fs', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      currentFormat = format;
+      dlog(`pipeline rebuilt with target format: ${format}`);
+    } catch (error) {
+      gpuError = `GPU pipeline rebuild failed: ${error?.message || String(error)}`;
+      derr(`GPU pipeline rebuild failed: ${error?.message || String(error)}`);
+      releaseGpuResources();
+    }
   }
 
   function render() {
@@ -542,18 +556,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     if (crush.fullscreen === 'monitor') {
       if (!document.fullscreenElement) {
         document.documentElement.requestFullscreen().catch((e) => {
-          // Browser rejected the request (e.g. rapid repeated calls without a
-          // fresh user gesture, or a request already in flight). If we're
-          // still supposed to be in monitor mode, retry shortly — otherwise
-          // rapid clicking can leave crush.fullscreen==='monitor' while the
-          // real fullscreenElement never gets set, permanently desyncing state.
-          dwarn(`requestFullscreen failed: ${e.message}`);
-          if (crush.fullscreen === 'monitor' && !document.fullscreenElement) {
-            setTimeout(() => {
-              if (crush.fullscreen === 'monitor' && !document.fullscreenElement) {
-                document.documentElement.requestFullscreen().catch(() => {});
-              }
-            }, 150);
+          // Fullscreen requests require a current user activation. Retrying
+          // from a timer cannot restore that activation and only creates a
+          // second rejected promise, so return to a truthful non-fullscreen
+          // state and require the user to initiate the action again.
+          dwarn(`requestFullscreen failed: ${e?.message || String(e)}`);
+          if (!document.fullscreenElement && crush.fullscreen === 'monitor') {
+            crush.fullscreen = 'normal';
           }
         });
       }

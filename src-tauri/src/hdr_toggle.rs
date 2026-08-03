@@ -41,8 +41,9 @@ pub struct HdrCapability {
 }
 
 fn query_active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+    const MAX_TOPOLOGY_RETRIES: usize = 4;
     unsafe {
-        loop {
+        for attempt in 0..=MAX_TOPOLOGY_RETRIES {
             let mut path_count: u32 = 0;
             let mut mode_count: u32 = 0;
             let sizes_result =
@@ -70,6 +71,10 @@ fn query_active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONF
             // Topology can change between the size query and the fetch (e.g. a
             // display waking up); retry once more if the buffer is now too small.
             if query_result == ERROR_INSUFFICIENT_BUFFER {
+                if attempt == MAX_TOPOLOGY_RETRIES {
+                    return Err("display topology kept changing while querying HDR state".into());
+                }
+                std::thread::yield_now();
                 continue;
             }
             if query_result != ERROR_SUCCESS {
@@ -80,6 +85,7 @@ fn query_active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONF
             modes.truncate(mode_count as usize);
             return Ok((paths, modes));
         }
+        Err("unable to query active display paths".into())
     }
 }
 

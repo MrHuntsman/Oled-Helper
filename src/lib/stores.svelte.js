@@ -386,12 +386,20 @@ export function bumpEnvTick() {
 // is plain and the reactive version is gated below, inactive tabs pay only the
 // small cost of storing each compact log record.
 const GPU_LOG_MAX = 5000;
+let gpuLogStart = 0;
 export const gpuLogEntries = [];
 export const gpuLogVersion = $state({ n: 0 });
 
 export function pushGpuLog(level, message, { persist = true } = {}) {
-  gpuLogEntries.push({ level, message, ts: Date.now() });
-  if (gpuLogEntries.length > GPU_LOG_MAX) gpuLogEntries.shift();
+  const entry = { level, message, ts: Date.now() };
+  if (gpuLogEntries.length < GPU_LOG_MAX) {
+    gpuLogEntries.push(entry);
+  } else {
+    // Overwrite the oldest slot in-place rather than shifting 5,000 entries
+    // on every overflow. TabDebug reads the chronological snapshot below.
+    gpuLogEntries[gpuLogStart] = entry;
+    gpuLogStart = (gpuLogStart + 1) % GPU_LOG_MAX;
+  }
   // Only invalidate the Debug tab while it is mounted/open. In other tabs the
   // plain buffer still retains the entry, but Svelte does no log-list work.
   if (app.activeTab === 'debug') gpuLogVersion.n++;
@@ -404,7 +412,13 @@ export function pushGpuLog(level, message, { persist = true } = {}) {
   }
 }
 
+export function gpuLogSnapshot() {
+  if (gpuLogEntries.length < GPU_LOG_MAX || gpuLogStart === 0) return [...gpuLogEntries];
+  return gpuLogEntries.slice(gpuLogStart).concat(gpuLogEntries.slice(0, gpuLogStart));
+}
+
 export function clearGpuLog() {
   gpuLogEntries.length = 0;
+  gpuLogStart = 0;
   if (app.activeTab === 'debug') gpuLogVersion.n++;
 }

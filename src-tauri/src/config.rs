@@ -4,9 +4,16 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::{atomic::{AtomicU64, Ordering}, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Condvar, Mutex, OnceLock,
+};
 use tauri::AppHandle;
+#[cfg(target_os = "windows")]
+use windows::core::PCWSTR;
+#[cfg(target_os = "windows")]
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
 #[cfg(not(target_os = "windows"))]
 use tauri::Manager;
 
@@ -133,8 +140,89 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
     }
 }
 
-static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+struct PendingConfigWrite {
+    path: PathBuf,
+    text: String,
+    version: u64,
+}
+
 static CONFIG_WRITE_VERSION: AtomicU64 = AtomicU64::new(0);
+static CONFIG_WRITE_STOP: AtomicBool = AtomicBool::new(false);
+static CONFIG_WRITE_QUEUE: OnceLock<(Mutex<Option<PendingConfigWrite>>, Condvar)> = OnceLock::new();
+static CONFIG_WRITE_WORKER: OnceLock<Result<Mutex<Option<std::thread::JoinHandle<()>>>, String>> = OnceLock::new();
+
+fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let temp = temp_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let target = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(temp.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            ).map_err(|e| format!("could not replace {path:?}: {e}"))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        fs::rename(temp_path, path).map_err(|e| format!("could not replace {path:?}: {e}"))
+    }
+}
+
+fn config_write_worker() {
+    let Some((queue, wake)) = CONFIG_WRITE_QUEUE.get() else { return; };
+    loop {
+        let pending = {
+            let Ok(mut guard) = queue.lock() else { return; };
+            while guard.is_none() && !CONFIG_WRITE_STOP.load(Ordering::Acquire) {
+                let Ok(next) = wake.wait(guard) else { return; };
+                guard = next;
+            }
+            if let Some(pending) = guard.take() {
+                Some(pending)
+            } else if CONFIG_WRITE_STOP.load(Ordering::Acquire) {
+                None
+            } else {
+                continue;
+            }
+        };
+        let Some(pending) = pending else { break; };
+
+        // A newer snapshot may have arrived while this write was waiting for
+        // the worker. Skip stale snapshots so rapid slider/mode changes cannot
+        // restore an older profile map after the latest save.
+        if pending.version != CONFIG_WRITE_VERSION.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let temp_path = pending.path.with_extension("json.tmp");
+        if let Err(e) = fs::write(&temp_path, &pending.text) {
+            log::warn!("save_config: could not write {:?}: {e}", temp_path);
+            continue;
+        }
+        if let Err(e) = replace_config_file(&temp_path, &pending.path) {
+            let _ = fs::remove_file(&temp_path);
+            log::warn!("save_config: {e}");
+        }
+    }
+}
+
+fn ensure_config_worker() -> Result<(), String> {
+    let worker = CONFIG_WRITE_WORKER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("config-write-worker".into())
+            .spawn(config_write_worker)
+            .map(Some)
+            .map(Mutex::new)
+            .map_err(|e| format!("could not start config write worker: {e}"))
+    });
+    match worker {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.clone()),
+    }
+}
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
@@ -144,22 +232,28 @@ pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     // a slow disk/OneDrive can stall it for hundreds of milliseconds.
     let path = config_path(&app)?;
     let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    let version = CONFIG_WRITE_VERSION.fetch_add(1, Ordering::Relaxed) + 1;
-    std::thread::spawn(move || {
-        let lock = CONFIG_WRITE_LOCK.get_or_init(|| Mutex::new(()));
-        let Ok(_guard) = lock.lock() else {
-            log::warn!("save_config: could not acquire config write lock");
-            return;
-        };
-        // A newer snapshot may have arrived while this write was waiting for
-        // the lock. Skip stale snapshots so rapid slider/mode changes cannot
-        // restore an older profile map after the latest save.
-        if version != CONFIG_WRITE_VERSION.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Err(e) = fs::write(&path, text) {
-            log::warn!("save_config: could not write {:?}: {e}", path);
-        }
-    });
+    let version = CONFIG_WRITE_VERSION.fetch_add(1, Ordering::AcqRel) + 1;
+    let (queue, wake) = CONFIG_WRITE_QUEUE.get_or_init(|| (Mutex::new(None), Condvar::new()));
+    ensure_config_worker()?;
+    if let Ok(mut pending) = queue.lock() {
+        *pending = Some(PendingConfigWrite { path, text, version });
+        wake.notify_one();
+    } else {
+        return Err("config write queue was poisoned".into());
+    }
     Ok(())
+}
+
+pub fn shutdown() {
+    CONFIG_WRITE_STOP.store(true, Ordering::Release);
+    if let Some((_, wake)) = CONFIG_WRITE_QUEUE.get() {
+        wake.notify_all();
+    }
+    if let Some(Ok(worker)) = CONFIG_WRITE_WORKER.get() {
+        if let Ok(mut worker) = worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 }

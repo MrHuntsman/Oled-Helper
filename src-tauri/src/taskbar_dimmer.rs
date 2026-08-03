@@ -64,16 +64,13 @@ mod platform {
     };
     use windows::core::PCWSTR;
 
+    // One adaptive timer handles both cursor polling and animation. It runs
+    // at the fast cadence only while a transition is active.
     const TIMER_ID: usize = 1;
-    // Poll timer: hover/fullscreen detection and z-order repair. Its interval
-    // can be raised (e.g. 100 ms) to cut idle work — the fade is NOT affected
-    // because it runs on its own dedicated timer below.
-    const TIMER_INTERVAL_MS: u32 = 33;
-    // Dedicated fade timer: animates the overlay alpha at a fixed fast rate so
-    // the easing stays smooth regardless of TIMER_INTERVAL_MS. Only runs while
-    // a fade is actually in progress.
-    const FADE_TIMER_ID: usize = 2;
-    const FADE_INTERVAL_MS: u32 = 16;
+    const IDLE_TIMER_INTERVAL_MS: u32 = 33;
+    const ACTIVE_TIMER_INTERVAL_MS: u32 = 16;
+    const TASKBAR_CACHE_REFRESH_MS: u64 = 1000;
+    const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
     const DEFAULT_EASE_DURATION_MS: u64 = 250;
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
@@ -85,11 +82,31 @@ mod platform {
         fade_out_duration_ms: u64,
         current_alpha: f64,
         target_alpha: f64,
-        last_tick: Instant,
+        // Absolute transition state. When the target reverses, the current
+        // alpha becomes the new start point so the fade continues smoothly
+        // from wherever the previous transition stopped.
+        start_alpha: f64,
+        fade_start_time: Instant,
+        transition_active: bool,
         timer_started: bool,
-        fade_timer_started: bool,
+        timer_interval_ms: u32,
         last_hovered: Option<bool>,
         last_diagnostic: Instant,
+        last_poll_tick: Option<Instant>,
+        last_poll_gap_diagnostic: Option<Instant>,
+        // Raw HWND value keeps this shared state Send + Sync; reconstruct the
+        // HWND only at the point where a Win32 call is made.
+        cached_taskbar: Option<(isize, RECT)>,
+        last_taskbar_cache_refresh: Instant,
+        last_zorder_repair: Instant,
+        last_applied_alpha: Option<u8>,
+        last_timer_failure_diagnostic: Option<Instant>,
+        last_fade_tick: Option<Instant>,
+        fade_tick_count: u64,
+        max_fade_tick_gap_ms: f64,
+        max_alpha_jump: f64,
+        max_layered_update_us: u128,
+        slow_layered_update_count: u64,
     }
 
     static FADE_STATE: OnceLock<Mutex<FadeState>> = OnceLock::new();
@@ -150,12 +167,11 @@ mod platform {
         match message {
             WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
             WM_TIMER => {
-                // Two independent timers share the window, distinguished by
-                // wParam: the configurable poll timer (hover/fullscreen/z-order)
-                // and the fixed-rate fade timer (alpha animation).
-                if wparam.0 == FADE_TIMER_ID {
-                    advance_fade(hwnd);
-                } else {
+                // A single adaptive timer handles hover detection, animation,
+                // and occasional z-order maintenance. Keeping these operations
+                // in one callback avoids competing WM_TIMER streams on the
+                // overlay's window thread.
+                if wparam.0 == TIMER_ID {
                     update_fade(hwnd);
                 }
                 LRESULT(0)
@@ -325,85 +341,31 @@ mod platform {
         }
     }
 
-    // Fade-timer callback (FADE_TIMER_ID, fixed fast rate): advances the alpha
-    // toward target_alpha using the real elapsed time, so the easing duration
-    // stays accurate regardless of the poll timer's interval. Stops itself as
-    // soon as the fade completes (or the dimmer is disabled).
-    fn advance_fade(hwnd: HWND) {
-        let Some(state) = FADE_STATE.get() else { return; };
-        let mut alpha_to_apply = None;
-        let done = {
-            let mut fade = state.lock().unwrap();
-            if fade.enabled {
-                let now = Instant::now();
-                let elapsed = now.duration_since(fade.last_tick);
-                fade.last_tick = now;
-                let distance = fade.target_alpha - fade.current_alpha;
-                if distance.abs() > 0.01 {
-                    // Fading in (alpha increasing) uses fade_in_duration_ms;
-                    // fading out (alpha decreasing, e.g. on hover or disable)
-                    // uses fade_out_duration_ms.
-                    let active_duration_ms = if distance > 0.0 {
-                        fade.fade_in_duration_ms
-                    } else {
-                        fade.fade_out_duration_ms
-                    };
-                    let progress = if active_duration_ms == 0 {
-                        1.0
-                    } else {
-                        let duration = Duration::from_millis(active_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS));
-                        (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
-                    };
-                    // Fast ease-out: move quickly at the beginning, then settle
-                    // smoothly over the final few alpha levels. This only
-                    // updates the native layered window, never the frontend.
-                    let eased = 1.0 - (1.0 - progress).powi(3);
-                    fade.current_alpha += distance * eased;
-                    if distance.abs() < 0.5 || progress >= 1.0 {
-                        fade.current_alpha = fade.target_alpha;
-                    }
-                    alpha_to_apply = Some(fade.current_alpha.round().clamp(0.0, 255.0) as u8);
-                }
-                (fade.target_alpha - fade.current_alpha).abs() <= 0.01
-            } else {
-                // Dimmer disabled mid-fade.
-                true
-            }
-        };
-        if done {
-            if let Some(state) = FADE_STATE.get() {
-                let mut fade = state.lock().unwrap();
-                if fade.fade_timer_started {
-                    unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
-                    fade.fade_timer_started = false;
-                }
-            }
-        }
-        if let Some(alpha) = alpha_to_apply {
-            unsafe {
-                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-            }
-        }
+    fn transition_summary(fade: &FadeState, reason: &str, now: Instant) -> String {
+        let elapsed_ms = now.duration_since(fade.fade_start_time).as_secs_f64() * 1000.0;
+        format!(
+            "[taskbar-dimmer] fade_summary reason={} start={:.1} target={:.1} current={:.1} elapsed_ms={:.1} ticks={} max_tick_gap_ms={:.1} max_alpha_jump={:.1} max_set_layered_us={} slow_set_layered_count={}",
+            reason,
+            fade.start_alpha,
+            fade.target_alpha,
+            fade.current_alpha,
+            elapsed_ms,
+            fade.fade_tick_count,
+            fade.max_fade_tick_gap_ms,
+            fade.max_alpha_jump,
+            fade.max_layered_update_us,
+            fade.slow_layered_update_count,
+        )
     }
 
     fn update_fade(hwnd: HWND) {
         let Some(state) = FADE_STATE.get() else { return; };
-        // A foreground fullscreen app (game, video, …) or the app's own
-        // monitor-fullscreen calibration strip (SUSPENDED, set by the
-        // frontend) must get the whole monitor. A still-visible always-on-top
-        // window over the taskbar stops Explorer from auto-hiding the taskbar,
-        // so the taskbar can render on top of the fullscreen app. Hide the
-        // window entirely and stop any in-flight fade; the poll timer keeps
-        // running so the overlay reappears as soon as fullscreen ends.
+        let now = Instant::now();
+
+        // Fullscreen suppression remains on the adaptive timer, but does not
+        // perform any taskbar/window queries while it is active.
         let fullscreen = fullscreen_app_active(hwnd) || SUSPENDED.load(Ordering::Relaxed);
         if fullscreen {
-            if let Some(state) = FADE_STATE.get() {
-                let mut fade = state.lock().unwrap();
-                if fade.fade_timer_started {
-                    unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
-                    fade.fade_timer_started = false;
-                }
-            }
             unsafe {
                 if IsWindowVisible(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
@@ -412,72 +374,245 @@ mod platform {
             return;
         }
 
-        let taskbar = taskbar_info();
-        let taskbar_rect = taskbar.map(|(_, rect)| rect);
-        let (hovered, cursor) = taskbar_rect.map(cursor_over_rect).unwrap_or((false, windows::Win32::Foundation::POINT::default()));
-        let now = Instant::now();
-
         let mut diagnostic = None;
+        let mut transition_log = None;
+        let mut poll_gap_log = None;
+        let mut timer_start_failed = false;
+        let mut should_repair_zorder = false;
+        let mut hovered = false;
+        let mut cursor = windows::Win32::Foundation::POINT::default();
+        let mut alpha_to_apply = None;
+        let mut transition_done = false;
+
         {
             let mut fade = state.lock().unwrap();
-            let new_target = if fade.enabled && !hovered {
-                fade.base_alpha
-            } else {
-                0.0
-            };
-            let target_changed = (fade.target_alpha - new_target).abs() > 0.01;
-            fade.target_alpha = new_target;
-            if fade.last_hovered != Some(hovered) || (VERBOSE_LOGGING.load(Ordering::Relaxed) && now.duration_since(fade.last_diagnostic) >= Duration::from_secs(1)) {
+            if let Some(previous) = fade.last_poll_tick {
+                let gap_ms = now.duration_since(previous).as_secs_f64() * 1000.0;
+                let can_report = fade.last_poll_gap_diagnostic
+                    .map(|last| now.duration_since(last) >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if gap_ms >= 60.0 && can_report {
+                    fade.last_poll_gap_diagnostic = Some(now);
+                    poll_gap_log = Some(format!("[taskbar-dimmer] poll_gap_ms={:.1}", gap_ms));
+                }
+            }
+            fade.last_poll_tick = Some(now);
+
+            let refresh_cache = fade.cached_taskbar.is_none()
+                || now.duration_since(fade.last_taskbar_cache_refresh).as_millis() as u64 >= TASKBAR_CACHE_REFRESH_MS;
+            if refresh_cache {
+                fade.last_taskbar_cache_refresh = now;
+                let previous = fade.cached_taskbar;
+                fade.cached_taskbar = taskbar_info().map(|(taskbar, rect)| (taskbar.0 as isize, rect));
+                if fade.cached_taskbar != previous {
+                    should_repair_zorder = true;
+                }
+            }
+            let cached = fade.cached_taskbar;
+            if let Some((_, rect)) = cached {
+                let (is_hovered, point) = cursor_over_rect(rect);
+                hovered = is_hovered;
+                cursor = point;
+            }
+
+            let new_target = if fade.enabled && !hovered { fade.base_alpha } else { 0.0 };
+            if (fade.target_alpha - new_target).abs() > 0.01 {
+                if fade.fade_tick_count > 0 {
+                    transition_log = Some(transition_summary(&fade, "reversed", now));
+                }
+                fade.start_alpha = fade.current_alpha;
+                fade.fade_start_time = now;
+                fade.target_alpha = new_target;
+                fade.transition_active = true;
+                fade.last_fade_tick = None;
+                fade.fade_tick_count = 0;
+                fade.max_fade_tick_gap_ms = 0.0;
+                fade.max_alpha_jump = 0.0;
+                fade.max_layered_update_us = 0;
+                fade.slow_layered_update_count = 0;
+                should_repair_zorder = true;
+            }
+
+            if fade.last_hovered != Some(hovered)
+                || (VERBOSE_LOGGING.load(Ordering::Relaxed)
+                    && now.duration_since(fade.last_diagnostic) >= Duration::from_secs(1))
+            {
                 fade.last_hovered = Some(hovered);
                 fade.last_diagnostic = now;
                 diagnostic = Some((fade.current_alpha, fade.target_alpha, fade.enabled));
             }
 
-            // The actual easing runs on its own fixed-rate timer (advance_fade)
-            // so it stays smooth no matter how low TIMER_INTERVAL_MS is set.
-            // Here we only (re)start that timer when a fade is needed and stop
-            // it once the alpha has settled.
-            let fading = fade.enabled && (fade.target_alpha - fade.current_alpha).abs() > 0.01;
-            if fading && !fade.fade_timer_started {
-                let timer = unsafe { SetTimer(Some(hwnd), FADE_TIMER_ID, FADE_INTERVAL_MS, None) };
-                if timer != 0 {
-                    fade.fade_timer_started = true;
-                    fade.last_tick = now;
+            if fade.enabled && fade.transition_active {
+                if let Some(previous) = fade.last_fade_tick {
+                    fade.max_fade_tick_gap_ms = fade.max_fade_tick_gap_ms.max(
+                        now.duration_since(previous).as_secs_f64() * 1000.0,
+                    );
                 }
-            } else if !fading && fade.fade_timer_started {
-                unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
-                fade.fade_timer_started = false;
-            } else if target_changed && fade.fade_timer_started {
-                // Target changed mid-fade: restart the easing clock so the new
-                // fade takes the full ease duration.
-                fade.last_tick = now;
+                fade.last_fade_tick = Some(now);
+                fade.fade_tick_count = fade.fade_tick_count.saturating_add(1);
+
+                let before = fade.current_alpha;
+                let distance = fade.target_alpha - fade.start_alpha;
+                if distance.abs() > 0.01 {
+                    let duration_ms = if distance > 0.0 {
+                        fade.fade_in_duration_ms
+                    } else {
+                        fade.fade_out_duration_ms
+                    };
+                    let progress = if duration_ms == 0 {
+                        1.0
+                    } else {
+                        let duration = Duration::from_millis(duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS));
+                        (now.duration_since(fade.fade_start_time).as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
+                    };
+                    let eased = 1.0 - (1.0 - progress).powi(3);
+                    fade.current_alpha = fade.start_alpha + distance * eased;
+                    if progress >= 1.0 {
+                        fade.current_alpha = fade.target_alpha;
+                    }
+                    fade.max_alpha_jump = fade.max_alpha_jump.max((fade.current_alpha - before).abs());
+                    alpha_to_apply = Some(fade.current_alpha.round().clamp(0.0, 255.0) as u8);
+                } else {
+                    fade.current_alpha = fade.target_alpha;
+                }
+
+                // Only mark completion when this tick was actually advancing
+                // a transition. Otherwise an idle timer tick would look like
+                // a completed fade and reset the diagnostic counters.
+                transition_done = distance.abs() > 0.01
+                    && (fade.target_alpha - fade.current_alpha).abs() <= 0.01;
+                if transition_done {
+                    fade.current_alpha = fade.target_alpha;
+                    fade.start_alpha = fade.target_alpha;
+                    fade.transition_active = false;
+                    should_repair_zorder = true;
+                }
+            }
+
+            let active = fade.enabled && fade.transition_active;
+            let desired_interval = if active { ACTIVE_TIMER_INTERVAL_MS } else { IDLE_TIMER_INTERVAL_MS };
+            if !fade.timer_started {
+                let timer = unsafe { SetTimer(Some(hwnd), TIMER_ID, desired_interval, None) };
+                if timer != 0 {
+                    fade.timer_started = true;
+                    fade.timer_interval_ms = desired_interval;
+                } else {
+                    let can_report = fade.last_timer_failure_diagnostic
+                        .map(|last| now.duration_since(last) >= Duration::from_secs(1))
+                        .unwrap_or(true);
+                    if can_report {
+                        fade.last_timer_failure_diagnostic = Some(now);
+                        timer_start_failed = true;
+                    }
+                }
+            } else if fade.timer_interval_ms != desired_interval {
+                let timer = unsafe { SetTimer(Some(hwnd), TIMER_ID, desired_interval, None) };
+                if timer != 0 {
+                    fade.timer_interval_ms = desired_interval;
+                } else {
+                    let can_report = fade.last_timer_failure_diagnostic
+                        .map(|last| now.duration_since(last) >= Duration::from_secs(1))
+                        .unwrap_or(true);
+                    if can_report {
+                        fade.last_timer_failure_diagnostic = Some(now);
+                        timer_start_failed = true;
+                    }
+                }
+            }
+
+            if now.duration_since(fade.last_zorder_repair).as_millis() as u64 >= ZORDER_REPAIR_INTERVAL_MS {
+                should_repair_zorder = true;
+            }
+            if should_repair_zorder {
+                fade.last_zorder_repair = now;
+            }
+        }
+        let cached_taskbar_for_log = if let Some(state) = FADE_STATE.get() {
+            state.lock().unwrap().cached_taskbar
+        } else {
+            None
+        };
+
+        if let Some(alpha) = alpha_to_apply {
+            let should_apply = FADE_STATE
+                .get()
+                .map(|state| state.lock().unwrap().last_applied_alpha != Some(alpha))
+                .unwrap_or(false);
+            if should_apply {
+                let started = Instant::now();
+                let result = unsafe {
+                    SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)
+                };
+                let duration = started.elapsed().as_micros();
+                if let Some(state) = FADE_STATE.get() {
+                    let mut fade = state.lock().unwrap();
+                    fade.max_layered_update_us = fade.max_layered_update_us.max(duration);
+                    if duration >= 2000 {
+                        fade.slow_layered_update_count = fade.slow_layered_update_count.saturating_add(1);
+                    }
+                    if result.is_ok() {
+                        // Only suppress future writes after Windows accepted
+                        // this one; failures must remain retryable.
+                        fade.last_applied_alpha = Some(alpha);
+                    }
+                }
+                if let Err(error) = result {
+                    emit_runtime("warn", format!(
+                        "[taskbar-dimmer] layered_update_failed alpha={} error={}",
+                        alpha, error,
+                    ));
+                }
             }
         }
 
-        // Z-order repair stays on the poll rate; the fade timer only touches
-        // the layered alpha, so the shell cannot disturb the freshly shown
-        // overlay during a transition.
-        maintain_overlay_zorder(hwnd, taskbar);
+        if should_repair_zorder {
+            let zorder_started = Instant::now();
+            maintain_overlay_zorder(
+                hwnd,
+                cached_taskbar_for_log.map(|(raw, rect)| (HWND(raw as *mut c_void), rect)),
+            );
+            let zorder_us = zorder_started.elapsed().as_micros();
+            if zorder_us >= 2000 {
+                emit_runtime("warn", format!("[taskbar-dimmer] slow_zorder_update duration_us={}", zorder_us));
+            }
+        }
+        if let Some(message) = transition_log {
+            emit_runtime("info", message);
+        }
+        if let Some(message) = poll_gap_log {
+            emit_runtime("warn", message);
+        }
+        if timer_start_failed {
+            emit_runtime("error", "[taskbar-dimmer] timer_start_or_update_failed".to_string());
+        }
+
+        if transition_done {
+            if let Some(state) = FADE_STATE.get() {
+                let mut fade = state.lock().unwrap();
+                if fade.fade_tick_count > 0 {
+                    let summary = transition_summary(&fade, "complete", now);
+                    fade.fade_tick_count = 0;
+                    fade.last_fade_tick = None;
+                    fade.max_fade_tick_gap_ms = 0.0;
+                    fade.max_alpha_jump = 0.0;
+                    fade.max_layered_update_us = 0;
+                    fade.slow_layered_update_count = 0;
+                    drop(fade);
+                    emit_runtime("info", summary);
+                }
+            }
+        }
 
         if let Some((current, target, enabled)) = diagnostic {
-            let mut overlay_rect = RECT::default();
-            let overlay_rect = unsafe {
-                if GetWindowRect(hwnd, &mut overlay_rect).is_ok() { Some(overlay_rect) } else { None }
-            };
             let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-            let foreground = unsafe { GetForegroundWindow() };
+            let overlay_rect = unsafe {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() { Some(rect) } else { None }
+            };
             emit_runtime("info", format!(
-                "[taskbar-dimmer] tick enabled={} hovered={} cursor=({}, {}) taskbar={} visible={} overlay={} alpha={:.0}->{:.0} foreground=0x{:x}",
-                enabled,
-                hovered,
-                cursor.x,
-                cursor.y,
-                rect_text(taskbar_rect),
-                visible,
-                rect_text(overlay_rect),
-                current,
-                target,
-                foreground.0 as isize,
+                "[taskbar-dimmer] tick enabled={} hovered={} cursor=({}, {}) taskbar={} visible={} overlay={} alpha={:.0}->{:.0}",
+                enabled, hovered, cursor.x, cursor.y, rect_text(cached_taskbar_for_log.map(|(_, rect)| rect)),
+                visible, rect_text(overlay_rect), current, target,
             ));
         }
     }
@@ -512,11 +647,26 @@ mod platform {
             fade_out_duration_ms: DEFAULT_EASE_DURATION_MS,
             current_alpha: 0.0,
             target_alpha: 0.0,
-            last_tick: Instant::now(),
+            start_alpha: 0.0,
+            fade_start_time: Instant::now(),
+            transition_active: false,
             timer_started: false,
-            fade_timer_started: false,
+            timer_interval_ms: IDLE_TIMER_INTERVAL_MS,
             last_hovered: None,
             last_diagnostic: Instant::now(),
+            last_poll_tick: None,
+            last_poll_gap_diagnostic: None,
+            last_timer_failure_diagnostic: None,
+            last_fade_tick: None,
+            fade_tick_count: 0,
+            max_fade_tick_gap_ms: 0.0,
+            max_alpha_jump: 0.0,
+            max_layered_update_us: 0,
+            slow_layered_update_count: 0,
+            cached_taskbar: None,
+            last_taskbar_cache_refresh: Instant::now(),
+            last_zorder_repair: Instant::now(),
+            last_applied_alpha: None,
         }));
 
         unsafe {
@@ -539,28 +689,42 @@ mod platform {
             fade.base_alpha = alpha;
             fade.fade_in_duration_ms = fade_in_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
             fade.fade_out_duration_ms = fade_out_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
-            fade.target_alpha = if enabled && !hovered { alpha } else { 0.0 };
+            let new_target = if enabled && !hovered { alpha } else { 0.0 };
+            let now = Instant::now();
+            if (fade.target_alpha - new_target).abs() > 0.01 {
+                fade.start_alpha = fade.current_alpha;
+                fade.fade_start_time = now;
+                fade.target_alpha = new_target;
+                fade.transition_active = true;
+            }
             if immediate {
                 fade.current_alpha = fade.target_alpha;
-                immediate_alpha = Some(fade.current_alpha.round().clamp(0.0, 255.0) as u8);
+                fade.start_alpha = fade.current_alpha;
+                fade.fade_start_time = now;
+                fade.transition_active = false;
+                let immediate_value = fade.current_alpha.round().clamp(0.0, 255.0) as u8;
+                fade.last_applied_alpha = Some(immediate_value);
+                immediate_alpha = Some(immediate_value);
             }
-            fade.last_tick = Instant::now();
             if !enabled {
                 fade.current_alpha = 0.0;
+                fade.start_alpha = 0.0;
+                fade.target_alpha = 0.0;
+                fade.transition_active = false;
+                fade.last_applied_alpha = Some(0);
             }
             if enabled && !fade.timer_started {
-                let timer = unsafe { SetTimer(Some(hwnd), TIMER_ID, TIMER_INTERVAL_MS, None) };
+                let timer = unsafe { SetTimer(Some(hwnd), TIMER_ID, IDLE_TIMER_INTERVAL_MS, None) };
                 if timer == 0 {
-                    return Err("could not start taskbar dimmer fade timer".into());
+                    return Err("could not start taskbar dimmer timer".into());
                 }
                 fade.timer_started = true;
+                fade.timer_interval_ms = IDLE_TIMER_INTERVAL_MS;
+                fade.cached_taskbar = Some((taskbar.0.0 as isize, rect));
+                fade.last_taskbar_cache_refresh = Instant::now();
             } else if !enabled && fade.timer_started {
                 unsafe { let _ = KillTimer(Some(hwnd), TIMER_ID); }
                 fade.timer_started = false;
-                if fade.fade_timer_started {
-                    unsafe { let _ = KillTimer(Some(hwnd), FADE_TIMER_ID); }
-                    fade.fade_timer_started = false;
-                }
             }
         }
 

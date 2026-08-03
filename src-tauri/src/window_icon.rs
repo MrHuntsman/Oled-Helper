@@ -10,6 +10,7 @@
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -24,6 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 pub const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
+
+static INSTALLED_ICONS: OnceLock<Mutex<(isize, isize)>> = OnceLock::new();
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -130,12 +133,11 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
             0
         };
 
-        let _ = ReleaseDC(None, hdc);
-        let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
-        let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
-        let _ = DestroyIcon(hicon);
-
         if copied <= 0 {
+            let _ = ReleaseDC(None, hdc);
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
+            let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
+            let _ = DestroyIcon(hicon);
             return None;
         }
 
@@ -150,9 +152,8 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
         }
 
         // Legacy ICO frames can carry transparency in the 1-bit mask instead
-        // of the color bitmap's alpha channel. Read that mask and use it only
-        // when the color alpha is entirely empty, preserving transparent edges
-        // instead of turning the whole icon into an opaque square.
+        // of the color bitmap's alpha channel. Read that mask before releasing
+        // the HDC and bitmap handles.
         if !alpha_has_content {
             let mask_width = bitmap_width;
             let mask_height = (bitmap_height / 2).max(1);
@@ -199,6 +200,11 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
             }
         }
 
+        let _ = ReleaseDC(None, hdc);
+        let _ = DeleteObject(HGDIOBJ(icon_info.hbmColor.0));
+        let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
+        let _ = DestroyIcon(hicon);
+
         Some(tauri::image::Image::new_owned(rgba, bitmap_width, bitmap_height))
     }
 }
@@ -225,21 +231,39 @@ pub fn apply_crisp_window_icon(hwnd_raw: isize) {
         let big_cx = GetSystemMetrics(SM_CXICON);
         let big_cy = GetSystemMetrics(SM_CYICON);
 
+        let installed = INSTALLED_ICONS.get_or_init(|| Mutex::new((0, 0)));
+        let mut installed = installed.lock().ok();
         if let Some(small) = load_icon(&icon_path, small_cx, small_cy) {
+            if let Some(ref mut icons) = installed {
+                if icons.0 != 0 {
+                    let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(icons.0 as *mut _));
+                }
+            }
             let _ = SendMessageW(
                 hwnd,
                 WM_SETICON,
                 Some(WPARAM(ICON_SMALL as usize)),
                 Some(LPARAM(small.0 as isize)),
             );
+            if let Some(ref mut icons) = installed {
+                icons.0 = small.0 as isize;
+            }
         }
         if let Some(big) = load_icon(&icon_path, big_cx, big_cy) {
+            if let Some(ref mut icons) = installed {
+                if icons.1 != 0 {
+                    let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(icons.1 as *mut _));
+                }
+            }
             let _ = SendMessageW(
                 hwnd,
                 WM_SETICON,
                 Some(WPARAM(ICON_BIG as usize)),
                 Some(LPARAM(big.0 as isize)),
             );
+            if let Some(ref mut icons) = installed {
+                icons.1 = big.0 as isize;
+            }
         }
 
         // Force the non-client area (titlebar) to repaint immediately with the

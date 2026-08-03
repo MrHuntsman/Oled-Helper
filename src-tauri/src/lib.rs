@@ -7,8 +7,9 @@ mod hdr_toggle;
 
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+use std::thread::JoinHandle;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -26,12 +27,24 @@ struct TrayState {
 // and out of WebView2's IPC round-trip, which is slow under sustained input.
 struct GammaState {
     inner: Arc<GammaInner>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct GammaInner {
     desired: AtomicI32,
     shutdown: AtomicBool,
     last_applied: AtomicI32,
+}
+
+impl Drop for GammaState {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 
 impl Default for GammaState {
@@ -42,6 +55,7 @@ impl Default for GammaState {
                 shutdown: AtomicBool::new(false),
                 last_applied: AtomicI32::new(i32::MIN),
             }),
+            worker: Mutex::new(None),
         }
     }
 }
@@ -49,22 +63,35 @@ impl Default for GammaState {
 fn gamma_worker_loop(state: &GammaInner) {
     // Short-sleep polling loop: applies the latest desired value within a few
     // milliseconds of the frontend writing it, without depending on WebView2
-    // message delivery back to JS. `desired` is only read here, so the loop
-    // runs independently of any IPC latency.
+    // message delivery back to JS. Failed applications use a bounded retry
+    // interval so unsupported display drivers cannot cause a tight failure/log
+    // loop.
+    let retry_delay = std::time::Duration::from_millis(250);
+    let mut failed_value = None;
+    let mut next_retry = std::time::Instant::now();
+
     while !state.shutdown.load(Ordering::Relaxed) {
         let desired = state.desired.load(Ordering::Relaxed);
         let last = state.last_applied.load(Ordering::Relaxed);
-        if desired != last {
-            let started = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        let value_changed = failed_value != Some(desired);
+        if desired != last && (value_changed || now >= next_retry) {
+            let started = now;
             let ramp = gamma_ramp::build_ramp(desired);
             let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
             if applied {
                 state.last_applied.store(desired, Ordering::Relaxed);
+                failed_value = None;
+                next_retry = now;
+            } else {
+                if value_changed {
+                    log::warn!("[gamma] value={} apply failed; retrying in {} ms", desired, retry_delay.as_millis());
+                }
+                failed_value = Some(desired);
+                next_retry = now + retry_delay;
             }
             let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-            if !applied {
-                log::warn!("[gamma] value={} apply failed", desired);
-            } else if total_ms >= 32.0 {
+            if applied && total_ms >= 32.0 {
                 log::info!("[gamma-slow] value={} apply={total_ms:.3}ms", desired);
             }
         }
@@ -118,6 +145,23 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn shutdown_gamma_worker(app: &AppHandle) {
+    let worker = {
+        let state = app.state::<GammaState>();
+        state.inner.shutdown.store(true, Ordering::Release);
+        state.worker.lock().ok().and_then(|mut worker| worker.take())
+    };
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+    config::shutdown();
+}
+
+fn request_shutdown_and_exit(app: &AppHandle) {
+    shutdown_gamma_worker(app);
+    app.exit(0);
+}
+
 #[tauri::command]
 fn set_tray_enabled(
     app: tauri::AppHandle,
@@ -168,7 +212,7 @@ pub fn run() {
             // busy processing drag input.
             {
                 let gamma = app.state::<GammaState>().inner.clone();
-                std::thread::Builder::new()
+                let worker = std::thread::Builder::new()
                     .name("gamma-ramp-worker".into())
                     .spawn(move || {
                         #[cfg(target_os = "windows")]
@@ -183,6 +227,11 @@ pub fn run() {
                         gamma_worker_loop(&gamma);
                     })
                     .map_err(|error| format!("could not start gamma worker: {error}"))?;
+                app.state::<GammaState>()
+                    .worker
+                    .lock()
+                    .map_err(|_| "gamma worker state was poisoned".to_string())?
+                    .replace(worker);
             }
 
             // Always-on rotating file log (not just debug builds) — GPU-init
@@ -216,7 +265,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
-                    "quit" => app.exit(0),
+                    "quit" => request_shutdown_and_exit(app),
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -273,10 +322,11 @@ pub fn run() {
                     }
                 }
                 tauri::WindowEvent::Destroyed => {
-                    let gamma = window.app_handle().state::<GammaState>();
-                    gamma.inner.shutdown.store(true, Ordering::Relaxed);
-                    // The worker resets the display ramp itself after observing
-                    // shutdown, so no race with an in-progress apply.
+                    // Closing with the tray enabled only hides the window. When
+                    // the window is actually destroyed, request a synchronous
+                    // worker shutdown so the display ramp is reset before the
+                    // process exits.
+                    shutdown_gamma_worker(window.app_handle());
                 }
                 _ => {}
             }

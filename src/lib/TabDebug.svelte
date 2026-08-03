@@ -1,5 +1,5 @@
 <script>
-  import { app, gpuLogEntries, gpuLogVersion, clearGpuLog, envTick, runtimeLogSettings, setVerbosePeriodicLogging } from './stores.svelte.js';
+  import { app, gpuLogVersion, gpuLogSnapshot, clearGpuLog, envTick, runtimeLogSettings, setVerbosePeriodicLogging } from './stores.svelte.js';
 
   let copied = $state(false);
   let copyFailed = $state(false);
@@ -51,12 +51,8 @@
 
   // Re-derive off the version counter so this stays in sync without deep-watching
   // the whole log array (which caused a startup hang — see stores.svelte.js).
-  // IMPORTANT: gpuLogEntries is a plain mutated-in-place array (not $state),
-  // so we must return a NEW array reference here (spread) each time the
-  // version bumps — returning the same reference back means Svelte's
-  // equality check sees "no change" and skips re-rendering the template,
-  // even though the array's contents did change (e.g. on clearGpuLog()).
-  let logEntries = $derived.by(() => { void gpuLogVersion.n; return [...gpuLogEntries]; });
+  // The store returns a fresh chronological snapshot from its ring buffer.
+  let logEntries = $derived.by(() => { void gpuLogVersion.n; return gpuLogSnapshot(); });
 
   let logEl = $state(null);
   let logAtBottom = $state(true);

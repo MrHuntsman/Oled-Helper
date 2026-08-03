@@ -7,6 +7,9 @@ use windows::Win32::Graphics::Gdi::{
     ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, CDS_UPDATEREGISTRY,
     DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSWIDTH, DM_PELSHEIGHT,
 };
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use windows::core::PCWSTR;
 
 #[derive(serde::Serialize, Clone)]
@@ -54,7 +57,31 @@ fn for_each_display_mode(mut callback: impl FnMut(&DEVMODEW) -> bool) {
     }
 }
 
-fn refresh_rates_for(current: &DEVMODEW) -> Vec<u32> {
+#[derive(Clone)]
+struct CachedModeLists {
+    width: u32,
+    height: u32,
+    bits_per_pixel: u32,
+    refresh_rates: Vec<u32>,
+    resolutions: Vec<ResolutionInfo>,
+    captured_at: Instant,
+}
+
+static MODE_CACHE: OnceLock<Mutex<Option<CachedModeLists>>> = OnceLock::new();
+
+fn mode_lists_for(current: &DEVMODEW) -> (Vec<u32>, Vec<ResolutionInfo>) {
+    let cache = MODE_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref().filter(|cached| {
+            cached.width == current.dmPelsWidth
+                && cached.height == current.dmPelsHeight
+                && cached.bits_per_pixel == current.dmBitsPerPel
+                && cached.captured_at.elapsed() < Duration::from_secs(2)
+        }) {
+            return (cached.refresh_rates.clone(), cached.resolutions.clone());
+        }
+    }
+
     let mut rates = Vec::new();
     for_each_display_mode(|mode| {
         // Keep the active resolution and colour depth fixed: changing only
@@ -73,10 +100,7 @@ fn refresh_rates_for(current: &DEVMODEW) -> Vec<u32> {
     }
     rates.sort_unstable();
     rates.dedup();
-    rates
-}
 
-fn resolutions_for(current: &DEVMODEW) -> Vec<ResolutionInfo> {
     let mut resolutions = Vec::new();
     for_each_display_mode(|mode| {
         if mode_matches_display(mode, current)
@@ -101,7 +125,18 @@ fn resolutions_for(current: &DEVMODEW) -> Vec<ResolutionInfo> {
         });
     }
     resolutions.sort_unstable_by_key(|resolution| (resolution.width, resolution.height));
-    resolutions
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedModeLists {
+            width: current.dmPelsWidth,
+            height: current.dmPelsHeight,
+            bits_per_pixel: current.dmBitsPerPel,
+            refresh_rates: rates.clone(),
+            resolutions: resolutions.clone(),
+            captured_at: Instant::now(),
+        });
+    }
+    (rates, resolutions)
 }
 
 pub fn query_current_display() -> Option<DisplayInfo> {
@@ -113,12 +148,13 @@ pub fn query_current_display() -> Option<DisplayInfo> {
         if !ok.as_bool() {
             return None;
         }
+        let (refresh_rates, resolutions) = mode_lists_for(&devmode);
         Some(DisplayInfo {
             width: devmode.dmPelsWidth,
             height: devmode.dmPelsHeight,
             refresh_hz: devmode.dmDisplayFrequency,
-            refresh_rates: refresh_rates_for(&devmode),
-            resolutions: resolutions_for(&devmode),
+            refresh_rates,
+            resolutions,
         })
     }
 }
@@ -130,7 +166,7 @@ pub fn set_refresh_rate(hz: u32) -> Result<(), String> {
         if !ok.as_bool() {
             return Err("unable to read the current display mode".into());
         }
-        if !refresh_rates_for(&devmode).contains(&hz) {
+        if !mode_lists_for(&devmode).0.contains(&hz) {
             return Err(format!("{hz} Hz is not available at the current resolution"));
         }
 
@@ -147,7 +183,7 @@ pub fn set_resolution(width: u32, height: u32, preferred_hz: u32) -> Result<(), 
         if !ok.as_bool() {
             return Err("unable to read the current display mode".into());
         }
-        if !resolutions_for(&current).iter().any(|resolution| {
+        if !mode_lists_for(&current).1.iter().any(|resolution| {
             resolution.width == width && resolution.height == height
         }) {
             return Err(format!("{width}×{height} is not available on this display"));
