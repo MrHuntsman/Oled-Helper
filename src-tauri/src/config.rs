@@ -2,8 +2,10 @@
 // root as the log files, e.g. %APPDATA%/OledHelper on Windows). Currently
 // stores Black Crush and Taskbar Dimmer settings so they survive restarts.
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{atomic::{AtomicU64, Ordering}, Mutex, OnceLock};
 use tauri::AppHandle;
 #[cfg(not(target_os = "windows"))]
 use tauri::Manager;
@@ -12,6 +14,11 @@ use tauri::Manager;
 pub struct AppConfig {
     #[serde(default)]
     pub black_lift: f64,
+    // New configs store one display-unit black level per refresh rate. An
+    // empty/missing map is valid for legacy configs and new refresh rates
+    // default to zero in the frontend.
+    #[serde(default)]
+    pub black_lift_profiles: HashMap<String, f64>,
     #[serde(default = "default_true")]
     pub black_enabled: bool,
     #[serde(default)]
@@ -52,6 +59,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             black_lift: 0.0,
+            black_lift_profiles: HashMap::new(),
             black_enabled: true,
             taskbar_dimmer_enabled: false,
             taskbar_dimmer_opacity: default_dimmer_opacity(),
@@ -125,18 +133,30 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
     }
 }
 
+static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CONFIG_WRITE_VERSION: AtomicU64 = AtomicU64::new(0);
+
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     // Write on a background thread and return immediately. File I/O on the
     // IPC command thread would block every other command (including the
     // high-frequency gamma ramp updates) for the duration of the write — and
-    // a slow disk/OneDrive can stall it for hundreds of milliseconds. The
-    // write ordering is preserved by always spawning; duplicate stale writes
-    // are harmless because the frontend debounces saves after the drag
-    // settles, so the final write carries the latest config.
+    // a slow disk/OneDrive can stall it for hundreds of milliseconds.
     let path = config_path(&app)?;
     let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let version = CONFIG_WRITE_VERSION.fetch_add(1, Ordering::Relaxed) + 1;
     std::thread::spawn(move || {
+        let lock = CONFIG_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+        let Ok(_guard) = lock.lock() else {
+            log::warn!("save_config: could not acquire config write lock");
+            return;
+        };
+        // A newer snapshot may have arrived while this write was waiting for
+        // the lock. Skip stale snapshots so rapid slider/mode changes cannot
+        // restore an older profile map after the latest save.
+        if version != CONFIG_WRITE_VERSION.load(Ordering::Relaxed) {
+            return;
+        }
         if let Err(e) = fs::write(&path, text) {
             log::warn!("save_config: could not write {:?}: {e}", path);
         }

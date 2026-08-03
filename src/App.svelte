@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, pollDisplayInfo, pollHDRStatus, pollHDRLuminance, bumpEnvTick, loadConfig, setDimmerSuspendedForFullscreen } from './lib/stores.svelte.js';
+  import { app, crush, pollDisplayInfo, pollHDRStatus, pollHDRLuminance, bumpEnvTick, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
@@ -111,22 +111,22 @@
 
   const resolutionNames = new Map([
     ['1280x720', 'HD'],
-    ['1366x768', 'HD+'],
-    ['1600x900', 'HD+'],
     ['1920x1080', 'Full HD'],
-    ['1920x1200', 'WUXGA'],
     ['2560x1080', 'Ultrawide Full HD'],
     ['2560x1440', 'QHD'],
     ['3440x1440', 'UWQHD'],
-    ['3840x2160', '4K UHD'],
-    ['5120x1440', 'DQHD'],
+    ['3840x2160', '4K'],
     ['5120x2160', '5K Ultrawide'],
-    ['5120x2880', '5K UHD'],
-    ['7680x4320', '8K UHD'],
+    ['5120x2880', '5K'],
+    ['7680x4320', '8K'],
   ]);
 
   function resolutionName(resolution) {
     return resolutionNames.get(`${resolution.width}x${resolution.height}`) || '';
+  }
+
+  function currentResolutionName() {
+    return resolutionNames.get(`${app.displayInfo.width}x${app.displayInfo.height}`) || '';
   }
 
   function resolutionAspectRatio(resolution) {
@@ -188,13 +188,24 @@
     const currentHz = app.displayInfo.refreshRateHz;
     if (!Number.isFinite(hz) || hz <= 0 || app.refreshRateBusy || app.displayModeBusy || hz === currentHz) return;
 
+    // Save the profile for the mode we are leaving before changing the mode.
+    persistCurrentBlackLevelProfile();
     app.refreshRateBusy = true;
     app.displayInfo.refreshRateHz = hz;
     refreshRateError = '';
     try {
       await invoke('set_refresh_rate', { hz });
+      // Apply immediately; the next display poll still confirms the actual
+      // mode in case Windows selected a different mode or rejected the call.
+      applyBlackLevelProfileForRefreshRate(hz);
+      saveConfig();
     } catch (e) {
       refreshRateError = String(e);
+      // Restore the rejected mode before resolving its profile; otherwise the
+      // next poll could briefly save the old value under the target Hz.
+      app.displayInfo.refreshRateHz = currentHz;
+      applyBlackLevelProfileForRefreshRate(currentHz);
+      saveConfig();
     } finally {
       app.refreshRateBusy = false;
       // Read the mode back after Windows has accepted or rejected the change.
@@ -347,7 +358,7 @@
           title={resolutionError || 'Choose resolution'}
           disabled={app.displayModeBusy || app.displayInfo.resolutions.length === 0}
           onclick={toggleResMenu}>
-          {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '—×—'}
+          {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '—×—'}{#if currentResolutionName()}<span class="refresh-rate-select-value"> · {currentResolutionName()}</span>{/if}
         </button>
         {#if resMenuOpen}
           <div class="hz-menu res-menu" bind:this={resMenuEl} role="listbox" aria-label="Resolution options">
@@ -384,7 +395,7 @@
           title={refreshRateError || 'Choose refresh rate'}
           disabled={app.refreshRateBusy || app.displayModeBusy || app.displayInfo.refreshRates.length === 0}
           onclick={toggleHzMenu}>
-          {app.displayInfo.refreshRateHz ? `${app.displayInfo.refreshRateHz} Hz` : '— Hz'}
+          {app.displayInfo.refreshRateHz ? `${app.displayInfo.refreshRateHz} Hz` : '— Hz'}{#if app.displayInfo.refreshRateHz && blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)}<span class="refresh-rate-select-value"> ({blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)})</span>{/if}
         </button>
         {#if hzMenuOpen}
           <div class="hz-menu" bind:this={hzMenuEl} role="listbox" aria-label="Refresh rate options">
@@ -392,7 +403,8 @@
               <button type="button" class="hz-menu-item" class:active={hz === app.displayInfo.refreshRateHz}
                 role="option" aria-selected={hz === app.displayInfo.refreshRateHz}
                 onclick={() => pickHz(hz)}>
-                {hz} Hz
+                <span>{hz} Hz</span>
+                <span class="hz-profile-value">{blackLevelDisplayForRefreshRate(hz)}</span>
               </button>
             {/each}
           </div>

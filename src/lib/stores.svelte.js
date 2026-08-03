@@ -12,10 +12,18 @@ export const app = $state({
 
 export const crush = $state({
   adjustment: 0,
+  // Values are stored in tenths, matching the slider's internal range. The
+  // persisted config converts them to the display units shown in the UI.
+  blackProfiles: {},
   blackEnabled: true,
   squareCount: 12,
   fullscreen: 'normal',
 });
+
+// Config files from before refresh-rate profiles existed only had one
+// `black_lift` value. Preserve it for the first detected refresh rate, then
+// all subsequently unseen rates intentionally start at 0.
+let legacyBlackLift = null;
 
 export const taskbarDimmer = $state({
   enabled: false,
@@ -41,6 +49,60 @@ export function blackLift() {
   return crush.blackEnabled ? crush.adjustment : 0;
 }
 
+function profileKey(hz) {
+  const value = Number(hz);
+  return Number.isFinite(value) && value > 0 ? String(Math.round(value)) : null;
+}
+
+function clampAdjustment(value) {
+  return Math.max(-150, Math.min(150, Math.round(Number(value) || 0)));
+}
+
+export function blackLevelForRefreshRate(hz) {
+  const key = profileKey(hz);
+  if (!key) return 0;
+  return Object.prototype.hasOwnProperty.call(crush.blackProfiles, key)
+    ? clampAdjustment(crush.blackProfiles[key])
+    : 0;
+}
+
+export function blackLevelDisplayForRefreshRate(hz) {
+  const key = profileKey(hz);
+  const currentKey = profileKey(app.displayInfo.refreshRateHz);
+  // Keep the open menu in sync with a slider drag even before its debounced
+  // config save updates the profile map.
+  if (key && key === currentKey) {
+    const value = crush.adjustment;
+    return `${value > 0 ? '+' : ''}${(value / 10).toFixed(1)}`;
+  }
+  // No saved profile for this rate yet — show nothing rather than a
+  // misleading "0.0" that implies a deliberately-set neutral value.
+  if (!key || !Object.prototype.hasOwnProperty.call(crush.blackProfiles, key)) return '';
+  const value = blackLevelForRefreshRate(hz);
+  return `${value > 0 ? '+' : ''}${(value / 10).toFixed(1)}`;
+}
+
+// Record the currently displayed value before a mode change or save. This is
+// deliberately separate from the gamma effect so dragging remains cheap and
+// profile switching cannot accidentally persist a stale value.
+export function persistCurrentBlackLevelProfile() {
+  const key = profileKey(app.displayInfo.refreshRateHz);
+  if (key) crush.blackProfiles[key] = clampAdjustment(crush.adjustment);
+}
+
+export function applyBlackLevelProfileForRefreshRate(hz) {
+  if (!configLoaded.v) return;
+  const key = profileKey(hz);
+  if (!key) return;
+  if (!Object.prototype.hasOwnProperty.call(crush.blackProfiles, key)) {
+    crush.blackProfiles[key] = legacyBlackLift !== null
+      ? clampAdjustment(legacyBlackLift)
+      : 0;
+    legacyBlackLift = null;
+  }
+  crush.adjustment = blackLevelForRefreshRate(hz);
+}
+
 export const configLoaded = $state({ v: false });
 
 // Load persisted config (black_lift in tenths-display units, e.g. 9 means
@@ -49,8 +111,22 @@ export const configLoaded = $state({ v: false });
 export async function loadConfig() {
   try {
     const cfg = await invoke('load_config');
-    if (cfg && typeof cfg.black_lift === 'number') {
-      crush.adjustment = Math.round(cfg.black_lift * 10);
+    let loadedProfileCount = 0;
+    if (cfg && cfg.black_lift_profiles && typeof cfg.black_lift_profiles === 'object') {
+      const profiles = {};
+      for (const [hz, value] of Object.entries(cfg.black_lift_profiles)) {
+        if (profileKey(hz) && typeof value === 'number' && Number.isFinite(value)) {
+          profiles[profileKey(hz)] = clampAdjustment(value * 10);
+          loadedProfileCount++;
+        }
+      }
+      crush.blackProfiles = profiles;
+    }
+    // Only migrate the old single value when no per-rate values were loaded.
+    // New configs retain black_lift as a compatibility field, so using it
+    // unconditionally would incorrectly seed every newly encountered Hz.
+    if (loadedProfileCount === 0 && cfg && typeof cfg.black_lift === 'number' && Number.isFinite(cfg.black_lift)) {
+      legacyBlackLift = clampAdjustment(cfg.black_lift * 10);
     }
     if (cfg && typeof cfg.black_enabled === 'boolean') {
       crush.blackEnabled = cfg.black_enabled;
@@ -95,6 +171,7 @@ export async function loadConfig() {
     // this async load completes) doesn't immediately overwrite the file
     // we just read from.
     configLoaded.v = true;
+    applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
   }
 }
 
@@ -103,8 +180,15 @@ export async function loadConfig() {
 // of crush.adjustment), so the config file reads e.g. 9 instead of 90.
 export function saveConfig() {
   if (!configLoaded.v) return;
+  persistCurrentBlackLevelProfile();
+  const blackLiftProfiles = Object.fromEntries(
+    Object.entries(crush.blackProfiles).map(([hz, value]) => [hz, clampAdjustment(value) / 10]),
+  );
   invoke('save_config', { config: {
+    // Keep black_lift as a compatibility field for older builds; new builds
+    // use black_lift_profiles for the per-refresh-rate values.
     black_lift: crush.adjustment / 10,
+    black_lift_profiles: blackLiftProfiles,
     black_enabled: crush.blackEnabled,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
@@ -247,17 +331,26 @@ export function pollDisplayInfo() {
     // the newest request update the dropdown, otherwise a slower old result
     // could snap the selection back after a successful change.
     if (requestSequence !== displayPollSequence || !info) return;
+      const modeChangeBusy = app.displayModeBusy || app.refreshRateBusy;
+    const nextRefreshRate = modeChangeBusy
+      ? app.displayInfo.refreshRateHz
+      : (info.refresh_hz || null);
+    const previousRefreshRate = app.displayInfo.refreshRateHz;
+    if (nextRefreshRate && nextRefreshRate !== previousRefreshRate) {
+      persistCurrentBlackLevelProfile();
+    }
     app.displayInfo = {
       // Keep the user's pending choice visible until Windows finishes the
       // mode switch and the next poll confirms the actual value.
       width: app.displayModeBusy ? app.displayInfo.width : info.width,
       height: app.displayModeBusy ? app.displayInfo.height : info.height,
-      refreshRateHz: app.displayModeBusy
-        ? app.displayInfo.refreshRateHz
-        : (info.refresh_hz || null),
+      refreshRateHz: nextRefreshRate,
       refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [],
       resolutions: Array.isArray(info.resolutions) ? info.resolutions : [],
     };
+    if (nextRefreshRate && nextRefreshRate !== previousRefreshRate) {
+      applyBlackLevelProfileForRefreshRate(nextRefreshRate);
+    }
   }).catch(() => {});
 }
 

@@ -1211,10 +1211,12 @@ button {
   bottom: calc(100% + 6px);
   right: 0;
   z-index: 30;
-  min-width: 100%;
+  min-width: max-content;
+  width: auto;
   max-height: 340px;
   overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-gutter: stable;
   background: var(--panel);
   border: 1px solid var(--divider);
   border-radius: 8px;
@@ -1226,10 +1228,16 @@ button {
   user-select: none;
 }
 .hz-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
   width: 100%;
+  height: 32px;
+  flex: 0 0 20px;
+  box-sizing: border-box;
   text-align: left;
-  padding: 6px 10px;
+  padding: 0 10px;
   border-radius: 5px;
   font-size: 11px;
   font-weight: 600;
@@ -1240,6 +1248,12 @@ button {
 }
 .hz-menu-item:hover { background: var(--hover); color: #fff; transform: translateX(2px); }
 .hz-menu-item.active { color: var(--accent); font-weight: 700; background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.hz-profile-value {
+  color: var(--text-weak);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.hz-menu-item.active .hz-profile-value { color: var(--accent); }
 .hz-menu-group-label {
   font-size: 10px;
   font-weight: 600;
@@ -1249,6 +1263,14 @@ button {
   padding: 6px 10px 3px;
 }
 .res-menu { min-width: 100%; }
+.res-menu .hz-menu-item {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.res-menu .hz-menu-group-label:not(:first-child) {
+  margin-top: 4px;
+}
 
 /* Compact display-mode pickers in the bottom status panel. Native selects
    preserve keyboard navigation and accessibility while the styling makes
@@ -1256,7 +1278,7 @@ button {
 .resolution-wrap,
 .refresh-rate-wrap {
   position: relative;
-  display: inline-flex;
+  display: inline-block;
   align-items: center;
 }
 .resolution-select,
@@ -1280,6 +1302,17 @@ button {
   outline: none;
   transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
 }
+/* Fixed width so the resolution/refresh-rate buttons and their menus never
+   shift size as the selected value changes, and so the button and its menu
+   always match exactly — the menu's min-width: 100% (see .res-menu below)
+   inherits this. 200px comfortably fits the longest realistic label
+   ("3840×2160 · 4K UHD") without the wide-item cases from earlier attempts. */
+.resolution-select {
+  width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.refresh-rate-select { width: 122px; overflow: hidden; text-overflow: ellipsis; }
 .resolution-select.active,
 .refresh-rate-select.active {
   color: var(--text);
@@ -1322,6 +1355,14 @@ button {
   font-size: 12px;
   font-weight: 700;
   cursor: help;
+}
+.refresh-rate-select-value {
+  color: var(--text-weak);
+  font-weight: 500;
+}
+.refresh-rate-select.active .refresh-rate-select-value,
+.refresh-rate-select:hover:not(:disabled) .refresh-rate-select-value {
+  color: rgba(255, 255, 255, 0.7);
 }
 
 /* ── Debug tab diagnostics ────────────────────────────────────────── */
