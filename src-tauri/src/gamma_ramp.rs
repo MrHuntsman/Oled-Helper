@@ -4,7 +4,7 @@
 use windows::Win32::Graphics::Gdi::{GetDC, HDC, ReleaseDC};
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct GammaRamp {
     pub red:   [u16; 256],
     pub green: [u16; 256],
@@ -20,6 +20,7 @@ impl GammaRamp {
 #[link(name = "gdi32")]
 extern "system" {
     pub fn SetDeviceGammaRamp(hdc: HDC, lpramp: *const GammaRamp) -> i32;
+    pub fn GetDeviceGammaRamp(hdc: HDC, lpramp: *mut GammaRamp) -> i32;
 }
 
 pub fn build_ramp(black_lift: i32) -> GammaRamp {
@@ -65,4 +66,15 @@ pub unsafe fn set_display_ramp(ramp: &GammaRamp) -> bool {
 pub unsafe fn reset_display_ramp() {
     let ramp = build_linear_ramp();
     set_display_ramp(&ramp);
+}
+
+/// Reads the current system gamma ramp from the primary display.
+#[allow(dead_code)]
+pub unsafe fn get_display_ramp() -> Option<GammaRamp> {
+    let hdc = GetDC(None);
+    if hdc.0.is_null() { return None; }
+    let mut ramp = GammaRamp::zeroed();
+    let ok = GetDeviceGammaRamp(hdc, &mut ramp);
+    ReleaseDC(None, hdc);
+    if ok != 0 { Some(ramp) } else { None }
 }

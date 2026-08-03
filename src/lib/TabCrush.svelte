@@ -336,10 +336,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     return () => { resizeObs?.disconnect(); if (resizeRaf) cancelAnimationFrame(resizeRaf); };
   });
 
-  // Gamma updates are fire-and-forget: the frontend writes the latest desired
-  // black level and a dedicated Rust worker continuously applies it. The
-  // display update never waits on WebView2 IPC (which is fast to send but slow
-  // to deliver responses under sustained input).
+  // Gamma updates are applied synchronously on every slider change — the
+  // Tauri command builds the ramp and calls SetDeviceGammaRamp immediately.
+  // A background safety thread re-applies every 2s to recover from external
+  // gamma resets (fullscreen games, driver mode switches).
   let gammaRampDestroyed = false;
   let gammaRampLastValue = null;
 

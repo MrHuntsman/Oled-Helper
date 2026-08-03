@@ -1289,6 +1289,7 @@ button {
   padding: 0 22px 0 8px;
   border: 1px solid transparent;
   border-radius: 5px;
+  user-select: none;
   background:
     linear-gradient(45deg, transparent 50%, var(--text-weak) 50%) calc(100% - 11px) 9px / 5px 5px no-repeat,
     linear-gradient(135deg, var(--text-weak) 50%, transparent 50%) calc(100% - 7px) 9px / 5px 5px no-repeat,

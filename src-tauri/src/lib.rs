@@ -20,92 +20,60 @@ struct TrayState {
     enabled: AtomicBool,
 }
 
-// Gamma state shared between the webview command and the dedicated worker
-// thread. The frontend only ever writes the latest desired black level
-// (fire-and-forget, never waiting for a response), and the worker thread
-// continuously applies it. This keeps the display update on the native side
-// and out of WebView2's IPC round-trip, which is slow under sustained input.
+// Gamma state — synchronous apply + periodic safety restore.
+// The frontend calls apply_gamma_ramp on every slider change; the ramp is
+// applied immediately (no polling thread, no IPC round-trip delay). A
+// lightweight safety thread re-applies every 2 seconds so another app
+// resetting the system gamma (fullscreen games, driver updates) is
+// corrected without user interaction.
 struct GammaState {
-    inner: Arc<GammaInner>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-}
-
-struct GammaInner {
-    desired: AtomicI32,
-    shutdown: AtomicBool,
-    last_applied: AtomicI32,
+    desired: Arc<AtomicI32>,
+    shutdown: Arc<AtomicBool>,
+    safety_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for GammaState {
     fn drop(&mut self) {
-        self.inner.shutdown.store(true, Ordering::Release);
-        if let Ok(mut worker) = self.worker.lock() {
-            if let Some(worker) = worker.take() {
-                let _ = worker.join();
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.safety_thread.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
             }
         }
+        unsafe { gamma_ramp::reset_display_ramp(); }
     }
 }
 
-impl Default for GammaState {
-    fn default() -> Self {
-        Self {
-            inner: Arc::new(GammaInner {
-                desired: AtomicI32::new(0),
-                shutdown: AtomicBool::new(false),
-                last_applied: AtomicI32::new(i32::MIN),
-            }),
-            worker: Mutex::new(None),
+fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if shutdown.load(Ordering::Relaxed) {
+            break;
         }
+        let value = desired.load(Ordering::Relaxed);
+        // When black lift is zero the system ramp is linear (OS default) —
+        // nothing to restore. Skip the GDI call to keep the thread truly idle
+        // while black crush is disabled or set to OFF.
+        if value == 0 {
+            continue;
+        }
+        let ramp = gamma_ramp::build_ramp(value);
+        unsafe { gamma_ramp::set_display_ramp(&ramp); }
     }
 }
 
-fn gamma_worker_loop(state: &GammaInner) {
-    // Short-sleep polling loop: applies the latest desired value within a few
-    // milliseconds of the frontend writing it, without depending on WebView2
-    // message delivery back to JS. Failed applications use a bounded retry
-    // interval so unsupported display drivers cannot cause a tight failure/log
-    // loop.
-    let retry_delay = std::time::Duration::from_millis(250);
-    let mut failed_value = None;
-    let mut next_retry = std::time::Instant::now();
-
-    while !state.shutdown.load(Ordering::Relaxed) {
-        let desired = state.desired.load(Ordering::Relaxed);
-        let last = state.last_applied.load(Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        let value_changed = failed_value != Some(desired);
-        if desired != last && (value_changed || now >= next_retry) {
-            let started = now;
-            let ramp = gamma_ramp::build_ramp(desired);
-            let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
-            if applied {
-                state.last_applied.store(desired, Ordering::Relaxed);
-                failed_value = None;
-                next_retry = now;
-            } else {
-                if value_changed {
-                    log::warn!("[gamma] value={} apply failed; retrying in {} ms", desired, retry_delay.as_millis());
-                }
-                failed_value = Some(desired);
-                next_retry = now + retry_delay;
-            }
-            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-            if applied && total_ms >= 32.0 {
-                log::info!("[gamma-slow] value={} apply={total_ms:.3}ms", desired);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(4));
-    }
-    unsafe { gamma_ramp::reset_display_ramp(); }
-}
-
-// Fire-and-forget: stores the latest value and returns immediately. The
-// worker applies it on its own thread. No response is waited on, so WebView2's
-// slow return path can never delay the display update.
+// Applies the gamma ramp synchronously — the display update happens on the
+// caller's thread (the Tauri command thread) and returns immediately. No
+// background polling, no IPC delay. A separate safety thread re-applies at
+// 2-second intervals to recover from external gamma resets.
 #[tauri::command]
 fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), String> {
-    state.inner.desired.store(black_lift, Ordering::Relaxed);
+    let ramp = gamma_ramp::build_ramp(black_lift);
+    let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
+    if !applied {
+        return Err("SetDeviceGammaRamp failed".into());
+    }
+    state.desired.store(black_lift, Ordering::Relaxed);
     Ok(())
 }
 
@@ -146,14 +114,14 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn shutdown_gamma_worker(app: &AppHandle) {
-    let worker = {
-        let state = app.state::<GammaState>();
-        state.inner.shutdown.store(true, Ordering::Release);
-        state.worker.lock().ok().and_then(|mut worker| worker.take())
-    };
-    if let Some(worker) = worker {
-        let _ = worker.join();
+    let state = app.state::<GammaState>();
+    state.shutdown.store(true, Ordering::Release);
+    if let Ok(mut guard) = state.safety_thread.lock() {
+        if let Some(handle) = guard.take() {
+            let _ = handle.join();
+        }
     }
+    unsafe { gamma_ramp::reset_display_ramp(); }
     config::shutdown();
 }
 
@@ -180,7 +148,11 @@ fn set_tray_enabled(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(GammaState::default())
+        .manage(GammaState {
+            desired: Arc::new(AtomicI32::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            safety_thread: Mutex::new(None),
+        })
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
         .manage(TrayState {
             enabled: AtomicBool::new(true),
@@ -208,32 +180,22 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            // Gamma worker: continuously applies the latest desired black
-            // level so display updates never wait on WebView2 IPC. Runs at a
-            // boosted priority so it stays responsive while the renderer is
-            // busy processing drag input.
+            // Gamma safety thread: re-applies the last known ramp every 2
+            // seconds so another app resetting the system gamma (fullscreen
+            // games, driver mode switches) is corrected automatically.
             {
-                let gamma = app.state::<GammaState>().inner.clone();
-                let worker = std::thread::Builder::new()
-                    .name("gamma-ramp-worker".into())
-                    .spawn(move || {
-                        #[cfg(target_os = "windows")]
-                        unsafe {
-                            // Raise this thread above normal so it is scheduled
-                            // promptly even while the renderer burns CPU.
-                            use windows::Win32::System::Threading::{
-                                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-                            };
-                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-                        }
-                        gamma_worker_loop(&gamma);
-                    })
-                    .map_err(|error| format!("could not start gamma worker: {error}"))?;
-                app.state::<GammaState>()
-                    .worker
+                let state = app.state::<GammaState>();
+                let desired = state.desired.clone();
+                let shutdown = state.shutdown.clone();
+                let handle = std::thread::Builder::new()
+                    .name("gamma-safety".into())
+                    .spawn(move || gamma_safety_loop(desired, shutdown))
+                    .map_err(|error| format!("could not start gamma safety thread: {error}"))?;
+                state
+                    .safety_thread
                     .lock()
-                    .map_err(|_| "gamma worker state was poisoned".to_string())?
-                    .replace(worker);
+                    .map_err(|_| "gamma state was poisoned".to_string())?
+                    .replace(handle);
             }
 
             // Always-on rotating file log (not just debug builds) — GPU-init

@@ -43,7 +43,7 @@ pub struct TaskbarDimmerStatus {
 #[cfg(target_os = "windows")]
 mod platform {
     use std::ffi::c_void;
-    use std::sync::{atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering}, Mutex, OnceLock};
+    use std::sync::{atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering}, Condvar, Mutex, OnceLock};
     use std::thread::JoinHandle;
     use tauri::{AppHandle, Emitter};
     use super::RuntimeLogEvent;
@@ -69,10 +69,17 @@ mod platform {
     // at the fast cadence only while a transition is active.
     const WM_DIMMER_TICK: u32 = WM_APP;
     const WM_DIMMER_REPAIR_ZORDER: u32 = WM_APP + 1;
-    const IDLE_TIMER_INTERVAL_MS: u32 = 33;
+    const IDLE_TIMER_INTERVAL_MS: u32 = 60;
     const ACTIVE_TIMER_INTERVAL_MS: u32 = 16;
     const TASKBAR_CACHE_REFRESH_MS: u64 = 1000;
     const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
+    // Fullscreen detection runs the expensive Win32 foreground-window chain
+    // (GetForegroundWindow → GetWindowThreadProcessId → GetWindowRect →
+    // MonitorFromWindow → GetMonitorInfoW → GetWindowLongPtrW). It is
+    // decoupled from the fade animation tick: the result is cached and only
+    // re-queried at this slow cadence, so the fade timer can stay as fast as
+    // possible without paying the detection cost every tick.
+    const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
     const DEFAULT_EASE_DURATION_MS: u64 = 250;
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
@@ -94,6 +101,10 @@ mod platform {
         last_diagnostic: Instant,
         last_poll_tick: Option<Instant>,
         last_poll_gap_diagnostic: Option<Instant>,
+        // Cached fullscreen state, refreshed at FULLSCREEN_CHECK_INTERVAL_MS
+        // so the expensive detection chain doesn't run on every animation tick.
+        fullscreen_active: bool,
+        last_fullscreen_check: Instant,
         // Raw HWND value keeps this shared state Send + Sync; reconstruct the
         // HWND only at the point where a Win32 call is made.
         cached_taskbar: Option<(isize, RECT)>,
@@ -127,6 +138,16 @@ mod platform {
     static TICK_INTERVAL_MS: AtomicU32 = AtomicU32::new(0);
     static TICK_POSTED: AtomicBool = AtomicBool::new(false);
     static TICK_THREAD_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+    // Wake channel for the tick thread. When update_fade switches the tick
+    // interval (idle → active on a fade start), it notifies this condvar so
+    // the thread abandons the rest of its current sleep and re-reads the new
+    // interval immediately. Without this, the thread commits to one full
+    // idle-interval sleep after posting a tick, so a fade that starts on that
+    // tick wouldn't receive its next animation frame until the whole idle
+    // interval elapsed — effectively subtracting the idle timer from the fade
+    // duration (a 200ms idle + 200ms fade showed no fade at all).
+    static TICK_WAKE_MUTEX: Mutex<()> = Mutex::new(());
+    static TICK_WAKE_CONDVAR: Condvar = Condvar::new();
     static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
     static SUSPENDED: AtomicBool = AtomicBool::new(false);
 
@@ -419,6 +440,9 @@ mod platform {
     fn stop_tick_thread() {
         TICK_THREAD_SHUTDOWN.store(true, Ordering::Relaxed);
         TICK_INTERVAL_MS.store(0, Ordering::Relaxed);
+        // Wake the thread so it exits its wait and sees the shutdown flag
+        // immediately instead of sleeping out the current interval.
+        TICK_WAKE_CONDVAR.notify_all();
         if let Some(threads) = TICK_THREAD.get() {
             if let Ok(mut guard) = threads.lock() {
                 if let Some(handle) = guard.take() {
@@ -430,14 +454,32 @@ mod platform {
 
     fn tick_thread_loop() {
         while !TICK_THREAD_SHUTDOWN.load(Ordering::Relaxed) {
+            // Read the interval while holding the wake mutex, then wait on the
+            // condvar. update_fade performs its interval swap + notify under
+            // the same mutex, so the read and the wait are atomic with respect
+            // to the notify — a fade that starts between iterations can never
+            // be missed (which would otherwise keep the thread sleeping the
+            // stale idle interval and subtract it from the fade duration).
+            let guard = TICK_WAKE_MUTEX.lock().unwrap();
             let interval = TICK_INTERVAL_MS.load(Ordering::Relaxed);
-            if interval == 0 {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
+            if TICK_THREAD_SHUTDOWN.load(Ordering::Relaxed) {
+                drop(guard);
+                break;
             }
-            std::thread::sleep(Duration::from_millis(interval as u64));
+            // Wait the current interval (or a short poll while interval == 0),
+            // waking early when update_fade notifies an interval change.
+            let wait_ms = if interval == 0 { 100u64 } else { interval as u64 };
+            let (guard, wait_result) = TICK_WAKE_CONDVAR
+                .wait_timeout(guard, Duration::from_millis(wait_ms))
+                .unwrap();
+            drop(guard);
             if TICK_THREAD_SHUTDOWN.load(Ordering::Relaxed) {
                 break;
+            }
+            // Woken early (interval changed): loop and re-read it rather than
+            // posting a tick on a stale cadence.
+            if !wait_result.timed_out() {
+                continue;
             }
             // Coalesce: don't post another tick if the previous one hasn't
             // been processed yet. This prevents queue buildup during modal
@@ -471,15 +513,27 @@ mod platform {
         let Some(state) = FADE_STATE.get() else { return; };
         let now = Instant::now();
 
-        // Fullscreen suppression remains on the adaptive timer. When the
+        // Fullscreen suppression is decoupled from the animation tick: the
+        // expensive detection chain runs at FULLSCREEN_CHECK_INTERVAL_MS and
+        // the result is cached, so the fade timer can stay fast. When the
         // detection toggle is off the overlay never hides for external
         // fullscreen (but SUSPENDED — the app's own monitor-fullscreen strip
-        // — still takes effect).
-        let fullscreen = if FULLSCREEN_DETECTION.load(Ordering::Relaxed) {
-            fullscreen_app_active(hwnd)
+        // — still takes effect immediately).
+        let fullscreen = if SUSPENDED.load(Ordering::Relaxed) {
+            true
         } else {
-            false
-        } || SUSPENDED.load(Ordering::Relaxed);
+            let mut fade = state.lock().unwrap();
+            if now.duration_since(fade.last_fullscreen_check).as_millis() as u64 >= FULLSCREEN_CHECK_INTERVAL_MS {
+                fade.last_fullscreen_check = now;
+                drop(fade);
+                let active = FULLSCREEN_DETECTION.load(Ordering::Relaxed)
+                    && fullscreen_app_active(hwnd);
+                state.lock().unwrap().fullscreen_active = active;
+                active
+            } else {
+                fade.fullscreen_active
+            }
+        };
         if fullscreen {
             unsafe {
                 if IsWindowVisible(hwnd).as_bool() {
@@ -609,7 +663,17 @@ mod platform {
 
             let active = fade.enabled && fade.transition_active;
             let desired_interval = if active { ACTIVE_TIMER_INTERVAL_MS } else { IDLE_TIMER_INTERVAL_MS };
-            TICK_INTERVAL_MS.store(desired_interval, Ordering::Relaxed);
+            // Swap + notify under the wake mutex so the tick thread's
+            // read-then-wait (also under this mutex) sees either the new
+            // interval or the notify — never a stale long sleep that would
+            // eat into the fade duration.
+            {
+                let guard = TICK_WAKE_MUTEX.lock().unwrap();
+                if TICK_INTERVAL_MS.swap(desired_interval, Ordering::Relaxed) != desired_interval {
+                    TICK_WAKE_CONDVAR.notify_all();
+                }
+                drop(guard);
+            }
 
             if now.duration_since(fade.last_zorder_repair).as_millis() as u64 >= ZORDER_REPAIR_INTERVAL_MS {
                 should_repair_zorder = true;
@@ -745,6 +809,8 @@ mod platform {
             last_diagnostic: Instant::now(),
             last_poll_tick: None,
             last_poll_gap_diagnostic: None,
+            fullscreen_active: false,
+            last_fullscreen_check: Instant::now(),
             last_fade_tick: None,
             fade_tick_count: 0,
             max_fade_tick_gap_ms: 0.0,

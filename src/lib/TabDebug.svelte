@@ -43,7 +43,8 @@
       ['Browser / WebView', navigator.userAgent],
       ['WebGPU Support', navigator.gpu ? 'Available' : 'Not available'],
       ['Display Type', displayType],
-      ['HDR Max Luminance', hdrLuminance],
+      // Peak luminance is only meaningful while HDR is active; hide it in SDR.
+      ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
       ['Screen Resolution', `${screen.width * devicePixelRatio}x${screen.height * devicePixelRatio}${app.displayInfo.refreshRateHz ? `@${app.displayInfo.refreshRateHz}Hz` : ''}`],
       ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
       ['Color Depth', perChannelBits ? `${perChannelBits}-bit per channel` : '?'],
