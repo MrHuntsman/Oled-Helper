@@ -41,6 +41,25 @@ export const runtimeLogSettings = $state({
   verbosePeriodic: false,
 });
 
+export const dimmerDetections = $state({
+  fullscreen: true,
+  taskbarCache: true,
+  zorder: true,
+  cursor: true,
+});
+
+export function setDimmerDetection(name, enabled) {
+  dimmerDetections[name] = enabled;
+  invoke('set_taskbar_dimmer_detection', { name, enabled }).catch((e) => {
+    console.warn('[dimmer-detection] toggle failed', e);
+    dimmerDetections[name] = !enabled;
+  });
+}
+
+export function bumpDebugEnv() {
+  envTick.n++;
+}
+
 export function adjustmentDisplay() {
   if (!crush.blackEnabled) return 'OFF';
   return `${crush.adjustment > 0 ? '+' : ''}${(crush.adjustment / 10).toFixed(1)}`;
@@ -317,12 +336,18 @@ export function pollDisplayInfo() {
   const dpr = window.devicePixelRatio || 1;
   // Fall back to browser-reported size immediately so the UI has something
   // to show while the async Tauri call resolves.
+  // Snapshot existing values into locals first — reading app.displayInfo.*
+  // and writing app.displayInfo in the same synchronous tick creates a
+  // reactive read→write cycle that blows Svelte's effect update depth limit.
+  const prevRefreshRateHz = app.displayInfo.refreshRateHz ?? null;
+  const prevRefreshRates = app.displayInfo.refreshRates;
+  const prevResolutions = app.displayInfo.resolutions;
   app.displayInfo = {
     width: Math.round(s.width * dpr),
     height: Math.round(s.height * dpr),
-    refreshRateHz: app.displayInfo.refreshRateHz ?? null,
-    refreshRates: app.displayInfo.refreshRates,
-    resolutions: app.displayInfo.resolutions,
+    refreshRateHz: prevRefreshRateHz,
+    refreshRates: prevRefreshRates,
+    resolutions: prevResolutions,
   };
   // Browsers don't expose real refresh rate, so ask the Tauri backend
   // (Win32 EnumDisplaySettingsW) for accurate resolution + Hz.

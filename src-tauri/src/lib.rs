@@ -158,6 +158,7 @@ fn shutdown_gamma_worker(app: &AppHandle) {
 }
 
 fn request_shutdown_and_exit(app: &AppHandle) {
+    taskbar_dimmer::shutdown();
     shutdown_gamma_worker(app);
     app.exit(0);
 }
@@ -195,6 +196,7 @@ pub fn run() {
             config::save_config,
             taskbar_dimmer::set_taskbar_dimmer,
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
+            taskbar_dimmer::set_taskbar_dimmer_detection,
             taskbar_dimmer::set_taskbar_dimmer_suspended,
             taskbar_dimmer::get_taskbar_dimmer_status,
             hdr_toggle::get_windows_hdr_status,
@@ -326,6 +328,7 @@ pub fn run() {
                     // the window is actually destroyed, request a synchronous
                     // worker shutdown so the display ramp is reset before the
                     // process exits.
+                    taskbar_dimmer::shutdown();
                     shutdown_gamma_worker(window.app_handle());
                 }
                 _ => {}

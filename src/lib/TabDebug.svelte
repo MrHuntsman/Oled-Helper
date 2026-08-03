@@ -1,5 +1,6 @@
 <script>
-  import { app, gpuLogVersion, gpuLogSnapshot, clearGpuLog, envTick, runtimeLogSettings, setVerbosePeriodicLogging } from './stores.svelte.js';
+  import { onMount } from 'svelte';
+  import { app, gpuLogVersion, gpuLogSnapshot, clearGpuLog, envTick, runtimeLogSettings, setVerbosePeriodicLogging, dimmerDetections, setDimmerDetection } from './stores.svelte.js';
 
   let copied = $state(false);
   let copyFailed = $state(false);
@@ -87,6 +88,13 @@
     }
   });
 
+  // Refresh the environment info table once when this tab becomes active.
+  // TabDebug is conditionally rendered (App.svelte: {#if}), so onMount runs
+  // every time the user switches to the Debug tab.
+  onMount(() => {
+    envTick.n++;
+  });
+
   function formatTs(ts) {
     const d = new Date(ts);
     const pad = (n, l = 2) => String(n).padStart(l, '0');
@@ -157,6 +165,25 @@
         <label class="diag-verbose-toggle">
           <input type="checkbox" checked={runtimeLogSettings.verbosePeriodic} onchange={(e) => setVerbosePeriodicLogging(e.currentTarget.checked)} />
           <span>Detailed logging</span>
+        </label>
+      </div>
+      <div class="diag-detection-toggles">
+        <span class="diag-detection-label">Detection toggles</span>
+        <label class="diag-detection-toggle">
+          <input type="checkbox" checked={dimmerDetections.fullscreen} onchange={(e) => setDimmerDetection('fullscreen', e.currentTarget.checked)} />
+          <span>Fullscreen</span>
+        </label>
+        <label class="diag-detection-toggle">
+          <input type="checkbox" checked={dimmerDetections.taskbarCache} onchange={(e) => setDimmerDetection('taskbarCache', e.currentTarget.checked)} />
+          <span>Taskbar cache</span>
+        </label>
+        <label class="diag-detection-toggle">
+          <input type="checkbox" checked={dimmerDetections.zorder} onchange={(e) => setDimmerDetection('zorder', e.currentTarget.checked)} />
+          <span>Z-order repair</span>
+        </label>
+        <label class="diag-detection-toggle">
+          <input type="checkbox" checked={dimmerDetections.cursor} onchange={(e) => setDimmerDetection('cursor', e.currentTarget.checked)} />
+          <span>Cursor polling</span>
         </label>
       </div>
       <div style="display:flex; gap:6px;">

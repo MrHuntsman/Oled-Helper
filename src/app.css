@@ -1472,6 +1472,60 @@ button {
   border-width: 0 1.6px 1.6px 0;
   transform: rotate(45deg);
 }
+.diag-detection-toggles {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.diag-detection-label {
+  color: var(--text-weak);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin-right: 2px;
+}
+.diag-detection-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-weak);
+  font-size: 11px;
+  user-select: none;
+  cursor: pointer;
+}
+.diag-detection-toggle input {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  background: var(--hover);
+  border: 1px solid var(--divider);
+  border-radius: 3px;
+  position: relative;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.diag-detection-toggle input:hover,
+.diag-detection-toggle input:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+.diag-detection-toggle input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.diag-detection-toggle input:checked::after {
+  content: '';
+  position: absolute;
+  left: 3px; top: 1px;
+  width: 3px; height: 5px;
+  border: solid var(--bg);
+  border-width: 0 1.3px 1.3px 0;
+  transform: rotate(45deg);
+}
 .diag-section h3 { font-size: 13px; font-weight: 600; }
 .copy-btn {
   display: flex;

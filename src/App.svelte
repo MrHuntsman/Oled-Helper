@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, pollDisplayInfo, pollHDRStatus, pollHDRLuminance, bumpEnvTick, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate } from './lib/stores.svelte.js';
+  import { app, crush, pollDisplayInfo, pollHDRStatus, pollHDRLuminance, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
@@ -239,6 +239,11 @@
   }
 
   onMount(() => {
+    // One-time: seed display info and HDR status. Mode changes re-poll
+    // explicitly afterward — there is no periodic poll on the main thread.
+    pollDisplayInfo();
+    pollHDRStatus();
+
     let unlisten;
     listen('window-visibility', (event) => {
       windowVisible = event.payload !== false;
@@ -255,37 +260,25 @@
     loadConfig();
   });
 
-  // Poll display info and HDR status every 1s.
-  // NOTE: pollDisplayInfo() must NOT be called synchronously as the first
-  // statement of this effect body — it writes app.displayInfo ($state), and
-  // now also kicks off an async invoke().then() that writes it again. Calling
-  // it synchronously inside the effect's own tracked scope is the exact
-  // write-inside-effect pattern that trips Svelte's effect_update_depth_exceeded
-  // loop guard (see the gpuLogVersion footgun comment in stores.svelte.js).
-  // Deferring the first call with setTimeout(...,0) keeps it out of the
-  // effect's synchronous execution while still firing immediately on mount.
+  // Event-driven HDR detection — matchMedia fires when Windows HDR is
+  // toggled from Settings or via the keyboard shortcut.
   $effect(() => {
-    if (!windowVisible) return;
-    const pollDisplay = () => { if (!hzMenuOpen && !resMenuOpen) pollDisplayInfo(); };
-    // HDR luminance is only displayed in the Debug tab, so only enumerate
-    // DXGI while that tab is open (cheaper than every-second polling).
-    const pollLuminance = () => { if (app.activeTab === 'debug') pollHDRLuminance(); };
-    const initial = setTimeout(() => { pollDisplay(); pollHDRStatus(); pollLuminance(); }, 0);
-    const timer = setInterval(() => { pollDisplay(); pollHDRStatus(); pollLuminance(); }, 1000);
-    return () => { clearTimeout(initial); clearInterval(timer); };
+    const mq = window.matchMedia('(dynamic-range: high)');
+    function onHdrChange() { pollHDRStatus(); }
+    try { mq.addEventListener('change', onHdrChange); } catch { /* old browser */ }
+    return () => {
+      try { mq.removeEventListener('change', onHdrChange); } catch {}
+    };
   });
 
-  // Separate timer for envTick (drives live-refresh of non-reactive globals
-  // like navigator.*/screen.* in the Debug tab). Kept in its own effect,
-  // deliberately NOT combined with the poll effect above — stacking multiple
-  // $state writes (pollDisplayInfo's object reassignment + pollHDRStatus +
-  // bumpEnvTick) inside one setInterval callback tripped Svelte's
-  // effect_update_depth_exceeded loop guard, even though none of them read
-  // back their own state. See stores.svelte.js footgun comment near envTick.
+  // HDR luminance is a DXGI call; only refresh while the Debug tab is
+  // open, at a gentle 5-second cadence (purely informational).
   $effect(() => {
-    if (!windowVisible) return;
-    const timer = setInterval(() => { bumpEnvTick(); }, 1000);
-    return () => clearInterval(timer);
+    if (app.activeTab === 'debug' && windowVisible) {
+      pollHDRLuminance();
+      const timer = setInterval(() => pollHDRLuminance(), 5000);
+      return () => clearInterval(timer);
+    }
   });
 
   // Monitor fullscreen of the calibration strip: suspend the taskbar dimmer
