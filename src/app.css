@@ -197,6 +197,119 @@ button {
 .nav-icon { width: 16px; height: 16px; opacity: 0.95; flex-shrink: 0; }
 .nav-btn.active .nav-icon { opacity: 1; }
 
+.sidebar-spacer { flex: 1; }
+
+/* ── Windows HDR switch (sidebar) — flips real OS HDR. Styled to match the
+   .sdr-pill-toggle reference component (HDR_Gallery lightbox toggle). */
+.hdr-switch-wrap {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+.hdr-switch {
+  display: inline-flex;
+  align-items: center;
+  background: #1a1a20;
+  border: 1px solid #444;
+  border-radius: 5px;
+  cursor: pointer;
+  flex-shrink: 0;
+  height: 22px;
+  position: relative;
+  padding: 2px;
+  gap: 0;
+  width: 92px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.hdr-switch:hover:not(:disabled) {
+  border-color: #666;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.04);
+}
+.hdr-switch::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: calc(50% - 2px);
+  border-radius: 3px;
+  background: #4a5060;
+  box-shadow: 0 0 6px rgba(74, 80, 96, 0.3);
+  transition: transform 0.22s cubic-bezier(0.34, 1.3, 0.64, 1), background 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+  left: 2px;
+  transform: translateX(0);
+  pointer-events: none;
+}
+.hdr-switch.hdr::before {
+  transform: translateX(100%);
+  background: linear-gradient(135deg, #f5c518 0%, #e8a800 100%);
+  box-shadow: 0 0 8px rgba(245, 197, 24, 0.55), 0 0 2px rgba(245, 197, 24, 0.3);
+}
+/* Hover preview: nudge the highlight toward the side it would land on if
+   clicked right now, and fade it slightly so the motion reads as a hint
+   rather than the committed state. */
+.hdr-switch:hover:not(:disabled):not(.hdr)::before {
+  transform: translateX(6%);
+  opacity: 0.8;
+}
+.hdr-switch.hdr:hover:not(:disabled)::before {
+  transform: translateX(94%);
+  opacity: 0.8;
+}
+.hdr-switch:active::before { transform: translateX(0) scaleX(0.95); }
+.hdr-switch.hdr:active::before { transform: translateX(100%) scaleX(0.95); }
+.hdr-switch:disabled { cursor: default; opacity: 0.5; }
+.hdr-switch-opt {
+  position: relative;
+  z-index: 1;
+  padding: 0 6px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: #666;
+  line-height: 18px;
+  flex: 1;
+  text-align: center;
+  user-select: none;
+  transition: color 0.18s ease;
+}
+.hdr-switch-opt:disabled { cursor: default; }
+.hdr-switch-opt.active { color: #fff; }
+.hdr-switch.hdr .hdr-switch-opt.active { color: #1a1200; }
+.hdr-switch:hover:not(:disabled) .hdr-switch-opt:not(.active) { color: #aaa; }
+
+.hdr-switch-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px) scale(0.92);
+  background: #1c1c22;
+  border: 1px solid var(--divider);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 8px;
+  border-radius: 5px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 4;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.hdr-switch-wrap:hover .hdr-switch-tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0) scale(1);
+}
+.hdr-switch-tooltip::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 5px solid transparent;
+  border-top-color: #1c1c22;
+}
+
 /* ── Content / Tab heading ────────────────────────────────────────── */
 .tab-body { padding: 16px; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
 .tab-heading {
@@ -579,27 +692,65 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-width: 28px;
   align-self: stretch;
 }
 .dimmer-chain-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
+  width: 100%;
+  height: 100%;
+  border-radius: 8px;
   color: var(--text-weak);
   transition: color 0.15s, background 0.15s;
 }
-.dimmer-chain-btn:hover { color: var(--text); background: var(--hover); }
+.dimmer-chain-btn:hover { color: var(--text); background: none; }
 .dimmer-chain-btn.linked { color: var(--accent); }
-.dimmer-chain-btn svg { width: 20px; height: 20px; }
+.dimmer-chain-btn svg { width: 20px; height: 20px; overflow: visible; }
+.chain-hook {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform 0.15s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+}
+.chain-bar {
+  transition: opacity 0.3s;
+}
+/* Rest state: unlinked hooks sit pulled apart (broken look); linked hooks
+   sit pulled together, closing the gap the bar bridges. This is the actual
+   linked/unlinked distinction — hover (below) nudges further in the
+   direction the click would move them, as a preview on top of this. */
+.dimmer-chain-btn:not(.linked) .chain-hook-a { transform: translate(1.5px, -1.5px); }
+.dimmer-chain-btn:not(.linked) .chain-hook-b { transform: translate(-1.5px, 1.5px); }
+.dimmer-chain-btn.linked .chain-hook-a { transform: translate(-1px, 1px); }
+.dimmer-chain-btn.linked .chain-hook-b { transform: translate(1px, -1px); }
+/* Hover: nudge further in the same direction as the rest state already
+   points — unlinked hovers pull apart more, linked hovers pull together
+   more — previewing that the state is about to flip. Kept subtle: a small
+   increment on top of the rest-state offset, not a large sweep. */
+.dimmer-chain-btn.linked:hover .chain-hook-a { transform: translate(-1.5px, 1.5px); }
+.dimmer-chain-btn.linked:hover .chain-hook-b { transform: translate(1.5px, -1.5px); }
+.dimmer-chain-btn:not(.linked):hover .chain-hook-a { transform: translate(2.2px, -2.2px); }
+.dimmer-chain-btn:not(.linked):hover .chain-hook-b { transform: translate(-2.2px, 2.2px); }
+/* Right after a click the cursor is still over the button, so :hover would
+   otherwise immediately apply the OTHER state's hover rule (see
+   toggleFadeLinked in TabDimmer.svelte). Pin the hooks back to their plain
+   rest-state transform until pointerleave actually fires — driven by the
+   real event, not a guessed timeout, so it can't desync from the cursor. */
+.dimmer-chain-btn.suppress-hover:hover.linked .chain-hook-a,
+.dimmer-chain-btn.suppress-hover.linked .chain-hook-a { transform: translate(-1px, 1px); }
+.dimmer-chain-btn.suppress-hover:hover.linked .chain-hook-b,
+.dimmer-chain-btn.suppress-hover.linked .chain-hook-b { transform: translate(1px, -1px); }
+.dimmer-chain-btn.suppress-hover:hover:not(.linked) .chain-hook-a,
+.dimmer-chain-btn.suppress-hover:not(.linked) .chain-hook-a { transform: translate(1.5px, -1.5px); }
+.dimmer-chain-btn.suppress-hover:hover:not(.linked) .chain-hook-b,
+.dimmer-chain-btn.suppress-hover:not(.linked) .chain-hook-b { transform: translate(-1.5px, 1.5px); }
 
 .dimmer-fade-row {
   display: flex;
   align-items: stretch;
-  gap: 4px;
+  gap: 0;
   margin-top: 16px;
 }
 .dimmer-fade-col {

@@ -17,8 +17,8 @@ export const crush = $state({
 export const taskbarDimmer = $state({
   enabled: false,
   opacity: 0.95,
-  fadeInDurationMs: 250,
-  fadeOutDurationMs: 250,
+  fadeInDurationMs: 300,
+  fadeOutDurationMs: 300,
   available: true,
 });
 
@@ -170,7 +170,7 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
 }
 
 export function restoreTaskbarDimmerDefaults() {
-  setTaskbarDimmer(false, 0.95, 250, 250, true, true);
+  setTaskbarDimmer(false, 0.95, 300, 300, true, true);
 }
 
 // The taskbar dimmer overlay is an always-on-top native window over the

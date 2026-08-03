@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { app, crush, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig, setDimmerSuspendedForFullscreen } from './lib/stores.svelte.js';
+  import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
@@ -10,6 +11,28 @@
   import TabAbout from './lib/TabAbout.svelte';
 
   let windowVisible = $state(true);
+
+  // Toggling real Windows HDR (Settings > Display > HDR) via the backend.
+  // Detection already exists (app.hdrStatus, driven by pollHDRStatus's
+  // matchMedia check below) — this just adds the write side.
+  let windowsHdrBusy = $state(false);
+  let windowsHdrError = $state('');
+
+  async function toggleWindowsHdr() {
+    if (windowsHdrBusy || app.hdrStatus === 'unknown') return;
+    const next = app.hdrStatus !== 'hdr';
+    windowsHdrBusy = true;
+    try {
+      await invoke('set_windows_hdr_enabled', { enabled: next });
+      windowsHdrError = '';
+    } catch (e) {
+      windowsHdrError = String(e);
+    } finally {
+      windowsHdrBusy = false;
+      // matchMedia picks up the real change on its own via the next poll tick;
+      // no separate status call needed.
+    }
+  }
 
   onMount(() => {
     let unlisten;
@@ -93,6 +116,8 @@
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src="/icons/tab_hotkeys.png" alt="" /> Hotkeys
     </button>
+
+    <div class="sidebar-spacer"></div>
   </nav>
 
   <main class="content">
@@ -117,7 +142,17 @@
     <span>v0.1.0</span>
     <div class="status-bar-right">
       <span class="display-info">{app.displayInfo.width}×{app.displayInfo.height}{app.displayInfo.refreshRateHz ? '@' + app.displayInfo.refreshRateHz + 'Hz' : ''}</span>
-      <span class="hdr-badge {app.hdrStatus}">{app.hdrStatus === 'hdr' ? 'HDR' : app.hdrStatus === 'sdr' ? 'SDR' : '--'}</span>
+      <div class="hdr-switch-wrap">
+        <button class="hdr-switch" class:hdr={app.hdrStatus === 'hdr'} disabled={windowsHdrBusy || app.hdrStatus === 'unknown'}
+          aria-label="Windows HDR"
+          onclick={toggleWindowsHdr}>
+          <span class="hdr-switch-opt" class:active={app.hdrStatus !== 'hdr'}>SDR</span>
+          <span class="hdr-switch-opt" class:active={app.hdrStatus === 'hdr'}>HDR</span>
+        </button>
+        <div class="hdr-switch-tooltip">
+          {windowsHdrError || (app.hdrStatus === 'unknown' ? 'HDR status unknown' : `Switch to ${app.hdrStatus === 'hdr' ? 'SDR' : 'HDR'}`)}
+        </div>
+      </div>
     </div>
   </div>
 </div>

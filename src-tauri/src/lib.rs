@@ -3,6 +3,7 @@ mod window_icon;
 mod display_info;
 mod config;
 mod taskbar_dimmer;
+mod hdr_toggle;
 
 use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 use tauri::{
@@ -92,6 +93,8 @@ pub fn run() {
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
             taskbar_dimmer::set_taskbar_dimmer_suspended,
             taskbar_dimmer::get_taskbar_dimmer_status,
+            hdr_toggle::get_windows_hdr_status,
+            hdr_toggle::set_windows_hdr_enabled,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,

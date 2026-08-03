@@ -5,7 +5,7 @@
     setTaskbarDimmer(!taskbarDimmer.enabled);
   }
 
-  let fadeLinked = $state(false);
+  let fadeLinked = $state(true);
   let opacityDragging = $state(false);
   let opacityHovering = $state(false);
   let fadeInDragging = $state(false);
@@ -71,11 +71,21 @@
   // Toggling the chain link on immediately syncs fade-out to match fade-in,
   // so the two sliders visually agree the moment they're linked rather than
   // waiting for the next drag.
+  //
+  // The cursor is still physically over the button right after a click, so
+  // :hover immediately re-applies — but now against the OTHER state's hover
+  // rule, causing a visible extra jump right after the toggle's own
+  // transition plays. chainSuppressHover pins the hooks back to their plain
+  // rest-state transform (see .just-toggled in app.css) until the pointer
+  // actually leaves the button — no guessed timeout, driven by the real
+  // pointerleave event so it can never desync from what the cursor is doing.
+  let chainSuppressHover = $state(false);
   function toggleFadeLinked() {
     fadeLinked = !fadeLinked;
     if (fadeLinked && taskbarDimmer.fadeOutDurationMs !== taskbarDimmer.fadeInDurationMs) {
       setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeInDurationMs);
     }
+    chainSuppressHover = true;
   }
 </script>
 
@@ -156,11 +166,11 @@
       </div>
 
       <div class="dimmer-chain-btn-wrap">
-        <button class="dimmer-chain-btn" class:linked={fadeLinked} onclick={toggleFadeLinked} title={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={fadeLinked}>
+        <button class="dimmer-chain-btn" class:linked={fadeLinked} class:suppress-hover={chainSuppressHover} onclick={toggleFadeLinked} onpointerleave={() => chainSuppressHover = false} title={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={fadeLinked}>
           <svg viewBox="0 0 24 24" fill="none">
-            <path d="M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <path d="M11 6.5L12.5 5C14.4 3.1 17.5 3.1 19.4 5C21.3 6.9 21.3 10 19.4 11.9L17.9 13.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M13 17.5L11.5 19C9.6 20.9 6.5 20.9 4.6 19C2.7 17.1 2.7 14 4.6 12.1L6.1 10.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path class="chain-bar" d="M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path class="chain-hook chain-hook-a" d="M11 6.5L12.5 5C14.4 3.1 17.5 3.1 19.4 5C21.3 6.9 21.3 10 19.4 11.9L17.9 13.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path class="chain-hook chain-hook-b" d="M13 17.5L11.5 19C9.6 20.9 6.5 20.9 4.6 19C2.7 17.1 2.7 14 4.6 12.1L6.1 10.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
       </div>

@@ -20,9 +20,17 @@ pub struct AppConfig {
     pub taskbar_dimmer_opacity: f64,
     // alias handles config files written before fade-in/out were split into
     // separate durations, so existing users don't silently lose their setting.
+    // Both fields share the same legacy key on purpose: the old single
+    // duration applied symmetrically to fade-in and fade-out, so a pre-split
+    // config should seed both new fields from it. Serde's alias only binds
+    // the first field that claims it per input key when deserializing a
+    // struct from a map, so the JSON key would only reach whichever field is
+    // listed first — to migrate old configs correctly, the fade-out field
+    // reads the legacy key by hand in `migrate_legacy_ease_duration` below
+    // instead of relying on a second #[serde(alias)] here.
     #[serde(default = "default_dimmer_ease_duration", alias = "taskbar_dimmer_ease_duration_ms")]
     pub taskbar_dimmer_fade_in_duration_ms: u64,
-    #[serde(default = "default_dimmer_ease_duration", alias = "taskbar_dimmer_ease_duration_ms")]
+    #[serde(default = "default_dimmer_ease_duration")]
     pub taskbar_dimmer_fade_out_duration_ms: u64,
     #[serde(default = "default_true")]
     pub tray_enabled: bool,
@@ -87,11 +95,33 @@ pub fn load_config(app: AppHandle) -> AppConfig {
         }
     };
     match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-            log::warn!("load_config: failed to parse {path:?}: {e}");
-            AppConfig::default()
-        }),
+        Ok(text) => {
+            let mut config = serde_json::from_str::<AppConfig>(&text).unwrap_or_else(|e| {
+                log::warn!("load_config: failed to parse {path:?}: {e}");
+                AppConfig::default()
+            });
+            migrate_legacy_ease_duration(&text, &mut config);
+            config
+        }
         Err(_) => AppConfig::default(), // file doesn't exist yet — first run
+    }
+}
+
+// Pre-split configs stored one `taskbar_dimmer_ease_duration_ms` that applied
+// to both fade-in and fade-out. serde's #[serde(alias)] only lets one field
+// claim a given input key, so only fade_in_duration_ms picks it up
+// automatically (see the field comment in AppConfig above); this fills in
+// fade_out_duration_ms from the same legacy key by hand, but only when the
+// config predates the split (no explicit fade-out key present) so it never
+// clobbers a value the user has already set post-split.
+fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else { return };
+    let Some(obj) = value.as_object() else { return };
+    if obj.contains_key("taskbar_dimmer_fade_out_duration_ms") {
+        return; // already on the split format
+    }
+    if let Some(legacy) = obj.get("taskbar_dimmer_ease_duration_ms").and_then(|v| v.as_u64()) {
+        config.taskbar_dimmer_fade_out_duration_ms = legacy;
     }
 }
 
