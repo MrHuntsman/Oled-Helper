@@ -90,27 +90,25 @@
 </script>
 
 <div class="tab-body">
-  <div class="tab-heading">
-    <img class="tab-icon" src="/icons/tab_dimmer.png" alt="" />
-    <h2>Taskbar Dimmer</h2>
-    <div class="info-tip-wrap">
-      <button class="info-tip-btn" aria-label="About Taskbar Dimmer" tabindex="0">Info</button>
-      <div class="info-tip">Darkens the Windows taskbar without blocking clicks or changing the rest of the display.</div>
+  <div class="tab-heading tab-heading-2line">
+    <div class="tab-heading-toggle" class:disabled={!taskbarDimmer.available} role="button" tabindex="0" onclick={() => { if (taskbarDimmer.available) toggleDimmer(); }} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && taskbarDimmer.available) { e.preventDefault(); toggleDimmer(); } }} title="Enable Taskbar Dimmer" aria-label="Enable Taskbar Dimmer" aria-pressed={taskbarDimmer.enabled}>
+      <img class="tab-icon" src="/icons/tab_dimmer.png" alt="" />
+      <div class="tab-heading-titles">
+        <div class="tab-heading-title-row">
+          <h2>Taskbar Dimmer</h2>
+          <div class="info-tip-wrap" role="presentation" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+            <button class="info-tip-btn" aria-label="About Taskbar Dimmer" tabindex="0">Info</button>
+            <div class="info-tip">Darkens the Windows taskbar without blocking clicks or changing the rest of the display.</div>
+          </div>
+        </div>
+        <span class="subtitle">Uses a click-through overlay over the taskbar.</span>
+      </div>
+      <div class="tab-heading-spacer"></div>
+      <span class={`pill${taskbarDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
-    <div class="tab-heading-spacer"></div>
     <button class="restore-defaults-btn" onclick={restoreTaskbarDimmerDefaults}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
-
-  <button class="settings-row dimmer-toggle-row" disabled={!taskbarDimmer.available} onclick={toggleDimmer}>
-    <div class="settings-row-text">
-      <span class="settings-row-label">Enable Taskbar Dimmer</span>
-      <span class="settings-row-desc">Uses a click-through overlay over the taskbar.</span>
-    </div>
-    <div class="pill-wrap">
-      <span class={`pill${taskbarDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
-    </div>
-  </button>
 
   <div class="dimmer-control-group" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
     <div class="dimmer-control">

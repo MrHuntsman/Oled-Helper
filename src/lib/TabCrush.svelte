@@ -618,23 +618,21 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 <svelte:window onkeydown={onKeydown} />
 
 <div class="tab-body">
-  <div class="tab-heading">
-<img class="tab-icon" src="/icons/tab_crush.png" alt="" />
-    <h2>Black Crush Tweak</h2>
-    <div class="tab-heading-spacer"></div>
+  <div class="tab-heading tab-heading-2line">
+    <div class="tab-heading-toggle" role="button" tabindex="0" onclick={toggleBlackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBlackEnabled(); } }} title="Enable Black Level" aria-label="Enable Black Level" aria-pressed={crush.blackEnabled}>
+      <img class="tab-icon" src="/icons/tab_crush.png" alt="" />
+      <div class="tab-heading-titles">
+        <div class="tab-heading-title-row">
+          <h2>Black Crush Tweak</h2>
+        </div>
+        <span class="subtitle">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</span>
+      </div>
+      <div class="tab-heading-spacer"></div>
+      <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
+    </div>
     <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
-
-  <div class="settings-row dimmer-toggle-row" role="button" tabindex="0" onclick={toggleBlackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBlackEnabled(); } }}>
-    <div class="settings-row-text">
-      <span class="settings-row-label">Enable Black Level</span>
-      <span class="settings-row-desc">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</span>
-    </div>
-    <div class="pill-wrap">
-      <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
-    </div>
-  </div>
 
   <div class="dimmer-control" class:disabled={!crush.blackEnabled} onwheel={(e) => handleSliderWheel(e, mainSliderInput, setBlackLevel, 5)}>
     <div class="dimmer-control-heading">
