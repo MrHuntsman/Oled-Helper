@@ -127,7 +127,19 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
 
 #[tauri::command]
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
+    // Write on a background thread and return immediately. File I/O on the
+    // IPC command thread would block every other command (including the
+    // high-frequency gamma ramp updates) for the duration of the write — and
+    // a slow disk/OneDrive can stall it for hundreds of milliseconds. The
+    // write ordering is preserved by always spawning; duplicate stale writes
+    // are harmless because the frontend debounces saves after the drag
+    // settles, so the final write carries the latest config.
     let path = config_path(&app)?;
     let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(&path, text).map_err(|e| format!("could not write {path:?}: {e}"))
+    std::thread::spawn(move || {
+        if let Err(e) = fs::write(&path, text) {
+            log::warn!("save_config: could not write {:?}: {e}", path);
+        }
+    });
+    Ok(())
 }

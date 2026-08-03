@@ -5,30 +5,80 @@ mod config;
 mod taskbar_dimmer;
 mod hdr_toggle;
 
-use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicI32, Ordering},
+    Arc,
+};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
 
-struct AppState {
-    black_lift: Mutex<i32>,
-}
-
 struct TrayState {
     enabled: AtomicBool,
 }
 
-#[tauri::command]
-fn apply_gamma_ramp(state: State<AppState>, black_lift: i32) -> Result<(), String> {
-    let ramp = gamma_ramp::build_ramp(black_lift);
-    unsafe {
-        if !gamma_ramp::set_display_ramp(&ramp) {
-            return Err("SetDeviceGammaRamp failed".into());
+// Gamma state shared between the webview command and the dedicated worker
+// thread. The frontend only ever writes the latest desired black level
+// (fire-and-forget, never waiting for a response), and the worker thread
+// continuously applies it. This keeps the display update on the native side
+// and out of WebView2's IPC round-trip, which is slow under sustained input.
+struct GammaState {
+    inner: Arc<GammaInner>,
+}
+
+struct GammaInner {
+    desired: AtomicI32,
+    shutdown: AtomicBool,
+    last_applied: AtomicI32,
+}
+
+impl Default for GammaState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(GammaInner {
+                desired: AtomicI32::new(0),
+                shutdown: AtomicBool::new(false),
+                last_applied: AtomicI32::new(i32::MIN),
+            }),
         }
     }
-    *state.black_lift.lock().unwrap() = black_lift;
+}
+
+fn gamma_worker_loop(state: &GammaInner) {
+    // Short-sleep polling loop: applies the latest desired value within a few
+    // milliseconds of the frontend writing it, without depending on WebView2
+    // message delivery back to JS. `desired` is only read here, so the loop
+    // runs independently of any IPC latency.
+    while !state.shutdown.load(Ordering::Relaxed) {
+        let desired = state.desired.load(Ordering::Relaxed);
+        let last = state.last_applied.load(Ordering::Relaxed);
+        if desired != last {
+            let started = std::time::Instant::now();
+            let ramp = gamma_ramp::build_ramp(desired);
+            let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
+            if applied {
+                state.last_applied.store(desired, Ordering::Relaxed);
+            }
+            let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if !applied {
+                log::warn!("[gamma] value={} apply failed", desired);
+            } else if total_ms >= 32.0 {
+                log::info!("[gamma-slow] value={} apply={total_ms:.3}ms", desired);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    unsafe { gamma_ramp::reset_display_ramp(); }
+}
+
+// Fire-and-forget: stores the latest value and returns immediately. The
+// worker applies it on its own thread. No response is waited on, so WebView2's
+// slow return path can never delay the display update.
+#[tauri::command]
+fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), String> {
+    state.inner.desired.store(black_lift, Ordering::Relaxed);
     Ok(())
 }
 
@@ -85,9 +135,7 @@ fn set_tray_enabled(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState {
-            black_lift: Mutex::new(0),
-        })
+        .manage(GammaState::default())
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
         .manage(TrayState {
             enabled: AtomicBool::new(true),
@@ -107,12 +155,36 @@ pub fn run() {
             taskbar_dimmer::get_taskbar_dimmer_status,
             hdr_toggle::get_windows_hdr_status,
             hdr_toggle::set_windows_hdr_enabled,
+            hdr_toggle::get_hdr_luminance,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .setup(|app| {
+            // Gamma worker: continuously applies the latest desired black
+            // level so display updates never wait on WebView2 IPC. Runs at a
+            // boosted priority so it stays responsive while the renderer is
+            // busy processing drag input.
+            {
+                let gamma = app.state::<GammaState>().inner.clone();
+                std::thread::Builder::new()
+                    .name("gamma-ramp-worker".into())
+                    .spawn(move || {
+                        #[cfg(target_os = "windows")]
+                        unsafe {
+                            // Raise this thread above normal so it is scheduled
+                            // promptly even while the renderer burns CPU.
+                            use windows::Win32::System::Threading::{
+                                GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+                            };
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                        }
+                        gamma_worker_loop(&gamma);
+                    })
+                    .map_err(|error| format!("could not start gamma worker: {error}"))?;
+            }
+
             // Always-on rotating file log (not just debug builds) — GPU-init
             // hangs/crashes can happen in release builds too, and without a
             // persistent log the only evidence is whatever DevTools happened
@@ -200,9 +272,12 @@ pub fn run() {
                         }
                     }
                 }
-                tauri::WindowEvent::Destroyed => unsafe {
-                    gamma_ramp::reset_display_ramp();
-                },
+                tauri::WindowEvent::Destroyed => {
+                    let gamma = window.app_handle().state::<GammaState>();
+                    gamma.inner.shutdown.store(true, Ordering::Relaxed);
+                    // The worker resets the display ramp itself after observing
+                    // shutdown, so no race with an in-progress apply.
+                }
                 _ => {}
             }
         })

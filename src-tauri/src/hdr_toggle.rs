@@ -188,3 +188,65 @@ pub fn get_windows_hdr_status() -> Result<Option<HdrCapability>, String> {
 pub fn set_windows_hdr_enabled(enabled: bool) -> Result<(), String> {
     set_windows_hdr(enabled)
 }
+
+#[derive(serde::Serialize, Clone, Copy)]
+pub struct HdrLuminance {
+    pub max_nits: Option<f32>,
+}
+
+// Queries HDR luminance capability for the PRIMARY display (matching the
+// PCWSTR::null() primary-display target used elsewhere in the app) via DXGI:
+//   IDXGIFactory1::EnumAdapters1 -> IDXGIAdapter1::EnumOutputs ->
+//   IDXGIOutput::GetDesc (to match the monitor handle) ->
+//   IDXGIOutput6::GetDesc1 (DXGI_OUTPUT_DESC1, luminance in nits directly).
+//
+// NOTE: the CCD/DisplayConfig API used by the HDR toggle above does NOT
+// expose nit values (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 in wingdi.h has
+// no luminance fields) — DXGI_OUTPUT_DESC1 is the correct source.
+pub fn query_hdr_luminance() -> Option<HdrLuminance> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6};
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTOPRIMARY};
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+
+    unsafe {
+        let primary: HMONITOR = MonitorFromWindow(GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
+        let Ok(factory): windows::core::Result<IDXGIFactory1> = CreateDXGIFactory1() else {
+            return None;
+        };
+        for adapter_index in 0u32.. {
+            let Ok(adapter) = factory.EnumAdapters1(adapter_index) else {
+                break;
+            };
+            for output_index in 0u32.. {
+                let Ok(output) = adapter.EnumOutputs(output_index) else {
+                    break;
+                };
+                // Only the output that is actually the primary monitor.
+                let Ok(desc) = output.GetDesc() else {
+                    continue;
+                };
+                if desc.Monitor != primary {
+                    continue;
+                }
+                let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+                    return None;
+                };
+                let Ok(desc1) = output6.GetDesc1() else {
+                    return None;
+                };
+                // DXGI reports 0.0 for fields the EDID/driver didn't provide.
+                let val = |n: f32| if n > 0.0 { Some(n) } else { None };
+                return Some(HdrLuminance {
+                    max_nits: val(desc1.MaxLuminance),
+                });
+            }
+        }
+        None
+    }
+}
+
+#[tauri::command]
+pub fn get_hdr_luminance() -> Option<HdrLuminance> {
+    query_hdr_luminance()
+}

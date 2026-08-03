@@ -10,6 +10,24 @@
     app.hdrStatus === 'hdr' ? 'HDR' : app.hdrStatus === 'sdr' ? 'SDR' : 'Detecting...'
   );
 
+  function fmtNits(v) {
+    if (v == null) return null;
+    if (v >= 100) return String(Math.round(v));
+    if (v >= 10) return String(Math.round(v * 10) / 10);
+    if (v >= 1) return String(Math.round(v * 100) / 100);
+    return v.toPrecision(2);
+  }
+
+  // Peak luminance in nits comes from the monitor's EDID/driver via DXGI
+  // (IDXGIOutput6::GetDesc1) — see hdr_toggle.rs. Falls back to '—' when
+  // the panel doesn't report it (some drivers return 0).
+  let hdrLuminance = $derived.by(() => {
+    const l = app.hdrLuminance;
+    if (!l) return '—';
+    const max = fmtNits(l.maxNits);
+    return max ? `${max} nits` : '—';
+  });
+
   // Depends on envTick (bumped every 1s in App.svelte) so this whole table
   // stays live without needing a tab switch/remount — navigator.*/screen.*
   // are plain globals Svelte can't track on its own.
@@ -24,7 +42,8 @@
       ['Browser / WebView', navigator.userAgent],
       ['WebGPU Support', navigator.gpu ? 'Available' : 'Not available'],
       ['Display Type', displayType],
-      ['Screen Resolution', `${screen.width * devicePixelRatio}x${screen.height * devicePixelRatio}`],
+      ['HDR Max Luminance', hdrLuminance],
+      ['Screen Resolution', `${screen.width * devicePixelRatio}x${screen.height * devicePixelRatio}${app.displayInfo.refreshRateHz ? `@${app.displayInfo.refreshRateHz}Hz` : ''}`],
       ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
       ['Color Depth', perChannelBits ? `${perChannelBits}-bit per channel` : '?'],
     ];

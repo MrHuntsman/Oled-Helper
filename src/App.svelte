@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, pollDisplayInfo, pollHDRStatus, bumpEnvTick, loadConfig, setDimmerSuspendedForFullscreen } from './lib/stores.svelte.js';
+  import { app, crush, pollDisplayInfo, pollHDRStatus, pollHDRLuminance, bumpEnvTick, loadConfig, setDimmerSuspendedForFullscreen } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
@@ -206,16 +206,24 @@
   async function toggleWindowsHdr() {
     if (windowsHdrBusy || app.hdrStatus === 'unknown') return;
     const next = app.hdrStatus !== 'hdr';
+    const previous = app.hdrStatus;
     windowsHdrBusy = true;
+    // Reflect the switch instantly instead of waiting for the next 1s poll
+    // tick to pick it up via matchMedia — that wait is what made toggling
+    // from inside the app feel slower than the Windows keyboard shortcut,
+    // even though the underlying OS-level change completes at the same speed
+    // either way. Reverted in the catch block if the backend call fails.
+    app.hdrStatus = next ? 'hdr' : 'sdr';
     try {
       await invoke('set_windows_hdr_enabled', { enabled: next });
       windowsHdrError = '';
     } catch (e) {
       windowsHdrError = String(e);
+      app.hdrStatus = previous;
     } finally {
       windowsHdrBusy = false;
-      // matchMedia picks up the real change on its own via the next poll tick;
-      // no separate status call needed.
+      // The next poll tick's matchMedia read will still confirm/correct this
+      // against the real OS state shortly after.
     }
   }
 
@@ -248,8 +256,11 @@
   $effect(() => {
     if (!windowVisible) return;
     const pollDisplay = () => { if (!hzMenuOpen && !resMenuOpen) pollDisplayInfo(); };
-    const initial = setTimeout(() => { pollDisplay(); pollHDRStatus(); }, 0);
-    const timer = setInterval(() => { pollDisplay(); pollHDRStatus(); }, 1000);
+    // HDR luminance is only displayed in the Debug tab, so only enumerate
+    // DXGI while that tab is open (cheaper than every-second polling).
+    const pollLuminance = () => { if (app.activeTab === 'debug') pollHDRLuminance(); };
+    const initial = setTimeout(() => { pollDisplay(); pollHDRStatus(); pollLuminance(); }, 0);
+    const timer = setInterval(() => { pollDisplay(); pollHDRStatus(); pollLuminance(); }, 1000);
     return () => { clearTimeout(initial); clearInterval(timer); };
   });
 
@@ -396,6 +407,8 @@
           onclick={toggleWindowsHdr}>
           <span class="hdr-switch-opt" class:active={app.hdrStatus !== 'hdr'}>SDR</span>
           <span class="hdr-switch-opt" class:active={app.hdrStatus === 'hdr'}>HDR</span>
+          <svg class="hdr-switch-arrow hdr-switch-arrow-right" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 2L7 5L3 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg class="hdr-switch-arrow hdr-switch-arrow-left" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M7 2L3 5L7 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <div class="hdr-switch-tooltip">
           {windowsHdrError || (app.hdrStatus === 'unknown' ? 'HDR status unknown' : `Switch to ${app.hdrStatus === 'hdr' ? 'SDR' : 'HDR'}`)}

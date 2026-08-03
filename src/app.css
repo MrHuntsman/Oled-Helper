@@ -223,7 +223,7 @@ button {
 }
 .hdr-switch:hover:not(:disabled),
 .hdr-switch:focus-visible {
-  border-color: #666;
+  border-color: transparent;
   box-shadow: 0 0 0 1px rgba(255,255,255,0.04);
 }
 .hdr-switch::before {
@@ -277,6 +277,38 @@ button {
 .hdr-switch-opt.active { color: #fff; }
 .hdr-switch.hdr .hdr-switch-opt.active { color: #1a1200; }
 .hdr-switch:hover:not(:disabled) .hdr-switch-opt:not(.active) { color: #aaa; }
+
+.hdr-switch-arrow {
+  position: absolute;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  transform: translateY(-50%);
+  color: #fff;
+  filter: drop-shadow(0 0 1.5px rgba(0,0,0,0.9)) drop-shadow(0 0 1px rgba(0,0,0,0.9));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  z-index: 2;
+}
+.hdr-switch-arrow-right { left: calc(50% - 4px); }
+.hdr-switch-arrow-left { left: calc(50% - 4px); }
+.hdr-switch:hover:not(:disabled):not(.hdr) .hdr-switch-arrow-right {
+  opacity: 0.8;
+  animation: hdr-arrow-nudge-right 0.9s ease-in-out infinite;
+}
+.hdr-switch.hdr:hover:not(:disabled) .hdr-switch-arrow-left {
+  opacity: 0.8;
+  animation: hdr-arrow-nudge-left 0.9s ease-in-out infinite;
+}
+@keyframes hdr-arrow-nudge-right {
+  0%, 100% { transform: translateY(-50%) translateX(0); }
+  50% { transform: translateY(-50%) translateX(3px); }
+}
+@keyframes hdr-arrow-nudge-left {
+  0%, 100% { transform: translateY(-50%) translateX(0); }
+  50% { transform: translateY(-50%) translateX(-3px); }
+}
 
 .hdr-switch-tooltip {
   position: absolute;
@@ -797,7 +829,8 @@ button {
 .calibration-strip-panel {
   display: flex;
   flex-direction: column;
-  flex: 0 0 auto;
+  flex: 1;
+  min-height: 0;
   padding: 10px 12px;
   border: 1px solid var(--divider);
   border-radius: 8px;
@@ -826,20 +859,6 @@ button {
   position: fixed; inset: 0; z-index: 9999;
   border-radius: 0;
 }
-
-/* ── Status bar badges ────────────────────────────────────────────── */
-.hdr-badge {
-  font-size: 10px;
-  font-weight: 700;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1.5px solid;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
-}
-.hdr-badge.hdr { color: var(--accent-hdr); border-color: var(--accent-hdr); }
-.hdr-badge.sdr { color: var(--accent-sdr); border-color: var(--accent-sdr); }
-.hdr-badge.unknown { color: var(--text-weak); border-color: var(--text-weak); }
 
 /* ── Fullscreen hint ──────────────────────────────────────────────── */
 /* ── Fullscreen controls help (? icon + tooltip) ───────────────── */
@@ -1154,6 +1173,7 @@ button {
   min-width: 100%;
   max-height: 340px;
   overflow-y: auto;
+  overflow-x: hidden;
   background: var(--panel);
   border: 1px solid var(--divider);
   border-radius: 8px;
@@ -1175,9 +1195,9 @@ button {
   font-variant-numeric: tabular-nums;
   color: var(--text);
   white-space: nowrap;
-  transition: background 0.08s, color 0.08s;
+  transition: background 0.08s, color 0.08s, transform 0.08s;
 }
-.hz-menu-item:hover { background: var(--hover); color: #fff; }
+.hz-menu-item:hover { background: var(--hover); color: #fff; transform: translateX(2px); }
 .hz-menu-item.active { color: var(--accent); font-weight: 700; background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .hz-menu-group-label {
   font-size: 10px;
@@ -1187,7 +1207,7 @@ button {
   letter-spacing: 0.4px;
   padding: 6px 10px 3px;
 }
-.res-menu { min-width: 220px; }
+.res-menu { min-width: 100%; }
 
 /* Compact display-mode pickers in the bottom status panel. Native selects
    preserve keyboard navigation and accessibility while the styling makes

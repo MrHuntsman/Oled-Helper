@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 export const app = $state({
   activeTab: 'crush',
   hdrStatus: 'unknown',  // set by pollHDRStatus via matchMedia
+  hdrLuminance: null,    // { maxNits } | null, set by pollHDRLuminance
   displayInfo: { width: 0, height: 0, refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
@@ -205,6 +206,22 @@ export function pollHDRStatus() {
   } catch {
     // matchMedia not available — stay unknown (very old browser)
   }
+}
+
+export function pollHDRLuminance() {
+  invoke('get_hdr_luminance')
+    .then((info) => {
+      if (!info) {
+        app.hdrLuminance = null;
+        return;
+      }
+      app.hdrLuminance = {
+        maxNits: info.max_nits ?? null,
+      };
+    })
+    .catch(() => {
+      app.hdrLuminance = null;
+    });
 }
 
 let displayPollSequence = 0;

@@ -55,7 +55,14 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   $effect(() => {
     if (!sliderDragging && !fsSliderDragging) return;
-    function onUp() { sliderDragging = false; fsSliderDragging = false; }
+    function onUp() {
+      sliderDragging = false;
+      fsSliderDragging = false;
+      // Persist exactly once, when the drag ends (mouse button released) —
+      // never mid-drag, so a paused drag can't trigger a config write while
+      // the user is still adjusting.
+      scheduleConfigSave();
+    }
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
     return () => {
@@ -315,10 +322,55 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     return () => { resizeObs?.disconnect(); if (resizeRaf) cancelAnimationFrame(resizeRaf); };
   });
 
+  // Gamma updates are fire-and-forget: the frontend writes the latest desired
+  // black level and a dedicated Rust worker continuously applies it. The
+  // display update never waits on WebView2 IPC (which is fast to send but slow
+  // to deliver responses under sustained input).
+  let gammaRampDestroyed = false;
+  let gammaRampLastValue = null;
+
+  // Send the latest value to the Rust worker. Returns immediately; the worker
+  // picks up the newest value on its own loop, so even a slow invoke response
+  // (or no response at all) cannot delay the display update.
+  function requestGammaRamp() {
+    if (gammaRampDestroyed) return;
+    const value = blackLift();
+    // Slider events frequently normalize to the same effective value (the
+    // -4..4 dead zone snaps to 0, and trackpad/wheel drags repeat positions).
+    // Skip redundant sends so a drag doesn't spam the IPC channel.
+    if (value === gammaRampLastValue) return;
+    gammaRampLastValue = value;
+    invoke('apply_gamma_ramp', { blackLift: value })
+      .catch((error) => console.warn(`[gamma] send value=${value} failed: ${String(error)}`));
+  }
+
+  let configSaveTimer = null;
+  function scheduleConfigSave() {
+    clearTimeout(configSaveTimer);
+    configSaveTimer = setTimeout(() => {
+      configSaveTimer = null;
+      saveConfig();
+    }, 150);
+  }
+
+  onDestroy(() => {
+    gammaRampDestroyed = true;
+    gammaRampLastValue = null;
+    if (configSaveTimer) {
+      clearTimeout(configSaveTimer);
+      configSaveTimer = null;
+      // Preserve the last slider value if the tab is destroyed before the
+      // debounce window expires (for example during a rapid tab switch).
+      saveConfig();
+    }
+  });
+
   $effect(() => {
     void crush.adjustment; void crush.blackEnabled;
-    invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch(() => {});
-    saveConfig();
+    requestGammaRamp();
+    // No config save here: the adjustment changes on every pointer event
+    // during a drag, and saving is now tied to discrete events only (drag
+    // release, wheel, keyboard, toggle, restore defaults).
   });
 
   // Lets a drag start anywhere in the slider's expanded vertical buffer zone
@@ -335,6 +387,11 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   function setBlackLevel(value) {
     crush.adjustment = normalizeBlackLevel(value);
+  }
+
+  function toggleBlackEnabled() {
+    crush.blackEnabled = !crush.blackEnabled;
+    scheduleConfigSave();
   }
 
   function handleBlackLevelInput(e) {
@@ -362,6 +419,8 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     // Jump across that dead zone so the first wheel tick always changes it.
     if (next === current && current === 0) next = direction > 0 ? 5 : -5;
     setValue(next);
+    // Wheel changes are discrete inputs (not drags), so persist them.
+    if (setValue === setBlackLevel) scheduleConfigSave();
   }
 
   function handleTrackWrapPointerdown(e, inputEl) {
@@ -382,6 +441,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
+      // The drag (or click on the track) ended — persist the final value.
+      // Saved directly in this handler (not in an $effect) because the
+      // effect's window listener may not be registered yet for fast clicks.
+      scheduleConfigSave();
     }
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
@@ -544,10 +607,11 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     if (!crush.blackEnabled) return;
     // crush.adjustment is stored in tenths (adjustmentDisplay() divides by 10),
     // so Left/Right move a whole point (10) and Up/Down move 0.1 (1).
-    if (e.key === 'ArrowRight') { crush.adjustment = Math.min(150, crush.adjustment + 10); }
-    if (e.key === 'ArrowLeft') { crush.adjustment = Math.max(-150, crush.adjustment - 10); }
-    if (e.key === 'ArrowUp') { e.preventDefault(); crush.adjustment = Math.min(150, crush.adjustment + 1); }
-    if (e.key === 'ArrowDown') { e.preventDefault(); crush.adjustment = Math.max(-150, crush.adjustment - 1); }
+    // Keyboard changes are discrete inputs (not drags), so persist them.
+    if (e.key === 'ArrowRight') { crush.adjustment = Math.min(150, crush.adjustment + 10); scheduleConfigSave(); }
+    if (e.key === 'ArrowLeft') { crush.adjustment = Math.max(-150, crush.adjustment - 10); scheduleConfigSave(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); crush.adjustment = Math.min(150, crush.adjustment + 1); scheduleConfigSave(); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); crush.adjustment = Math.max(-150, crush.adjustment - 1); scheduleConfigSave(); }
   }
 </script>
 
@@ -562,7 +626,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   </div>
   <div class="separator"></div>
 
-  <div class="settings-row dimmer-toggle-row" role="button" tabindex="0" onclick={() => crush.blackEnabled = !crush.blackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); crush.blackEnabled = !crush.blackEnabled; } }}>
+  <div class="settings-row dimmer-toggle-row" role="button" tabindex="0" onclick={toggleBlackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBlackEnabled(); } }}>
     <div class="settings-row-text">
       <span class="settings-row-label">Enable Black Level</span>
       <span class="settings-row-desc">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</span>
@@ -583,7 +647,8 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
         oninput={handleBlackLevelInput}
         onpointerdown={() => sliderDragging = true}
-        onpointerup={() => sliderDragging = false}
+        onpointerup={() => { sliderDragging = false; scheduleConfigSave(); }}
+        onpointercancel={() => { sliderDragging = false; scheduleConfigSave(); }}
         onpointerenter={() => sliderHovering = true}
         onpointerleave={() => sliderHovering = false}
         disabled={!crush.blackEnabled} />
@@ -662,7 +727,8 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
               style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
               oninput={handleBlackLevelInput}
               onpointerdown={() => fsSliderDragging = true}
-              onpointerup={() => fsSliderDragging = false}
+              onpointerup={() => { fsSliderDragging = false; scheduleConfigSave(); }}
+              onpointercancel={() => { fsSliderDragging = false; scheduleConfigSave(); }}
               onpointerenter={() => fsSliderHovering = true}
               onpointerleave={() => fsSliderHovering = false}
               disabled={!crush.blackEnabled} />
