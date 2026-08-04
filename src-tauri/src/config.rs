@@ -9,13 +9,15 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Condvar, Mutex, OnceLock,
 };
-use tauri::AppHandle;
+#[cfg(not(target_os = "windows"))]
+use tauri::Manager;
+use tauri::{AppHandle, Emitter};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
-use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-#[cfg(not(target_os = "windows"))]
-use tauri::Manager;
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
@@ -42,7 +44,10 @@ pub struct AppConfig {
     // listed first — to migrate old configs correctly, the fade-out field
     // reads the legacy key by hand in `migrate_legacy_ease_duration` below
     // instead of relying on a second #[serde(alias)] here.
-    #[serde(default = "default_dimmer_ease_duration", alias = "taskbar_dimmer_ease_duration_ms")]
+    #[serde(
+        default = "default_dimmer_ease_duration",
+        alias = "taskbar_dimmer_ease_duration_ms"
+    )]
     pub taskbar_dimmer_fade_in_duration_ms: u64,
     #[serde(default = "default_dimmer_ease_duration")]
     pub taskbar_dimmer_fade_out_duration_ms: u64,
@@ -108,7 +113,8 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 #[cfg(target_os = "windows")]
 fn local_app_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let localappdata = std::env::var("LOCALAPPDATA").map_err(|e| format!("LOCALAPPDATA not set: {e}"))?;
+    let localappdata =
+        std::env::var("LOCALAPPDATA").map_err(|e| format!("LOCALAPPDATA not set: {e}"))?;
     let identifier = app.config().identifier.clone();
     Ok(PathBuf::from(localappdata).join(identifier))
 }
@@ -150,12 +156,17 @@ pub fn load_config(app: AppHandle) -> AppConfig {
 // config predates the split (no explicit fade-out key present) so it never
 // clobbers a value the user has already set post-split.
 fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else { return };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+        return;
+    };
     let Some(obj) = value.as_object() else { return };
     if obj.contains_key("taskbar_dimmer_fade_out_duration_ms") {
         return; // already on the split format
     }
-    if let Some(legacy) = obj.get("taskbar_dimmer_ease_duration_ms").and_then(|v| v.as_u64()) {
+    if let Some(legacy) = obj
+        .get("taskbar_dimmer_ease_duration_ms")
+        .and_then(|v| v.as_u64())
+    {
         config.taskbar_dimmer_fade_out_duration_ms = legacy;
     }
 }
@@ -169,19 +180,38 @@ struct PendingConfigWrite {
 static CONFIG_WRITE_VERSION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_WRITE_STOP: AtomicBool = AtomicBool::new(false);
 static CONFIG_WRITE_QUEUE: OnceLock<(Mutex<Option<PendingConfigWrite>>, Condvar)> = OnceLock::new();
-static CONFIG_WRITE_WORKER: OnceLock<Result<Mutex<Option<std::thread::JoinHandle<()>>>, String>> = OnceLock::new();
+static CONFIG_WRITE_WORKER: OnceLock<Result<Mutex<Option<std::thread::JoinHandle<()>>>, String>> =
+    OnceLock::new();
+// The worker runs on its own thread, so the only way to tell the frontend a
+// background write failed is an event (save_config returns before the write).
+static CONFIG_APP: OnceLock<AppHandle> = OnceLock::new();
+
+fn emit_config_write_failed(message: &str) {
+    if let Some(app) = CONFIG_APP.get() {
+        let _ = app.emit("config-write-failed", message.to_string());
+    }
+}
 
 fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let temp = temp_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
-        let target = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+        let temp = temp_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let target = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
         unsafe {
             MoveFileExW(
                 PCWSTR(temp.as_ptr()),
                 PCWSTR(target.as_ptr()),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            ).map_err(|e| format!("could not replace {path:?}: {e}"))?;
+            )
+            .map_err(|e| format!("could not replace {path:?}: {e}"))?;
         }
         Ok(())
     }
@@ -192,12 +222,18 @@ fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
 }
 
 fn config_write_worker() {
-    let Some((queue, wake)) = CONFIG_WRITE_QUEUE.get() else { return; };
+    let Some((queue, wake)) = CONFIG_WRITE_QUEUE.get() else {
+        return;
+    };
     loop {
         let pending = {
-            let Ok(mut guard) = queue.lock() else { return; };
+            let Ok(mut guard) = queue.lock() else {
+                return;
+            };
             while guard.is_none() && !CONFIG_WRITE_STOP.load(Ordering::Acquire) {
-                let Ok(next) = wake.wait(guard) else { return; };
+                let Ok(next) = wake.wait(guard) else {
+                    return;
+                };
                 guard = next;
             }
             if let Some(pending) = guard.take() {
@@ -208,7 +244,9 @@ fn config_write_worker() {
                 continue;
             }
         };
-        let Some(pending) = pending else { break; };
+        let Some(pending) = pending else {
+            break;
+        };
 
         // A newer snapshot may have arrived while this write was waiting for
         // the worker. Skip stale snapshots so rapid slider/mode changes cannot
@@ -218,13 +256,21 @@ fn config_write_worker() {
         }
 
         let temp_path = pending.path.with_extension("json.tmp");
+        // Re-check right before the disk I/O: a newer snapshot landing between
+        // dequeue and here would otherwise trigger a wasted temp-file write
+        // (the stale snapshot is skipped, but only after touching the disk).
+        if pending.version != CONFIG_WRITE_VERSION.load(Ordering::Acquire) {
+            continue;
+        }
         if let Err(e) = fs::write(&temp_path, &pending.text) {
             log::warn!("save_config: could not write {:?}: {e}", temp_path);
+            emit_config_write_failed(&format!("could not write {:?}: {e}", temp_path));
             continue;
         }
         if let Err(e) = replace_config_file(&temp_path, &pending.path) {
             let _ = fs::remove_file(&temp_path);
             log::warn!("save_config: {e}");
+            emit_config_write_failed(&format!("could not replace {:?}: {e}", pending.path));
         }
     }
 }
@@ -252,13 +298,18 @@ fn enqueue_config_write(app: &AppHandle, config: &AppConfig) -> Result<(), Strin
     // IPC command thread would block every other command (including the
     // high-frequency gamma ramp updates) for the duration of the write — and
     // a slow disk/OneDrive can stall it for hundreds of milliseconds.
+    let _ = CONFIG_APP.set(app.clone());
     let path = config_path(app)?;
     let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     let version = CONFIG_WRITE_VERSION.fetch_add(1, Ordering::AcqRel) + 1;
     let (queue, wake) = CONFIG_WRITE_QUEUE.get_or_init(|| (Mutex::new(None), Condvar::new()));
     ensure_config_worker()?;
     if let Ok(mut pending) = queue.lock() {
-        *pending = Some(PendingConfigWrite { path, text, version });
+        *pending = Some(PendingConfigWrite {
+            path,
+            text,
+            version,
+        });
         wake.notify_one();
     } else {
         return Err("config write queue was poisoned".into());
@@ -293,5 +344,49 @@ pub fn shutdown() {
                 let _ = worker.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> AppConfig {
+        AppConfig {
+            taskbar_dimmer_fade_in_duration_ms: 100,
+            taskbar_dimmer_fade_out_duration_ms: 200,
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn legacy_ease_duration_seeds_fade_out() {
+        let raw = r#"{"taskbar_dimmer_ease_duration_ms": 400}"#;
+        let mut config = sample_config();
+        migrate_legacy_ease_duration(raw, &mut config);
+        assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 400);
+    }
+
+    #[test]
+    fn split_format_is_not_overwritten() {
+        let raw = r#"{"taskbar_dimmer_ease_duration_ms": 400, "taskbar_dimmer_fade_out_duration_ms": 350}"#;
+        let mut config = sample_config();
+        migrate_legacy_ease_duration(raw, &mut config);
+        assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
+    }
+
+    #[test]
+    fn missing_legacy_key_is_noop() {
+        let raw = r#"{"black_lift": 0.5}"#;
+        let mut config = sample_config();
+        migrate_legacy_ease_duration(raw, &mut config);
+        assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
+    }
+
+    #[test]
+    fn invalid_json_is_noop() {
+        let mut config = sample_config();
+        migrate_legacy_ease_duration("not json", &mut config);
+        assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
     }
 }

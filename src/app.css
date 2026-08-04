@@ -853,6 +853,7 @@ button {
   display: flex;
   align-items: flex-end;
   justify-content: flex-end;
+  gap: 8px;
   padding-top: 12px;
 }
 .settings-footer .restore-defaults-btn {
@@ -1556,6 +1557,25 @@ button {
 .res-menu .hz-menu-group-label:not(:first-child) {
   margin-top: 4px;
 }
+.ultrawide-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: -6px;
+  color: inherit;
+}
+.ultrawide-separator {
+  line-height: 1;
+}
+.ultrawide-icon {
+  width: 23px;
+  height: 13px;
+  flex-shrink: 0;
+  color: inherit;
+  vertical-align: -2px;
+}
+.hz-menu-item:hover .ultrawide-icon { color: #fff; }
+.hz-menu-item.active .ultrawide-icon { color: var(--accent); }
 
 /* Compact display-mode pickers in the bottom status panel. Native selects
    preserve keyboard navigation and accessibility while the styling makes
@@ -1770,11 +1790,16 @@ button {
   border-width: 0 1.6px 1.6px 0;
   transform: rotate(45deg);
 }
-.diag-detection-toggles {
+.diag-detection-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   flex-wrap: wrap;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--hover) 45%, transparent);
+  border: 1px solid var(--divider);
+  border-radius: 6px;
 }
 .diag-detection-label {
   color: var(--text-weak);

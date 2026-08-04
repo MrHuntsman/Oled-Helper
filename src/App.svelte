@@ -7,6 +7,7 @@
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
   import TabDebug from './lib/TabDebug.svelte';
+  import TabSystem from './lib/TabSystem.svelte';
   import TabSettings from './lib/TabSettings.svelte';
   import TabAbout from './lib/TabAbout.svelte';
 
@@ -138,6 +139,12 @@
 
   function currentResolutionName() {
     return resolutionNames.get(`${app.displayInfo.width}x${app.displayInfo.height}`) || '';
+  }
+
+  // Anything wider than a standard 16:9 panel (1.9 gives headroom above
+  // 16:9's 1.78 without also catching it) is treated as ultrawide.
+  function isUltrawide(width, height) {
+    return width / height > 1.9;
   }
 
   // Flat list sorted largest-first, matching the plain (ungrouped) style
@@ -284,10 +291,11 @@
     };
   });
 
-  // HDR luminance is a DXGI call; only refresh while the Debug tab is
-  // open, at a gentle 5-second cadence (purely informational).
+  // HDR luminance is a DXGI call; only refresh while the System Info tab is
+  // open (it owns the HDR Max Luminance row), at a gentle 5-second cadence
+  // (purely informational).
   $effect(() => {
-    if (app.activeTab === 'debug' && windowVisible) {
+    if (app.activeTab === 'system' && windowVisible) {
       pollHDRLuminance();
       const timer = setInterval(() => pollHDRLuminance(), 5000);
       return () => clearInterval(timer);
@@ -344,6 +352,8 @@
         <TabHotkeys />
       {:else if app.activeTab === 'debug'}
         <TabDebug />
+      {:else if app.activeTab === 'system'}
+        <TabSystem />
       {:else if app.activeTab === 'settings'}
         <TabSettings />
       {:else if app.activeTab === 'about'}
@@ -377,10 +387,11 @@
                   {@const name = resolutionName(resolution)}
                   {@const current = resolution.width === app.displayInfo.width && resolution.height === app.displayInfo.height}
                   {@const recommended = isRecommendedResolution(resolution)}
+                  {@const ultrawide = isUltrawide(resolution.width, resolution.height)}
                   <button type="button" class="hz-menu-item" class:active={current}
                     role="option" aria-selected={current}
                     onclick={() => pickResolution(resolution.width, resolution.height)}>
-                    {resolution.width}×{resolution.height}{name ? ` · ${name}` : ''}{recommended ? ' (Recommended)' : ''}
+                    {resolution.width}×{resolution.height}{#if ultrawide}<span class="ultrawide-tag"><span class="ultrawide-separator">·</span><svg class="ultrawide-icon" viewBox="0 0 24 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="22.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="12" y="10.8" text-anchor="middle" fill="currentColor" font-size="8" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}{name ? ` · ${name}` : ''}{recommended ? ' (Recommended)' : ''}
                   </button>
                 {/each}
             {/if}
@@ -403,7 +414,7 @@
         </button>
         {#if hzMenuOpen}
           <div class="hz-menu" bind:this={hzMenuEl} role="listbox" aria-label="Refresh rate options">
-            {#each app.displayInfo.refreshRates as hz}
+            {#each [...app.displayInfo.refreshRates].sort((a, b) => b - a) as hz}
               <button type="button" class="hz-menu-item" class:active={hz === app.displayInfo.refreshRateHz}
                 role="option" aria-selected={hz === app.displayInfo.refreshRateHz}
                 onclick={() => pickHz(hz)}>

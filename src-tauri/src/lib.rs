@@ -1,13 +1,13 @@
-mod gamma_ramp;
-mod window_icon;
-mod display_info;
 mod config;
-mod taskbar_dimmer;
+mod display_info;
+mod gamma_ramp;
 mod hdr_toggle;
+mod taskbar_dimmer;
+mod window_icon;
 
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
 use tauri::{
@@ -26,30 +26,50 @@ struct TrayState {
 // lightweight safety thread re-applies every 2 seconds so another app
 // resetting the system gamma (fullscreen games, driver updates) is
 // corrected without user interaction.
+struct GammaShutdown {
+    requested: AtomicBool,
+    wake: Condvar,
+    lock: Mutex<()>,
+}
+
 struct GammaState {
     desired: Arc<AtomicI32>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Arc<GammaShutdown>,
     safety_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for GammaState {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.shutdown.requested.store(true, Ordering::Release);
+        self.shutdown.wake.notify_one();
         if let Ok(mut guard) = self.safety_thread.lock() {
             if let Some(handle) = guard.take() {
                 let _ = handle.join();
             }
         }
-        unsafe { gamma_ramp::reset_display_ramp(); }
+        unsafe {
+            gamma_ramp::reset_display_ramp();
+        }
     }
 }
 
-fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<AtomicBool>) {
-    while !shutdown.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        if shutdown.load(Ordering::Relaxed) {
+fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
+    loop {
+        let guard = shutdown
+            .lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (_guard, _timeout) = shutdown
+            .wake
+            .wait_timeout_while(guard, std::time::Duration::from_secs(2), |_| {
+                !shutdown.requested.load(Ordering::Acquire)
+            })
+            .unwrap_or_else(|error| error.into_inner());
+        if shutdown.requested.load(Ordering::Acquire) {
             break;
         }
+        // A timeout is the normal two-second safety tick. The predicate also
+        // closes the lost-notification race during shutdown.
         let value = desired.load(Ordering::Relaxed);
         // When black lift is zero the system ramp is linear (OS default) —
         // nothing to restore. Skip the GDI call to keep the thread truly idle
@@ -58,7 +78,9 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<AtomicBool>) {
             continue;
         }
         let ramp = gamma_ramp::build_ramp(value);
-        unsafe { gamma_ramp::set_display_ramp(&ramp); }
+        unsafe {
+            gamma_ramp::set_display_ramp(&ramp);
+        }
     }
 }
 
@@ -66,8 +88,95 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<AtomicBool>) {
 // caller's thread (the Tauri command thread) and returns immediately. No
 // background polling, no IPC delay. A separate safety thread re-applies at
 // 2-second intervals to recover from external gamma resets.
+// ── Pre-WebView log history ────────────────────────────────────────────────
+// tauri-plugin-log's Webview target only forwards records while the frontend
+// listener is attached; records logged before then (setup, config load, tray
+// and dimmer initialization) are emitted as events with no listener and
+// dropped. This extra Dispatch target captures those early records into a
+// bounded ring buffer, and the frontend drains them via take_log_history
+// right after it attaches the listener — so the terminal, file, Debug tab,
+// and DevTools stay 1:1 even for startup records.
+mod log_history {
+    use serde::Serialize;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const MAX_HISTORY: usize = 512;
+
+    #[derive(Serialize, Clone)]
+    pub struct LogHistoryEntry {
+        pub level: String,
+        pub message: String,
+        // Wall-clock ms at capture time, so the frontend can replay startup
+        // records with their true timestamps and in their true order instead
+        // of stamping them with the (later) replay time.
+        pub ts_ms: u64,
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    static HISTORY: Mutex<VecDeque<LogHistoryEntry>> = Mutex::new(VecDeque::new());
+    static REPLAYED: AtomicBool = AtomicBool::new(false);
+
+    fn level_str(level: log::Level) -> &'static str {
+        match level {
+            log::Level::Trace => "trace",
+            log::Level::Debug => "debug",
+            log::Level::Info => "info",
+            log::Level::Warn => "warn",
+            log::Level::Error => "error",
+        }
+    }
+
+    fn capture(level: log::Level, message: String) {
+        if REPLAYED.load(Ordering::Relaxed) {
+            return; // live event stream is the single source now
+        }
+        if let Ok(mut history) = HISTORY.lock() {
+            if history.len() >= MAX_HISTORY {
+                history.pop_front();
+            }
+            history.push_back(LogHistoryEntry {
+                level: level_str(level).to_string(),
+                message,
+                ts_ms: now_ms(),
+            });
+        }
+    }
+
+    // Runs inside tauri-plugin-log's fern pipeline as an extra target, so the
+    // exact same record that reaches stdout/file/webview is captured here.
+    pub fn fern_dispatch() -> fern::Dispatch {
+        fern::Dispatch::new().chain(fern::Output::call(|record: &log::Record| {
+            capture(record.level(), record.args().to_string());
+        }))
+    }
+
+    // Drains the buffer once and stops buffering. Called by main.js after the
+    // log://log listener resolves; from then on records flow live only.
+    #[tauri::command]
+    pub fn take_log_history() -> Vec<LogHistoryEntry> {
+        REPLAYED.store(true, Ordering::Relaxed);
+        let mut drained = Vec::new();
+        if let Ok(mut history) = HISTORY.lock() {
+            drained = history.drain(..).collect();
+        }
+        drained
+    }
+}
+
 #[tauri::command]
 fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), String> {
+    // Frontend clamps to ±150 already; clamp here too so a stray caller can
+    // never drive the ramp math with an extreme value.
+    let black_lift = black_lift.clamp(-150, 150);
     let ramp = gamma_ramp::build_ramp(black_lift);
     let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
     if !applied {
@@ -77,34 +186,19 @@ fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), Str
     Ok(())
 }
 
-// Bridge for frontend console/log lines and uncaught JS errors, so the
-// on-disk log captures what happened even if the app hangs or crashes
+// Bridge for frontend warnings/errors and uncaught JS errors, so the
+// on-disk log captures actionable failures even if the app hangs or crashes
 // before the user can open DevTools or the in-app Diagnostics tab.
 #[tauri::command]
 fn log_frontend(level: String, message: String) {
+    // Keep the message untouched. The terminal/file formatter, Debug tab, and
+    // DevTools all receive this same message through the canonical log record.
     match level.as_str() {
-        "error" => log::error!("[frontend] {message}"),
-        "warn" => log::warn!("[frontend] {message}"),
-        _ => log::info!("[frontend] {message}"),
-    }
-}
-
-// Wipes the WebView2 HTTP cache (and other stored web data — this app uses
-// none). Tray restarts on older builds hard-killed the process mid-write
-// (Tauri's app.restart() calls std::process::exit(0)), which corrupted cache
-// entries for some embedded icons; the corrupt responses were then served as
-// broken images on the next launch. The pre-build purge (purge_webview_cache)
-// is the primary mechanism — this command is a fallback that clears through
-// the WebView2 API itself, so it works even if the purge's hardcoded path
-// ever stops matching. Called by the frontend a couple of seconds after
-// mount, after the (healthy) initial page load has settled.
-#[tauri::command]
-fn clear_webview_cache(app: tauri::AppHandle) -> Result<(), String> {
-    match app.get_webview_window("main") {
-        Some(window) => window
-            .clear_all_browsing_data()
-            .map_err(|error| error.to_string()),
-        None => Err("main window not found".into()),
+        "trace" => log::trace!("{message}"),
+        "debug" => log::debug!("{message}"),
+        "error" => log::error!("{message}"),
+        "warn" => log::warn!("{message}"),
+        _ => log::info!("{message}"),
     }
 }
 
@@ -134,13 +228,16 @@ fn show_main_window(app: &AppHandle) {
 
 fn shutdown_gamma_worker(app: &AppHandle) {
     let state = app.state::<GammaState>();
-    state.shutdown.store(true, Ordering::Release);
+    state.shutdown.requested.store(true, Ordering::Release);
+    state.shutdown.wake.notify_one();
     if let Ok(mut guard) = state.safety_thread.lock() {
         if let Some(handle) = guard.take() {
             let _ = handle.join();
         }
     }
-    unsafe { gamma_ramp::reset_display_ramp(); }
+    unsafe {
+        gamma_ramp::reset_display_ramp();
+    }
     config::shutdown();
 }
 
@@ -151,42 +248,30 @@ fn request_shutdown_and_exit(app: &AppHandle) {
 }
 
 fn request_restart(app: &AppHandle) {
-    // In dev mode the app runs under `tauri dev`, which owns the vite dev
-    // server. Exiting this process tears the whole dev environment down
-    // (vite included), so a spawned replacement instance would be left with
-    // no dev server — the page can't even load, and any asset requested
-    // after the teardown renders as a broken icon. Reload the webview
-    // instead: the frontend fully re-initializes (config reload, dimmer and
-    // gamma re-sync) while the Rust backend and the dev server stay alive.
-    if tauri::is_dev() {
-        log::info!("dev-mode restart: reloading webview (process stays alive so the dev server survives)");
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.reload();
+    // Always perform a real process restart, including when launched through
+    // `tauri dev`. Spawn first so a failure leaves the current instance fully
+    // functional rather than closing the app.
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            log::error!("failed to locate replacement executable: {error}");
+            return;
         }
+    };
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    args.push("--restart-parent".into());
+    args.push(std::process::id().to_string().into());
+    if let Err(error) = std::process::Command::new(exe).args(args).spawn() {
+        log::error!("failed to spawn replacement instance: {error}");
         return;
     }
 
-    // Production path: real process restart.
     taskbar_dimmer::shutdown();
     shutdown_gamma_worker(app);
-    // Tauri's app.restart() spawns the new process and then hard-exits via
-    // std::process::exit(0), which kills WebView2 mid-write. The abrupt
-    // termination corrupts the WebView2 disk cache in the shared user-data
-    // folder, and on the next launch the webview serves the corrupt cached
-    // responses — the broken icon images after a tray restart. Spawn the
-    // replacement instance first, then exit through the event loop
-    // (app.exit) so WebView2 flushes its cache and releases the user-data
-    // folder before the new process opens it. The child is told which PID to
-    // wait for (--restart-parent) so it never starts WebView2 while the old
-    // process still holds the user-data folder or cache files.
-    if let Ok(exe) = std::env::current_exe() {
-        let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        args.push("--restart-parent".into());
-        args.push(std::process::id().to_string().into());
-        if let Err(e) = std::process::Command::new(exe).args(args).spawn() {
-            log::error!("failed to spawn replacement instance: {e}");
-        }
-    }
+    // Spawn the replacement before leaving the event loop so the next process
+    // has a guaranteed handoff path. The child waits for this PID to exit
+    // (--restart-parent) before initializing WebView2, preventing overlapping
+    // browser/profile lifetimes during a tray restart.
     app.exit(0);
 }
 
@@ -199,85 +284,69 @@ fn set_tray_enabled(
     let tray = app
         .tray_by_id("main-tray")
         .ok_or_else(|| "system tray icon is not available".to_string())?;
-    tray.set_visible(enabled).map_err(|error| error.to_string())?;
+    tray.set_visible(enabled)
+        .map_err(|error| error.to_string())?;
     state.enabled.store(enabled, Ordering::Relaxed);
     Ok(())
 }
 
 // When this instance was spawned by a tray Restart, --restart-parent carries
-// the old process's PID. Wait for it to fully exit (bounded, ~5 s) before
-// creating the WebView2 environment: starting the new instance while the old
-// one still holds the user-data folder makes WebView2 attach to the old
-// process's browser process, which is being torn down — in-flight asset
-// requests then abort and some images render as broken icons. Polling with
-// GetExitCodeProcess is cheaper and more reliable than waiting on a named
-// event, and it also fails safe (if the parent is already gone, OpenProcess
-// errors and we proceed immediately).
+// the old process's PID. Wait for it to fully exit before creating the
+// WebView2 environment. A vanished parent is success; a live parent remains
+// polled with low-frequency warnings until it exits.
 #[cfg(target_os = "windows")]
-fn wait_for_restart_parent(parent_pid: u32) {
-    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+fn wait_for_restart_parent(parent_pid: u32) -> bool {
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+    };
     use windows::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) else {
-            return; // parent already gone — nothing to wait for
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // ERROR_INVALID_PARAMETER means the PID no longer exists;
+                // other failures (for example, an access restriction) do not
+                // prove that the parent released the WebView2 profile.
+                if GetLastError() == ERROR_INVALID_PARAMETER {
+                    log::info!("restart parent {parent_pid} is already gone");
+                    return true;
+                }
+                log::error!(
+                    "could not inspect restart parent {parent_pid}: {error}; aborting replacement"
+                );
+                return false;
+            }
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last_warning = std::time::Instant::now();
         loop {
             let mut exit_code = 0u32;
-            let _ = GetExitCodeProcess(handle, &mut exit_code);
-            if exit_code != STILL_ACTIVE.0 as u32 {
-                break;
+            if GetExitCodeProcess(handle, &mut exit_code).is_err() {
+                let _ = CloseHandle(handle);
+                log::error!(
+                    "could not read restart parent {parent_pid} status; aborting replacement"
+                );
+                return false;
             }
-            if std::time::Instant::now() >= deadline {
-                log::warn!("restart parent {parent_pid} did not exit within 5s — continuing anyway");
-                break;
+            if exit_code != STILL_ACTIVE.0 as u32 {
+                let _ = CloseHandle(handle);
+                return true;
+            }
+            if last_warning.elapsed() >= std::time::Duration::from_secs(5) {
+                log::warn!("restart parent {parent_pid} is still shutting down; replacement remains waiting");
+                last_warning = std::time::Instant::now();
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let _ = CloseHandle(handle);
-    }
-}
-
-// Deletes the WebView2 HTTP disk cache before the webview starts. Tray
-// restarts on older builds hard-killed the process mid-write (Tauri's
-// app.restart() → std::process::exit(0)), corrupting cache entries for some
-// embedded icons; on the next launch WebView2 served the corrupt responses
-// and those icons rendered as the broken-image logo. The cache has no value
-// here — every asset is embedded in the binary or served fresh by the dev
-// server — so purge it once per launch to guarantee a stale entry can never
-// be served. Runs before tauri::Builder is built, so WebView2 isn't running
-// and no cache file is locked.
-#[cfg(target_os = "windows")]
-fn purge_webview_cache() {
-    let base = std::env::var("LOCALAPPDATA")
-        .or_else(|_| std::env::var("APPDATA"))
-        .unwrap_or_default();
-    if base.is_empty() {
-        return;
-    }
-    // Default WebView2 user-data folder for the "OledHelper" identifier:
-    // %LOCALAPPDATA%\OledHelper\EBWebView\Default\Cache. NOTE: this path
-    // depends on the app identifier in tauri.conf.json — if it is ever
-    // renamed, the purge silently no-ops (NotFound is swallowed) and the
-    // frontend clear_webview_cache fallback still covers the cleanup.
-    let cache_dir = std::path::Path::new(&base)
-        .join("OledHelper")
-        .join("EBWebView")
-        .join("Default")
-        .join("Cache");
-    match std::fs::remove_dir_all(&cache_dir) {
-        Ok(()) => log::info!("purged WebView2 disk cache at {}", cache_dir.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("could not purge WebView2 cache: {e}"),
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Tray-restart child: let the old instance release the user-data folder
-    // and cache files before we start WebView2.
+    // before we start WebView2. If the parent remains alive or its state cannot
+    // be verified, abort this child rather than competing for the profile.
     #[cfg(target_os = "windows")]
     {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -287,16 +356,21 @@ pub fn run() {
                 .and_then(|arg| arg.to_str())
                 .and_then(|text| text.parse::<u32>().ok())
             {
-                wait_for_restart_parent(pid);
+                if !wait_for_restart_parent(pid) {
+                    return;
+                }
             }
         }
-        purge_webview_cache();
     }
 
     tauri::Builder::default()
         .manage(GammaState {
             desired: Arc::new(AtomicI32::new(0)),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(GammaShutdown {
+                requested: AtomicBool::new(false),
+                wake: Condvar::new(),
+                lock: Mutex::new(()),
+            }),
             safety_thread: Mutex::new(None),
         })
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
@@ -306,7 +380,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             apply_gamma_ramp,
             log_frontend,
-            clear_webview_cache,
             get_display_info,
             set_refresh_rate,
             set_resolution,
@@ -314,6 +387,7 @@ pub fn run() {
             config::load_config,
             config::save_config,
             config::reset_config,
+            log_history::take_log_history,
             taskbar_dimmer::set_taskbar_dimmer,
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
             taskbar_dimmer::set_taskbar_dimmer_detection,
@@ -355,15 +429,30 @@ pub fn run() {
             // and the console bridge in main.js for how JS-side output gets in.
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
-                    .level(log::LevelFilter::Info)
+                    .level(log::LevelFilter::Trace)
+                    // tao's event-loop runner emits DEBUG lifecycle
+                    // diagnostics ("NewEvents emitted without explicit
+                    // RedrawEventsCleared" on every window focus/redraw when
+                    // clicking the app) that are noise, not problems. Cap the
+                    // whole tao module at Info so they are suppressed in every
+                    // destination (stdout, file, Debug tab, DevTools) while
+                    // real tao warnings/errors still pass through.
+                    .level_for("tao", log::LevelFilter::Info)
                     .max_file_size(5_000_000)
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                    // The same logger record is fanned out to terminal, file,
+                    // and the frontend event consumed by main.js. Keeping one
+                    // logger target set prevents the three views from drifting.
+                    .target(tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::Webview,
+                    ))
+                    // Captures records emitted before the WebView attaches its
+                    // listener, for the startup replay in main.js.
+                    .target(tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::Dispatch(log_history::fern_dispatch()),
+                    ))
                     .build(),
             )?;
-
-            // Let display_info's EDID diagnostics reach the Runtime Log (the
-            // Debug tab mirrors the "runtime-log" event in main.js).
-            display_info::init_app_handle(app.handle().clone());
 
             let saved_config = config::load_config(app.handle().clone());
             app.state::<TrayState>()
@@ -393,7 +482,8 @@ pub fn run() {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
-                    } = event {
+                    } = event
+                    {
                         show_main_window(tray.app_handle());
                     }
                 })

@@ -5,110 +5,170 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { pushGpuLog } from './lib/stores.svelte.js'
 
-// ── Forward uncaught errors / console output to the Rust-side file log ─────
-// This runs before App mounts, so it catches crashes that happen during
-// mount/init too — not just ones the in-app Diagnostics tab can display
-// (that tab only exists once Svelte has successfully mounted). Best-effort:
-// swallow failures here, since logging must never itself break startup.
-function logToFile(level, message) {
-  try { invoke('log_frontend', { level, message }).catch(() => {}); } catch (_) {}
-}
+// The Rust tauri-plugin-log Webview target is the canonical fan-out path:
+// every record is written to stdout/file and emitted as `log://log`. We do not
+// write directly to the Debug store from console interception, because that
+// would make the three destinations diverge or duplicate records.
+const nativeConsole = {
+  trace: console.trace.bind(console),
+  debug: console.debug.bind(console),
+  info: console.info.bind(console),
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
 
-// Rust-native diagnostics (such as the taskbar overlay timer) use the same
-// runtime buffer as browser logs. They are already written to the Rust file
-// logger, so do not send them back through logToFile or they would duplicate.
-listen('runtime-log', (event) => {
-  const entry = event.payload;
-  if (!entry || typeof entry.message !== 'string') return;
-  const level = entry.level === 'error' || entry.level === 'warn' ? entry.level : 'info';
-  setTimeout(() => pushGpuLog(level, entry.message, { persist: false }), 0);
-}).catch(() => {});
+function normalizeLevel(level) {
+  if (typeof level === 'number') {
+    return ['trace', 'debug', 'info', 'warn', 'error'][Math.max(1, Math.min(5, level)) - 1] || 'info';
+  }
+  return ['trace', 'debug', 'info', 'warn', 'error'].includes(level) ? level : 'info';
+}
 
 function formatLogArg(value) {
   if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
   if (typeof value === 'string') return value;
-  try { return JSON.stringify(value); } catch (_) { return String(value); }
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? String(value) : json;
+  } catch (_) {
+    return String(value);
+  }
 }
 
-function mirrorRuntimeLog(level, args) {
-  const message = args.map(formatLogArg).join(' ');
-  // Defer the reactive-buffer write. Console calls can happen while a Svelte
-  // effect is executing; mutating gpuLogVersion synchronously there causes
-  // effect_update_depth_exceeded. The Rust file log remains immediate.
-  setTimeout(() => pushGpuLog(level, message, { persist: false }), 0);
-  logToFile(level, message);
+function formatConsoleArgs(args) {
+  return args.map(formatLogArg).join(' ');
 }
 
-window.addEventListener('error', (e) => {
-  const message = `Uncaught error: ${e.message} at ${e.filename}:${e.lineno}:${e.colno}\n${e.error?.stack || ''}`;
-  setTimeout(() => pushGpuLog('error', message, { persist: false }), 0);
-  logToFile('error', message);
-});
-window.addEventListener('unhandledrejection', (e) => {
-  const message = `Unhandled promise rejection: ${formatLogArg(e.reason)}`;
-  setTimeout(() => pushGpuLog('error', message, { persist: false }), 0);
-  logToFile('error', message);
+function showCanonicalRecord(level, message, ts) {
+  const method = nativeConsole[level] || nativeConsole.info;
+  // This is the only call that reaches DevTools. Since it uses the saved
+  // native method, it cannot re-enter the console interception below.
+  method(message);
+  // Svelte state is updated asynchronously so console calls from an $effect
+  // cannot trigger effect_update_depth_exceeded. `ts` is passed through for
+  // replayed startup records so the Debug tab shows their true log time.
+  setTimeout(() => pushGpuLog(level, message, ts), 0);
+}
+
+function sendFrontendRecord(level, message) {
+  // Rust assigns this record to the same log facade used by native messages;
+  // tauri-plugin-log then fans it out to stdout, file, Webview, and here.
+  try {
+    invoke('log_frontend', { level, message }).catch(() => {
+      // If the WebView is shutting down, there may be no Rust listener left.
+      // Keep the failure visible in DevTools without recursively logging it.
+      (nativeConsole[level] || nativeConsole.error)(message);
+    });
+  } catch (_) {
+    (nativeConsole[level] || nativeConsole.error)(message);
+  }
+}
+
+// Receive every Rust/native/frontend record from the plugin's Webview target.
+// Numeric levels are tauri-plugin-log's LogLevel repr: 1 trace, 2 debug,
+// 3 info, 4 warn, 5 error.
+let dedupeWindowActive = false;
+// Map of (level, message) -> count of live deliveries during the handshake.
+// Counts (not a Set) so two identical buffered records matching one live
+// record both still get replayed once.
+const liveDuringReplayWindow = new Map();
+
+listen('log://log', (event) => {
+  const payload = event.payload;
+  if (!payload || typeof payload.message !== 'string') return;
+  const level = normalizeLevel(payload.level);
+  const message = payload.message;
+  // Records emitted while the startup replay handshake is in flight can be
+  // BOTH buffered in Rust and delivered here live — remember them so the
+  // replay below skips them instead of printing duplicates.
+  if (dedupeWindowActive) {
+    const key = `${level}\u0000${message}`;
+    liveDuringReplayWindow.set(key, (liveDuringReplayWindow.get(key) || 0) + 1);
+  }
+  showCanonicalRecord(level, message);
+}).then(() => {
+  // The listener is live now. Drain Rust's pre-WebView history (setup, config
+  // load, tray/dimmer init) and replay it so startup records also reach the
+  // Debug tab and DevTools exactly once, keeping all three views 1:1.
+  dedupeWindowActive = true;
+  invoke('take_log_history').then((entries) => {
+    // True chronological order, oldest first, with their original timestamps.
+    const ordered = [...(entries || [])].sort((a, b) => (a.ts_ms || 0) - (b.ts_ms || 0));
+    for (const entry of ordered) {
+      if (!entry || typeof entry.message !== 'string') continue;
+      const level = normalizeLevel(entry.level);
+      const key = `${level}\u0000${entry.message}`;
+      const count = liveDuringReplayWindow.get(key);
+      if (count) { liveDuringReplayWindow.set(key, count - 1); continue; }
+      showCanonicalRecord(level, entry.message, entry.ts_ms);
+    }
+    // Keep the window open briefly for events still in flight, then close it.
+    setTimeout(() => {
+      liveDuringReplayWindow.clear();
+      dedupeWindowActive = false;
+    }, 250);
+  }).catch(() => { dedupeWindowActive = false; });
+}).catch(() => {});
+
+// Async config writes run on a Rust worker thread, so a background write
+// failure can't surface through the save_config invoke promise. Rust emits
+// this event instead; routing it through log_frontend keeps it in the same
+// 1:1 pipeline as everything else.
+listen('config-write-failed', (event) => {
+  sendFrontendRecord('warn', `[config] disk save failed: ${event.payload}`);
+}).catch(() => {});
+
+// Capture uncaught errors before Svelte mounts. They are sent to Rust and then
+// return through `log://log`, so each appears once in all three destinations.
+window.addEventListener('error', (event) => {
+  // Resource failures are handled by the capture-phase listener below.
+  if (event.target && event.target !== window) return;
+  const message = `Uncaught error: ${event.message} at ${event.filename}:${event.lineno}:${event.colno}\n${event.error?.stack || ''}`;
+  sendFrontendRecord('error', message);
 });
 
-// Capture-phase listener for failed subresource loads (broken icon after a
-// tray restart). Browser-generated resource errors do NOT reach window.onerror
-// or the console bridge above, so log them here explicitly with the failing
-// URL — that pinpoints whether an image failed to fetch (net::ERR_*), was
-// served a corrupt body, or failed to decode.
-window.addEventListener('error', (e) => {
-  const target = e.target;
+window.addEventListener('unhandledrejection', (event) => {
+  sendFrontendRecord('error', `Unhandled promise rejection: ${formatLogArg(event.reason)}`);
+});
+
+// Browser-generated resource errors do not reach window.onerror or console
+// interception. Convert them into normal canonical records instead. NOTE:
+// Chromium/WebView2 also prints its own native "Failed to load resource"
+// line to DevTools that JS cannot intercept, so resource failures appear
+// twice in DevTools (one native line + one canonical record) — the terminal,
+// file, and Debug tab see exactly one copy.
+window.addEventListener('error', (event) => {
+  const target = event.target;
   if (!target || !target.tagName) return;
   const tag = String(target.tagName).toLowerCase();
-  if (tag !== 'img' && tag !== 'script' && tag !== 'link' && tag !== 'audio' && tag !== 'video') return;
+  if (!['img', 'script', 'link', 'audio', 'video'].includes(tag)) return;
   const src = target.currentSrc || target.src || target.href || '';
-  const detail = (target.error && target.error.message) || e.message || '';
-  const message = `Resource load failed: <${tag}> ${src}${detail ? ` — ${detail}` : ''}`;
-  setTimeout(() => pushGpuLog('error', message, { persist: false }), 0);
-  logToFile('error', message);
+  const detail = (target.error && target.error.message) || event.message || '';
+  sendFrontendRecord('error', `Resource load failed: <${tag}> ${src}${detail ? ` — ${detail}` : ''}`);
 }, true);
 
-// Mirror all browser console levels to both the in-app Debug log and the
-// Rust-side file/terminal log. GPU call sites use these same console methods,
-// so they are included exactly once alongside Taskbar Dimmer and Settings
-// warnings/errors.
-const _consoleLog = console.log.bind(console);
-console.log = (...args) => { _consoleLog(...args); mirrorRuntimeLog('info', args); };
-const _consoleError = console.error.bind(console);
-console.error = (...args) => { _consoleError(...args); mirrorRuntimeLog('error', args); };
-const _consoleWarn = console.warn.bind(console);
-console.warn = (...args) => { _consoleWarn(...args); mirrorRuntimeLog('warn', args); };
 
-// Visible canary — proves the script even runs
+// Intercept every standard console level. The original call is deliberately
+// not made here; Rust is the single source of truth and the event above makes
+// the one corresponding DevTools call after the record is accepted by Rust.
+for (const level of ['trace', 'debug', 'info', 'log', 'warn', 'error']) {
+  console[level] = (...args) => sendFrontendRecord(level === 'log' ? 'info' : level, formatConsoleArgs(args));
+}
+
 document.title = 'OLED Helper';
-// Remove the loading fallback
 try { const pb = document.getElementById('preboot'); if (pb) pb.remove(); } catch (_) {}
 
 try {
   const target = document.getElementById('app');
   if (!target) throw new Error('#app not found');
 
-  const app = mount(App, { target });
-
-  // Block right-click context menu — this is an app, not a website
+  mount(App, { target });
   document.addEventListener('contextmenu', e => e.preventDefault());
-
-  console.log('OLED Helper mounted OK');
-  logToFile('info', 'OLED Helper mounted OK');
-
-  // Fallback layer for the Rust-side pre-build WebView2 cache purge: clears
-  // through the WebView2 API itself, so it works regardless of the purge's
-  // hardcoded path. Tray restarts on older builds hard-killed the process
-  // mid-write, corrupting cache entries for some embedded icons (served back
-  // as broken images). Delayed a couple of seconds so the already-healthy
-  // initial page load is not disturbed.
-  setTimeout(() => {
-    invoke('clear_webview_cache').catch((err) => {
-      logToFile('warn', `cache clear failed: ${String(err)}`);
-    });
-  }, 2000);
 } catch (e) {
   console.error('OLED Helper mount failed:', e);
-  // Show the error visibly so we can debug without DevTools
   document.body.innerHTML = `<div style="color:#E05555;padding:20px;font:14px monospace;background:#0D0D0F;height:100vh;">
     <h2>Startup Error</h2>
     <pre>${e.message}\n${e.stack || ''}</pre>

@@ -154,6 +154,9 @@
   {/if}
 
   <div class="settings-footer">
+    <button class="restore-defaults-btn" onclick={() => app.activeTab = 'system'}>
+      <img class="top-btn-icon" src={tabSystemIcon} alt="" /> System Info
+    </button>
     <button class="restore-defaults-btn" onclick={() => app.activeTab = 'debug'}>
       <img class="top-btn-icon" src={tabDebugIcon} alt="" /> Debug
     </button>

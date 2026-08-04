@@ -40,14 +40,18 @@ pub struct HdrCapability {
     pub enabled: bool,
 }
 
-fn query_active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+fn query_active_paths(
+) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
     const MAX_TOPOLOGY_RETRIES: usize = 4;
     unsafe {
         for attempt in 0..=MAX_TOPOLOGY_RETRIES {
             let mut path_count: u32 = 0;
             let mut mode_count: u32 = 0;
-            let sizes_result =
-                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count);
+            let sizes_result = GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS,
+                &mut path_count,
+                &mut mode_count,
+            );
             if sizes_result != ERROR_SUCCESS {
                 return Err(format!(
                     "GetDisplayConfigBufferSizes failed: {sizes_result:?}"
@@ -89,7 +93,9 @@ fn query_active_paths() -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONF
     }
 }
 
-fn get_advanced_color_info(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO> {
+fn get_advanced_color_info(
+    path: &DISPLAYCONFIG_PATH_INFO,
+) -> Option<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO> {
     unsafe {
         let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
             header: DISPLAYCONFIG_DEVICE_INFO_HEADER {

@@ -12,17 +12,17 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDIBits, GetDC,
-    GetObjectW, HGDIOBJ, ReleaseDC, RGBQUAD,
+    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS, HGDIOBJ, RGBQUAD,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, GetIconInfo, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL,
-    ICONINFO, IMAGE_ICON, LR_LOADFROMFILE, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+    DestroyIcon, GetIconInfo, GetSystemMetrics, LoadImageW, SendMessageW, ICONINFO, ICON_BIG,
+    ICON_SMALL, IMAGE_ICON, LR_LOADFROMFILE, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
     WM_SETICON,
 };
-use windows::core::PCWSTR;
 
 pub const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
 
@@ -50,7 +50,11 @@ fn materialize_icon_file() -> Option<PathBuf> {
     Some(path)
 }
 
-unsafe fn load_icon(path: &Path, cx: i32, cy: i32) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+unsafe fn load_icon(
+    path: &Path,
+    cx: i32,
+    cy: i32,
+) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
     let wide = to_wide(path.to_str()?);
     let handle = LoadImageW(
         None,
@@ -59,7 +63,8 @@ unsafe fn load_icon(path: &Path, cx: i32, cy: i32) -> Option<windows::Win32::UI:
         cx,
         cy,
         LR_LOADFROMFILE,
-    ).ok()?;
+    )
+    .ok()?;
     Some(windows::Win32::UI::WindowsAndMessaging::HICON(handle.0))
 }
 
@@ -190,7 +195,8 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
                     let row = &mask_bits[mask_y * mask_row_bytes as usize..];
                     for x in 0..bitmap_width as usize {
                         let bit = (row[x / 8] >> (7 - (x % 8))) & 1;
-                        rgba[(y * bitmap_width as usize + x) * 4 + 3] = if bit == 0 { 255 } else { 0 };
+                        rgba[(y * bitmap_width as usize + x) * 4 + 3] =
+                            if bit == 0 { 255 } else { 0 };
                     }
                 }
             } else {
@@ -205,7 +211,11 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
         let _ = DeleteObject(HGDIOBJ(icon_info.hbmMask.0));
         let _ = DestroyIcon(hicon);
 
-        Some(tauri::image::Image::new_owned(rgba, bitmap_width, bitmap_height))
+        Some(tauri::image::Image::new_owned(
+            rgba,
+            bitmap_width,
+            bitmap_height,
+        ))
     }
 }
 
@@ -236,7 +246,9 @@ pub fn apply_crisp_window_icon(hwnd_raw: isize) {
         if let Some(small) = load_icon(&icon_path, small_cx, small_cy) {
             if let Some(ref mut icons) = installed {
                 if icons.0 != 0 {
-                    let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(icons.0 as *mut _));
+                    let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(
+                        icons.0 as *mut _,
+                    ));
                 }
             }
             let _ = SendMessageW(
@@ -252,7 +264,9 @@ pub fn apply_crisp_window_icon(hwnd_raw: isize) {
         if let Some(big) = load_icon(&icon_path, big_cx, big_cy) {
             if let Some(ref mut icons) = installed {
                 if icons.1 != 0 {
-                    let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(icons.1 as *mut _));
+                    let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(
+                        icons.1 as *mut _,
+                    ));
                 }
             }
             let _ = SendMessageW(

@@ -2084,6 +2084,7 @@ dependencies = [
 name = "oled-helper"
 version = "0.1.0"
 dependencies = [
+ "fern",
  "log",
  "serde",
  "serde_json",

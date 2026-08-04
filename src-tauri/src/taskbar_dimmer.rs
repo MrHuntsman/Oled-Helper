@@ -2,12 +2,6 @@ use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
 
-#[derive(Clone, Serialize)]
-pub struct RuntimeLogEvent {
-    pub level: String,
-    pub message: String,
-}
-
 pub struct TaskbarDimmerState {
     pub enabled: Mutex<bool>,
     pub opacity: Mutex<f64>,
@@ -21,11 +15,14 @@ pub struct TaskbarDimmerState {
 
 impl Default for TaskbarDimmerState {
     fn default() -> Self {
+        // Must match config.rs's default_dimmer_ease_duration() (300 ms) — the
+        // frontend pushes its persisted values shortly after launch, but the
+        // state defaults govern the first ticks and reset-all.
         Self {
             enabled: Mutex::new(false),
             opacity: Mutex::new(0.95),
-            fade_in_duration_ms: Mutex::new(250),
-            fade_out_duration_ms: Mutex::new(250),
+            fade_in_duration_ms: Mutex::new(300),
+            fade_out_duration_ms: Mutex::new(300),
             overlay: Mutex::new(None),
         }
     }
@@ -43,36 +40,40 @@ pub struct TaskbarDimmerStatus {
 #[cfg(target_os = "windows")]
 mod platform {
     use std::ffi::c_void;
-    use std::sync::{atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering}, Condvar, Mutex, OnceLock};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
+        Condvar, Mutex, OnceLock,
+    };
     use std::thread::JoinHandle;
-    use tauri::{AppHandle, Emitter};
-    use super::RuntimeLogEvent;
     use std::time::{Duration, Instant};
+    use tauri::AppHandle;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, EndPaint, FillRect, GetStockObject, GetMonitorInfoW, HBRUSH, MONITORINFO,
-        MonitorFromWindow, BLACK_BRUSH, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+        BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, MonitorFromWindow,
+        BLACK_BRUSH, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect,
-        PostMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-        GetClassNameW, GetCursorPos, GetForegroundWindow, IsIconic, IsWindowVisible,
-        CallNextHookEx, DispatchMessageW, GetMessageW, MSG,
-        PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-        WH_MOUSE_LL, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_QUIT,
-        ShowWindow, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, LWA_ALPHA, SW_HIDE,
-        SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_SHOWWINDOW, SW_SHOW,
-        WS_MAXIMIZE, WM_APP, WM_NCHITTEST, WM_PAINT, WS_CAPTION, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
-        WNDCLASSW, HTTRANSPARENT,
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID,
     };
-    use windows::core::PCWSTR;
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::Security::{GetTokenInformation, GetSidSubAuthority, GetSidSubAuthorityCount, PSID};
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW,
+        GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+        GetWindowRect, IsIconic, IsWindowVisible, PostMessageW, PostThreadMessageW, RegisterClassW,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
+        TranslateMessage, UnhookWindowsHookEx, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE,
+        HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW,
+        SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP,
+        WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WNDCLASSW, WS_CAPTION,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_MAXIMIZE,
+        WS_POPUP, WS_THICKFRAME,
+    };
 
     // One adaptive timer handles both cursor polling and animation. It runs
     // at the fast cadence only while a transition is active.
@@ -102,7 +103,7 @@ mod platform {
     const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
     const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
     const EVENT_OBJECT_STATECHANGE: u32 = 0x800A;
-    const DEFAULT_EASE_DURATION_MS: u64 = 250;
+    const DEFAULT_EASE_DURATION_MS: u64 = 300; // must match config.rs default_dimmer_ease_duration()
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
 
@@ -143,7 +144,6 @@ mod platform {
 
     static FADE_STATE: OnceLock<Mutex<FadeState>> = OnceLock::new();
     static TICK_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-    static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
     // Per-detection toggle flags, settable from the Debug tab to isolate
     // which tick-time Win32 call is causing poll-gap stutter.
@@ -238,7 +238,7 @@ mod platform {
     // GetCursorPos poll interval in poll mode and as the elevated-fallback
     // poll interval in event mode. Default matches the previous hardcoded
     // IDLE_TIMER_INTERVAL_MS. Bounds enforced in the Tauri command below.
-    const DEFAULT_POLL_INTERVAL_MS: u32 = 500;
+    const DEFAULT_POLL_INTERVAL_MS: u32 = 100; // must match config.rs default_poll_interval() and the frontend store
     static POLL_INTERVAL_MS: AtomicU32 = AtomicU32::new(DEFAULT_POLL_INTERVAL_MS);
 
     pub fn set_poll_interval_ms(ms: u32) {
@@ -280,14 +280,12 @@ mod platform {
                 }
             } else {
                 stop_mouse_hook();
-                // Safety net: in event mode the hook is the primary hover
-                // detector and the cursor poll defaults off there. Disabling
-                // the hook must fall back to polling, otherwise both
-                // detectors would be off and hover detection would silently
-                // stop.
-                if PREFER_EVENT_HOVER.load(Ordering::Relaxed) {
-                    CURSOR_POLLING.store(true, Ordering::Relaxed);
-                }
+                // No fallback is forced here: the Debug-tab toggles are meant to
+                // be independent A/B switches, so disabling the hook leaves
+                // cursor polling exactly as the user set it (both may be off —
+                // that is an explicit test configuration). Switching the
+                // Detection Method in the dimmer tab re-syncs both defaults via
+                // set_hover_mode instead.
             }
         }
     }
@@ -341,15 +339,17 @@ mod platform {
             if process_id == 0 || process_id == std::process::id() {
                 return false;
             }
-            let process = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                false,
-                process_id,
-            );
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id);
             let Ok(process) = process else { return false };
             let mut token = windows::Win32::Foundation::HANDLE::default();
             const TOKEN_QUERY: u32 = 0x0008;
-            if OpenProcessToken(process, windows::Win32::Security::TOKEN_ACCESS_MASK(TOKEN_QUERY), &mut token).is_err() {
+            if OpenProcessToken(
+                process,
+                windows::Win32::Security::TOKEN_ACCESS_MASK(TOKEN_QUERY),
+                &mut token,
+            )
+            .is_err()
+            {
                 let _ = CloseHandle(process);
                 return false;
             }
@@ -467,7 +467,17 @@ mod platform {
                 ));
             }
         }
-        FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        // Only the foreground window (or a foreground-switch event) can flip
+        // fullscreen state — a location/state change on a background window
+        // cannot. Filtering here keeps system-wide window churn (other apps
+        // animating, tray balloons, background resizes) from triggering
+        // main-thread fullscreen rechecks on every event.
+        let foreground = unsafe { GetForegroundWindow() };
+        let affects_fullscreen =
+            event == EVENT_SYSTEM_FOREGROUND || (!foreground.0.is_null() && foreground == hwnd);
+        if affects_fullscreen {
+            FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        }
         // Event-driven taskbar cache: when an event targets the cached
         // taskbar window itself (drag to another edge, resize, auto-hide
         // slide, minimize), request an immediate cache refresh so the hook
@@ -503,7 +513,10 @@ mod platform {
             )
         };
         if foreground_hook.0.is_null() {
-            emit_runtime("warn", "[taskbar-dimmer] elevation WinEvent hook install failed".into());
+            emit_runtime(
+                "warn",
+                "[taskbar-dimmer] elevation WinEvent hook install failed".into(),
+            );
             ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
             ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
             return;
@@ -581,9 +594,15 @@ mod platform {
         }
         unsafe {
             let _ = UnhookWinEvent(foreground_hook);
-            if !movesize_hook.0.is_null() { let _ = UnhookWinEvent(movesize_hook); }
-            if !location_hook.0.is_null() { let _ = UnhookWinEvent(location_hook); }
-            if !statechange_hook.0.is_null() { let _ = UnhookWinEvent(statechange_hook); }
+            if !movesize_hook.0.is_null() {
+                let _ = UnhookWinEvent(movesize_hook);
+            }
+            if !location_hook.0.is_null() {
+                let _ = UnhookWinEvent(location_hook);
+            }
+            if !statechange_hook.0.is_null() {
+                let _ = UnhookWinEvent(statechange_hook);
+            }
         }
         ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
         ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
@@ -635,23 +654,20 @@ mod platform {
     }
 
     fn emit_runtime(level: &str, message: String) {
-        // Taskbar-dimmer logging is disabled by default: the hover/periodic
-        // tick diagnostics can fill the on-disk log while the app idles. The
-        // code stays in place — the Debug tab's "Verbose periodic logs" toggle
-        // flips VERBOSE_LOGGING to re-enable all of it for debugging.
-        if !VERBOSE_LOGGING.load(Ordering::Relaxed) {
+        // The standard logger is the single fan-out point: the terminal,
+        // rotating file, Debug tab, and DevTools all receive this exact record.
+        // Only the periodic info diagnostics are opt-in (to avoid idle log
+        // floods); warn/error records are real failures and always pass
+        // through, otherwise the exact clues needed to diagnose a broken
+        // hook or slow overlay update would be invisible by default.
+        let verbose_only = level != "warn" && level != "error";
+        if verbose_only && !VERBOSE_LOGGING.load(Ordering::Relaxed) {
             return;
         }
         match level {
             "warn" => log::warn!("{message}"),
             "error" => log::error!("{message}"),
             _ => log::info!("{message}"),
-        }
-        if let Some(app) = APP_HANDLE.get() {
-            let _ = app.emit("runtime-log", RuntimeLogEvent {
-                level: level.to_string(),
-                message,
-            });
         }
     }
 
@@ -709,8 +725,21 @@ mod platform {
                         drop(fade);
                         maintain_overlay_zorder(hwnd, Some((HWND(raw as *mut c_void), rect)));
                         let zorder_us = zorder_started.elapsed().as_micros();
-                        if zorder_us >= 2000 {
-                            emit_runtime("warn", format!("[taskbar-dimmer] slow_zorder_update duration_us={}", zorder_us));
+                        // A healthy repair routinely costs 2-5 ms: SetWindowPos
+                        // to HWND_TOPMOST triggers DWM z-order reflow plus shell
+                        // notifications, and the popup-menu FindWindowW scan and
+                        // owner check add to it. The old 2 ms floor fired on
+                        // every normal repair, spamming warn. Only >=10 ms
+                        // indicates a real stall (hung Explorer/DWM, pathological
+                        // shell state) worth surfacing.
+                        if zorder_us >= 10_000 {
+                            emit_runtime(
+                                "warn",
+                                format!(
+                                    "[taskbar-dimmer] slow_zorder_update duration_us={}",
+                                    zorder_us
+                                ),
+                            );
                         }
                     }
                 }
@@ -793,7 +822,8 @@ mod platform {
                 foreground,
                 Some(&mut process_id),
             );
-            if process_id == std::process::id() || process_id == 0 || IsIconic(foreground).as_bool() {
+            if process_id == std::process::id() || process_id == 0 || IsIconic(foreground).as_bool()
+            {
                 return false;
             }
 
@@ -846,23 +876,36 @@ mod platform {
     fn cursor_over_rect(rect: RECT) -> (bool, windows::Win32::Foundation::POINT) {
         let mut point = windows::Win32::Foundation::POINT::default();
         unsafe {
-            if GetCursorPos(&mut point).is_err() { return (false, point); }
+            if GetCursorPos(&mut point).is_err() {
+                return (false, point);
+            }
         }
         (
-            point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom,
+            point.x >= rect.left
+                && point.x < rect.right
+                && point.y >= rect.top
+                && point.y < rect.bottom,
             point,
         )
     }
 
     fn rect_text(rect: Option<RECT>) -> String {
         match rect {
-            Some(r) => format!("({},{} {}x{})", r.left, r.top, r.right - r.left, r.bottom - r.top),
+            Some(r) => format!(
+                "({},{} {}x{})",
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top
+            ),
             None => "none".into(),
         }
     }
 
     fn maintain_overlay_zorder(hwnd: HWND, info: Option<(HWND, RECT)>) {
-        let Some((taskbar, rect)) = info else { return; };
+        let Some((taskbar, rect)) = info else {
+            return;
+        };
         let popup_menu = open_popup_menu();
         unsafe {
             // Make the taskbar the popup owner. This keeps the overlay in the
@@ -890,7 +933,10 @@ mod platform {
                 // else re-shows it except this SetWindowPos(SWP_SHOWWINDOW),
                 // so a hidden→visible transition here marks the restore.
                 if !IsWindowVisible(hwnd).as_bool() {
-                    emit_runtime("info", "[taskbar-dimmer] overlay_reshown via zorder repair".into());
+                    emit_runtime(
+                        "info",
+                        "[taskbar-dimmer] overlay_reshown via zorder repair".into(),
+                    );
                 }
             }
             if let Err(error) = SetWindowPos(
@@ -902,7 +948,10 @@ mod platform {
                 rect.bottom - rect.top,
                 visibility | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
             ) {
-                emit_runtime("warn", format!("[taskbar-dimmer] z-order repair failed: {error}"));
+                emit_runtime(
+                    "warn",
+                    format!("[taskbar-dimmer] z-order repair failed: {error}"),
+                );
             }
             // Do not call BringWindowToTop or repeatedly ShowWindow here.
             // BringWindowToTop can activate/focus the overlay despite the
@@ -975,7 +1024,11 @@ mod platform {
             }
             // Wait the current interval (or a short poll while interval == 0),
             // waking early when update_fade notifies an interval change.
-            let wait_ms = if interval == 0 { 100u64 } else { interval as u64 };
+            let wait_ms = if interval == 0 {
+                100u64
+            } else {
+                interval as u64
+            };
             let (guard, wait_result) = TICK_WAKE_CONDVAR
                 .wait_timeout(guard, Duration::from_millis(wait_ms))
                 .unwrap();
@@ -1033,7 +1086,11 @@ mod platform {
     // to the virtual screen — the same source as the polling fallback — so
     // both detectors agree. Still event-driven: one cheap call per mouse
     // event, zero idle polling.
-    unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn mouse_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> LRESULT {
         if code >= 0 && MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed) {
             // Any mouse message (move, button, wheel) is a hover candidate,
             // so react to the whole mouse message range WM_MOUSEFIRST..=
@@ -1088,7 +1145,10 @@ mod platform {
                 // Hook unavailable (security software, broken system hook
                 // chain) — the tick thread's GetCursorPos fallback still
                 // detects hover, just with the idle-timer latency.
-                emit_runtime("warn", format!("[taskbar-dimmer] mouse hook install failed: {error}"));
+                emit_runtime(
+                    "warn",
+                    format!("[taskbar-dimmer] mouse hook install failed: {error}"),
+                );
                 MOUSE_HOOK.store(0, Ordering::Relaxed);
             }
         }
@@ -1147,7 +1207,9 @@ mod platform {
     }
 
     fn update_fade(hwnd: HWND) {
-        let Some(state) = FADE_STATE.get() else { return; };
+        let Some(state) = FADE_STATE.get() else {
+            return;
+        };
         let now = Instant::now();
 
         // Fullscreen suppression is decoupled from the animation tick: the
@@ -1174,25 +1236,28 @@ mod platform {
             // to install so detection never silently stops.
             let event_driven = PREFER_EVENT_HOVER.load(Ordering::Relaxed)
                 && ELEVATION_WINEVENT_HOOK.load(Ordering::Acquire) != 0;
-            let recheck_requested = event_driven
-                && FULLSCREEN_RECHECK_REQUESTED.swap(false, Ordering::Relaxed);
+            let recheck_requested =
+                event_driven && FULLSCREEN_RECHECK_REQUESTED.swap(false, Ordering::Relaxed);
             let timer_due = !event_driven
-                && now.duration_since(fade.last_fullscreen_check).as_millis() as u64 >= FULLSCREEN_CHECK_INTERVAL_MS;
+                && now.duration_since(fade.last_fullscreen_check).as_millis() as u64
+                    >= FULLSCREEN_CHECK_INTERVAL_MS;
             if recheck_requested || timer_due {
                 // since_last_ms shows the gap between consecutive rechecks —
                 // during a slow multi-step transition it grows to the full
                 // transition tail before the active flag finally drops.
-                let check_gap_ms = now.duration_since(fade.last_fullscreen_check).as_secs_f64() * 1000.0;
+                let check_gap_ms =
+                    now.duration_since(fade.last_fullscreen_check).as_secs_f64() * 1000.0;
                 fade.last_fullscreen_check = now;
                 let prev_active = fade.fullscreen_active;
                 drop(fade);
-                let active = FULLSCREEN_DETECTION.load(Ordering::Relaxed)
-                    && fullscreen_app_active(hwnd);
+                let active =
+                    FULLSCREEN_DETECTION.load(Ordering::Relaxed) && fullscreen_app_active(hwnd);
                 state.lock().unwrap().fullscreen_active = active;
                 if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                     // fg_class helps confirm the detection source — e.g. the
                     // desktop (WorkerW/Progman) must never count as fullscreen.
-                    let fg_class = window_class_name(unsafe { GetForegroundWindow() }).unwrap_or_default();
+                    let fg_class =
+                        window_class_name(unsafe { GetForegroundWindow() }).unwrap_or_default();
                     emit_runtime("info", format!(
                         "[taskbar-dimmer] fullscreen_check trigger={} active={} prev={} since_last_ms={:.1} fg_class={}",
                         if recheck_requested { "event" } else { "timer" },
@@ -1209,7 +1274,10 @@ mod platform {
                 if IsWindowVisible(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     if VERBOSE_LOGGING.load(Ordering::Relaxed) {
-                        emit_runtime("info", "[taskbar-dimmer] fullscreen_hide overlay hidden".into());
+                        emit_runtime(
+                            "info",
+                            "[taskbar-dimmer] fullscreen_hide overlay hidden".into(),
+                        );
                     }
                 }
             }
@@ -1231,10 +1299,25 @@ mod platform {
             let mut fade = state.lock().unwrap();
             if let Some(previous) = fade.last_poll_tick {
                 let gap_ms = now.duration_since(previous).as_secs_f64() * 1000.0;
-                let can_report = fade.last_poll_gap_diagnostic
+                let can_report = fade
+                    .last_poll_gap_diagnostic
                     .map(|last| now.duration_since(last) >= Duration::from_secs(1))
                     .unwrap_or(true);
-                if gap_ms >= 60.0 && can_report {
+                // The tick thread sleeps the FULL interval between ticks, so a
+                // healthy gap equals the cadence (the poll interval when idle,
+                // 16 ms during a fade) plus a few ms of timer/message overhead
+                // — NOT zero. The old fixed 60 ms floor fired on every tick of
+                // a 100 ms poll interval, spamming warn once per second. Flag
+                // only gaps that exceed the expected cadence by ~1.5x: that is
+                // real stutter (stalled message pump, modal loop, slow z-order
+                // repair), while a 16 ms fade cadence still keeps a 60 ms floor.
+                let interval = TICK_INTERVAL_MS.load(Ordering::Relaxed);
+                let expected_ms = if interval == 0 {
+                    POLL_INTERVAL_MS.load(Ordering::Relaxed) as f64
+                } else {
+                    interval as f64
+                };
+                if gap_ms >= (expected_ms * 1.5).max(60.0) && can_report {
                     fade.last_poll_gap_diagnostic = Some(now);
                     poll_gap_log = Some(format!("[taskbar-dimmer] poll_gap_ms={:.1}", gap_ms));
                 }
@@ -1257,7 +1340,10 @@ mod platform {
                 };
                 let refresh_cache = fade.cached_taskbar.is_none()
                     || cache_recheck_requested
-                    || now.duration_since(fade.last_taskbar_cache_refresh).as_millis() as u64 >= cache_interval;
+                    || now
+                        .duration_since(fade.last_taskbar_cache_refresh)
+                        .as_millis() as u64
+                        >= cache_interval;
                 if refresh_cache {
                     let trigger = if fade.cached_taskbar.is_none() {
                         "initial"
@@ -1270,7 +1356,8 @@ mod platform {
                     };
                     fade.last_taskbar_cache_refresh = now;
                     let previous = fade.cached_taskbar;
-                    fade.cached_taskbar = taskbar_info().map(|(taskbar, rect)| (taskbar.0 as isize, rect));
+                    fade.cached_taskbar =
+                        taskbar_info().map(|(taskbar, rect)| (taskbar.0 as isize, rect));
                     // Keep the hook's hit-test rect in sync with the cache so
                     // the two detectors never disagree about the taskbar.
                     *HOOK_TASKBAR_RECT.lock().unwrap() = fade.cached_taskbar.map(|(_, rect)| rect);
@@ -1278,11 +1365,14 @@ mod platform {
                         should_repair_zorder = true;
                     }
                     if VERBOSE_LOGGING.load(Ordering::Relaxed) {
-                        emit_runtime("info", format!(
-                            "[taskbar-dimmer] taskbar_cache refresh trigger={} taskbar={}",
-                            trigger,
-                            rect_text(fade.cached_taskbar.map(|(_, rect)| rect)),
-                        ));
+                        emit_runtime(
+                            "info",
+                            format!(
+                                "[taskbar-dimmer] taskbar_cache refresh trigger={} taskbar={}",
+                                trigger,
+                                rect_text(fade.cached_taskbar.map(|(_, rect)| rect)),
+                            ),
+                        );
                     }
                 }
             }
@@ -1297,8 +1387,8 @@ mod platform {
                 // 2) Event mode is active but the foreground is elevated (hook
                 //    can't provide accurate positions), so we fall back to
                 //    polling until the foreground returns to normal.
-                let should_poll = CURSOR_POLLING.load(Ordering::Relaxed)
-                    || (hook_active && elevated);
+                let should_poll =
+                    CURSOR_POLLING.load(Ordering::Relaxed) || (hook_active && elevated);
                 if should_poll {
                     let (is_hovered, point) = cursor_over_rect(rect);
                     hovered = is_hovered;
@@ -1328,7 +1418,11 @@ mod platform {
                 should_repair_zorder = true;
             }
 
-            let new_target = if fade.enabled && !hovered { fade.base_alpha } else { 0.0 };
+            let new_target = if fade.enabled && !hovered {
+                fade.base_alpha
+            } else {
+                0.0
+            };
             if (fade.target_alpha - new_target).abs() > 0.01 {
                 if fade.fade_tick_count > 0 {
                     transition_log = Some(transition_summary(&fade, "reversed", now));
@@ -1357,9 +1451,9 @@ mod platform {
 
             if fade.enabled && fade.transition_active {
                 if let Some(previous) = fade.last_fade_tick {
-                    fade.max_fade_tick_gap_ms = fade.max_fade_tick_gap_ms.max(
-                        now.duration_since(previous).as_secs_f64() * 1000.0,
-                    );
+                    fade.max_fade_tick_gap_ms = fade
+                        .max_fade_tick_gap_ms
+                        .max(now.duration_since(previous).as_secs_f64() * 1000.0);
                 }
                 fade.last_fade_tick = Some(now);
                 fade.fade_tick_count = fade.fade_tick_count.saturating_add(1);
@@ -1375,15 +1469,20 @@ mod platform {
                     let progress = if duration_ms == 0 {
                         1.0
                     } else {
-                        let duration = Duration::from_millis(duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS));
-                        (now.duration_since(fade.fade_start_time).as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
+                        let duration = Duration::from_millis(
+                            duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS),
+                        );
+                        (now.duration_since(fade.fade_start_time).as_secs_f64()
+                            / duration.as_secs_f64())
+                        .clamp(0.0, 1.0)
                     };
                     let eased = 1.0 - (1.0 - progress).powi(3);
                     fade.current_alpha = fade.start_alpha + distance * eased;
                     if progress >= 1.0 {
                         fade.current_alpha = fade.target_alpha;
                     }
-                    fade.max_alpha_jump = fade.max_alpha_jump.max((fade.current_alpha - before).abs());
+                    fade.max_alpha_jump =
+                        fade.max_alpha_jump.max((fade.current_alpha - before).abs());
                     alpha_to_apply = Some(fade.current_alpha.round().clamp(0.0, 255.0) as u8);
                 } else {
                     fade.current_alpha = fade.target_alpha;
@@ -1392,8 +1491,8 @@ mod platform {
                 // Only mark completion when this tick was actually advancing
                 // a transition. Otherwise an idle timer tick would look like
                 // a completed fade and reset the diagnostic counters.
-                transition_done = distance.abs() > 0.01
-                    && (fade.target_alpha - fade.current_alpha).abs() <= 0.01;
+                transition_done =
+                    distance.abs() > 0.01 && (fade.target_alpha - fade.current_alpha).abs() <= 0.01;
                 if transition_done {
                     fade.current_alpha = fade.target_alpha;
                     fade.start_alpha = fade.target_alpha;
@@ -1403,7 +1502,11 @@ mod platform {
             }
 
             let active = fade.enabled && fade.transition_active;
-            let desired_interval = if active { ACTIVE_TIMER_INTERVAL_MS } else { POLL_INTERVAL_MS.load(Ordering::Relaxed) };
+            let desired_interval = if active {
+                ACTIVE_TIMER_INTERVAL_MS
+            } else {
+                POLL_INTERVAL_MS.load(Ordering::Relaxed)
+            };
             // Swap + notify under the wake mutex so the tick thread's
             // read-then-wait (also under this mutex) sees either the new
             // interval or the notify — never a stale long sleep that would
@@ -1416,7 +1519,9 @@ mod platform {
                 drop(guard);
             }
 
-            if now.duration_since(fade.last_zorder_repair).as_millis() as u64 >= ZORDER_REPAIR_INTERVAL_MS {
+            if now.duration_since(fade.last_zorder_repair).as_millis() as u64
+                >= ZORDER_REPAIR_INTERVAL_MS
+            {
                 should_repair_zorder = true;
             }
             if should_repair_zorder {
@@ -1447,15 +1552,15 @@ mod platform {
                 .unwrap_or(false);
             if should_apply {
                 let started = Instant::now();
-                let result = unsafe {
-                    SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)
-                };
+                let result =
+                    unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) };
                 let duration = started.elapsed().as_micros();
                 if let Some(state) = FADE_STATE.get() {
                     let mut fade = state.lock().unwrap();
                     fade.max_layered_update_us = fade.max_layered_update_us.max(duration);
                     if duration >= 2000 {
-                        fade.slow_layered_update_count = fade.slow_layered_update_count.saturating_add(1);
+                        fade.slow_layered_update_count =
+                            fade.slow_layered_update_count.saturating_add(1);
                     }
                     if result.is_ok() {
                         // Only suppress future writes after Windows accepted
@@ -1464,10 +1569,13 @@ mod platform {
                     }
                 }
                 if let Err(error) = result {
-                    emit_runtime("warn", format!(
-                        "[taskbar-dimmer] layered_update_failed alpha={} error={}",
-                        alpha, error,
-                    ));
+                    emit_runtime(
+                        "warn",
+                        format!(
+                            "[taskbar-dimmer] layered_update_failed alpha={} error={}",
+                            alpha, error,
+                        ),
+                    );
                 }
             }
         }
@@ -1477,14 +1585,8 @@ mod platform {
         // The repair handler checks the throttle clock and the cached taskbar
         // geometry independently.
         if should_repair_zorder && ZORDER_REPAIR.load(Ordering::Relaxed) {
-            let _ = unsafe {
-                PostMessageW(
-                    Some(hwnd),
-                    WM_DIMMER_REPAIR_ZORDER,
-                    WPARAM(0),
-                    LPARAM(0),
-                )
-            };
+            let _ =
+                unsafe { PostMessageW(Some(hwnd), WM_DIMMER_REPAIR_ZORDER, WPARAM(0), LPARAM(0)) };
         }
         if let Some(message) = transition_log {
             emit_runtime("info", message);
@@ -1513,7 +1615,11 @@ mod platform {
             let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
             let overlay_rect = unsafe {
                 let mut rect = RECT::default();
-                if GetWindowRect(hwnd, &mut rect).is_ok() { Some(rect) } else { None }
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    Some(rect)
+                } else {
+                    None
+                }
             };
             // Cursor is only meaningful when it was actually polled this
             // tick; in event mode (hook-active, polling off) show n/a instead
@@ -1531,8 +1637,7 @@ mod platform {
         }
     }
 
-    pub fn create(app: &AppHandle) -> Result<isize, String> {
-        let _ = APP_HANDLE.set(app.clone());
+    pub fn create(_app: &AppHandle) -> Result<isize, String> {
         register_class();
         let name = class_name();
         let title = wide("OLED Helper Taskbar Dimmer");
@@ -1595,7 +1700,14 @@ mod platform {
         stop_elevation_win_event();
     }
 
-    pub fn apply(raw: isize, enabled: bool, opacity: f64, fade_in_duration_ms: u64, fade_out_duration_ms: u64, immediate: bool) -> Result<(), String> {
+    pub fn apply(
+        raw: isize,
+        enabled: bool,
+        opacity: f64,
+        fade_in_duration_ms: u64,
+        fade_out_duration_ms: u64,
+        immediate: bool,
+    ) -> Result<(), String> {
         let taskbar = taskbar_info().ok_or_else(|| "Windows taskbar was not found".to_string())?;
         let rect = taskbar.1;
         let hwnd = HWND(raw as *mut c_void);
@@ -1611,8 +1723,10 @@ mod platform {
             let mut fade = state.lock().unwrap();
             fade.enabled = enabled;
             fade.base_alpha = alpha;
-            fade.fade_in_duration_ms = fade_in_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
-            fade.fade_out_duration_ms = fade_out_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
+            fade.fade_in_duration_ms =
+                fade_in_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
+            fade.fade_out_duration_ms =
+                fade_out_duration_ms.clamp(MIN_EASE_DURATION_MS, MAX_EASE_DURATION_MS);
             let new_target = if enabled && !hovered { alpha } else { 0.0 };
             let now = Instant::now();
             if (fade.target_alpha - new_target).abs() > 0.01 {
@@ -1638,7 +1752,7 @@ mod platform {
                 fade.last_applied_alpha = Some(0);
             }
             if enabled {
-                fade.cached_taskbar = Some((taskbar.0.0 as isize, rect));
+                fade.cached_taskbar = Some((taskbar.0 .0 as isize, rect));
                 fade.last_taskbar_cache_refresh = Instant::now();
                 ensure_tick_thread();
                 // Event mode installs both hooks: the mouse hook for instant
@@ -1673,7 +1787,11 @@ mod platform {
                     .map_err(|e| format!("could not hide overlay: {e}"))?;
             }
 
-            let visibility = if enabled { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
+            let visibility = if enabled {
+                SWP_SHOWWINDOW
+            } else {
+                SWP_HIDEWINDOW
+            };
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -1701,7 +1819,9 @@ mod platform {
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    pub fn available() -> bool { false }
+    pub fn available() -> bool {
+        false
+    }
     pub fn set_verbose_logging(_enabled: bool) {}
     pub fn set_detection(_name: &str, _enabled: bool) {}
     pub fn set_hover_mode(_mode: &str) {}
@@ -1710,7 +1830,14 @@ mod platform {
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
-    pub fn apply(_raw: isize, _enabled: bool, _opacity: f64, _fade_in_duration_ms: u64, _fade_out_duration_ms: u64, _immediate: bool) -> Result<(), String> {
+    pub fn apply(
+        _raw: isize,
+        _enabled: bool,
+        _opacity: f64,
+        _fade_in_duration_ms: u64,
+        _fade_out_duration_ms: u64,
+        _immediate: bool,
+    ) -> Result<(), String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
 }
@@ -1724,12 +1851,21 @@ pub fn set_taskbar_dimmer(
     fade_out_duration_ms: u64,
     immediate: bool,
 ) -> Result<(), String> {
-    let raw = state.overlay.lock().unwrap().ok_or_else(|| {
-        "taskbar dimmer native overlay is not initialized".to_string()
-    })?;
+    let raw = state
+        .overlay
+        .lock()
+        .unwrap()
+        .ok_or_else(|| "taskbar dimmer native overlay is not initialized".to_string())?;
     let fade_in_duration_ms = fade_in_duration_ms.clamp(0, 1000);
     let fade_out_duration_ms = fade_out_duration_ms.clamp(0, 1000);
-    platform::apply(raw, enabled, opacity, fade_in_duration_ms, fade_out_duration_ms, immediate)?;
+    platform::apply(
+        raw,
+        enabled,
+        opacity,
+        fade_in_duration_ms,
+        fade_out_duration_ms,
+        immediate,
+    )?;
     *state.enabled.lock().unwrap() = enabled;
     *state.opacity.lock().unwrap() = opacity.clamp(0.0, 1.0);
     *state.fade_in_duration_ms.lock().unwrap() = fade_in_duration_ms;
@@ -1759,7 +1895,9 @@ pub fn set_taskbar_dimmer_hover_mode(mode: String) {
 
 #[tauri::command]
 pub fn set_taskbar_dimmer_poll_interval(ms: u32) {
-    platform::set_poll_interval_ms(ms.clamp(16, 2000));
+    // UI bounds: the frontend slider clamps 16..200, so keep the backend
+    // clamp identical instead of allowing a hidden 2000 ms ceiling.
+    platform::set_poll_interval_ms(ms.clamp(16, 200));
 }
 
 #[tauri::command]
