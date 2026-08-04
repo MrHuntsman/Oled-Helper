@@ -31,6 +31,12 @@ export const taskbarDimmer = $state({
   fadeInDurationMs: 300,
   fadeOutDurationMs: 300,
   available: true,
+  // 'event' = WH_MOUSE_LL hook (instant, low CPU, auto-fallback when elevated)
+  // 'poll'  = GetCursorPos polling (always works, slightly higher CPU)
+  hoverDetection: 'event',
+  // Polling cadence in ms, used as the poll-mode interval and as the
+  // elevated-foreground fallback interval in event mode.
+  pollIntervalMs: 500,
 });
 
 export const traySettings = $state({
@@ -46,6 +52,7 @@ export const dimmerDetections = $state({
   taskbarCache: true,
   zorder: true,
   cursor: true,
+  mouseHook: true,
 });
 
 export function setDimmerDetection(name, enabled) {
@@ -165,6 +172,15 @@ export async function loadConfig() {
     if (cfg && typeof cfg.tray_enabled === 'boolean') {
       traySettings.enabled = cfg.tray_enabled;
     }
+    if (cfg && typeof cfg.taskbar_dimmer_hover_detection === 'string') {
+      taskbarDimmer.hoverDetection = cfg.taskbar_dimmer_hover_detection;
+      // Sync the Rust side immediately on startup
+      invoke('set_taskbar_dimmer_hover_mode', { mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
+    }
+    if (cfg && typeof cfg.taskbar_dimmer_poll_interval_ms === 'number' && Number.isFinite(cfg.taskbar_dimmer_poll_interval_ms)) {
+      taskbarDimmer.pollIntervalMs = Math.max(16, Math.min(2000, Math.round(cfg.taskbar_dimmer_poll_interval_ms)));
+      invoke('set_taskbar_dimmer_poll_interval', { ms: taskbarDimmer.pollIntervalMs }).catch(() => {});
+    }
     try {
       const status = await invoke('get_taskbar_dimmer_status');
       if (status) taskbarDimmer.available = status.available !== false;
@@ -213,6 +229,8 @@ export function saveConfig() {
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
     taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
     taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,
+    taskbar_dimmer_hover_detection: taskbarDimmer.hoverDetection || 'event',
+    taskbar_dimmer_poll_interval_ms: taskbarDimmer.pollIntervalMs,
     tray_enabled: traySettings.enabled,
   } }).catch((e) => {
     console.warn('[config] save failed', e);
@@ -289,6 +307,28 @@ export function restoreTaskbarDimmerDefaults() {
 // fullscreen keeps the OS window/taskbar intact.
 export function setDimmerSuspendedForFullscreen(suspended) {
   invoke('set_taskbar_dimmer_suspended', { suspended }).catch(() => {});
+}
+
+export function setHoverDetection(mode) {
+  taskbarDimmer.hoverDetection = mode;
+  invoke('set_taskbar_dimmer_hover_mode', { mode }).catch((e) => {
+    console.warn('[hover-detection] toggle failed', e);
+    taskbarDimmer.hoverDetection = mode === 'event' ? 'poll' : 'event';
+  });
+}
+
+let pollIntervalSaveTimer = null;
+export function setPollIntervalMs(ms) {
+  const clamped = Math.max(16, Math.min(2000, Math.round(ms)));
+  taskbarDimmer.pollIntervalMs = clamped;
+  invoke('set_taskbar_dimmer_poll_interval', { ms: clamped }).catch((e) => {
+    console.warn('[poll-interval] update failed', e);
+  });
+  // Debounce the config write like the dimmer sliders elsewhere — a slider
+  // drag fires many updates per second, but only the settled value needs
+  // to be persisted to disk.
+  clearTimeout(pollIntervalSaveTimer);
+  pollIntervalSaveTimer = setTimeout(() => saveConfig(), 400);
 }
 
 export function setVerbosePeriodicLogging(enabled) {

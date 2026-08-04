@@ -170,6 +170,8 @@ pub fn run() {
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
             taskbar_dimmer::set_taskbar_dimmer_detection,
             taskbar_dimmer::set_taskbar_dimmer_suspended,
+            taskbar_dimmer::set_taskbar_dimmer_hover_mode,
+            taskbar_dimmer::set_taskbar_dimmer_poll_interval,
             taskbar_dimmer::get_taskbar_dimmer_status,
             hdr_toggle::get_windows_hdr_status,
             hdr_toggle::set_windows_hdr_enabled,

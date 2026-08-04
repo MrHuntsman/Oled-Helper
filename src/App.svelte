@@ -300,10 +300,10 @@
     </div>
     <div class="spacer"></div>
     <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
-      <img class="top-btn-icon" src="/icons/tab_system.png" alt="" /> Settings
+      <span class="top-btn-inner"><img class="top-btn-icon" src="/icons/tab_system.png" alt="" /> Settings</span>
     </button>
     <button class="top-btn" class:active={app.activeTab === 'about'} onclick={() => app.activeTab = 'about'}>
-      <img class="top-btn-icon" src="/icons/tab_about.png" alt="" /> About
+      <span class="top-btn-inner"><img class="top-btn-icon" src="/icons/tab_about.png" alt="" /> About</span>
     </button>
   </div>
 

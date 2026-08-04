@@ -48,6 +48,8 @@ pub struct AppConfig {
     pub taskbar_dimmer_fade_out_duration_ms: u64,
     #[serde(default = "default_true")]
     pub tray_enabled: bool,
+    #[serde(default = "default_hover_detection")]
+    pub taskbar_dimmer_hover_detection: String,
 }
 
 fn default_true() -> bool {
@@ -62,6 +64,10 @@ fn default_dimmer_ease_duration() -> u64 {
     250
 }
 
+fn default_hover_detection() -> String {
+    "event".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -72,6 +78,7 @@ impl Default for AppConfig {
             taskbar_dimmer_opacity: default_dimmer_opacity(),
             taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),
             taskbar_dimmer_fade_out_duration_ms: default_dimmer_ease_duration(),
+            taskbar_dimmer_hover_detection: default_hover_detection(),
             tray_enabled: true,
         }
     }

@@ -57,6 +57,9 @@ mod platform {
         CreateWindowExW, DefWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect,
         PostMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
         GetCursorPos, GetForegroundWindow, IsIconic, IsWindowVisible,
+        CallNextHookEx, DispatchMessageW, GetMessageW, MSG,
+        PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+        WH_MOUSE_LL, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_QUIT,
         ShowWindow, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, LWA_ALPHA, SW_HIDE,
         SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_SHOWWINDOW, SW_SHOW,
         WS_MAXIMIZE, WM_APP, WM_NCHITTEST, WM_PAINT, WS_CAPTION, WS_EX_LAYERED,
@@ -64,12 +67,17 @@ mod platform {
         WNDCLASSW, HTTRANSPARENT,
     };
     use windows::core::PCWSTR;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::Security::{GetTokenInformation, GetSidSubAuthority, GetSidSubAuthorityCount, PSID};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+
 
     // One adaptive timer handles both cursor polling and animation. It runs
     // at the fast cadence only while a transition is active.
     const WM_DIMMER_TICK: u32 = WM_APP;
     const WM_DIMMER_REPAIR_ZORDER: u32 = WM_APP + 1;
-    const IDLE_TIMER_INTERVAL_MS: u32 = 60;
     const ACTIVE_TIMER_INTERVAL_MS: u32 = 16;
     const TASKBAR_CACHE_REFRESH_MS: u64 = 1000;
     const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
@@ -80,6 +88,7 @@ mod platform {
     // re-queried at this slow cadence, so the fade timer can stay as fast as
     // possible without paying the detection cost every tick.
     const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
+    const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
     const DEFAULT_EASE_DURATION_MS: u64 = 250;
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
@@ -150,6 +159,60 @@ mod platform {
     static TICK_WAKE_CONDVAR: Condvar = Condvar::new();
     static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
     static SUSPENDED: AtomicBool = AtomicBool::new(false);
+    // WH_MOUSE_LL hover detection — instant fade triggers without polling.
+    // A dedicated thread hosts the hook (low-level hooks only fire on the
+    // installing thread's message loop) and converts mouse events into a
+    // fade wake. This decouples hover response from the tick cadence: the
+    // fade starts the moment the cursor crosses the taskbar edge instead of
+    // waiting for the next idle tick. The tick thread keeps the slow jobs
+    // (fullscreen detection, taskbar cache, z-order repair) and doubles as a
+    // GetCursorPos fallback when the hook can't see the cursor (elevated
+    // foreground windows don't reach a non-elevated hook) or is disabled
+    // from the Debug tab.
+    static ELEVATION_WINEVENT_HOOK: AtomicIsize = AtomicIsize::new(0); // HWINEVENTHOOK
+    static ELEVATION_WINEVENT_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+    static ELEVATION_WINEVENT_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0); // HHOOK handle, 0 = not installed
+    static MOUSE_HOOK_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+    static MOUSE_HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+    static MOUSE_HOOK_TOGGLE: AtomicBool = AtomicBool::new(true);
+    // Taskbar rect the hook hit-tests against, kept in sync with the cached
+    // taskbar geometry refreshed by update_fade and apply().
+    static HOOK_TASKBAR_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+    // Last hover state seen by either the hook (instant) or the poll
+    // fallback in update_fade. Written by both, read by update_fade.
+    static CURRENT_HOVER: AtomicBool = AtomicBool::new(false);
+    // True when the foreground window is at a higher integrity level than
+    // this process (e.g. an elevated admin prompt / game). WH_MOUSE_LL
+    // still fires, but MSLLHOOKSTRUCT.pt is zeroed — the hook callback
+    // can't GetCursorPos accurately either (the hook's thread is not
+    // trusted). When this is true, update_fade falls back to the tick
+    // thread's slow GetCursorPos poll so the overlay doesn't freeze.
+    static FOREGROUND_ELEVATED: AtomicBool = AtomicBool::new(false);
+    // When true (default), the hook is the primary hover detector and the
+    // tick thread only polls cursor when FOREGROUND_ELEVATED is true.
+    // When false, the hook is never installed and the tick thread always
+    // polls cursor at the idle cadence — a universal fallback for users
+    // whose security software, remote desktop, or other edge cases
+    // conflict with WH_MOUSE_LL.
+    static PREFER_EVENT_HOVER: AtomicBool = AtomicBool::new(true);
+    // User-configurable idle polling cadence (ms), used both as the
+    // GetCursorPos poll interval in poll mode and as the elevated-fallback
+    // poll interval in event mode. Default matches the previous hardcoded
+    // IDLE_TIMER_INTERVAL_MS. Bounds enforced in the Tauri command below.
+    const DEFAULT_POLL_INTERVAL_MS: u32 = 500;
+    static POLL_INTERVAL_MS: AtomicU32 = AtomicU32::new(DEFAULT_POLL_INTERVAL_MS);
+
+    pub fn set_poll_interval_ms(ms: u32) {
+        POLL_INTERVAL_MS.store(ms, Ordering::Relaxed);
+        // If the tick thread is currently idling (not mid-fade), wake it so
+        // the new interval takes effect immediately instead of waiting out
+        // whatever cadence was previously in flight.
+        let guard = TICK_WAKE_MUTEX.lock().unwrap();
+        TICK_INTERVAL_MS.store(ms, Ordering::Relaxed);
+        TICK_WAKE_CONDVAR.notify_all();
+        drop(guard);
+    }
 
     pub fn set_verbose_logging(enabled: bool) {
         VERBOSE_LOGGING.store(enabled, Ordering::Relaxed);
@@ -158,12 +221,214 @@ mod platform {
     pub fn set_detection(name: &str, enabled: bool) {
         let flag = match name {
             "fullscreen" => &FULLSCREEN_DETECTION,
-            "taskbar_cache" => &TASKBAR_CACHE_REFRESH,
+            "taskbar_cache" | "taskbarCache" => &TASKBAR_CACHE_REFRESH,
             "zorder" => &ZORDER_REPAIR,
             "cursor" => &CURSOR_POLLING,
+            "mouse_hook" | "mouseHook" => &MOUSE_HOOK_TOGGLE,
             _ => return,
         };
         flag.store(enabled, Ordering::Relaxed);
+        // Mouse-hook toggling needs lifecycle management beyond the flag: the
+        // hook is uninstalled when disabled and (re)installed when enabled
+        // while the dimmer is on, so the Debug tab can A/B test it live.
+        if name == "mouse_hook" || name == "mouseHook" {
+            if enabled {
+                let dimmer_on = FADE_STATE
+                    .get()
+                    .map(|state| state.lock().unwrap().enabled)
+                    .unwrap_or(false);
+                if dimmer_on {
+                    ensure_mouse_hook();
+                }
+            } else {
+                stop_mouse_hook();
+            }
+        }
+    }
+
+    pub fn set_hover_mode(mode: &str) {
+        let event = mode == "event";
+        PREFER_EVENT_HOVER.store(event, Ordering::Relaxed);
+        // If the dimmer is on, toggle the hook lifecycle to match. When
+        // switching to event mode: install the hook. When switching to
+        // poll mode: stop the hook (the tick thread keeps polling cursor
+        // regardless).
+        let dimmer_on = FADE_STATE
+            .get()
+            .map(|state| state.lock().unwrap().enabled)
+            .unwrap_or(false);
+        if dimmer_on {
+            if event {
+                ensure_mouse_hook();
+            } else {
+                stop_mouse_hook();
+            }
+        }
+    }
+
+    // Checks whether the foreground window runs at a higher integrity level
+    // than this process by reading the foreground process's token. Returns
+    // true when the foreground is elevated (admin prompt, UAC-high game)
+    // and the mouse hook can't provide accurate cursor positions.
+    fn check_foreground_elevation() -> bool {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            if foreground.0.is_null() {
+                return false;
+            }
+            let mut process_id = 0u32;
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                foreground,
+                Some(&mut process_id),
+            );
+            if process_id == 0 || process_id == std::process::id() {
+                return false;
+            }
+            let process = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                process_id,
+            );
+            let Ok(process) = process else { return false };
+            let mut token = windows::Win32::Foundation::HANDLE::default();
+            const TOKEN_QUERY: u32 = 0x0008;
+            if OpenProcessToken(process, windows::Win32::Security::TOKEN_ACCESS_MASK(TOKEN_QUERY), &mut token).is_err() {
+                let _ = CloseHandle(process);
+                return false;
+            }
+            let mut buffer = [0u8; 256];
+            let mut return_length = 0u32;
+            let result = GetTokenInformation(
+                token,
+                windows::Win32::Security::TOKEN_INFORMATION_CLASS(25),
+                Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+                buffer.len() as u32,
+                &mut return_length,
+            );
+            let _ = CloseHandle(token);
+            let _ = CloseHandle(process);
+            if result.is_err() {
+                return false;
+            }
+            // Parse the TOKEN_INTEGRITY_LEVEL struct from the buffer.
+            // The struct starts with a TOKEN_LABEL which has a SID_AND_ATTRIBUTES,
+            // and the first field of that is a PSID.
+            // SECURITY_MANDATORY_HIGH_RID = 0x3000. Any integrity level at
+            // or above High is elevated from our medium-integrity perspective.
+            // Verify the buffer is large enough for the response.
+            if return_length < 8 || return_length > buffer.len() as u32 {
+                return false;
+            }
+            // Parse the TOKEN_INTEGRITY_LEVEL from the buffer manually.
+            // The struct is: TOKEN_LABEL { SID_AND_ATTRIBUTES { PSID, Attributes } }
+            // The PSID is at offset 0 (8 bytes on 64-bit).
+            let sid_ptr = std::ptr::read::<*mut std::ffi::c_void>(buffer.as_ptr() as *const _);
+            if sid_ptr.is_null() {
+                return false;
+            }
+            let sid_authority = sid_ptr;
+            let sub_auth = GetSidSubAuthorityCount(PSID(sid_authority));
+            if sub_auth.is_null() || *sub_auth == 0 {
+                return false;
+            }
+            let count = (*sub_auth as u32) - 1;
+            let value = *GetSidSubAuthority(PSID(sid_authority), count);
+            const SECURITY_MANDATORY_HIGH_RID: u32 = 0x0000_3000;
+            value >= SECURITY_MANDATORY_HIGH_RID
+        }
+    }
+
+    // WinEvent callback for EVENT_SYSTEM_FOREGROUND. When the foreground
+    // window changes, re-check elevation and update the flag. This is a
+    // single event-driven call per foreground switch — zero polling.
+    unsafe extern "system" fn elevation_win_event_proc(
+        _h_hook: HWINEVENTHOOK,
+        _event: u32,
+        _hwnd: HWND,
+        _id_object: i32,
+        _id_child: i32,
+        _event_thread: u32,
+        _dwms_event_time: u32,
+    ) {
+        let elevated = check_foreground_elevation();
+        FOREGROUND_ELEVATED.store(elevated, Ordering::Relaxed);
+        // If the elevation state changed, poke the overlay to re-evaluate
+        // hover. The tick thread will pick up the right source (hook or
+        // poll) on the next tick.
+        post_dimmer_tick();
+    }
+
+    fn elevation_win_event_thread_loop() {
+        ELEVATION_WINEVENT_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+        let hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                None,
+                Some(elevation_win_event_proc),
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        if hook.0.is_null() {
+            emit_runtime("warn", "[taskbar-dimmer] elevation WinEvent hook install failed".into());
+            ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
+            ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
+            return;
+        }
+        ELEVATION_WINEVENT_HOOK.store(hook.0 as isize, Ordering::Release);
+        let mut msg = MSG::default();
+        unsafe {
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                let _ = DispatchMessageW(&msg);
+            }
+        }
+        unsafe { let _ = UnhookWinEvent(hook); }
+        ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
+        ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
+    }
+
+    fn ensure_elevation_win_event() {
+        let threads = ELEVATION_WINEVENT_THREAD.get_or_init(|| Mutex::new(None));
+        let mut guard = threads.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let handle = std::thread::Builder::new()
+            .name("taskbar-dimmer-elevation".into())
+            .spawn(elevation_win_event_thread_loop)
+            .expect("taskbar dimmer elevation WinEvent thread");
+        *guard = Some(handle);
+    }
+
+    fn stop_elevation_win_event() {
+        let thread_exists = ELEVATION_WINEVENT_THREAD
+            .get()
+            .map(|threads| threads.lock().unwrap().is_some())
+            .unwrap_or(false);
+        if !thread_exists {
+            ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut id = ELEVATION_WINEVENT_THREAD_ID.load(Ordering::Relaxed);
+        while id == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+            id = ELEVATION_WINEVENT_THREAD_ID.load(Ordering::Relaxed);
+        }
+        if id != 0 {
+            let _ = unsafe { PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        }
+        if let Some(threads) = ELEVATION_WINEVENT_THREAD.get() {
+            if let Ok(mut guard) = threads.lock() {
+                if let Some(handle) = guard.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
     }
 
     pub fn set_suspended(enabled: bool) {
@@ -429,7 +694,7 @@ mod platform {
             return;
         }
         TICK_THREAD_SHUTDOWN.store(false, Ordering::Relaxed);
-        TICK_INTERVAL_MS.store(IDLE_TIMER_INTERVAL_MS, Ordering::Relaxed);
+        TICK_INTERVAL_MS.store(POLL_INTERVAL_MS.load(Ordering::Relaxed), Ordering::Relaxed);
         let handle = std::thread::Builder::new()
             .name("taskbar-dimmer-tick".into())
             .spawn(tick_thread_loop)
@@ -484,29 +749,159 @@ mod platform {
             // Coalesce: don't post another tick if the previous one hasn't
             // been processed yet. This prevents queue buildup during modal
             // loops (window drag, menu open, etc.).
-            if TICK_POSTED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-            let overlay_raw = OVERLAY_HWND.load(Ordering::Acquire);
-            if overlay_raw == 0 {
-                TICK_POSTED.store(false, Ordering::Release);
-                continue;
-            }
-            let result = unsafe {
-                PostMessageW(
-                    Some(HWND(overlay_raw as *mut c_void)),
-                    WM_DIMMER_TICK,
-                    WPARAM(0),
-                    LPARAM(0),
-                )
-            };
-            if result.is_err() {
-                TICK_POSTED.store(false, Ordering::Release);
+            post_dimmer_tick();
+        }
+    }
+
+    // Posts a WM_DIMMER_TICK to the overlay, coalescing so at most one tick
+    // is queued at a time. Used by the tick thread (scheduled cadence) and by
+    // the mouse hook (instant hover-change wake).
+    fn post_dimmer_tick() {
+        if TICK_POSTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let overlay_raw = OVERLAY_HWND.load(Ordering::Acquire);
+        if overlay_raw == 0 {
+            TICK_POSTED.store(false, Ordering::Release);
+            return;
+        }
+        let result = unsafe {
+            PostMessageW(
+                Some(HWND(overlay_raw as *mut c_void)),
+                WM_DIMMER_TICK,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        if result.is_err() {
+            TICK_POSTED.store(false, Ordering::Release);
+        }
+    }
+
+    // WH_MOUSE_LL callback. The system delivers every mouse event to this
+    // procedure on the installing thread, which is what makes hover response
+    // instant. The hover hit-test itself uses GetCursorPos rather than
+    // MSLLHOOKSTRUCT.pt: the raw point can sit one or more pixels beyond the
+    // screen edge while the cursor rests against the left / bottom / right
+    // boundary (the taskbar's screen-edge sides), which would fail the rect
+    // test and make the overlay re-appear there. GetCursorPos always clamps
+    // to the virtual screen — the same source as the polling fallback — so
+    // both detectors agree. Still event-driven: one cheap call per mouse
+    // event, zero idle polling.
+    unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, _lparam: LPARAM) -> LRESULT {
+        if code >= 0 && MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed) {
+            // Any mouse message (move, button, wheel) is a hover candidate,
+            // so react to the whole mouse message range WM_MOUSEFIRST..=
+            // WM_MOUSEHWHEEL (0x0200..=0x020E).
+            let msg_type = wparam.0 as u32;
+            if (WM_MOUSEFIRST..=WM_MOUSEHWHEEL).contains(&msg_type) {
+                let hovered = {
+                    let guard = HOOK_TASKBAR_RECT.lock().unwrap();
+                    match *guard {
+                        Some(rect) => {
+                            let mut point = windows::Win32::Foundation::POINT::default();
+                            GetCursorPos(&mut point).is_ok()
+                                && point.x >= rect.left
+                                && point.x < rect.right
+                                && point.y >= rect.top
+                                && point.y < rect.bottom
+                        }
+                        None => false,
+                    }
+                };
+                if CURRENT_HOVER.swap(hovered, Ordering::AcqRel) != hovered {
+                    post_dimmer_tick();
+                }
             }
         }
+        CallNextHookEx(None, code, wparam, _lparam)
+    }
+
+    fn mouse_hook_thread_loop() {
+        // Registered first so stop_mouse_hook() can find this thread id even
+        // if a stop races an in-flight start (WM_QUIT queues before the loop
+        // begins and GetMessageW returns immediately).
+        MOUSE_HOOK_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+        let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) };
+        match hook {
+            Ok(hook) => {
+                MOUSE_HOOK.store(hook.0 as isize, Ordering::Release);
+                emit_runtime("info", "[taskbar-dimmer] mouse hook installed".into());
+                let mut msg = MSG::default();
+                unsafe {
+                    // Low-level hooks only fire while the installing thread
+                    // pumps messages; WM_QUIT ends the loop on shutdown.
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        let _ = DispatchMessageW(&msg);
+                    }
+                }
+                let _ = unsafe { UnhookWindowsHookEx(hook) };
+                MOUSE_HOOK.store(0, Ordering::Relaxed);
+            }
+            Err(error) => {
+                // Hook unavailable (security software, broken system hook
+                // chain) — the tick thread's GetCursorPos fallback still
+                // detects hover, just with the idle-timer latency.
+                emit_runtime("warn", format!("[taskbar-dimmer] mouse hook install failed: {error}"));
+                MOUSE_HOOK.store(0, Ordering::Relaxed);
+            }
+        }
+        MOUSE_HOOK_THREAD_ID.store(0, Ordering::Relaxed);
+    }
+
+    fn ensure_mouse_hook() {
+        if !MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed) {
+            return;
+        }
+        let threads = MOUSE_HOOK_THREAD.get_or_init(|| Mutex::new(None));
+        let mut guard = threads.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let handle = std::thread::Builder::new()
+            .name("taskbar-dimmer-mouse-hook".into())
+            .spawn(mouse_hook_thread_loop)
+            .expect("taskbar dimmer mouse hook thread");
+        *guard = Some(handle);
+    }
+
+    fn stop_mouse_hook() {
+        // If no hook thread was ever spawned (dimmer never enabled) there is
+        // nothing to stop — bail immediately so disable/shutdown paths with
+        // the dimmer off don't pay the registration-wait below.
+        let thread_exists = MOUSE_HOOK_THREAD
+            .get()
+            .map(|threads| threads.lock().unwrap().is_some())
+            .unwrap_or(false);
+        if !thread_exists {
+            MOUSE_HOOK.store(0, Ordering::Relaxed);
+            return;
+        }
+        // The hook thread blocks in GetMessageW until WM_QUIT arrives. Post it
+        // to the thread id, retrying briefly so a stop racing an in-flight
+        // start can't leave the thread parked forever (the id is registered as
+        // the very first statement of the thread body).
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut id = MOUSE_HOOK_THREAD_ID.load(Ordering::Relaxed);
+        while id == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+            id = MOUSE_HOOK_THREAD_ID.load(Ordering::Relaxed);
+        }
+        if id != 0 {
+            let _ = unsafe { PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        }
+        if let Some(threads) = MOUSE_HOOK_THREAD.get() {
+            if let Ok(mut guard) = threads.lock() {
+                if let Some(handle) = guard.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        MOUSE_HOOK.store(0, Ordering::Relaxed);
     }
 
     fn update_fade(hwnd: HWND) {
@@ -573,17 +968,38 @@ mod platform {
                     fade.last_taskbar_cache_refresh = now;
                     let previous = fade.cached_taskbar;
                     fade.cached_taskbar = taskbar_info().map(|(taskbar, rect)| (taskbar.0 as isize, rect));
+                    // Keep the hook's hit-test rect in sync with the cache so
+                    // the two detectors never disagree about the taskbar.
+                    *HOOK_TASKBAR_RECT.lock().unwrap() = fade.cached_taskbar.map(|(_, rect)| rect);
                     if fade.cached_taskbar != previous {
                         should_repair_zorder = true;
                     }
                 }
             }
             let cached = fade.cached_taskbar;
+            let hook_active = MOUSE_HOOK.load(Ordering::Acquire) != 0
+                && MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed)
+                && PREFER_EVENT_HOVER.load(Ordering::Relaxed);
+            let elevated = FOREGROUND_ELEVATED.load(Ordering::Relaxed);
             if let Some((_, rect)) = cached {
-                if CURSOR_POLLING.load(Ordering::Relaxed) {
+                // Poll cursor when:
+                // 1) CURSOR_POLLING is explicitly enabled (Debug tab toggle), OR
+                // 2) Event mode is active but the foreground is elevated (hook
+                //    can't provide accurate positions), so we fall back to
+                //    polling until the foreground returns to normal.
+                let should_poll = CURSOR_POLLING.load(Ordering::Relaxed)
+                    || (hook_active && elevated);
+                if should_poll {
                     let (is_hovered, point) = cursor_over_rect(rect);
                     hovered = is_hovered;
                     cursor = point;
+                    // Keep the hook's hover cache in sync so an immediate hook
+                    // poke after this tick never sees a stale value.
+                    CURRENT_HOVER.store(hovered, Ordering::Relaxed);
+                } else if hook_active {
+                    // Cursor polling off (low-CPU mode): the hook is the sole
+                    // hover detector.
+                    hovered = CURRENT_HOVER.load(Ordering::Relaxed);
                 }
             }
 
@@ -662,7 +1078,7 @@ mod platform {
             }
 
             let active = fade.enabled && fade.transition_active;
-            let desired_interval = if active { ACTIVE_TIMER_INTERVAL_MS } else { IDLE_TIMER_INTERVAL_MS };
+            let desired_interval = if active { ACTIVE_TIMER_INTERVAL_MS } else { POLL_INTERVAL_MS.load(Ordering::Relaxed) };
             // Swap + notify under the wake mutex so the tick thread's
             // read-then-wait (also under this mutex) sees either the new
             // interval or the notify — never a stale long sleep that would
@@ -831,6 +1247,8 @@ mod platform {
 
     pub fn shutdown() {
         stop_tick_thread();
+        stop_mouse_hook();
+        stop_elevation_win_event();
     }
 
     pub fn apply(raw: isize, enabled: bool, opacity: f64, fade_in_duration_ms: u64, fade_out_duration_ms: u64, immediate: bool) -> Result<(), String> {
@@ -839,6 +1257,10 @@ mod platform {
         let hwnd = HWND(raw as *mut c_void);
         let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round();
         let hovered = enabled && cursor_over_rect(rect).0;
+        // Seed the hook's hover cache + hit-test rect so it doesn't fire a
+        // spurious poke for a state that predates its installation.
+        CURRENT_HOVER.store(hovered, Ordering::Relaxed);
+        *HOOK_TASKBAR_RECT.lock().unwrap() = if enabled { Some(rect) } else { None };
 
         let mut immediate_alpha = None;
         if let Some(state) = FADE_STATE.get() {
@@ -875,8 +1297,17 @@ mod platform {
                 fade.cached_taskbar = Some((taskbar.0.0 as isize, rect));
                 fade.last_taskbar_cache_refresh = Instant::now();
                 ensure_tick_thread();
+                // Elevation WinEvent always runs when the dimmer is on — it
+                // detects elevated foreground windows so the tick thread can
+                // fall back to polling cursor when the hook can't see it.
+                ensure_elevation_win_event();
+                if PREFER_EVENT_HOVER.load(Ordering::Relaxed) {
+                    ensure_mouse_hook();
+                }
             } else {
                 stop_tick_thread();
+                stop_mouse_hook();
+                stop_elevation_win_event();
             }
         }
 
@@ -927,6 +1358,8 @@ mod platform {
     pub fn available() -> bool { false }
     pub fn set_verbose_logging(_enabled: bool) {}
     pub fn set_detection(_name: &str, _enabled: bool) {}
+    pub fn set_hover_mode(_mode: &str) {}
+    pub fn set_poll_interval_ms(_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
@@ -971,6 +1404,16 @@ pub fn set_taskbar_dimmer_detection(name: String, enabled: bool) {
 #[tauri::command]
 pub fn set_taskbar_dimmer_suspended(suspended: bool) {
     platform::set_suspended(suspended);
+}
+
+#[tauri::command]
+pub fn set_taskbar_dimmer_hover_mode(mode: String) {
+    platform::set_hover_mode(&mode);
+}
+
+#[tauri::command]
+pub fn set_taskbar_dimmer_poll_interval(ms: u32) {
+    platform::set_poll_interval_ms(ms.clamp(16, 2000));
 }
 
 #[tauri::command]

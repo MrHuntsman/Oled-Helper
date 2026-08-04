@@ -186,6 +186,10 @@
           <input type="checkbox" checked={dimmerDetections.cursor} onchange={(e) => setDimmerDetection('cursor', e.currentTarget.checked)} />
           <span>Cursor polling</span>
         </label>
+        <label class="diag-detection-toggle">
+          <input type="checkbox" checked={dimmerDetections.mouseHook} onchange={(e) => setDimmerDetection('mouseHook', e.currentTarget.checked)} />
+          <span>Mouse hook</span>
+        </label>
       </div>
       <div style="display:flex; gap:6px;">
         <button class="copy-btn" class:success={logCopied} class:error={logCopyFailed} onclick={copyGpuLog} title={logCopied ? 'Copied!' : logCopyFailed ? 'Copy failed' : 'Copy runtime log'} aria-label="Copy runtime log">
