@@ -47,16 +47,41 @@ export const runtimeLogSettings = $state({
   verbosePeriodic: false,
 });
 
+// Debug detection toggles default to the user's actual configuration, not
+// all-ON: cursor polling and the mouse hook follow the hover detection mode
+// (event mode relies on the hook and stands the cursor poll down; poll mode
+// does the opposite), while the maintenance toggles (fullscreen, taskbar
+// cache, z-order repair) are always active. loadConfig() re-syncs these from
+// the persisted hover mode, and the Debug tab can still override any of them
+// live for A/B testing.
 export const dimmerDetections = $state({
   fullscreen: true,
   taskbarCache: true,
   zorder: true,
-  cursor: true,
+  cursor: false,
   mouseHook: true,
 });
 
+// Mode-appropriate default states for the detection toggles.
+function detectionDefaultsForMode(mode) {
+  const event = mode === 'event';
+  return {
+    fullscreen: true,
+    taskbarCache: true,
+    zorder: true,
+    cursor: !event,
+    mouseHook: event,
+  };
+}
+
 export function setDimmerDetection(name, enabled) {
   dimmerDetections[name] = enabled;
+  // Safety net mirroring the Rust side: disabling the mouse hook in event
+  // mode falls back to cursor polling, so hover detection never goes dead
+  // with both detectors off.
+  if ((name === 'mouseHook' || name === 'mouse_hook') && !enabled && taskbarDimmer.hoverDetection === 'event') {
+    dimmerDetections.cursor = true;
+  }
   invoke('set_taskbar_dimmer_detection', { name, enabled }).catch((e) => {
     console.warn('[dimmer-detection] toggle failed', e);
     dimmerDetections[name] = !enabled;
@@ -174,6 +199,9 @@ export async function loadConfig() {
     }
     if (cfg && typeof cfg.taskbar_dimmer_hover_detection === 'string') {
       taskbarDimmer.hoverDetection = cfg.taskbar_dimmer_hover_detection;
+      // Debug detection toggles reflect the user's actual configuration —
+      // cursor polling / mouse hook follow the hover mode.
+      Object.assign(dimmerDetections, detectionDefaultsForMode(cfg.taskbar_dimmer_hover_detection));
       // Sync the Rust side immediately on startup
       invoke('set_taskbar_dimmer_hover_mode', { mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
     }
@@ -310,10 +338,17 @@ export function setDimmerSuspendedForFullscreen(suspended) {
 }
 
 export function setHoverDetection(mode) {
+  const previous = taskbarDimmer.hoverDetection;
   taskbarDimmer.hoverDetection = mode;
+  // Keep the Debug detection toggles aligned with the mode by default —
+  // switching to event mode stands the cursor poll down and relies on the
+  // hook; switching to poll mode does the opposite. Manual Debug overrides
+  // are still possible afterwards.
+  Object.assign(dimmerDetections, detectionDefaultsForMode(mode));
   invoke('set_taskbar_dimmer_hover_mode', { mode }).catch((e) => {
     console.warn('[hover-detection] toggle failed', e);
-    taskbarDimmer.hoverDetection = mode === 'event' ? 'poll' : 'event';
+    taskbarDimmer.hoverDetection = previous;
+    Object.assign(dimmerDetections, detectionDefaultsForMode(previous));
   });
 }
 

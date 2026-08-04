@@ -56,7 +56,7 @@ mod platform {
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, FindWindowW, GetWindowLongPtrW, GetWindowRect,
         PostMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-        GetCursorPos, GetForegroundWindow, IsIconic, IsWindowVisible,
+        GetClassNameW, GetCursorPos, GetForegroundWindow, IsIconic, IsWindowVisible,
         CallNextHookEx, DispatchMessageW, GetMessageW, MSG,
         PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
         WH_MOUSE_LL, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_QUIT,
@@ -84,11 +84,19 @@ mod platform {
     // Fullscreen detection runs the expensive Win32 foreground-window chain
     // (GetForegroundWindow → GetWindowThreadProcessId → GetWindowRect →
     // MonitorFromWindow → GetMonitorInfoW → GetWindowLongPtrW). It is
-    // decoupled from the fade animation tick: the result is cached and only
-    // re-queried at this slow cadence, so the fade timer can stay as fast as
-    // possible without paying the detection cost every tick.
+    // decoupled from the fade animation tick: the result is cached, so the
+    // fade timer can stay as fast as possible without paying the detection
+    // cost every tick. This cadence is the detection source in poll hover
+    // mode; in event hover mode the WinEvent hook replaces the timer
+    // entirely, and this timer only takes over if the hook fails to install.
     const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
     const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+    const EVENT_SYSTEM_MOVESIZESTART: u32 = 0x000A;
+    const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
+    const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+    const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+    const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+    const EVENT_OBJECT_STATECHANGE: u32 = 0x800A;
     const DEFAULT_EASE_DURATION_MS: u64 = 250;
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
@@ -137,7 +145,12 @@ mod platform {
     static FULLSCREEN_DETECTION: AtomicBool = AtomicBool::new(true);
     static TASKBAR_CACHE_REFRESH: AtomicBool = AtomicBool::new(true);
     static ZORDER_REPAIR: AtomicBool = AtomicBool::new(true);
-    static CURSOR_POLLING: AtomicBool = AtomicBool::new(true);
+    // Defaults follow the hover mode: in event mode (the default) the mouse
+    // hook is the hover detector and the cursor poll stands down; in poll
+    // mode the cursor poll is the detector and the hook is unused. set_hover_mode
+    // re-syncs both flags on startup and on mode changes; the Debug tab can
+    // override either live for A/B tests.
+    static CURSOR_POLLING: AtomicBool = AtomicBool::new(false);
     // Set by the frontend while the app's own window is in monitor fullscreen
     // (the calibration strip). fullscreen_app_active() can't detect that case
     // — it intentionally ignores the app's own window so the dimmer keeps
@@ -196,6 +209,18 @@ mod platform {
     // whose security software, remote desktop, or other edge cases
     // conflict with WH_MOUSE_LL.
     static PREFER_EVENT_HOVER: AtomicBool = AtomicBool::new(true);
+    // Set by the WinEvent hooks (foreground switch, move/size, minimize/
+    // restore, location change). In event hover mode this is the ONLY
+    // trigger for a fullscreen recheck — the timer stands down entirely,
+    // so fullscreen enter/exit reacts on the same tick as the triggering
+    // event with zero polling. In poll mode it stays unused; the timer-
+    // based check is the only path (and takes over if the WinEvent hook
+    // fails to install, so event-mode detection never silently stops).
+    static FULLSCREEN_RECHECK_REQUESTED: AtomicBool = AtomicBool::new(false);
+    // Diagnostic: timestamp of the last logged WinEvent, used to throttle the
+    // winevent log so continuous window drags don't flood the log while still
+    // showing the burst pattern of a fullscreen enter/exit transition.
+    static LAST_WINEVENT_LOG: Mutex<Option<Instant>> = Mutex::new(None);
     // User-configurable idle polling cadence (ms), used both as the
     // GetCursorPos poll interval in poll mode and as the elevated-fallback
     // poll interval in event mode. Default matches the previous hardcoded
@@ -242,6 +267,14 @@ mod platform {
                 }
             } else {
                 stop_mouse_hook();
+                // Safety net: in event mode the hook is the primary hover
+                // detector and the cursor poll defaults off there. Disabling
+                // the hook must fall back to polling, otherwise both
+                // detectors would be off and hover detection would silently
+                // stop.
+                if PREFER_EVENT_HOVER.load(Ordering::Relaxed) {
+                    CURSOR_POLLING.store(true, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -249,19 +282,30 @@ mod platform {
     pub fn set_hover_mode(mode: &str) {
         let event = mode == "event";
         PREFER_EVENT_HOVER.store(event, Ordering::Relaxed);
-        // If the dimmer is on, toggle the hook lifecycle to match. When
-        // switching to event mode: install the hook. When switching to
-        // poll mode: stop the hook (the tick thread keeps polling cursor
-        // regardless).
+        // Keep the per-detection toggles aligned with the mode by default:
+        // in event mode the mouse hook is the hover detector and the cursor
+        // poll stands down (resuming automatically only while the foreground
+        // is elevated); in poll mode the cursor poll is the detector and the
+        // hook is unused. The Debug tab can override either live for A/B
+        // tests — a later mode switch just re-syncs these defaults.
+        CURSOR_POLLING.store(!event, Ordering::Relaxed);
+        MOUSE_HOOK_TOGGLE.store(event, Ordering::Relaxed);
+        // If the dimmer is on, toggle the hook lifecycles to match. When
+        // switching to event mode: install the mouse hook (instant hover)
+        // and the WinEvent hook (elevation + event-driven fullscreen). When
+        // switching to poll mode: stop both — the tick thread's cursor poll
+        // and fullscreen timer handle everything.
         let dimmer_on = FADE_STATE
             .get()
             .map(|state| state.lock().unwrap().enabled)
             .unwrap_or(false);
         if dimmer_on {
             if event {
+                ensure_elevation_win_event();
                 ensure_mouse_hook();
             } else {
                 stop_mouse_hook();
+                stop_elevation_win_event();
             }
         }
     }
@@ -338,29 +382,88 @@ mod platform {
         }
     }
 
-    // WinEvent callback for EVENT_SYSTEM_FOREGROUND. When the foreground
-    // window changes, re-check elevation and update the flag. This is a
-    // single event-driven call per foreground switch — zero polling.
+    // WinEvent callback for foreground switches and window move/size/
+    // minimize/restore changes. Foreground switches re-check elevation
+    // (as before) and always request a fullscreen recheck, since a new
+    // foreground window means fullscreen state can only be evaluated fresh.
+    // The other events (move/size end, minimize start/end) don't change
+    // elevation but can flip fullscreen state without a foreground change
+    // (e.g. a borderless window resizing to fill the screen, or restoring
+    // from minimized back into the same fullscreen geometry) — those just
+    // set the recheck flag without touching FOREGROUND_ELEVATED.
+    fn winevent_name(event: u32) -> &'static str {
+        match event {
+            EVENT_SYSTEM_FOREGROUND => "foreground",
+            EVENT_SYSTEM_MOVESIZESTART => "movesize_start",
+            EVENT_SYSTEM_MOVESIZEEND => "movesize_end",
+            EVENT_SYSTEM_MINIMIZESTART => "minimize_start",
+            EVENT_SYSTEM_MINIMIZEEND => "minimize_end",
+            EVENT_OBJECT_STATECHANGE => "state_change",
+            EVENT_OBJECT_LOCATIONCHANGE => "location_change",
+            _ => "other",
+        }
+    }
+
     unsafe extern "system" fn elevation_win_event_proc(
         _h_hook: HWINEVENTHOOK,
-        _event: u32,
-        _hwnd: HWND,
-        _id_object: i32,
+        event: u32,
+        hwnd: HWND,
+        id_object: i32,
         _id_child: i32,
         _event_thread: u32,
         _dwms_event_time: u32,
     ) {
-        let elevated = check_foreground_elevation();
-        FOREGROUND_ELEVATED.store(elevated, Ordering::Relaxed);
-        // If the elevation state changed, poke the overlay to re-evaluate
-        // hover. The tick thread will pick up the right source (hook or
-        // poll) on the next tick.
+        // EVENT_OBJECT_LOCATIONCHANGE / EVENT_OBJECT_STATECHANGE fire very
+        // frequently (any object, any window) when subscribed without
+        // idObject filtering — restrict to top-level window events (idObject
+        // == OBJID_WINDOW, which SetWinEventHook reports as 0) so ordinary
+        // child-control state flips (checkboxes, buttons) don't flood the
+        // tick thread with reposts. STATE_CHANGE covers the one transition
+        // the other subscriptions can't see: a style-only fullscreen flip
+        // (maximize state change, chrome removal) with identical geometry,
+        // which fires neither a foreground switch nor a location change.
+        const OBJID_WINDOW: i32 = 0;
+        if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_OBJECT_STATECHANGE)
+            && id_object != OBJID_WINDOW
+        {
+            return;
+        }
+        let mut elevated = false;
+        if event == EVENT_SYSTEM_FOREGROUND {
+            elevated = check_foreground_elevation();
+            FOREGROUND_ELEVATED.store(elevated, Ordering::Relaxed);
+        }
+        if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+            // Log each top-level window event that actually sets the recheck
+            // flag, throttled by gap so a continuous drag can't flood the log
+            // while a fullscreen transition's event burst stays visible.
+            let now = Instant::now();
+            let gap_ms = {
+                let mut last = LAST_WINEVENT_LOG.lock().unwrap();
+                let gap = match *last {
+                    Some(prev) => now.duration_since(prev).as_secs_f64() * 1000.0,
+                    None => 0.0,
+                };
+                *last = Some(now);
+                gap
+            };
+            if gap_ms >= 25.0 {
+                emit_runtime("info", format!(
+                    "[taskbar-dimmer] winevent event={} idObject={} hwnd=0x{:x} elevated={} gap_ms={:.1}",
+                    winevent_name(event), id_object, hwnd.0 as usize, elevated, gap_ms,
+                ));
+            }
+        }
+        FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        // Poke the overlay to re-evaluate hover/fullscreen. The tick thread
+        // will pick up the right source (hook or poll, and the forced
+        // fullscreen recheck) on the next tick.
         post_dimmer_tick();
     }
 
     fn elevation_win_event_thread_loop() {
         ELEVATION_WINEVENT_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
-        let hook = unsafe {
+        let foreground_hook = unsafe {
             SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_SYSTEM_FOREGROUND,
@@ -371,13 +474,76 @@ mod platform {
                 windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
             )
         };
-        if hook.0.is_null() {
+        if foreground_hook.0.is_null() {
             emit_runtime("warn", "[taskbar-dimmer] elevation WinEvent hook install failed".into());
             ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
             ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
             return;
         }
-        ELEVATION_WINEVENT_HOOK.store(hook.0 as isize, Ordering::Release);
+        ELEVATION_WINEVENT_HOOK.store(foreground_hook.0 as isize, Ordering::Release);
+        // Seed the elevation flag and request an initial fullscreen recheck
+        // so event mode starts from a correct state instead of waiting for
+        // the first foreground event (e.g. the dimmer was enabled while an
+        // elevated or fullscreen window was already active).
+        FOREGROUND_ELEVATED.store(check_foreground_elevation(), Ordering::Relaxed);
+        FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        post_dimmer_tick();
+        // Second hook on the same thread, covering MOVESIZESTART..MINIMIZEEND
+        // (0x000A..0x0017, spanning both the move/size and minimize/restore
+        // pairs plus a few harmless codes between them — SetWinEventHook
+        // takes a min/max range, not a set). This catches interactive drag-
+        // resize and minimize/restore, but NOT title-bar double-click
+        // maximize or programmatic resizing — neither of those raise
+        // MOVESIZESTART/END. The third hook below (LOCATIONCHANGE) is what
+        // actually catches those, since it fires on any bounds change
+        // regardless of cause; this range is kept anyway because it
+        // distinguishes drag-start from drag-end, which LOCATIONCHANGE alone
+        // does not. A different numeric range (0x8000+) so it can't be
+        // merged into the first hook's range. Multiple SetWinEventHook calls
+        // per thread are supported — all deliver to the same message loop
+        // below.
+        let movesize_hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_MOVESIZESTART,
+                EVENT_SYSTEM_MINIMIZEEND,
+                None,
+                Some(elevation_win_event_proc),
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        let location_hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                None,
+                Some(elevation_win_event_proc),
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        let statechange_hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_STATECHANGE,
+                EVENT_OBJECT_STATECHANGE,
+                None,
+                Some(elevation_win_event_proc),
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
+            )
+        };
+        if movesize_hook.0.is_null() {
+            emit_runtime("warn", "[taskbar-dimmer] move/size WinEvent hook install failed — fullscreen detection stays timer-based for resize/minimize".into());
+        }
+        if location_hook.0.is_null() {
+            emit_runtime("warn", "[taskbar-dimmer] location-change WinEvent hook install failed — fullscreen detection stays timer-based for in-place resize".into());
+        }
+        if statechange_hook.0.is_null() {
+            emit_runtime("warn", "[taskbar-dimmer] state-change WinEvent hook install failed — style-only fullscreen flips stay undetected in event mode".into());
+        }
         let mut msg = MSG::default();
         unsafe {
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -385,7 +551,12 @@ mod platform {
                 let _ = DispatchMessageW(&msg);
             }
         }
-        unsafe { let _ = UnhookWinEvent(hook); }
+        unsafe {
+            let _ = UnhookWinEvent(foreground_hook);
+            if !movesize_hook.0.is_null() { let _ = UnhookWinEvent(movesize_hook); }
+            if !location_hook.0.is_null() { let _ = UnhookWinEvent(location_hook); }
+            if !statechange_hook.0.is_null() { let _ = UnhookWinEvent(statechange_hook); }
+        }
         ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
         ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
     }
@@ -555,6 +726,18 @@ mod platform {
         taskbar_info().is_some()
     }
 
+    // Returns the window class name of the given window, if any.
+    fn window_class_name(hwnd: HWND) -> Option<String> {
+        unsafe {
+            let mut buf = [0u16; 128];
+            let len = GetClassNameW(hwnd, &mut buf);
+            if len == 0 {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&buf[..len as usize]))
+        }
+    }
+
     // Returns true when another application occupies the entire monitor in
     // exclusive fullscreen or borderless fullscreen mode. Normal maximized
     // windows retain caption/frame styles and are intentionally excluded.
@@ -572,6 +755,17 @@ mod platform {
             );
             if process_id == std::process::id() || process_id == 0 || IsIconic(foreground).as_bool() {
                 return false;
+            }
+
+            // The desktop itself ("Progman" / "WorkerW") is a top-level window
+            // that covers the entire monitor with no window chrome, so it would
+            // be misclassified as a fullscreen app whenever the user clicks the
+            // desktop — hiding the overlay until the foreground changes back to
+            // a real window. Exclude it explicitly.
+            if let Some(class) = window_class_name(foreground) {
+                if class == "Progman" || class == "WorkerW" {
+                    return false;
+                }
             }
 
             let mut window_rect = RECT::default();
@@ -651,6 +845,14 @@ mod platform {
             } else {
                 SWP_SHOWWINDOW
             };
+            if popup_menu.is_none() && VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                // The fullscreen path hides the overlay with SW_HIDE; nothing
+                // else re-shows it except this SetWindowPos(SWP_SHOWWINDOW),
+                // so a hidden→visible transition here marks the restore.
+                if !IsWindowVisible(hwnd).as_bool() {
+                    emit_runtime("info", "[taskbar-dimmer] overlay_reshown via zorder repair".into());
+                }
+            }
             if let Err(error) = SetWindowPos(
                 hwnd,
                 insert_after,
@@ -909,21 +1111,54 @@ mod platform {
         let now = Instant::now();
 
         // Fullscreen suppression is decoupled from the animation tick: the
-        // expensive detection chain runs at FULLSCREEN_CHECK_INTERVAL_MS and
-        // the result is cached, so the fade timer can stay fast. When the
-        // detection toggle is off the overlay never hides for external
-        // fullscreen (but SUSPENDED — the app's own monitor-fullscreen strip
-        // — still takes effect immediately).
+        // expensive detection chain result is cached, so the fade timer can
+        // stay fast. The detection source follows the hover mode setting:
+        //  - Event mode: the WinEvent hook is the sole detector — rechecks
+        //    run only on events (foreground switch, move/size, minimize/
+        //    restore, location change), no timer polling at all.
+        //  - Poll mode: the timer cadence below is the only path.
+        //  - Event mode with a failed WinEvent install: the timer takes
+        //    over so detection never silently stops.
+        // When the detection toggle is off the overlay never hides for
+        // external fullscreen (but SUSPENDED — the app's own monitor-
+        // fullscreen strip — still takes effect immediately).
         let fullscreen = if SUSPENDED.load(Ordering::Relaxed) {
             true
         } else {
             let mut fade = state.lock().unwrap();
-            if now.duration_since(fade.last_fullscreen_check).as_millis() as u64 >= FULLSCREEN_CHECK_INTERVAL_MS {
+            // Event mode: the WinEvent hook is the sole fullscreen detector.
+            // The check runs only when an event (foreground switch, move/
+            // size, minimize/restore, location change) requests a recheck —
+            // no timer polling at all. Poll mode keeps the timer cadence;
+            // event mode falls back to the timer only when the hook failed
+            // to install so detection never silently stops.
+            let event_driven = PREFER_EVENT_HOVER.load(Ordering::Relaxed)
+                && ELEVATION_WINEVENT_HOOK.load(Ordering::Acquire) != 0;
+            let recheck_requested = event_driven
+                && FULLSCREEN_RECHECK_REQUESTED.swap(false, Ordering::Relaxed);
+            let timer_due = !event_driven
+                && now.duration_since(fade.last_fullscreen_check).as_millis() as u64 >= FULLSCREEN_CHECK_INTERVAL_MS;
+            if recheck_requested || timer_due {
+                // since_last_ms shows the gap between consecutive rechecks —
+                // during a slow multi-step transition it grows to the full
+                // transition tail before the active flag finally drops.
+                let check_gap_ms = now.duration_since(fade.last_fullscreen_check).as_secs_f64() * 1000.0;
                 fade.last_fullscreen_check = now;
+                let prev_active = fade.fullscreen_active;
                 drop(fade);
                 let active = FULLSCREEN_DETECTION.load(Ordering::Relaxed)
                     && fullscreen_app_active(hwnd);
                 state.lock().unwrap().fullscreen_active = active;
+                if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                    // fg_class helps confirm the detection source — e.g. the
+                    // desktop (WorkerW/Progman) must never count as fullscreen.
+                    let fg_class = window_class_name(unsafe { GetForegroundWindow() }).unwrap_or_default();
+                    emit_runtime("info", format!(
+                        "[taskbar-dimmer] fullscreen_check trigger={} active={} prev={} since_last_ms={:.1} fg_class={}",
+                        if recheck_requested { "event" } else { "timer" },
+                        active, prev_active, check_gap_ms, fg_class,
+                    ));
+                }
                 active
             } else {
                 fade.fullscreen_active
@@ -933,6 +1168,9 @@ mod platform {
             unsafe {
                 if IsWindowVisible(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
+                    if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                        emit_runtime("info", "[taskbar-dimmer] fullscreen_hide overlay hidden".into());
+                    }
                 }
             }
             return;
@@ -942,8 +1180,10 @@ mod platform {
         let mut transition_log = None;
         let mut poll_gap_log = None;
         let mut should_repair_zorder = false;
+        let mut should_reshow_overlay = false;
         let mut hovered = false;
         let mut cursor = windows::Win32::Foundation::POINT::default();
+        let mut cursor_polled = false;
         let mut alpha_to_apply = None;
         let mut transition_done = false;
 
@@ -993,6 +1233,7 @@ mod platform {
                     let (is_hovered, point) = cursor_over_rect(rect);
                     hovered = is_hovered;
                     cursor = point;
+                    cursor_polled = true;
                     // Keep the hook's hover cache in sync so an immediate hook
                     // poke after this tick never sees a stale value.
                     CURRENT_HOVER.store(hovered, Ordering::Relaxed);
@@ -1001,6 +1242,20 @@ mod platform {
                     // hover detector.
                     hovered = CURRENT_HOVER.load(Ordering::Relaxed);
                 }
+            }
+
+            // Self-heal overlay visibility. The z-order repair that re-shows
+            // the overlay is throttled to 250ms and rides the periodic tick,
+            // so after a fullscreen exit (or an external hide) it can leave
+            // the overlay hidden for up to ~500ms — the visible flicker when
+            // toggling fullscreen quickly. Flag a direct re-show whenever the
+            // overlay is hidden but the dimmer is on and the cursor is not
+            // over the taskbar (i.e. it should be showing at base alpha); the
+            // ShowWindow itself runs after the lock is dropped.
+            let overlay_visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+            if fade.enabled && !hovered && !overlay_visible {
+                should_reshow_overlay = true;
+                should_repair_zorder = true;
             }
 
             let new_target = if fade.enabled && !hovered { fade.base_alpha } else { 0.0 };
@@ -1098,6 +1353,17 @@ mod platform {
                 fade.last_zorder_repair = now;
             }
         }
+        // Re-show the overlay outside the lock, matching the codebase pattern
+        // of not holding FADE_STATE across window calls (ShowWindow can send
+        // WM_SHOWWINDOW / WM_WINDOWPOSCHANGED synchronously).
+        if should_reshow_overlay {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
+            if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                emit_runtime("info", "[taskbar-dimmer] overlay_reshown self-heal".into());
+            }
+        }
         let cached_taskbar_for_log = if let Some(state) = FADE_STATE.get() {
             state.lock().unwrap().cached_taskbar
         } else {
@@ -1179,9 +1445,17 @@ mod platform {
                 let mut rect = RECT::default();
                 if GetWindowRect(hwnd, &mut rect).is_ok() { Some(rect) } else { None }
             };
+            // Cursor is only meaningful when it was actually polled this
+            // tick; in event mode (hook-active, polling off) show n/a instead
+            // of a misleading (0, 0).
+            let cursor_text = if cursor_polled {
+                format!("({}, {})", cursor.x, cursor.y)
+            } else {
+                "n/a".into()
+            };
             emit_runtime("info", format!(
-                "[taskbar-dimmer] tick enabled={} hovered={} cursor=({}, {}) taskbar={} visible={} overlay={} alpha={:.0}->{:.0}",
-                enabled, hovered, cursor.x, cursor.y, rect_text(cached_taskbar_for_log.map(|(_, rect)| rect)),
+                "[taskbar-dimmer] tick enabled={} hovered={} cursor={} taskbar={} visible={} overlay={} alpha={:.0}->{:.0}",
+                enabled, hovered, cursor_text, rect_text(cached_taskbar_for_log.map(|(_, rect)| rect)),
                 visible, rect_text(overlay_rect), current, target,
             ));
         }
@@ -1297,11 +1571,13 @@ mod platform {
                 fade.cached_taskbar = Some((taskbar.0.0 as isize, rect));
                 fade.last_taskbar_cache_refresh = Instant::now();
                 ensure_tick_thread();
-                // Elevation WinEvent always runs when the dimmer is on — it
-                // detects elevated foreground windows so the tick thread can
-                // fall back to polling cursor when the hook can't see it.
-                ensure_elevation_win_event();
+                // Event mode installs both hooks: the mouse hook for instant
+                // hover, and the WinEvent hook for elevation detection +
+                // event-driven fullscreen. Poll mode installs neither — the
+                // tick thread's cursor poll and fullscreen timer handle
+                // everything.
                 if PREFER_EVENT_HOVER.load(Ordering::Relaxed) {
+                    ensure_elevation_win_event();
                     ensure_mouse_hook();
                 }
             } else {
