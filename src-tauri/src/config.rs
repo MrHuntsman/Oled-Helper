@@ -50,6 +50,11 @@ pub struct AppConfig {
     pub tray_enabled: bool,
     #[serde(default = "default_hover_detection")]
     pub taskbar_dimmer_hover_detection: String,
+    // The polling cadence is a real persisted setting — the frontend sends
+    // it in save_config, so it needs a matching field here or serde silently
+    // drops it and the value never survives a restart.
+    #[serde(default = "default_poll_interval")]
+    pub taskbar_dimmer_poll_interval_ms: u64,
 }
 
 fn default_true() -> bool {
@@ -61,11 +66,18 @@ fn default_dimmer_opacity() -> f64 {
 }
 
 fn default_dimmer_ease_duration() -> u64 {
-    250
+    // Matches the frontend store's initial value and the dimmer tab's own
+    // "Restore Tab Defaults" (300 ms each way) — Rust is the single source
+    // of truth for reset-all, so it must agree with the UI's defaults.
+    300
 }
 
 fn default_hover_detection() -> String {
     "event".to_string()
+}
+
+fn default_poll_interval() -> u64 {
+    100
 }
 
 impl Default for AppConfig {
@@ -79,6 +91,7 @@ impl Default for AppConfig {
             taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),
             taskbar_dimmer_fade_out_duration_ms: default_dimmer_ease_duration(),
             taskbar_dimmer_hover_detection: default_hover_detection(),
+            taskbar_dimmer_poll_interval_ms: default_poll_interval(),
             tray_enabled: true,
         }
     }
@@ -231,14 +244,16 @@ fn ensure_config_worker() -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
+// Enqueue a serialized config for the background write worker. Shared by
+// save_config and reset_config so both go through the same atomic pipeline
+// (temp file + MoveFileEx + versioned stale-write skipping).
+fn enqueue_config_write(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
     // Write on a background thread and return immediately. File I/O on the
     // IPC command thread would block every other command (including the
     // high-frequency gamma ramp updates) for the duration of the write — and
     // a slow disk/OneDrive can stall it for hundreds of milliseconds.
-    let path = config_path(&app)?;
-    let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    let path = config_path(app)?;
+    let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     let version = CONFIG_WRITE_VERSION.fetch_add(1, Ordering::AcqRel) + 1;
     let (queue, wake) = CONFIG_WRITE_QUEUE.get_or_init(|| (Mutex::new(None), Condvar::new()));
     ensure_config_worker()?;
@@ -249,6 +264,22 @@ pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
         return Err("config write queue was poisoned".into());
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
+    enqueue_config_write(&app, &config)
+}
+
+// Wipes every persisted setting by writing AppConfig::default() through the
+// same atomic pipeline, then hands the defaults back so the frontend can
+// re-sync its stores from a single source of truth instead of duplicating
+// default values in JS.
+#[tauri::command]
+pub fn reset_config(app: AppHandle) -> Result<AppConfig, String> {
+    let defaults = AppConfig::default();
+    enqueue_config_write(&app, &defaults)?;
+    Ok(defaults)
 }
 
 pub fn shutdown() {

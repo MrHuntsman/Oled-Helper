@@ -1,5 +1,7 @@
 <script>
-  import { taskbarDimmer, setTaskbarDimmer, restoreTaskbarDimmerDefaults } from './stores.svelte.js';
+  // Inlined data URI — see App.svelte for why icons never hit the network.
+  import tabDimmerIcon from './icons/tab_dimmer.png?inline';
+  import { taskbarDimmer, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs } from './stores.svelte.js';
 
   function toggleDimmer() {
     setTaskbarDimmer(!taskbarDimmer.enabled);
@@ -92,21 +94,17 @@
 <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
     <div class="tab-heading-toggle" class:disabled={!taskbarDimmer.available} role="button" tabindex="0" onclick={() => { if (taskbarDimmer.available) toggleDimmer(); }} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && taskbarDimmer.available) { e.preventDefault(); toggleDimmer(); } }} title="Enable Taskbar Dimmer" aria-label="Enable Taskbar Dimmer" aria-pressed={taskbarDimmer.enabled}>
-      <img class="tab-icon" src="/icons/tab_dimmer.png" alt="" />
+      <img class="tab-icon" src={tabDimmerIcon} alt="" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Taskbar Dimmer</h2>
-          <div class="info-tip-wrap" role="presentation" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-            <button class="info-tip-btn" aria-label="About Taskbar Dimmer" tabindex="0">Info</button>
-            <div class="info-tip">Darkens the Windows taskbar without blocking clicks or changing the rest of the display.</div>
-          </div>
         </div>
-        <span class="subtitle">Uses a click-through overlay over the taskbar.</span>
+        <span class="subtitle">Adds a dark overlay over the taskbar.</span>
       </div>
       <div class="tab-heading-spacer"></div>
       <span class={`pill${taskbarDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
-    <button class="restore-defaults-btn" onclick={restoreTaskbarDimmerDefaults}>↻ Restore defaults</button>
+    <button class="restore-defaults-btn" onclick={restoreTaskbarDimmerDefaults}>↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -198,6 +196,42 @@
         </div>
         <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
       </div>
+    </div>
+  </div>
+
+  <div class="dimmer-hover-section" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
+    <span class="settings-row-label dimmer-section-heading">Detection Method</span>
+    <span class="settings-row-desc dimmer-section-desc">How the app detects the cursor, fullscreen mode, and taskbar changes.</span>
+    <div class="hover-detect-radios" role="radiogroup" aria-label="Detection method">
+      <button type="button" class="hover-detect-radio-row dimmer-control" class:active={taskbarDimmer.hoverDetection === 'event'}
+        role="radio" aria-checked={taskbarDimmer.hoverDetection === 'event'}
+        disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+        onclick={() => setHoverDetection('event')}>
+        <span class="hover-detect-radio-dot" aria-hidden="true"></span>
+        <span class="hover-detect-radio-text">
+          <span class="hover-detect-radio-title">Event-driven</span>
+          <span class="hover-detect-radio-desc">Recommended — instant response, near-zero CPU. Falls back to polling for elevated (admin) windows.</span>
+        </span>
+      </button>
+      <button type="button" class="hover-detect-radio-row dimmer-control" class:active={taskbarDimmer.hoverDetection === 'poll'}
+        role="radio" aria-checked={taskbarDimmer.hoverDetection === 'poll'}
+        disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+        onclick={() => setHoverDetection('poll')}>
+        <span class="hover-detect-radio-dot" aria-hidden="true"></span>
+        <span class="hover-detect-radio-text">
+          <span class="hover-detect-radio-title">Polling</span>
+          <span class="hover-detect-radio-desc">Checks on a timer — more compatible, very low CPU use.</span>
+          <span class="hover-detect-poll-rate" role="presentation" onclick={(e) => e.stopPropagation()}>
+            <span class="hover-detect-poll-rate-label">Poll interval</span>
+            <input type="range" min="16" max="200" step="1"
+              value={taskbarDimmer.pollIntervalMs}
+              disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+              oninput={(e) => setPollIntervalMs(Number(e.currentTarget.value))}
+              style={`--fill: ${((taskbarDimmer.pollIntervalMs - 16) / (200 - 16)) * 100}%`} />
+            <span class="hover-detect-poll-rate-val">{taskbarDimmer.pollIntervalMs} ms</span>
+          </span>
+        </span>
+      </button>
     </div>
   </div>
 

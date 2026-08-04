@@ -1,6 +1,11 @@
+<script>
+  // Inlined data URI — see App.svelte for why icons never hit the network.
+  import tabAboutIcon from './icons/tab_about.png?inline';
+</script>
+
 <div class="tab-body">
   <div class="tab-heading">
-    <img class="tab-icon" src="/icons/tab_about.png" alt="" />
+    <img class="tab-icon" src={tabAboutIcon} alt="" />
     <h2>About</h2>
   </div>
   <div class="separator"></div>

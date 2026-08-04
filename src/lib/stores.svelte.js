@@ -5,7 +5,7 @@ export const app = $state({
   activeTab: 'crush',
   hdrStatus: 'unknown',  // set by pollHDRStatus via matchMedia
   hdrLuminance: null,    // { maxNits } | null, set by pollHDRLuminance
-  displayInfo: { width: 0, height: 0, refreshRateHz: null, refreshRates: [], resolutions: [] },
+  displayInfo: { width: 0, height: 0, nativeWidth: 0, nativeHeight: 0, nativeSource: '', refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
 });
@@ -36,7 +36,7 @@ export const taskbarDimmer = $state({
   hoverDetection: 'event',
   // Polling cadence in ms, used as the poll-mode interval and as the
   // elevated-foreground fallback interval in event mode.
-  pollIntervalMs: 500,
+  pollIntervalMs: 100,
 });
 
 export const traySettings = $state({
@@ -158,10 +158,12 @@ export const configLoaded = $state({ v: false });
 
 // Load persisted config (black_lift in tenths-display units, e.g. 9 means
 // +0.9, matching what's shown in the UI/slider) once at startup and apply
-// it to the crush store before the UI reacts to it.
-export async function loadConfig() {
+// it to the crush store before the UI reacts to it. Accepts an optional
+// prefetched config so reset-all can hand over AppConfig::default() from
+// reset_config instead of re-reading the file.
+export async function loadConfig(prefetchedCfg = null) {
   try {
-    const cfg = await invoke('load_config');
+    const cfg = prefetchedCfg ?? await invoke('load_config');
     let loadedProfileCount = 0;
     if (cfg && cfg.black_lift_profiles && typeof cfg.black_lift_profiles === 'object') {
       const profiles = {};
@@ -206,7 +208,7 @@ export async function loadConfig() {
       invoke('set_taskbar_dimmer_hover_mode', { mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
     }
     if (cfg && typeof cfg.taskbar_dimmer_poll_interval_ms === 'number' && Number.isFinite(cfg.taskbar_dimmer_poll_interval_ms)) {
-      taskbarDimmer.pollIntervalMs = Math.max(16, Math.min(2000, Math.round(cfg.taskbar_dimmer_poll_interval_ms)));
+      taskbarDimmer.pollIntervalMs = Math.max(16, Math.min(200, Math.round(cfg.taskbar_dimmer_poll_interval_ms)));
       invoke('set_taskbar_dimmer_poll_interval', { ms: taskbarDimmer.pollIntervalMs }).catch(() => {});
     }
     try {
@@ -323,6 +325,35 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
 
 export function restoreTaskbarDimmerDefaults() {
   setTaskbarDimmer(false, 0.95, 300, 300, true, true);
+  setHoverDetection('event');
+  setPollIntervalMs(100);
+}
+
+// Reset every setting in the app back to its default. Used by the "Restore
+// all" button in Settings (gated behind a confirmation there). Rust's
+// AppConfig::default() is the single source of truth — reset_config writes
+// it through the atomic save pipeline and returns it, then loadConfig
+// re-syncs every store from it. Start on Boot lives in the autostart plugin
+// rather than the config file, so the caller (TabSettings) disables it
+// separately.
+export async function restoreAllDefaults() {
+  const defaults = await invoke('reset_config');
+  await loadConfig(defaults);
+  // Square count and fullscreen mode are pure UI state — not persisted in
+  // the config file, so loadConfig can't reset them. (The gamma ramp is
+  // reset below because TabCrush's effect only runs while that tab is
+  // mounted.)
+  crush.squareCount = 12;
+  crush.fullscreen = 'normal';
+  // Re-enable the tray icon on the backend — loadConfig only updates the
+  // store value, it doesn't call set_tray_enabled.
+  invoke('set_tray_enabled', { enabled: true }).catch((e) => {
+    console.warn('[restore-all] tray update failed', e);
+  });
+  // Reset the gamma ramp immediately — TabCrush's effect only runs while that
+  // tab is mounted, so the display would otherwise keep the old black level
+  // until the user visits the Crush tab again.
+  invoke('apply_gamma_ramp', { blackLift: 0 }).catch(() => {});
 }
 
 // The taskbar dimmer overlay is an always-on-top native window over the
@@ -354,7 +385,7 @@ export function setHoverDetection(mode) {
 
 let pollIntervalSaveTimer = null;
 export function setPollIntervalMs(ms) {
-  const clamped = Math.max(16, Math.min(2000, Math.round(ms)));
+  const clamped = Math.max(16, Math.min(200, Math.round(ms)));
   taskbarDimmer.pollIntervalMs = clamped;
   invoke('set_taskbar_dimmer_poll_interval', { ms: clamped }).catch((e) => {
     console.warn('[poll-interval] update failed', e);
@@ -403,6 +434,18 @@ export function pollHDRLuminance() {
 }
 
 let displayPollSequence = 0;
+// Bounded one-shot retry for transitional display states (sleep/resume,
+// hotplug, cold start mid-wake). Keeps the dropdowns from staying blank when
+// the only poll happened while the driver was still waking up and the window
+// is already visible (so the visibility re-poll never fires). Capped so it
+// can't turn into a periodic poll if the display genuinely reports nothing.
+let displayInfoRetryCount = 0;
+
+function scheduleDisplayInfoRetry() {
+  if (displayInfoRetryCount >= 3) return;
+  displayInfoRetryCount++;
+  setTimeout(() => pollDisplayInfo(), 2000);
+}
 
 export function pollDisplayInfo() {
   const requestSequence = ++displayPollSequence;
@@ -417,9 +460,15 @@ export function pollDisplayInfo() {
   const prevRefreshRateHz = app.displayInfo.refreshRateHz ?? null;
   const prevRefreshRates = app.displayInfo.refreshRates;
   const prevResolutions = app.displayInfo.resolutions;
+  const prevNativeWidth = app.displayInfo.nativeWidth;
+  const prevNativeHeight = app.displayInfo.nativeHeight;
+  const prevNativeSource = app.displayInfo.nativeSource;
   app.displayInfo = {
     width: Math.round(s.width * dpr),
     height: Math.round(s.height * dpr),
+    nativeWidth: prevNativeWidth,
+    nativeHeight: prevNativeHeight,
+    nativeSource: prevNativeSource,
     refreshRateHz: prevRefreshRateHz,
     refreshRates: prevRefreshRates,
     resolutions: prevResolutions,
@@ -430,8 +479,21 @@ export function pollDisplayInfo() {
     // Polls can overlap while Windows is changing display modes. Only let
     // the newest request update the dropdown, otherwise a slower old result
     // could snap the selection back after a successful change.
-    if (requestSequence !== displayPollSequence || !info) return;
-      const modeChangeBusy = app.displayModeBusy || app.refreshRateBusy;
+    if (requestSequence !== displayPollSequence) return;
+    if (!info) {
+      scheduleDisplayInfoRetry();
+      return;
+    }
+    // Transitional display states (sleep/resume, hotplug, driver mode
+    // switches) can report no refresh rate and no supported modes. Keep the
+    // last known-good values instead of blanking the dropdowns, and retry a
+    // few times in case the driver is still waking up.
+    if (!info.refresh_hz && (!info.refresh_rates || info.refresh_rates.length === 0)) {
+      scheduleDisplayInfoRetry();
+      return;
+    }
+    displayInfoRetryCount = 0;
+    const modeChangeBusy = app.displayModeBusy || app.refreshRateBusy;
     const nextRefreshRate = modeChangeBusy
       ? app.displayInfo.refreshRateHz
       : (info.refresh_hz || null);
@@ -444,6 +506,9 @@ export function pollDisplayInfo() {
       // mode switch and the next poll confirms the actual value.
       width: app.displayModeBusy ? app.displayInfo.width : info.width,
       height: app.displayModeBusy ? app.displayInfo.height : info.height,
+      nativeWidth: Number(info.native_width) || 0,
+      nativeHeight: Number(info.native_height) || 0,
+      nativeSource: typeof info.native_source === 'string' ? info.native_source : '',
       refreshRateHz: nextRefreshRate,
       refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [],
       resolutions: Array.isArray(info.resolutions) ? info.resolutions : [],
@@ -451,7 +516,9 @@ export function pollDisplayInfo() {
     if (nextRefreshRate && nextRefreshRate !== previousRefreshRate) {
       applyBlackLevelProfileForRefreshRate(nextRefreshRate);
     }
-  }).catch(() => {});
+  }).catch(() => {
+    scheduleDisplayInfoRetry();
+  });
 }
 
 // Plain tick counter bumped alongside the poll timer in App.svelte, so any

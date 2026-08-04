@@ -50,6 +50,23 @@ window.addEventListener('unhandledrejection', (e) => {
   logToFile('error', message);
 });
 
+// Capture-phase listener for failed subresource loads (broken icon after a
+// tray restart). Browser-generated resource errors do NOT reach window.onerror
+// or the console bridge above, so log them here explicitly with the failing
+// URL — that pinpoints whether an image failed to fetch (net::ERR_*), was
+// served a corrupt body, or failed to decode.
+window.addEventListener('error', (e) => {
+  const target = e.target;
+  if (!target || !target.tagName) return;
+  const tag = String(target.tagName).toLowerCase();
+  if (tag !== 'img' && tag !== 'script' && tag !== 'link' && tag !== 'audio' && tag !== 'video') return;
+  const src = target.currentSrc || target.src || target.href || '';
+  const detail = (target.error && target.error.message) || e.message || '';
+  const message = `Resource load failed: <${tag}> ${src}${detail ? ` — ${detail}` : ''}`;
+  setTimeout(() => pushGpuLog('error', message, { persist: false }), 0);
+  logToFile('error', message);
+}, true);
+
 // Mirror all browser console levels to both the in-app Debug log and the
 // Rust-side file/terminal log. GPU call sites use these same console methods,
 // so they are included exactly once alongside Taskbar Dimmer and Settings
@@ -77,6 +94,18 @@ try {
 
   console.log('OLED Helper mounted OK');
   logToFile('info', 'OLED Helper mounted OK');
+
+  // Fallback layer for the Rust-side pre-build WebView2 cache purge: clears
+  // through the WebView2 API itself, so it works regardless of the purge's
+  // hardcoded path. Tray restarts on older builds hard-killed the process
+  // mid-write, corrupting cache entries for some embedded icons (served back
+  // as broken images). Delayed a couple of seconds so the already-healthy
+  // initial page load is not disturbed.
+  setTimeout(() => {
+    invoke('clear_webview_cache').catch((err) => {
+      logToFile('warn', `cache clear failed: ${String(err)}`);
+    });
+  }, 2000);
 } catch (e) {
   console.error('OLED Helper mount failed:', e);
   // Show the error visibly so we can debug without DevTools

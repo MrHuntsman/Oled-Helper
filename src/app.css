@@ -410,6 +410,7 @@ button {
   padding: 6px 10px 6px 0;
   border-radius: 8px;
   cursor: pointer;
+  user-select: none;
   transition: background 0.08s;
 }
 .tab-heading-toggle:hover { background: var(--hover); }
@@ -869,6 +870,7 @@ button {
   padding: 8px 12px;
   border-radius: 8px;
   text-align: left;
+  user-select: none;
   transition: background 0.08s;
 }
 .settings-row:hover:not(:disabled) { background: var(--hover); }
@@ -877,6 +879,93 @@ button {
 .settings-row-label { font-size: 13px; font-weight: 500; }
 .settings-row-desc { font-size: 12px; color: var(--text-weak); }
 .settings-row-toggle-only { justify-content: flex-end; }
+
+/* Destructive "Reset all settings" row — right side carries the action label
+   instead of a pill toggle. */
+.reset-all-row { cursor: pointer; }
+.reset-all-chevron {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-weak);
+  padding: 4px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 5px;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.reset-all-row:hover .reset-all-chevron {
+  color: #ff6b6b;
+  border-color: color-mix(in srgb, #ff6b6b 50%, var(--divider));
+}
+.reset-all-error {
+  margin: 6px 12px 0;
+  font-size: 12px;
+  color: #ff6b6b;
+}
+
+/* Confirmation modal — centered dialog over a dimmed backdrop. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: modal-backdrop-in 0.12s ease;
+}
+@keyframes modal-backdrop-in { from { opacity: 0; } }
+.modal {
+  width: min(380px, calc(100vw - 48px));
+  background: var(--panel);
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  padding: 18px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  animation: modal-in 0.14s cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.96); }
+}
+.modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 6px;
+}
+.modal-desc {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-weak);
+  margin-bottom: 16px;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.modal-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+  border: 1px solid var(--divider);
+  color: var(--text);
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
+}
+.modal-btn:hover,
+.modal-btn:focus-visible { background: var(--hover); border-color: var(--accent); outline: none; }
+.modal-btn-cancel { color: var(--text-weak); }
+.modal-btn-danger {
+  color: #ff6b6b;
+  border-color: color-mix(in srgb, #ff6b6b 40%, var(--divider));
+}
+.modal-btn-danger:hover,
+.modal-btn-danger:focus-visible {
+  color: #fff;
+  background: #ff6b6b;
+  border-color: #ff6b6b;
+}
 
 /* Two-line settings row: label on top, a full-width control (e.g. the
    hover-detection segmented switch) on its own row below, instead of the
@@ -890,6 +979,14 @@ button {
 }
 .settings-row-2line:hover,
 .settings-row-2line:hover:not(:disabled) { background: rgba(0, 0, 0, 0.12); }
+
+/* Detection Method section on the Dimmer tab — mirrors the spacing/heading
+   pattern of the fade-duration row above it (margin-top: 16px) rather than
+   the bordered .settings-row-2line wrapper used when this lived in Settings. */
+.dimmer-hover-section { margin-top: 16px; }
+.dimmer-hover-section.disabled { opacity: 0.5; pointer-events: none; }
+.dimmer-section-heading { display: block; margin-bottom: 8px; }
+.dimmer-section-desc { display: block; margin-bottom: 8px; }
 
 /* Segmented hover-detection switch — both options and their descriptions
    are visible at once so the user can compare before switching, instead of
@@ -945,21 +1042,20 @@ button {
 .hover-detect-radios {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 .hover-detect-radio-row {
   display: flex;
   align-items: flex-start;
   gap: 10px;
   text-align: left;
-  padding: 10px 12px;
-  border: 1px solid var(--divider);
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.12);
+  width: 100%;
+  user-select: none;
   transition: background 0.1s, border-color 0.1s;
 }
 .hover-detect-radio-row.active {
   background: color-mix(in srgb, var(--accent) 8%, rgba(0, 0, 0, 0.12));
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--divider));
 }
 .hover-detect-radio-row:hover:not(.active) { background: var(--hover); }
 .hover-detect-radio-dot {
@@ -1398,7 +1494,8 @@ button {
   right: 0;
   z-index: 30;
   min-width: max-content;
-  width: auto;
+  width: max-content;
+  max-width: 320px;
   max-height: 340px;
   overflow-y: auto;
   overflow-x: hidden;
@@ -1430,6 +1527,8 @@ button {
   font-variant-numeric: tabular-nums;
   color: var(--text);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: background 0.08s, color 0.08s, transform 0.08s;
 }
 .hz-menu-item:hover { background: var(--hover); color: #fff; transform: translateX(2px); }
@@ -1448,7 +1547,7 @@ button {
   letter-spacing: 0.4px;
   padding: 6px 10px 3px;
 }
-.res-menu { min-width: 100%; }
+.res-menu { min-width: 100%; width: max-content; max-width: 320px; }
 .res-menu .hz-menu-item {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1489,17 +1588,29 @@ button {
   outline: none;
   transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
 }
-/* Fixed width so the resolution/refresh-rate buttons and their menus never
-   shift size as the selected value changes, and so the button and its menu
-   always match exactly — the menu's min-width: 100% (see .res-menu below)
-   inherits this. 200px comfortably fits the longest realistic label
-   ("3840×2160 · 4K UHD") without the wide-item cases from earlier attempts. */
+/* Sized to content instead of a fixed width — a fixed 200px left a lot of
+   dead space after short labels like "1920×1080" since text is left-aligned.
+   min/max bound it so it neither collapses too small nor grows unbounded for
+   the longest realistic label ("3840×2160 · 4K UHD"). The dropdown menu
+   (.res-menu) matches this exact width via width: 100%, so button and menu
+   always line up. */
 .resolution-select {
-  width: 200px;
+  width: auto;
+  min-width: 110px;
+  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.refresh-rate-select { width: 122px; overflow: hidden; text-overflow: ellipsis; }
+/* Fixed width (not content-sized like .resolution-select) — this button's
+   label includes the black-level value in parens (e.g. "144 Hz (+0.9)"),
+   which changes digit count as the user adjusts black level. A content-fit
+   width would resize the button on every such change and shift the HDR
+   switch beside it in .status-bar-right. Fixed width absorbs that instead. */
+.refresh-rate-select {
+  width: 122px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .resolution-select.active,
 .refresh-rate-select.active {
   color: var(--text);

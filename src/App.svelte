@@ -10,6 +10,17 @@
   import TabSettings from './lib/TabSettings.svelte';
   import TabAbout from './lib/TabAbout.svelte';
 
+  // Icons are inlined as data URIs (?inline) instead of /icons/*.png URLs so
+  // they never depend on the dev server or asset protocol at runtime — a tray
+  // restart can leave the vite dev server dead, and any icon requested after
+  // that would otherwise render as a broken-image logo.
+  import appIcon from './lib/icons/app-icon.png?inline';
+  import tabSystemIcon from './lib/icons/tab_system.png?inline';
+  import tabAboutIcon from './lib/icons/tab_about.png?inline';
+  import tabCrushIcon from './lib/icons/tab_crush.png?inline';
+  import tabDimmerIcon from './lib/icons/tab_dimmer.png?inline';
+  import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
+
   let windowVisible = $state(true);
 
   // Custom click-only dropdown for resolution, replacing the native
@@ -111,8 +122,8 @@
 
   const resolutionNames = new Map([
     ['1280x720', 'HD'],
-    ['1920x1080', 'Full HD'],
-    ['2560x1080', 'Ultrawide Full HD'],
+    ['1920x1080', 'FHD'],
+    ['2560x1080', 'Ultrawide FHD'],
     ['2560x1440', 'QHD'],
     ['3440x1440', 'UWQHD'],
     ['3840x2160', '4K'],
@@ -129,30 +140,24 @@
     return resolutionNames.get(`${app.displayInfo.width}x${app.displayInfo.height}`) || '';
   }
 
-  function resolutionAspectRatio(resolution) {
-    const ratio = resolution.width / resolution.height;
-    // Treat 21:9, 32:9, and intermediate cinematic ratios (for example
-    // 2560×1080 and 5120×2160) as one navigable Ultrawide group.
-    if (ratio >= 2.1) return 'Ultrawide';
-    const commonRatios = [
-      [16 / 9, '16:9'], [16 / 10, '16:10'], [4 / 3, '4:3'], [5 / 4, '5:4'],
-    ];
-    return commonRatios.find(([value]) => Math.abs(ratio - value) < 0.025)?.[1] || 'Other';
+  // Flat list sorted largest-first, matching the plain (ungrouped) style
+  // Windows' own Display Settings resolution dropdown uses — no aspect-ratio
+  // sectioning. The display's native resolution comes from its EDID preferred
+  // timing (queried in Rust, same data Windows uses for its "(Recommended)"
+  // label); when the EDID can't be read the largest supported mode is used
+  // as the closest available proxy.
+  function sortedResolutions() {
+    return [...app.displayInfo.resolutions].sort((a, b) => (b.width * b.height) - (a.width * a.height));
   }
 
-  function resolutionGroups() {
-    const groups = new Map();
-    for (const resolution of app.displayInfo.resolutions) {
-      const aspect = resolutionAspectRatio(resolution);
-      if (!groups.has(aspect)) groups.set(aspect, []);
-      groups.get(aspect).push(resolution);
+  function isRecommendedResolution(resolution) {
+    const { nativeWidth, nativeHeight, resolutions } = app.displayInfo;
+    if (nativeWidth && nativeHeight) {
+      return resolution.width === nativeWidth && resolution.height === nativeHeight;
     }
-    return [...groups.entries()]
-      .sort(([a], [b]) => a === 'Other' ? 1 : b === 'Other' ? -1 : a.localeCompare(b, undefined, { numeric: true }))
-      .map(([aspect, resolutions]) => ({
-        aspect,
-        resolutions: resolutions.sort((a, b) => (a.width * a.height) - (b.width * b.height)),
-      }));
+    if (resolutions.length === 0) return false;
+    const largest = resolutions.reduce((best, r) => (r.width * r.height > best.width * best.height ? r : best));
+    return resolution.width === largest.width && resolution.height === largest.height;
   }
 
   async function changeResolution(event) {
@@ -246,7 +251,15 @@
 
     let unlisten;
     listen('window-visibility', (event) => {
-      windowVisible = event.payload !== false;
+      const visible = event.payload !== false;
+      windowVisible = visible;
+      if (visible) {
+        // Re-query display info when the window is shown again (e.g. after
+        // sleep/resume while hidden in the tray). The cached mode can be
+        // stale or empty from a transitional query during wake; this makes
+        // it self-heal without a periodic poll.
+        pollDisplayInfo();
+      }
     }).then((stop) => { unlisten = stop; }).catch(() => {});
     return () => unlisten?.();
   });
@@ -292,7 +305,7 @@
 <div class="app-shell">
   <div class="top-bar">
     <div class="top-bar-left">
-      <img class="app-icon" src="/icons/app-icon.png" alt="OLED Helper" />
+      <img class="app-icon" src={appIcon} alt="OLED Helper" />
       <div class="title-block">
         <span class="title">OLED HELPER</span>
         <span class="version">v0.1.0</span>
@@ -300,22 +313,22 @@
     </div>
     <div class="spacer"></div>
     <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
-      <span class="top-btn-inner"><img class="top-btn-icon" src="/icons/tab_system.png" alt="" /> Settings</span>
+      <span class="top-btn-inner"><img class="top-btn-icon" src={tabSystemIcon} alt="" /> Settings</span>
     </button>
     <button class="top-btn" class:active={app.activeTab === 'about'} onclick={() => app.activeTab = 'about'}>
-      <span class="top-btn-inner"><img class="top-btn-icon" src="/icons/tab_about.png" alt="" /> About</span>
+      <span class="top-btn-inner"><img class="top-btn-icon" src={tabAboutIcon} alt="" /> About</span>
     </button>
   </div>
 
   <nav class="sidebar">
     <button class="nav-btn" class:active={app.activeTab === 'crush'} onclick={() => app.activeTab = 'crush'}>
-      <img class="nav-icon" src="/icons/tab_crush.png" alt="" /> Black Crush Tweak
+      <img class="nav-icon" src={tabCrushIcon} alt="" /> Black Crush Tweak
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
-      <img class="nav-icon" src="/icons/tab_dimmer.png" alt="" /> Taskbar Dimmer
+      <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
-      <img class="nav-icon" src="/icons/tab_hotkeys.png" alt="" /> Hotkeys
+      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
 
     <div class="sidebar-spacer"></div>
@@ -360,18 +373,16 @@
                 {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '—×—'}
               </div>
             {:else}
-              {#each resolutionGroups() as group}
-                <div class="hz-menu-group-label">{group.aspect === 'Ultrawide' ? 'Ultrawide (21:9 / 32:9)' : `${group.aspect} resolutions`}</div>
-                {#each group.resolutions as resolution}
+                {#each sortedResolutions() as resolution}
                   {@const name = resolutionName(resolution)}
                   {@const current = resolution.width === app.displayInfo.width && resolution.height === app.displayInfo.height}
+                  {@const recommended = isRecommendedResolution(resolution)}
                   <button type="button" class="hz-menu-item" class:active={current}
                     role="option" aria-selected={current}
                     onclick={() => pickResolution(resolution.width, resolution.height)}>
-                    {resolution.width}×{resolution.height}{name ? ` · ${name}` : ''}
+                    {resolution.width}×{resolution.height}{name ? ` · ${name}` : ''}{recommended ? ' (Recommended)' : ''}
                   </button>
                 {/each}
-              {/each}
             {/if}
           </div>
         {/if}

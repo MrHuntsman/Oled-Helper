@@ -32,6 +32,17 @@
   // Depends on envTick (bumped every 1s in App.svelte) so this whole table
   // stays live without needing a tab switch/remount — navigator.*/screen.*
   // are plain globals Svelte can't track on its own.
+  // True native resolution (EDID preferred timing) — the same data Windows
+  // uses for its "(Recommended)" label. `nativeSource` says which EDID
+  // location supplied it ("CEA-861" for the extension block TVs use,
+  // "base EDID" for the base block, or empty when unreadable).
+  let nativeResolution = $derived.by(() => {
+    const d = app.displayInfo;
+    if (!d.nativeWidth || !d.nativeHeight) return '—';
+    const source = d.nativeSource === 'CEA-861' ? 'CEA-861 ext.' : d.nativeSource === 'base EDID' ? 'base EDID' : d.nativeSource;
+    return `${d.nativeWidth}×${d.nativeHeight}${source ? ` · ${source}` : ''}`;
+  });
+
   let rows = $derived.by(() => {
     void envTick.n;
     // screen.colorDepth/pixelDepth report combined bits across R+G+B (e.g. 30
@@ -45,6 +56,7 @@
       ['Display Type', displayType],
       // Peak luminance is only meaningful while HDR is active; hide it in SDR.
       ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
+      ['Native Resolution', nativeResolution],
       ['Screen Resolution', `${screen.width * devicePixelRatio}x${screen.height * devicePixelRatio}${app.displayInfo.refreshRateHz ? `@${app.displayInfo.refreshRateHz}Hz` : ''}`],
       ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
       ['Color Depth', perChannelBits ? `${perChannelBits}-bit per channel` : '?'],

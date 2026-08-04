@@ -692,6 +692,18 @@ mod platform {
                 // and returns immediately, keeping the WM_TIMER callback fast.
                 if let Some(state) = FADE_STATE.get() {
                     let fade = state.lock().unwrap();
+                    // Skip the repair while the overlay is hidden for
+                    // fullscreen (or the app's own fullscreen strip):
+                    // maintain_overlay_zorder's SetWindowPos uses
+                    // SWP_SHOWWINDOW, which would re-show a hidden overlay
+                    // and flash it back on screen. A repair that was already
+                    // queued when fullscreen was detected must not execute.
+                    // The restore after exit is covered by the self-heal in
+                    // update_fade, which posts a fresh repair only after
+                    // fullscreen_active is false again.
+                    if fade.fullscreen_active || SUSPENDED.load(Ordering::Relaxed) {
+                        return LRESULT(0);
+                    }
                     if let Some((raw, rect)) = fade.cached_taskbar {
                         let zorder_started = Instant::now();
                         drop(fade);

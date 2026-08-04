@@ -89,6 +89,25 @@ fn log_frontend(level: String, message: String) {
     }
 }
 
+// Wipes the WebView2 HTTP cache (and other stored web data — this app uses
+// none). Tray restarts on older builds hard-killed the process mid-write
+// (Tauri's app.restart() calls std::process::exit(0)), which corrupted cache
+// entries for some embedded icons; the corrupt responses were then served as
+// broken images on the next launch. The pre-build purge (purge_webview_cache)
+// is the primary mechanism — this command is a fallback that clears through
+// the WebView2 API itself, so it works even if the purge's hardcoded path
+// ever stops matching. Called by the frontend a couple of seconds after
+// mount, after the (healthy) initial page load has settled.
+#[tauri::command]
+fn clear_webview_cache(app: tauri::AppHandle) -> Result<(), String> {
+    match app.get_webview_window("main") {
+        Some(window) => window
+            .clear_all_browsing_data()
+            .map_err(|error| error.to_string()),
+        None => Err("main window not found".into()),
+    }
+}
+
 #[tauri::command]
 fn get_display_info() -> Option<display_info::DisplayInfo> {
     display_info::query_current_display()
@@ -131,6 +150,46 @@ fn request_shutdown_and_exit(app: &AppHandle) {
     app.exit(0);
 }
 
+fn request_restart(app: &AppHandle) {
+    // In dev mode the app runs under `tauri dev`, which owns the vite dev
+    // server. Exiting this process tears the whole dev environment down
+    // (vite included), so a spawned replacement instance would be left with
+    // no dev server — the page can't even load, and any asset requested
+    // after the teardown renders as a broken icon. Reload the webview
+    // instead: the frontend fully re-initializes (config reload, dimmer and
+    // gamma re-sync) while the Rust backend and the dev server stay alive.
+    if tauri::is_dev() {
+        log::info!("dev-mode restart: reloading webview (process stays alive so the dev server survives)");
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.reload();
+        }
+        return;
+    }
+
+    // Production path: real process restart.
+    taskbar_dimmer::shutdown();
+    shutdown_gamma_worker(app);
+    // Tauri's app.restart() spawns the new process and then hard-exits via
+    // std::process::exit(0), which kills WebView2 mid-write. The abrupt
+    // termination corrupts the WebView2 disk cache in the shared user-data
+    // folder, and on the next launch the webview serves the corrupt cached
+    // responses — the broken icon images after a tray restart. Spawn the
+    // replacement instance first, then exit through the event loop
+    // (app.exit) so WebView2 flushes its cache and releases the user-data
+    // folder before the new process opens it. The child is told which PID to
+    // wait for (--restart-parent) so it never starts WebView2 while the old
+    // process still holds the user-data folder or cache files.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        args.push("--restart-parent".into());
+        args.push(std::process::id().to_string().into());
+        if let Err(e) = std::process::Command::new(exe).args(args).spawn() {
+            log::error!("failed to spawn replacement instance: {e}");
+        }
+    }
+    app.exit(0);
+}
+
 #[tauri::command]
 fn set_tray_enabled(
     app: tauri::AppHandle,
@@ -145,8 +204,95 @@ fn set_tray_enabled(
     Ok(())
 }
 
+// When this instance was spawned by a tray Restart, --restart-parent carries
+// the old process's PID. Wait for it to fully exit (bounded, ~5 s) before
+// creating the WebView2 environment: starting the new instance while the old
+// one still holds the user-data folder makes WebView2 attach to the old
+// process's browser process, which is being torn down — in-flight asset
+// requests then abort and some images render as broken icons. Polling with
+// GetExitCodeProcess is cheaper and more reliable than waiting on a named
+// event, and it also fails safe (if the parent is already gone, OpenProcess
+// errors and we proceed immediately).
+#[cfg(target_os = "windows")]
+fn wait_for_restart_parent(parent_pid: u32) {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) else {
+            return; // parent already gone — nothing to wait for
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut exit_code = 0u32;
+            let _ = GetExitCodeProcess(handle, &mut exit_code);
+            if exit_code != STILL_ACTIVE.0 as u32 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!("restart parent {parent_pid} did not exit within 5s — continuing anyway");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = CloseHandle(handle);
+    }
+}
+
+// Deletes the WebView2 HTTP disk cache before the webview starts. Tray
+// restarts on older builds hard-killed the process mid-write (Tauri's
+// app.restart() → std::process::exit(0)), corrupting cache entries for some
+// embedded icons; on the next launch WebView2 served the corrupt responses
+// and those icons rendered as the broken-image logo. The cache has no value
+// here — every asset is embedded in the binary or served fresh by the dev
+// server — so purge it once per launch to guarantee a stale entry can never
+// be served. Runs before tauri::Builder is built, so WebView2 isn't running
+// and no cache file is locked.
+#[cfg(target_os = "windows")]
+fn purge_webview_cache() {
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
+        .unwrap_or_default();
+    if base.is_empty() {
+        return;
+    }
+    // Default WebView2 user-data folder for the "OledHelper" identifier:
+    // %LOCALAPPDATA%\OledHelper\EBWebView\Default\Cache. NOTE: this path
+    // depends on the app identifier in tauri.conf.json — if it is ever
+    // renamed, the purge silently no-ops (NotFound is swallowed) and the
+    // frontend clear_webview_cache fallback still covers the cleanup.
+    let cache_dir = std::path::Path::new(&base)
+        .join("OledHelper")
+        .join("EBWebView")
+        .join("Default")
+        .join("Cache");
+    match std::fs::remove_dir_all(&cache_dir) {
+        Ok(()) => log::info!("purged WebView2 disk cache at {}", cache_dir.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("could not purge WebView2 cache: {e}"),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Tray-restart child: let the old instance release the user-data folder
+    // and cache files before we start WebView2.
+    #[cfg(target_os = "windows")]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if let Some(pos) = args.iter().position(|arg| arg == "--restart-parent") {
+            if let Some(pid) = args
+                .get(pos + 1)
+                .and_then(|arg| arg.to_str())
+                .and_then(|text| text.parse::<u32>().ok())
+            {
+                wait_for_restart_parent(pid);
+            }
+        }
+        purge_webview_cache();
+    }
+
     tauri::Builder::default()
         .manage(GammaState {
             desired: Arc::new(AtomicI32::new(0)),
@@ -160,12 +306,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             apply_gamma_ramp,
             log_frontend,
+            clear_webview_cache,
             get_display_info,
             set_refresh_rate,
             set_resolution,
             set_tray_enabled,
             config::load_config,
             config::save_config,
+            config::reset_config,
             taskbar_dimmer::set_taskbar_dimmer,
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
             taskbar_dimmer::set_taskbar_dimmer_detection,
@@ -213,14 +361,19 @@ pub fn run() {
                     .build(),
             )?;
 
+            // Let display_info's EDID diagnostics reach the Runtime Log (the
+            // Debug tab mirrors the "runtime-log" event in main.js).
+            display_info::init_app_handle(app.handle().clone());
+
             let saved_config = config::load_config(app.handle().clone());
             app.state::<TrayState>()
                 .enabled
                 .store(saved_config.tray_enabled, Ordering::Relaxed);
 
             let show_item = MenuItem::with_id(app, "show", "Show OLED Helper", true, None::<&str>)?;
+            let restart_item = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &restart_item, &quit_item])?;
             let tray_image = window_icon::crisp_tray_image()
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
@@ -231,6 +384,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
+                    "restart" => request_restart(app),
                     "quit" => request_shutdown_and_exit(app),
                     _ => {}
                 })

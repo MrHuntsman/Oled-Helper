@@ -1,4 +1,7 @@
 <script>
+  // Inlined data URIs — see App.svelte for why icons never hit the network.
+  import tabCrushIcon from './icons/tab_crush.png?inline';
+  import zoomIcon from './icons/zoom.png?inline';
   import { app, crush, adjustmentDisplay, blackLift, saveConfig } from './stores.svelte.js';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
@@ -629,7 +632,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
     <div class="tab-heading-toggle" role="button" tabindex="0" onclick={toggleBlackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBlackEnabled(); } }} title="Enable Black Level" aria-label="Enable Black Level" aria-pressed={crush.blackEnabled}>
-      <img class="tab-icon" src="/icons/tab_crush.png" alt="" />
+      <img class="tab-icon" src={tabCrushIcon} alt="" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Black Crush Tweak</h2>
@@ -639,7 +642,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <div class="tab-heading-spacer"></div>
       <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
-    <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore defaults</button>
+    <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -747,7 +750,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     </div>
 
     <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCount = value)}>
-      <img class="slider-label-icon" src="/icons/zoom.png" alt="Zoom" />
+      <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />
       <div class="slider-track-wrap zoom-track-compact">
         <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCount} bind:this={zoomSliderInput}
           style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%" />
