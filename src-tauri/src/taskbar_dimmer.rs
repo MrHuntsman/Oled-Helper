@@ -80,6 +80,11 @@ mod platform {
     const WM_DIMMER_REPAIR_ZORDER: u32 = WM_APP + 1;
     const ACTIVE_TIMER_INTERVAL_MS: u32 = 16;
     const TASKBAR_CACHE_REFRESH_MS: u64 = 1000;
+    // Event mode refreshes the taskbar cache on taskbar window events
+    // (move, resize, auto-hide slide); this slow catch-all guarantees a
+    // stale cache can't persist if an event is ever missed (e.g. Explorer
+    // recreating the taskbar with a new HWND mid-transition).
+    const TASKBAR_CACHE_CATCHALL_MS: u64 = 5000;
     const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
     // Fullscreen detection runs the expensive Win32 foreground-window chain
     // (GetForegroundWindow → GetWindowThreadProcessId → GetWindowRect →
@@ -217,6 +222,14 @@ mod platform {
     // based check is the only path (and takes over if the WinEvent hook
     // fails to install, so event-mode detection never silently stops).
     static FULLSCREEN_RECHECK_REQUESTED: AtomicBool = AtomicBool::new(false);
+    // Set by the WinEvent callback when an event targets the cached taskbar
+    // window itself (moved to another edge, resized, auto-hide slide,
+    // minimized). In event mode this triggers an immediate taskbar-cache
+    // refresh so the hook's hit-test rect and the overlay position react
+    // instantly instead of waiting for the periodic timer. Poll mode (no
+    // WinEvent hook) keeps the plain timer cadence; the flag is simply
+    // never set there.
+    static TASKBAR_CACHE_RECHECK_REQUESTED: AtomicBool = AtomicBool::new(false);
     // Diagnostic: timestamp of the last logged WinEvent, used to throttle the
     // winevent log so continuous window drags don't flood the log while still
     // showing the burst pattern of a fullscreen enter/exit transition.
@@ -455,6 +468,21 @@ mod platform {
             }
         }
         FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        // Event-driven taskbar cache: when an event targets the cached
+        // taskbar window itself (drag to another edge, resize, auto-hide
+        // slide, minimize), request an immediate cache refresh so the hook
+        // hit-test rect and the overlay position react instantly. The hwnd
+        // comparison is cheap; a taskbar recreated with a new HWND (Explorer
+        // restart) is left to the slow catch-all timer.
+        let targets_taskbar = FADE_STATE
+            .get()
+            .and_then(|state| state.lock().ok())
+            .and_then(|fade| fade.cached_taskbar)
+            .map(|(raw, _)| hwnd.0 as isize == raw)
+            .unwrap_or(false);
+        if targets_taskbar {
+            TASKBAR_CACHE_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        }
         // Poke the overlay to re-evaluate hover/fullscreen. The tick thread
         // will pick up the right source (hook or poll, and the forced
         // fullscreen recheck) on the next tick.
@@ -1202,9 +1230,32 @@ mod platform {
             fade.last_poll_tick = Some(now);
 
             if TASKBAR_CACHE_REFRESH.load(Ordering::Relaxed) {
+                // Event mode refreshes the cache on taskbar window events
+                // (flag set by the WinEvent callback) with only a slow
+                // catch-all timer as a safety net; poll mode keeps the
+                // regular timer cadence.
+                let event_driven_cache = PREFER_EVENT_HOVER.load(Ordering::Relaxed)
+                    && ELEVATION_WINEVENT_HOOK.load(Ordering::Acquire) != 0;
+                let cache_recheck_requested = event_driven_cache
+                    && TASKBAR_CACHE_RECHECK_REQUESTED.swap(false, Ordering::Relaxed);
+                let cache_interval = if event_driven_cache {
+                    TASKBAR_CACHE_CATCHALL_MS
+                } else {
+                    TASKBAR_CACHE_REFRESH_MS
+                };
                 let refresh_cache = fade.cached_taskbar.is_none()
-                    || now.duration_since(fade.last_taskbar_cache_refresh).as_millis() as u64 >= TASKBAR_CACHE_REFRESH_MS;
+                    || cache_recheck_requested
+                    || now.duration_since(fade.last_taskbar_cache_refresh).as_millis() as u64 >= cache_interval;
                 if refresh_cache {
+                    let trigger = if fade.cached_taskbar.is_none() {
+                        "initial"
+                    } else if cache_recheck_requested {
+                        "event"
+                    } else if event_driven_cache {
+                        "catchall"
+                    } else {
+                        "timer"
+                    };
                     fade.last_taskbar_cache_refresh = now;
                     let previous = fade.cached_taskbar;
                     fade.cached_taskbar = taskbar_info().map(|(taskbar, rect)| (taskbar.0 as isize, rect));
@@ -1213,6 +1264,13 @@ mod platform {
                     *HOOK_TASKBAR_RECT.lock().unwrap() = fade.cached_taskbar.map(|(_, rect)| rect);
                     if fade.cached_taskbar != previous {
                         should_repair_zorder = true;
+                    }
+                    if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                        emit_runtime("info", format!(
+                            "[taskbar-dimmer] taskbar_cache refresh trigger={} taskbar={}",
+                            trigger,
+                            rect_text(fade.cached_taskbar.map(|(_, rect)| rect)),
+                        ));
                     }
                 }
             }
