@@ -124,12 +124,17 @@ export function blackLevelDisplayForRefreshRate(hz) {
   // config save updates the profile map.
   if (key && key === currentKey) {
     const value = crush.adjustment;
+    // A value of exactly 0 isn't a deliberately-set offset worth calling
+    // out next to the Hz entry — same reasoning as the "no saved profile"
+    // branch below, just also covering the live/currently-selected rate.
+    if (value === 0) return '';
     return `${value > 0 ? '+' : ''}${(value / 10).toFixed(1)}`;
   }
   // No saved profile for this rate yet — show nothing rather than a
   // misleading "0.0" that implies a deliberately-set neutral value.
   if (!key || !Object.prototype.hasOwnProperty.call(crush.blackProfiles, key)) return '';
   const value = blackLevelForRefreshRate(hz);
+  if (value === 0) return '';
   return `${value > 0 ? '+' : ''}${(value / 10).toFixed(1)}`;
 }
 
