@@ -314,11 +314,20 @@
   let modeConfirmationTimer = $state(null);
   let modeConfirmationBusy = $state(false);
   let modeConfirmationError = $state('');
+  // Plays the shared exit ease (mode-confirm-exit-in) before the modal is
+  // removed — mirrors Flyout.svelte's `exiting` state so the in-app modal
+  // and the tray flyout animate identically.
+  let modeConfirmationExiting = $state(false);
 
-  function clearModeConfirmation() {
+  function clearModeConfirmationTimer() {
     if (modeConfirmationTimer) clearInterval(modeConfirmationTimer);
     modeConfirmationTimer = null;
+  }
+
+  function clearModeConfirmation() {
+    clearModeConfirmationTimer();
     pendingModeConfirmation = null;
+    modeConfirmationExiting = false;
   }
 
   function startModeConfirmation(result) {
@@ -342,34 +351,79 @@
     }, 250);
   }
 
-  async function confirmModeChange() {
+  // Shared close path for Keep and Revert, mirroring Flyout.svelte's
+  // closeFlyout. The exit ease plays FIRST with nothing running concurrently
+  // — confirm_mode_change / rollback both re-apply the display mode via
+  // ChangeDisplaySettingsExW, and doing that while the animation plays stalls
+  // the compositor and makes it stutter. So the order is: play the exit
+  // animation (smooth), then run the mode-change invoke. On success the modal
+  // is removed; on failure it is re-shown (removing the exiting class
+  // re-applies the entrance animation) so the error is visible and retryable.
+  async function closeModeConfirmation(action) {
     if (modeConfirmationBusy || !pendingModeConfirmation) return;
     modeConfirmationBusy = true;
+    modeConfirmationError = '';
+    // Scope to the mode-confirm modal specifically — the generic
+    // .modal-backdrop .modal selector could match TabSettings' reset-all
+    // confirm if both were ever open at once.
+    const modal = document.querySelector('.mode-confirm-backdrop .modal');
+    modeConfirmationExiting = true;
+    const exitFinished = modal
+      ? new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(failsafe);
+            modal.removeEventListener('animationend', onEnd);
+            modal.removeEventListener('animationcancel', onCancel);
+            resolve();
+          };
+          // Only the exit animation ends the dialog — a leftover entrance
+          // animationend (mode-confirm-rise-in) must not resolve this early.
+          const onEnd = (event) => {
+            if (event.animationName === 'mode-confirm-exit-in') finish();
+          };
+          // If the exit class is removed before the animation completes
+          // (error path), the exit is cancelled rather than ended. Resolve
+          // and detach there too, or repeated attempts would accumulate
+          // listeners on the same modal.
+          const onCancel = (event) => {
+            if (event.animationName === 'mode-confirm-exit-in') finish();
+          };
+          modal.addEventListener('animationend', onEnd);
+          modal.addEventListener('animationcancel', onCancel);
+          // Safety net: never wait forever if the event is missed.
+          const failsafe = setTimeout(finish, 600);
+        })
+      : Promise.resolve();
     try {
-      await invoke('confirm_display_mode_change');
+      // Exit animation plays first — smooth, nothing concurrent yet.
+      await exitFinished;
+      // The mode change runs now; its display re-apply happens after the
+      // modal has faded out, so the compositor hiccup is invisible.
+      await invoke(action);
+      clearModeConfirmationTimer();
       clearModeConfirmation();
       resolutionError = '';
       refreshRateError = '';
     } catch (e) {
       modeConfirmationError = String(e);
+      // Re-show the dialog: removing the exiting class re-applies the
+      // entrance animation, keeping the error visible and retryable.
+      modeConfirmationExiting = false;
     } finally {
       modeConfirmationBusy = false;
       pollDisplayInfo();
     }
   }
 
+  async function confirmModeChange() {
+    await closeModeConfirmation('confirm_display_mode_change');
+  }
+
   async function rollbackModeChange() {
-    if (modeConfirmationBusy || !pendingModeConfirmation) return;
-    modeConfirmationBusy = true;
-    try {
-      await invoke('rollback_display_mode_change');
-      clearModeConfirmation();
-    } catch (e) {
-      modeConfirmationError = String(e);
-    } finally {
-      modeConfirmationBusy = false;
-      pollDisplayInfo();
-    }
+    await closeModeConfirmation('rollback_display_mode_change');
   }
 
   const resolutionNames = new Map([
@@ -887,7 +941,7 @@
 
   {#if pendingModeConfirmation}
     <div class="modal-backdrop mode-confirm-backdrop" role="presentation">
-      <div class="modal mode-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" tabindex="-1">
+      <div class="modal mode-confirm-modal" class:mode-confirm-exiting={modeConfirmationExiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" tabindex="-1">
         <h2 id="mode-confirm-title" class="modal-title">Keep display mode?</h2>
         <p class="modal-desc">
           {pendingModeConfirmation.monitor_name || 'Current monitor'} is temporarily using
@@ -897,7 +951,7 @@
         {#if modeConfirmationError}<p class="modal-error">Rollback failed: {modeConfirmationError}</p>{/if}
         <div class="modal-actions">
           <button class="modal-btn" onclick={confirmModeChange} disabled={modeConfirmationBusy}>Keep this mode</button>
-          <button class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert ({pendingModeConfirmation.remaining}s)</button>
+          <button class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert (<span class="modal-btn-countdown">{pendingModeConfirmation.remaining}</span>s)</button>
         </div>
       </div>
     </div>

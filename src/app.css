@@ -957,10 +957,89 @@ button {
 .modal-btn:hover,
 .modal-btn:focus-visible { background: var(--hover); border-color: var(--accent); outline: none; }
 .modal-btn-cancel { color: var(--text-weak); }
+/* Fixed-width slot for the countdown in "Revert (12s)" so the button
+   doesn't reflow as the seconds tick from two digits down to one (which
+   would otherwise shift the whole flex row of modal actions). */
+.modal-btn-countdown {
+  display: inline-block;
+  min-width: 2ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
 .mode-confirm-backdrop { z-index: 11000; }
 .mode-confirm-modal { max-width: min(430px, calc(100vw - 32px)); }
 .mode-confirm-modal .modal-desc strong { color: var(--text); font-weight: 600; }
 .mode-confirm-modal .modal-error { margin-top: 8px; color: #e87575; font-size: 11px; line-height: 1.35; }
+
+/* ── "Keep display mode?" confirm modal animations ────────────────────
+   Shared with the tray flyout (Flyout.svelte). The timings below are the
+   single source of truth referenced by BOTH windows: app.css is imported by
+   the main window (main.js) and by the flyout (flyout-main.js), so defining
+   the custom properties and keyframes here avoids duplicating them in
+   flyout.css. The flyout additionally holds the modal at opacity 0 until its
+   native window is actually shown (see flyout.css), but the animation
+   definitions themselves come from this block. */
+:root {
+  --mode-confirm-entrance-duration: 0.5s;
+  --mode-confirm-entrance-curve: cubic-bezier(0.22, 1, 0.36, 1);
+  --mode-confirm-entrance-rise: 14px;
+  --mode-confirm-exit-duration: 0.3s;
+  --mode-confirm-exit-curve: cubic-bezier(0.4, 0, 1, 1);
+  --mode-confirm-exit-drop: 14px;
+  /* Delay between the flyout's native window becoming visible and its
+     entrance animation starting (see FLYOUT_ENTRANCE_DWELL_MS in
+     Flyout.svelte). The in-app modal doesn't use it — it mounts into an
+     already-visible window, so its entrance plays immediately. */
+  --mode-confirm-entrance-dwell: 300ms;
+}
+
+/* Entrance: plays on mount in the main window; the flyout overrides with its
+   opacity-0 hold + .flyout-visible trigger (both rules win on specificity
+   in flyout.css). Later in the file than the generic .modal animation, so it
+   wins the cascade for the confirm modal. */
+.mode-confirm-modal {
+  animation: mode-confirm-rise-in var(--mode-confirm-entrance-duration) var(--mode-confirm-entrance-curve) forwards;
+}
+/* Exit: applied by App.svelte when Keep/Revert completes; the modal is
+   removed on the animationend event (mirrors Flyout.svelte's closeFlyout). */
+.mode-confirm-modal.mode-confirm-exiting {
+  animation: mode-confirm-exit-in var(--mode-confirm-exit-duration) var(--mode-confirm-exit-curve) forwards;
+}
+/* The in-app modal stays mounted through the mode-change invoke (its exit
+   animation ends at opacity 0 via forwards fill), so fade the dimmed
+   backdrop out in sync with the modal — otherwise the whole app would sit
+   dimmed with no visible dialog for the invoke's duration. On failure the
+   exiting class is removed and the base modal-backdrop-in re-applies. The
+   flyout never has this class (it uses .flyout-exiting), so it is
+   unaffected. */
+.mode-confirm-backdrop:has(.mode-confirm-modal.mode-confirm-exiting) {
+  animation: mode-confirm-backdrop-out var(--mode-confirm-exit-duration) var(--mode-confirm-exit-curve) forwards;
+}
+@keyframes mode-confirm-backdrop-out {
+  to { opacity: 0; }
+}
+
+@keyframes mode-confirm-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--mode-confirm-entrance-rise));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes mode-confirm-exit-in {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(var(--mode-confirm-exit-drop));
+  }
+}
 
 .modal-btn-danger {
   color: #ff6b6b;

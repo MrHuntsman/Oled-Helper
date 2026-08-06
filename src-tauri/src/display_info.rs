@@ -15,8 +15,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_TEST, CDS_TYPE,
-    CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_NORESET, CDS_TEST,
+    CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
     DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
     ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
@@ -1648,10 +1648,18 @@ pub fn confirm_mode_change() -> Result<(), String> {
         ));
     }
     unsafe {
-        change_mode(&target, &active, CDS_UPDATEREGISTRY)?;
+        // The requested mode is already active (verified above), so persist it
+        // to the registry WITHOUT re-applying it. A plain CDS_UPDATEREGISTRY
+        // call re-sets the same mode, which on HDMI/TV displays forces a
+        // full signal resync that freezes the entire desktop (including the
+        // cursor) for a moment. CDS_NORESET writes the settings to the
+        // registry but does not take effect, so nothing on screen changes.
+        change_mode(&target, &active, CDS_UPDATEREGISTRY | CDS_NORESET)?;
     }
     // Verify the persistent commit too. Keep the recovery record and pending
-    // transaction if the driver does not settle on the committed mode.
+    // transaction if the driver does not settle on the committed mode. Since
+    // CDS_NORESET did not change the mode, this confirms the previously
+    // verified mode is still active.
     if wait_for_mode(&target, &active).is_none() {
         return Err("the display mode was committed but could not be verified afterward; recovery state was kept".into());
     }

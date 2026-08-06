@@ -1,12 +1,35 @@
-/* flyout.css — re-asserts transparent window chrome for the flyout webview
-   AFTER app.css has loaded. app.css's `html, body, #app { background: var(--bg); ... }`
-   rule also matches plain `html, body` (that selector list applies to each
-   selector independently, #app-scoping only affects the third one), which
-   painted an opaque var(--bg) rectangle over the whole flyout window instead
-   of leaving it transparent outside .modal. Importing this file after
-   app.css in flyout-main.js lets its later cascade position win the tie
-   against equal-specificity selectors, without touching the main window's
-   shared app.css. */
+/* flyout.css — flyout-window-specific styles for the tray "Keep display mode?"
+   confirmation (src/lib/Flyout.svelte, mounted by src/flyout-main.js).
+
+   This file is imported AFTER app.css (see flyout-main.js), so its rules win
+   the cascade against equal-specificity app.css rules — exactly what we need
+   to override the shared .modal-backdrop / .modal styles for the tiny
+   always-on-top window without touching the main window's styling.
+
+   ── Timings ────────────────────────────────────────────────────────────────
+   The animation timings and keyframes are SHARED with the main window's
+   in-app "Keep display mode?" modal — they live in app.css as --mode-confirm-*
+   custom properties plus the mode-confirm-rise-in / mode-confirm-exit-in
+   keyframes (app.css is imported by both windows). Flyout-specific layout
+   overrides stay here; only the trigger classes differ (.flyout-visible /
+   .flyout-exiting vs the in-app .mode-confirm-exiting).
+
+   The JavaScript-side safety-net timeouts in Flyout.svelte reference these
+   values and must stay >= the matching CSS duration:
+     - script dwell  (FLYOUT_ENTRANCE_DWELL_MS)      -> --mode-confirm-entrance-dwell
+     - script fallback (FLYOUT_VISIBLE_FALLBACK_MS)  -> >= entrance duration + dwell
+     - script exit failsafe (FLYOUT_EXIT_FAILSAFE_MS) -> >= exit duration
+   The exit hide itself waits on the CSS `animationend` event, so it needs no
+   mirrored JS constant. */
+
+/* Re-assert transparent window chrome AFTER app.css has loaded. app.css's
+   `html, body, #app { background: var(--bg); ... }` rule also matches plain
+   `html, body` (that selector list applies to each selector independently,
+   #app-scoping only affects the third one), which painted an opaque
+   var(--bg) rectangle over the whole flyout window instead of leaving it
+   transparent outside .modal. Importing this file after app.css lets its
+   later cascade position win the tie against equal-specificity selectors,
+   without touching the main window's shared app.css. */
 html, body, #flyout-app {
   background: transparent !important;
 }
@@ -20,4 +43,59 @@ html, body, #flyout-app {
    modal's own border still gives it enough definition against the desktop. */
 .flyout-backdrop .modal {
   box-shadow: none;
+}
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+
+/* Keep the backdrop filling the whole window (the app.css base rule is
+   position: fixed; inset: 0). Overriding this to `static` earlier collapsed
+   it to the modal's height, which put all of the window's extra height BELOW
+   the modal and created the large gap above the taskbar. The window itself
+   is transparent, so the full-window backdrop paints nothing; it only
+   provides the layout box. */
+.flyout-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: auto;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  animation: none;
+}
+
+/* Pin the dialog to the bottom edge of the window so it sits right on top of
+   the taskbar; the window's spare height ends up ABOVE the modal as
+   invisible transparent space instead of below it as a visible gap. */
+.flyout-backdrop .modal {
+  width: 380px;
+  margin-top: auto;
+  margin-bottom: 0;
+  /* Hold the entrance animation's "from" state — no animation plays until
+     .flyout-visible is added (see the flyout-shown listener in
+     Flyout.svelte), which happens only after the native window is already
+     visible. Without this hold, the animation would run to completion while
+     the window is still hidden behind SetWindowPos and the user would only
+     ever see the final frame pop in with no motion. */
+  opacity: 0;
+  transform: translateY(var(--mode-confirm-entrance-rise));
+  animation: none;
+}
+
+/* ── Animations ──────────────────────────────────────────────────────────── */
+
+/* Entrance: rise out of the taskbar and fade in. The `from`/`to` states are
+   both explicit so the end state is authoritative regardless of the base
+   rule's computed values. */
+.flyout-backdrop .modal.flyout-visible {
+  opacity: 1;
+  transform: none;
+  animation: mode-confirm-rise-in var(--mode-confirm-entrance-duration) var(--mode-confirm-entrance-curve) forwards;
+}
+
+/* Exit: slide back down toward the taskbar and fade out, mirror of the
+   entrance. closeFlyout() (Flyout.svelte) hides the window on the
+   `animationend` event, so this duration needs no mirrored JS constant. */
+.flyout-backdrop .modal.flyout-exiting {
+  animation: mode-confirm-exit-in var(--mode-confirm-exit-duration) var(--mode-confirm-exit-curve) forwards;
 }

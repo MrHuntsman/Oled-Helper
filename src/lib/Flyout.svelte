@@ -13,6 +13,21 @@
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
 
+  // ── Timing constants ──────────────────────────────────────────────────────
+  // Single source of truth for the JS-side timers. The CSS animation
+  // durations live in src/app.css as --mode-confirm-* custom properties
+  // (shared with the main window's in-app modal); keep these values in sync
+  // there.
+  //
+  //   FLYOUT_ENTRANCE_DWELL_MS      == --mode-confirm-entrance-dwell
+  //   FLYOUT_VISIBLE_FALLBACK_MS    >= entrance duration + entrance dwell
+  //   FLYOUT_EXIT_FAILSAFE_MS       >= --mode-confirm-exit-duration (exit
+  //                                   hide is normally driven by the
+  //                                   animationend event; only a failsafe)
+  const FLYOUT_ENTRANCE_DWELL_MS = 300;
+  const FLYOUT_VISIBLE_FALLBACK_MS = 1600; // >= entrance duration (1000ms) + dwell (300ms)
+  const FLYOUT_EXIT_FAILSAFE_MS = 600;
+
   function diag(message) {
     // Temporary diagnostic logging while bringing up the new flyout window —
     // routes through the same log_frontend bridge main.js uses, so these
@@ -23,8 +38,8 @@
   let mode = $state(null); // { width, height, refresh_hz, monitor_name, confirmation_seconds }
   let remaining = $state(0);
   let busy = $state(false);
-  let error = $state('');
   let visible = $state(false); // becomes true only after Rust confirms the native window is shown
+  let exiting = $state(false); // plays the exit ease before the window hides
   let timer = null;
   let shownFallbackTimer = null; // safety net: never leave the modal stuck at opacity 0
 
@@ -43,15 +58,16 @@
   }
 
   // The entrance animation must not start at the exact moment the native
-  // window becomes visible (flyout-shown) — it would finish in 0.22s before
-  // the eye registers the popup, so the user would never see it. Wait a short
-  // dwell after the window is on screen, then trigger the animation.
+  // window becomes visible (flyout-shown) — it would finish before the eye
+  // registers the popup, so the user would never see it. Wait a short dwell
+  // after the window is on screen, then trigger the animation. Matches
+  // --mode-confirm-entrance-dwell in app.css.
   function showWithEntranceDelay() {
     clearShownFallback();
     shownFallbackTimer = setTimeout(() => {
       visible = true;
       shownFallbackTimer = null;
-    }, 300);
+    }, FLYOUT_ENTRANCE_DWELL_MS);
   }
 
   function notifyLayoutReady() {
@@ -79,38 +95,78 @@
     }, 250);
   }
 
-  async function confirm() {
+  // Shared close path for Keep and Revert. The exit ease must play FIRST
+  // with nothing running concurrently: confirm_mode_change / rollback both
+  // re-apply the display mode via ChangeDisplaySettingsExW, and doing that
+  // while the animation plays stalls the compositor and makes it stutter.
+  // So the order is: play the exit animation (smooth), hide the window, and
+  // only then run the mode-change invoke — its display work now happens
+  // invisibly. Clicking still feels instant because the exit starts
+  // immediately. If the invoke fails afterward the window is already gone;
+  // the recovery watchdog still restores the old mode at its deadline.
+  async function closeFlyout(action) {
     if (busy || !mode) return;
     busy = true;
-    error = '';
+    const modal = document.querySelector('.modal-backdrop .modal');
+    exiting = true;
+    const exitFinished = modal
+      ? new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(failsafe);
+            modal.removeEventListener('animationend', onEnd);
+            modal.removeEventListener('animationcancel', onCancel);
+            resolve();
+          };
+          // Only the exit animation ends the dialog — a leftover entrance
+          // animationend (mode-confirm-rise-in) must not resolve this early.
+          const onEnd = (event) => {
+            if (event.animationName === 'mode-confirm-exit-in') finish();
+          };
+          // If the exit class is removed before the animation completes
+          // (error path), the exit is cancelled rather than ended. Resolve
+          // and detach there too, or repeated attempts would accumulate
+          // listeners on the same modal.
+          const onCancel = (event) => {
+            if (event.animationName === 'mode-confirm-exit-in') finish();
+          };
+          modal.addEventListener('animationend', onEnd);
+          modal.addEventListener('animationcancel', onCancel);
+          // Safety net: never wait forever if the event is missed.
+          const failsafe = setTimeout(finish, FLYOUT_EXIT_FAILSAFE_MS);
+        })
+      : Promise.resolve();
     try {
-      await invoke('confirm_display_mode_change');
+      // 1. Exit animation plays smoothly — nothing concurrent yet.
+      await exitFinished;
       clearTimer();
+      // 2. Hide the window before touching the display.
       await win.hide();
       invoke('flyout_hidden').catch(() => {});
+      // 3. Now the mode change; the display re-apply happens invisibly.
+      await invoke(action);
       mode = null;
+      exiting = false;
     } catch (e) {
-      error = String(e);
+      // The window is already hidden, so there is nowhere to show the error.
+      // Log it; the recovery watchdog still restores the old mode if this
+      // transaction was never committed.
+      diag(`[flyout] ${action} failed after hide: ${e}`);
+      mode = null;
+      exiting = false;
     } finally {
       busy = false;
     }
   }
 
+  async function confirm() {
+    await closeFlyout('confirm_display_mode_change');
+  }
+
   async function rollback() {
-    if (busy || !mode) return;
-    busy = true;
-    error = '';
-    try {
-      await invoke('rollback_display_mode_change');
-      clearTimer();
-      await win.hide();
-      invoke('flyout_hidden').catch(() => {});
-      mode = null;
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = false;
-    }
+    await closeFlyout('rollback_display_mode_change');
   }
 
   onMount(() => {
@@ -124,7 +180,6 @@
       diag('[flyout] flyout-show event received');
       const payload = event.payload;
       busy = false;
-      error = '';
       visible = false;
       mode = payload;
       startCountdown(Number(payload?.confirmation_seconds) || 15);
@@ -136,7 +191,7 @@
       shownFallbackTimer = setTimeout(() => {
         visible = true;
         shownFallbackTimer = null;
-      }, 1200);
+      }, FLYOUT_VISIBLE_FALLBACK_MS);
     }).then((stop) => {
       unlistenShow = stop;
       diag('[flyout] listening for flyout-show');
@@ -173,68 +228,17 @@
 
 {#if mode}
   <div class="modal-backdrop mode-confirm-backdrop flyout-backdrop" role="presentation">
-    <div class="modal mode-confirm-modal" class:flyout-visible={visible} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" tabindex="-1">
+    <div class="modal mode-confirm-modal" class:flyout-visible={visible} class:flyout-exiting={exiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" tabindex="-1">
       <h2 id="mode-confirm-title" class="modal-title">Keep display mode?</h2>
       <p class="modal-desc">
         {mode.monitor_name || 'Current monitor'} is temporarily using
         <strong>{mode.width}×{mode.height} at {mode.refresh_hz} Hz</strong>.
         Confirm if the picture looks correct. It will automatically revert in {remaining}s.
       </p>
-      {#if error}<p class="modal-error">Rollback failed: {error}</p>{/if}
       <div class="modal-actions">
         <button class="modal-btn" onclick={confirm} disabled={busy}>Keep this mode</button>
-        <button class="modal-btn modal-btn-cancel" onclick={rollback} disabled={busy}>Revert ({remaining}s)</button>
+        <button class="modal-btn modal-btn-cancel" onclick={rollback} disabled={busy}>Revert (<span class="modal-btn-countdown">{remaining}</span>s)</button>
       </div>
     </div>
   </div>
 {/if}
-
-<style>
-  /* The flyout window is sized to fit the modal exactly and is itself
-     transparent (see flyout.html), so the full-viewport dimmed backdrop the
-     in-app version uses would just paint a translucent black rectangle the
-     size of the tiny window. Drop the dimming/centering and let the modal
-     fill the window instead. */
-  .flyout-backdrop {
-    position: static;
-    inset: auto;
-    z-index: auto;
-    background: transparent;
-    display: block;
-    animation: none;
-  }
-  .flyout-backdrop .modal {
-    width: 380px;
-    /* Hold the entrance animation's "from" state — no animation plays until
-       .flyout-visible is added (see the flyout-shown listener in <script>),
-       which happens only after the native window is already visible. Without
-       this hold, the animation would run to completion while the window is
-       still hidden behind SetWindowPos and the user would only ever see the
-       final frame pop in with no motion. */
-    opacity: 0;
-    transform: translateY(10px);
-    animation: none;
-  }
-  .flyout-backdrop .modal.flyout-visible {
-    opacity: 1;
-    transform: none;
-    /* Dedicated flyout entrance: slides up from below and fades in, like it
-       is rising out of the taskbar. Cannot reuse the in-app modal-in
-       keyframe (app.css) for the upward slide, because that keyframe's `to`
-       state is only the element's computed style — it defines just a `from`
-       — and the shared keyframe is intentionally generic. `to`/`from` both
-       explicit here, so the animation end state is authoritative and the
-       explicit end-state declarations above are redundant but harmless. */
-    animation: flyout-rise-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-  }
-  @keyframes flyout-rise-in {
-    from {
-      opacity: 0;
-      transform: translateY(14px);
-    }
-    to {
-      opacity: 1;
-      transform: none;
-    }
-  }
-</style>
