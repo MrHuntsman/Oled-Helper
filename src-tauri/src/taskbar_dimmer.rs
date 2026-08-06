@@ -64,15 +64,16 @@ mod platform {
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW,
-        GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
-        GetWindowRect, IsIconic, IsWindowVisible, PostMessageW, PostThreadMessageW, RegisterClassW,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
-        TranslateMessage, UnhookWindowsHookEx, GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE,
-        HTTRANSPARENT, HWND_TOPMOST, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW,
-        SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP,
-        WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_MAXIMIZE,
-        WS_POPUP, WS_THICKFRAME,
+        GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetTopWindow, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible, PostMessageW,
+        PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW,
+        SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+        GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT,
+        HWND_TOPMOST, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+        WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT,
+        WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
     };
 
     // One adaptive timer handles both cursor polling and animation. It runs
@@ -97,6 +98,8 @@ mod platform {
     // entirely, and this timer only takes over if the hook fails to install.
     const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
     const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+    const EVENT_SYSTEM_MENUPOPUPSTART: u32 = 0x0004;
+    const EVENT_SYSTEM_MENUPOPUPEND: u32 = 0x0005;
     const EVENT_SYSTEM_MOVESIZESTART: u32 = 0x000A;
     const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
     const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
@@ -200,6 +203,22 @@ mod platform {
     // Last hover state seen by either the hook (instant) or the poll
     // fallback in update_fade. Written by both, read by update_fade.
     static CURRENT_HOVER: AtomicBool = AtomicBool::new(false);
+    // True while a system popup menu (any app's context menu, or our own tray
+    // menu) is open. Driven by the WinEvent MENUPOPUPSTART/END hooks when
+    // they are installed; the repair's FindWindowW("#32768") scan is the
+    // fallback when they are not (poll mode / install failure). While set,
+    // z-order repair is paused so it cannot disturb the menu/taskbar boundary.
+    static MENU_POPUP_OPEN: AtomicBool = AtomicBool::new(false);
+    // When the flag was last set. Lets the repair distinguish a popup that is
+    // genuinely open (FindWindowW agrees) from a STALE flag whose
+    // MENUPOPUPEND was missed (abnormal dismissal, taskbar restart): a flag
+    // that has been set for longer than the grace period while no popup
+    // window exists is cleared so the overlay re-shows instead of staying
+    // hidden forever.
+    static MENU_POPUP_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+    // HWND of the popup most recently promoted above the overlay. This keeps
+    // the WinEvent and fallback repair paths idempotent while a menu is open.
+    static PROMOTED_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
     // True when the foreground window is at a higher integrity level than
     // this process (e.g. an elevated admin prompt / game). WH_MOUSE_LL
     // still fires, but MSLLHOOKSTRUCT.pt is zeroed — the hook callback
@@ -230,6 +249,13 @@ mod platform {
     // WinEvent hook) keeps the plain timer cadence; the flag is simply
     // never set there.
     static TASKBAR_CACHE_RECHECK_REQUESTED: AtomicBool = AtomicBool::new(false);
+    // After a foreground/minimize transition (Show Desktop, task switch),
+    // Explorer can reorder the topmost band, leaving the overlay behind the
+    // taskbar. This counter forces the next few z-order repairs to run
+    // unconditionally (matching the old 250ms SetWindowPos behaviour), then
+    // returns to the normal in_place skip. Set to 3 (= ~750ms at the normal
+    // 250ms ZORDER_REPAIR_INTERVAL_MS cadence) on each transition event.
+    static FORCE_REPAIR_COUNT: AtomicU32 = AtomicU32::new(0);
     // Diagnostic: timestamp of the last logged WinEvent, used to throttle the
     // winevent log so continuous window drags don't flood the log while still
     // showing the burst pattern of a fullscreen enter/exit transition.
@@ -407,6 +433,8 @@ mod platform {
     fn winevent_name(event: u32) -> &'static str {
         match event {
             EVENT_SYSTEM_FOREGROUND => "foreground",
+            EVENT_SYSTEM_MENUPOPUPSTART => "menu_popup_start",
+            EVENT_SYSTEM_MENUPOPUPEND => "menu_popup_end",
             EVENT_SYSTEM_MOVESIZESTART => "movesize_start",
             EVENT_SYSTEM_MOVESIZEEND => "movesize_end",
             EVENT_SYSTEM_MINIMIZESTART => "minimize_start",
@@ -441,7 +469,25 @@ mod platform {
         {
             return;
         }
+        // While a menu is open, the repair must not rewrite the overlay's
+        // z-order: doing so can demote the taskbar or cover a menu. The
+        // overlay itself stays visible; MENUPOPUPSTART/END only pause/resume
+        // repair activity. The immediate message makes the pause take effect
+        // without waiting for the normal 250ms repair cadence.
+        if event == EVENT_SYSTEM_MENUPOPUPSTART {
+            MENU_POPUP_OPEN.store(true, Ordering::Relaxed);
+            *MENU_POPUP_SINCE.lock().unwrap() = Some(Instant::now());
+            post_dimmer_repair();
+        } else if event == EVENT_SYSTEM_MENUPOPUPEND {
+            MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
+            PROMOTED_MENU_HWND.store(0, Ordering::Release);
+            *MENU_POPUP_SINCE.lock().unwrap() = None;
+            post_dimmer_repair();
+        }
         let mut elevated = false;
+        let foreground_transition = event == EVENT_SYSTEM_FOREGROUND
+            || event == EVENT_SYSTEM_MINIMIZESTART
+            || event == EVENT_SYSTEM_MINIMIZEEND;
         if event == EVENT_SYSTEM_FOREGROUND {
             elevated = check_foreground_elevation();
             FOREGROUND_ELEVATED.store(elevated, Ordering::Relaxed);
@@ -475,8 +521,34 @@ mod platform {
         let foreground = unsafe { GetForegroundWindow() };
         let affects_fullscreen =
             event == EVENT_SYSTEM_FOREGROUND || (!foreground.0.is_null() && foreground == hwnd);
-        if affects_fullscreen {
+        if affects_fullscreen || foreground_transition {
             FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        }
+        // Show Desktop changes the foreground to the desktop shell and can
+        // minimize/restore a large set of windows without changing the
+        // taskbar HWND. Force both caches to be reconsidered so a stale
+        // fullscreen/visibility decision cannot leave the overlay hidden
+        // until a later mouse event happens to wake it.
+        // Determine the foreground class once for both the forced-repair
+        // gate and the immediate-repair gate below.
+        let is_shell_foreground = || {
+            let foreground = unsafe { GetForegroundWindow() };
+            window_class_name(foreground)
+                .map(|cls| cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd")
+                .unwrap_or(false)
+        };
+        // Minimize-start/end fire reliably during Show Desktop (Windows
+        // minimizes all windows) and are the most robust signal that the
+        // shell just reordered the topmost band. The shell-foreground check
+        // catches the complementary case: a foreground switch directly to
+        // the desktop without a minimize transition.
+        let is_minimize = event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND;
+        if foreground_transition {
+            TASKBAR_CACHE_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+            FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Release);
+            if is_minimize || is_shell_foreground() {
+                request_forced_repairs();
+            }
         }
         // Event-driven taskbar cache: when an event targets the cached
         // taskbar window itself (drag to another edge, resize, auto-hide
@@ -492,11 +564,29 @@ mod platform {
             .unwrap_or(false);
         if targets_taskbar {
             TASKBAR_CACHE_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+            FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
         }
         // Poke the overlay to re-evaluate hover/fullscreen. The tick thread
         // will pick up the right source (hook or poll, and the forced
-        // fullscreen recheck) on the next tick.
+        // fullscreen recheck) on the next tick. An immediate repair message
+        // is only needed for taskbar events and desktop-shell transitions
+        // (Show Desktop). Normal foreground switches don't need it and can
+        // race with popup menu creation — the standard 250ms cadence will
+        // quietly re-check z-order on its own schedule.
         post_dimmer_tick();
+        if targets_taskbar || foreground_transition {
+            post_dimmer_repair();
+            // Custom menus may not exist yet when the foreground event
+            // fires — the app becomes foreground first, THEN creates its
+            // menu. Post a second repair 50ms later so the menu window
+            // has time to appear before we scan for it.
+            let _ = std::thread::Builder::new()
+                .name("taskbar-dimmer-delayed-repair".into())
+                .spawn(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    post_dimmer_repair();
+                });
+        }
     }
 
     fn elevation_win_event_thread_loop() {
@@ -576,6 +666,21 @@ mod platform {
                 windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
             )
         };
+        // Popup-menu open/close — the event-driven source for pausing
+        // overlay z-order repair while a system menu is open.
+        // Distinct numeric range from the other hooks so it stays its own
+        // subscription.
+        let menupopup_hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_MENUPOPUPSTART,
+                EVENT_SYSTEM_MENUPOPUPEND,
+                None,
+                Some(elevation_win_event_proc),
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT,
+            )
+        };
         if movesize_hook.0.is_null() {
             emit_runtime("warn", "[taskbar-dimmer] move/size WinEvent hook install failed — fullscreen detection stays timer-based for resize/minimize".into());
         }
@@ -584,6 +689,9 @@ mod platform {
         }
         if statechange_hook.0.is_null() {
             emit_runtime("warn", "[taskbar-dimmer] state-change WinEvent hook install failed — style-only fullscreen flips stay undetected in event mode".into());
+        }
+        if menupopup_hook.0.is_null() {
+            emit_runtime("warn", "[taskbar-dimmer] menu popup WinEvent hook install failed — overlay popup-hiding stays timer-based".into());
         }
         let mut msg = MSG::default();
         unsafe {
@@ -603,7 +711,15 @@ mod platform {
             if !statechange_hook.0.is_null() {
                 let _ = UnhookWinEvent(statechange_hook);
             }
+            if !menupopup_hook.0.is_null() {
+                let _ = UnhookWinEvent(menupopup_hook);
+            }
         }
+        // A menu could have been open when the hooks came down; clear the
+        // flag so the repair's FindWindowW scan alone decides its z-order.
+        MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
+        PROMOTED_MENU_HWND.store(0, Ordering::Release);
+        *MENU_POPUP_SINCE.lock().unwrap() = None;
         ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
         ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
     }
@@ -647,6 +763,9 @@ mod platform {
             }
         }
         ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
+        MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
+        PROMOTED_MENU_HWND.store(0, Ordering::Release);
+        *MENU_POPUP_SINCE.lock().unwrap() = None;
     }
 
     pub fn set_suspended(enabled: bool) {
@@ -717,7 +836,18 @@ mod platform {
                     // The restore after exit is covered by the self-heal in
                     // update_fade, which posts a fresh repair only after
                     // fullscreen_active is false again.
-                    if fade.fullscreen_active || SUSPENDED.load(Ordering::Relaxed) {
+                    if SUSPENDED.load(Ordering::Relaxed) {
+                        return LRESULT(0);
+                    }
+                    if fade.fullscreen_active && FORCE_REPAIR_COUNT.load(Ordering::Acquire) == 0 {
+                        // Skip the repair while the overlay is hidden for
+                        // fullscreen, unless we're inside the post-transition
+                        // recovery window (Show Desktop / minimize). During
+                        // recovery, fullscreen_active can be stale — a
+                        // previously queued tick hasn't re-evaluated it yet
+                        // — and blocking the repair here would leave the
+                        // overlay behind the taskbar until the user triggers
+                        // another shell event.
                         return LRESULT(0);
                     }
                     if let Some((raw, rect)) = fade.cached_taskbar {
@@ -800,13 +930,18 @@ mod platform {
     }
 
     // Windows popup menus, including the native Tauri tray menu, use the
-    // standard #32768 window class. The taskbar overlay must sit below this
-    // popup or it can cover the menu and intercept its visual surface.
+    // standard #32768 window class. While one is tracked, z-order repair is
+    // paused so the overlay cannot be moved across the menu/taskbar boundary
+    // or demote the shell's topmost ownership relationship.
     fn open_popup_menu() -> Option<HWND> {
         unsafe {
             let class = wide("#32768");
             FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()).ok()
         }
+    }
+
+    fn rects_intersect(a: RECT, b: RECT) -> bool {
+        a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
     }
 
     // The "Keep display mode?" flyout (flyout_window.rs) is also an
@@ -972,37 +1107,180 @@ mod platform {
         let Some((taskbar, rect)) = info else {
             return;
         };
-        let popup_menu = open_popup_menu();
         unsafe {
-            // Make the taskbar the popup owner. This keeps the overlay in the
-            // taskbar's shell-owned relationship instead of relying on a bare
-            // HWND_TOPMOST request, which Explorer can disturb after Start/
-            // taskbar activation transitions.
-            // The owner only needs to change when Explorer gives us a new
-            // taskbar HWND. Rewriting it on every 33 ms tick can itself cause
-            // needless shell window-manager churn while the app is clicked.
+            // Detect popup menus before changing ownership. If Explorer is
+            // rebuilding the taskbar while a menu is open, even a seemingly
+            // harmless owner update can disturb the menu/taskbar boundary.
+            let popup = open_popup_menu();
+            if MENU_POPUP_OPEN.load(Ordering::Relaxed) {
+                let since = *MENU_POPUP_SINCE.lock().unwrap();
+                if popup.is_none()
+                    && since.is_some_and(|t| t.elapsed() > Duration::from_millis(400))
+                {
+                    MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
+                    *MENU_POPUP_SINCE.lock().unwrap() = None;
+                }
+            }
+            if let Some(popup) = popup {
+                let mut popup_rect = RECT::default();
+                let popup_intersects_taskbar = GetWindowRect(popup, &mut popup_rect).is_ok()
+                    && rects_intersect(popup_rect, rect);
+                if popup_intersects_taskbar {
+                    // Keep the dimmer visible, but put only the overlapping
+                    // native menu above it. Promoting unrelated #32768 menus
+                    // elsewhere on the desktop would unnecessarily alter
+                    // another application's window ordering.
+                    let popup_raw = popup.0 as isize;
+                    if PROMOTED_MENU_HWND.load(Ordering::Acquire) != popup_raw {
+                        let _ = SetWindowPos(
+                            popup,
+                            Some(HWND_TOPMOST),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                        );
+                        PROMOTED_MENU_HWND.store(popup_raw, Ordering::Release);
+                    }
+                } else {
+                    PROMOTED_MENU_HWND.store(0, Ordering::Release);
+                }
+                // In either case, pause repair while the menu is tracked.
+                return;
+            }
+            PROMOTED_MENU_HWND.store(0, Ordering::Release);
+            if MENU_POPUP_OPEN.load(Ordering::Relaxed) {
+                // A short-lived popup can disappear between the WinEvent and
+                // fallback snapshots. Keep repair paused until MENUPOPUPEND,
+                // but do not hide the overlay.
+                return;
+            }
+
+            // No popup is active. Now restore the taskbar owner if Explorer
+            // supplied a new taskbar HWND.
             if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != taskbar.0 as isize {
                 SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, taskbar.0 as isize);
             }
 
-            // If a native popup menu is open, insert the overlay directly
-            // below that menu instead of above every topmost window. Once the
-            // menu closes, the next tick restores the normal topmost placement.
-            // The mode-change flyout takes the next priority: while it is
-            // visible, insert the dimmer overlay just behind it so the
-            // continuous z-order repair here can never cover the flyout (see
-            // active_flyout_window above for why HWND_TOPMOST alone is
-            // unsafe to use whenever another topmost popup needs to stay
-            // above this one).
-            let insert_after = popup_menu
-                .or_else(active_flyout_window)
-                .or(Some(HWND_TOPMOST));
-            let visibility = if popup_menu.is_some() {
-                SET_WINDOW_POS_FLAGS(0)
-            } else {
-                SWP_SHOWWINDOW
-            };
-            if popup_menu.is_none() && VERBOSE_LOGGING.load(Ordering::Relaxed) {
+            // The mode-change flyout is the only other always-on-top popup we
+
+            // must stay behind. It is a stable topmost window, so inserting
+            // directly below it is safe (no demotion, no cascade). When it is
+            // not visible, claim the front of the topmost band.
+            let insert_after = active_flyout_window().or(Some(HWND_TOPMOST)); // Walk the z-order from the top. Custom menus created with
+                                                                              // WS_EX_TOPMOST can end up anywhere in the topmost band — often
+                                                                              // behind the overlay, which was pushed to the front during
+                                                                              // creation. Find the highest topmost window that overlaps the
+                                                                              // taskbar (excluding the overlay, taskbar, and flyout) and
+                                                                              // insert the overlay directly behind it. This way any menu —
+                                                                              // #32768 or custom class — naturally stays above.
+            let mut walk = GetTopWindow(None);
+            while let Ok(w) = walk {
+                if !w.0.is_null() && w != hwnd && w != taskbar && active_flyout_window() != Some(w)
+                {
+                    let exstyle = GetWindowLongPtrW(w, GWL_EXSTYLE) as u32;
+                    // Z-order is arranged with all topmost windows first,
+                    // then non-topmost below. Once we hit a non-topmost
+                    // window we've passed the entire topmost band — stop.
+                    if (exstyle & WS_EX_TOPMOST.0) == 0 {
+                        break;
+                    }
+                    if (exstyle & WS_EX_TRANSPARENT.0) != 0 {
+                        walk = GetWindow(w, GW_HWNDNEXT);
+                        continue;
+                    }
+                    let mut w_rect = RECT::default();
+                    if GetWindowRect(w, &mut w_rect).is_ok() && rects_intersect(w_rect, rect) {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(w),
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                        );
+                        return;
+                    }
+                }
+                walk = GetWindow(w, GW_HWNDNEXT);
+            }
+
+            // Skip the SetWindowPos when the overlay is already where we want
+            // it: visible, and either directly below the flyout or in the
+            // topmost band (the topmost style plus the taskbar ownership
+            // guarantees it sits above the taskbar). GetWindow /
+            // GetWindowLongPtrW only READ the z-order — no DWM reflow, no
+            // shell notifications — so steady-state repairs become nearly
+            // free instead of re-triggering the window-manager churn (and the
+            // slow_zorder_update warnings) that a bare SetWindowPos every
+            // 250ms caused.
+            // During a shell transition (Show Desktop etc.) Explorer can
+            // reorder the topmost band so the overlay ends up behind the
+            // taskbar while still looking "in place" (WS_EX_TOPMOST set).
+            // Replicate the old unconditional repair for a few ticks after
+            // a foreground/minimize event, but only when no native popup
+            // menu is tracked.
+            let forced = FORCE_REPAIR_COUNT.load(Ordering::Acquire) > 0
+                && !MENU_POPUP_OPEN.load(Ordering::Relaxed);
+            if forced {
+                FORCE_REPAIR_COUNT.fetch_sub(1, Ordering::Release);
+            }
+            let in_place = IsWindowVisible(hwnd).as_bool()
+                && !forced
+                && match insert_after {
+                    Some(target) if target == HWND_TOPMOST => {
+                        (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0
+                    }
+                    Some(target) => GetWindow(hwnd, GW_HWNDPREV) == Ok(target),
+                    None => false,
+                };
+            if in_place {
+                return;
+            }
+
+            // Belt-and-suspenders: a menu can be spawned between the
+            // initial popup check above and this SetWindowPos (timing race:
+            // foreground event fires before MENUPOPUPSTART, so a repair
+            // message may execute while the menu window exists but
+            // MENU_POPUP_OPEN hasn't been set yet). Re-check right before
+            // committing so a newly created popup is never covered.
+            // Uses `forced` (pre-decrement) so the guard still fires on the
+            // last forced repair; also checks MENU_POPUP_OPEN in case it was
+            // set between entry and now but the window isn't findable yet.
+            let menu_flag_now = MENU_POPUP_OPEN.load(Ordering::Acquire);
+            if forced || menu_flag_now {
+                if let Some(late_popup) = open_popup_menu() {
+                    let mut late_rect = RECT::default();
+                    if GetWindowRect(late_popup, &mut late_rect).is_ok()
+                        && rects_intersect(late_rect, rect)
+                    {
+                        let late_raw = late_popup.0 as isize;
+                        if PROMOTED_MENU_HWND.load(Ordering::Acquire) != late_raw {
+                            let _ = SetWindowPos(
+                                late_popup,
+                                Some(HWND_TOPMOST),
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                            );
+                            PROMOTED_MENU_HWND.store(late_raw, Ordering::Release);
+                        }
+                        return;
+                    }
+                }
+                if menu_flag_now {
+                    // MENUPOPUPSTART fired but the #32768 window isn't
+                    // findable yet. Stand down so the next repair cycle
+                    // (which will see the flag set at entry) can handle it.
+                    return;
+                }
+            }
+
+            if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                 // The fullscreen path hides the overlay with SW_HIDE; nothing
                 // else re-shows it except this SetWindowPos(SWP_SHOWWINDOW),
                 // so a hidden→visible transition here marks the restore.
@@ -1020,7 +1298,7 @@ mod platform {
                 rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                visibility | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
             ) {
                 emit_runtime(
                     "warn",
@@ -1148,6 +1426,33 @@ mod platform {
         if result.is_err() {
             TICK_POSTED.store(false, Ordering::Release);
         }
+    }
+
+    // When the foreground/minimize hook fires, request several forced
+    // repairs. This is lightweight: just bumps a counter; the regular 250ms
+    // repair cycle consumes it. 5 repairs × 250ms = 1250ms recovery window —
+    // enough for the shell to fully settle after Show Desktop.
+    fn request_forced_repairs() {
+        FORCE_REPAIR_COUNT.store(5, Ordering::Release);
+    }
+
+    // Immediate z-order repair request that bypasses the 250ms repair
+    // throttle. Used by the WinEvent hook on menu popup open/close so repair
+    // pauses or resumes in the same frame instead of up to 250ms later.
+    // Idempotent — the repair handler re-checks the actual state before acting.
+    fn post_dimmer_repair() {
+        let overlay_raw = OVERLAY_HWND.load(Ordering::Acquire);
+        if overlay_raw == 0 {
+            return;
+        }
+        let _ = unsafe {
+            PostMessageW(
+                Some(HWND(overlay_raw as *mut c_void)),
+                WM_DIMMER_REPAIR_ZORDER,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
     }
 
     // WH_MOUSE_LL callback. The system delivers every mouse event to this
@@ -1464,6 +1769,12 @@ mod platform {
                 // 2) Event mode is active but the foreground is elevated (hook
                 //    can't provide accurate positions), so we fall back to
                 //    polling until the foreground returns to normal.
+                // Show Desktop can leave the low-level mouse hook's cached
+                // hover state at the taskbar button that was clicked. During
+                // the short, event-triggered shell-recovery window, refresh
+                // the hit-test directly so the overlay's alpha follows the
+                // cursor even if Windows emits no further mouse event. This
+                // is bounded transition recovery, not a normal idle poll.
                 let should_poll =
                     CURSOR_POLLING.load(Ordering::Relaxed) || (hook_active && elevated);
                 if should_poll {
@@ -1487,10 +1798,15 @@ mod platform {
             // the overlay hidden for up to ~500ms — the visible flicker when
             // toggling fullscreen quickly. Flag a direct re-show whenever the
             // overlay is hidden but the dimmer is on and the cursor is not
-            // over the taskbar (i.e. it should be showing at base alpha); the
-            // ShowWindow itself runs after the lock is dropped.
+            // over the taskbar (i.e. it should be showing at base alpha); the            // ShowWindow itself runs after the lock is dropped. Context menus
+            // no longer hide the overlay, so they do not need to gate this
+            // recovery path; an external hide or Show Desktop transition can
+            // therefore recover on the next tick without requiring a click.
+            // Do not require !hovered here: Show Desktop leaves the cursor
+            // over the taskbar button, and that was the exact case where the
+            // old condition prevented recovery until another click/move.
             let overlay_visible = unsafe { IsWindowVisible(hwnd).as_bool() };
-            if fade.enabled && !hovered && !overlay_visible {
+            if fade.enabled && !overlay_visible {
                 should_reshow_overlay = true;
                 should_repair_zorder = true;
             }
@@ -1596,8 +1912,15 @@ mod platform {
                 drop(guard);
             }
 
-            if now.duration_since(fade.last_zorder_repair).as_millis() as u64
-                >= ZORDER_REPAIR_INTERVAL_MS
+            // Only post z-order repairs during the recovery window after a
+            // shell transition (Show Desktop, minimize/restore). The steady-
+            // state cadence is a no-op via in_place during normal operation
+            // but SetWindowPos can still race with popup-menu creation —
+            // gating it behind FORCE_REPAIR_COUNT eliminates that race
+            // entirely while keeping recovery intact.
+            if FORCE_REPAIR_COUNT.load(Ordering::Acquire) > 0
+                && now.duration_since(fade.last_zorder_repair).as_millis() as u64
+                    >= ZORDER_REPAIR_INTERVAL_MS
             {
                 should_repair_zorder = true;
             }
@@ -1871,6 +2194,9 @@ mod platform {
                     .map_err(|e| format!("could not hide overlay: {e}"))?;
             }
 
+            // Context menus no longer change overlay visibility. They only
+            // pause the repair path, so enabling the dimmer while a menu is
+            // already open still shows the overlay normally.
             let visibility = if enabled {
                 SWP_SHOWWINDOW
             } else {
@@ -1878,8 +2204,18 @@ mod platform {
             };
             // Same flyout-priority reasoning as maintain_overlay_zorder: don't
             // blindly claim the front of the topmost band if the mode-change
-            // flyout is currently showing.
+            // flyout is currently showing. An active native menu is handled
+            // specially: apply() may be called while a menu is open, so keep
+            // the move/size/show operation but explicitly preserve its current
+            // z-order and let the menu-safe repair path handle ordering.
+            let popup_active =
+                open_popup_menu().is_some() || MENU_POPUP_OPEN.load(Ordering::Relaxed);
             let insert_after = active_flyout_window().unwrap_or(HWND_TOPMOST);
+            let zorder_flags = if popup_active {
+                SWP_NOZORDER
+            } else {
+                SET_WINDOW_POS_FLAGS(0)
+            };
             SetWindowPos(
                 hwnd,
                 Some(insert_after),
@@ -1887,7 +2223,7 @@ mod platform {
                 rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                visibility | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                visibility | zorder_flags | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
             )
             .map_err(|e| format!("could not position taskbar overlay: {e}"))?;
             if enabled {
@@ -1896,10 +2232,13 @@ mod platform {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
+        // Apply can run while a native menu is already open. Run the shared
+        // repair once after positioning so an overlapping #32768 popup is
+        // promoted above the overlay immediately, instead of waiting for the
+        // next tick or requiring another input event.
+        maintain_overlay_zorder(hwnd, Some(taskbar));
         if enabled {
             update_fade(hwnd);
-        } else {
-            maintain_overlay_zorder(hwnd, Some(taskbar));
         }
         Ok(())
     }
