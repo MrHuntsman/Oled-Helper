@@ -318,6 +318,39 @@
   // removed — mirrors Flyout.svelte's `exiting` state so the in-app modal
   // and the tray flyout animate identically.
   let modeConfirmationExiting = $state(false);
+  let modeConfirmKeepBtnEl = $state(null);
+  let modeConfirmRevertBtnEl = $state(null);
+  // Element that had focus before the modal opened; restored on close so
+  // keyboard users don't get stranded on <body> after the modal unmounts.
+  let modeConfirmLastFocused = null;
+
+  // Keyboard handling for the confirmation dialog, mirroring Flyout.svelte's
+  // onDialogKeydown and Windows' own display-confirm semantics: Revert is the
+  // default action (initial focus), Enter on the focused button is native,
+  // Enter/Escape with no focused button reverts, and Tab stays trapped
+  // between the two buttons.
+  function onModeConfirmKeydown(e) {
+    if (modeConfirmationBusy) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      rollbackModeChange();
+    } else if (e.key === 'Enter') {
+      if (e.target?.closest?.('button')) return;
+      e.preventDefault();
+      rollbackModeChange();
+    } else if (e.key === 'Tab') {
+      const first = modeConfirmKeepBtnEl;
+      const last = modeConfirmRevertBtnEl;
+      if (!first || !last) return;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }
 
   function clearModeConfirmationTimer() {
     if (modeConfirmationTimer) clearInterval(modeConfirmationTimer);
@@ -328,6 +361,10 @@
     clearModeConfirmationTimer();
     pendingModeConfirmation = null;
     modeConfirmationExiting = false;
+    // The modal is about to unmount; put focus back where it was before it
+    // opened (the dropdown button that triggered the change, etc.).
+    modeConfirmLastFocused?.focus?.();
+    modeConfirmLastFocused = null;
   }
 
   function startModeConfirmation(result) {
@@ -335,7 +372,18 @@
     modeConfirmationError = '';
     const seconds = Number(result?.confirmation_seconds) || 15;
     const started = Date.now();
+    // Capture what had focus BEFORE the modal renders (still the dropdown
+    // button that triggered the change) so closeModeConfirmation can restore
+    // it. Must happen here, not in an $effect: the countdown reassigns
+    // pendingModeConfirmation every 250ms, and an effect keyed on it would
+    // re-run each tick — stealing focus back to Revert after the user tabs
+    // to Keep this mode, and re-capturing the Revert button as the restore
+    // target just before it unmounts.
+    modeConfirmLastFocused = document.activeElement;
     pendingModeConfirmation = { ...result, remaining: seconds };
+    // Windows' display-confirm dialogs default to Revert: focus it as the
+    // safe action (after the modal is in the DOM, so the ref is bound).
+    setTimeout(() => modeConfirmRevertBtnEl?.focus(), 0);
     modeConfirmationTimer = setInterval(() => {
       const remaining = Math.max(0, seconds - Math.ceil((Date.now() - started) / 1000));
       if (remaining <= 0) {
@@ -412,9 +460,18 @@
       // Re-show the dialog: removing the exiting class re-applies the
       // entrance animation, keeping the error visible and retryable.
       modeConfirmationExiting = false;
+      // Re-focus the default action so keyboard users can immediately retry.
+      modeConfirmRevertBtnEl?.focus();
     } finally {
       modeConfirmationBusy = false;
-      pollDisplayInfo();
+      // Confirming persists the already-active mode via CDS_NORESET, so the
+      // display is unchanged and a full re-poll (mode enumeration + EDID
+      // reads) right after the commit is redundant work landing in the same
+      // frame as the registry persist. Rollback genuinely changes the mode
+      // and re-polls; a failed invoke re-polls to resync the dropdowns.
+      if (action !== 'confirm_display_mode_change' || modeConfirmationError) {
+        pollDisplayInfo();
+      }
     }
   }
 
@@ -941,17 +998,17 @@
 
   {#if pendingModeConfirmation}
     <div class="modal-backdrop mode-confirm-backdrop" role="presentation">
-      <div class="modal mode-confirm-modal" class:mode-confirm-exiting={modeConfirmationExiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" tabindex="-1">
+      <div class="modal mode-confirm-modal" class:mode-confirm-exiting={modeConfirmationExiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" aria-describedby="mode-confirm-desc" tabindex="-1" onkeydown={onModeConfirmKeydown}>
         <h2 id="mode-confirm-title" class="modal-title">Keep display mode?</h2>
-        <p class="modal-desc">
+        <p id="mode-confirm-desc" class="modal-desc">
           {pendingModeConfirmation.monitor_name || 'Current monitor'} is temporarily using
           <strong>{pendingModeConfirmation.width}×{pendingModeConfirmation.height} at {pendingModeConfirmation.refresh_hz} Hz</strong>.
           Confirm if the picture looks correct. It will automatically revert in {pendingModeConfirmation.remaining}s.
         </p>
         {#if modeConfirmationError}<p class="modal-error">Rollback failed: {modeConfirmationError}</p>{/if}
         <div class="modal-actions">
-          <button class="modal-btn" onclick={confirmModeChange} disabled={modeConfirmationBusy}>Keep this mode</button>
-          <button class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert (<span class="modal-btn-countdown">{pendingModeConfirmation.remaining}</span>s)</button>
+          <button bind:this={modeConfirmKeepBtnEl} class="modal-btn" onclick={confirmModeChange} disabled={modeConfirmationBusy}>Keep this mode</button>
+          <button bind:this={modeConfirmRevertBtnEl} class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert (<span class="modal-btn-countdown">{pendingModeConfirmation.remaining}</span>s)</button>
         </div>
       </div>
     </div>

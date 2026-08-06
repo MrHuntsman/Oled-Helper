@@ -994,7 +994,9 @@ mod platform {
             // active_flyout_window above for why HWND_TOPMOST alone is
             // unsafe to use whenever another topmost popup needs to stay
             // above this one).
-            let insert_after = popup_menu.or_else(active_flyout_window).or(Some(HWND_TOPMOST));
+            let insert_after = popup_menu
+                .or_else(active_flyout_window)
+                .or(Some(HWND_TOPMOST));
             let visibility = if popup_menu.is_some() {
                 SET_WINDOW_POS_FLAGS(0)
             } else {

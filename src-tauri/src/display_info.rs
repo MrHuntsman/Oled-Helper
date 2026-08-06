@@ -15,8 +15,8 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
 };
 use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_NORESET, CDS_TEST,
-    CDS_TYPE, CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_TEST, CDS_TYPE,
+    CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
     DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
     ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
@@ -252,7 +252,7 @@ fn restore_recovery_record(record: &RecoveryRecord) -> Result<(), String> {
         record.bits_per_pixel,
     )?;
     unsafe {
-        change_mode(&detected, &mode, CDS_TYPE(0))?;
+        change_mode(&detected, &mode, CDS_UPDATEREGISTRY)?;
     }
     wait_for_mode(&detected, &mode)
         .map(|_| ())
@@ -576,7 +576,7 @@ pub fn query_current_display() -> Option<DisplayInfo> {
     let (native_width, native_height, native_source) = native_resolution()
         .map(|(w, h, source)| (w, h, source.to_string()))
         .unwrap_or((0, 0, String::new()));
-    let monitor_name = edid_name_for_target(&target).unwrap_or(target.monitor_name);
+    let monitor_name = cached_edid_monitor_name(&target).unwrap_or(target.monitor_name);
     Some(DisplayInfo {
         width: devmode.dmPelsWidth,
         height: devmode.dmPelsHeight,
@@ -866,6 +866,54 @@ struct CachedNative {
 }
 
 static NATIVE_CACHE: OnceLock<Mutex<Option<CachedNative>>> = OnceLock::new();
+
+// The friendly monitor name is read from EDID through SetupAPI + a registry
+// lookup — the same cost class as the native resolution read. It is called on
+// every display poll and at every mode change, so cache it per monitor for the
+// same window as the native-resolution cache instead of re-walking SetupAPI
+// each time (that burst would otherwise land right in the middle of the
+// confirmation flow).
+struct CachedMonitorName {
+    display_key: String,
+    name: String,
+    captured_at: Instant,
+}
+
+static MONITOR_NAME_CACHE: OnceLock<Mutex<Option<CachedMonitorName>>> = OnceLock::new();
+
+fn cached_edid_monitor_name(target: &DisplayTarget) -> Option<String> {
+    let display_key = if target.monitor_id.is_empty() {
+        target.device_name.clone()
+    } else {
+        target.monitor_id.clone()
+    };
+    let cache = MONITOR_NAME_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref().filter(|cached| {
+            let max_age = if cached.name.is_empty() {
+                // A transient SetupAPI/registry failure should not re-walk the
+                // device tree on every poll, but it must recover promptly after
+                // resume or hot-plug.
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(60)
+            };
+            cached.display_key == display_key && cached.captured_at.elapsed() < max_age
+        }) {
+            return (!cached.name.is_empty()).then(|| cached.name.clone());
+        }
+    }
+    let name = edid_name_for_target(target);
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedMonitorName {
+            display_key,
+            name: name.clone().unwrap_or_default(),
+            captured_at: Instant::now(),
+        });
+    }
+    name
+}
+
 fn edid_name_for_target(target: &DisplayTarget) -> Option<String> {
     unsafe {
         let devices = SetupDiGetClassDevsW(
@@ -1451,12 +1499,15 @@ fn begin_mode_change(
             "could not start display recovery watchdog: {error}"
         ));
     }
-    // Apply without CDS_UPDATEREGISTRY. The mode is only committed after the
-    // frontend confirms it, and a watchdog restores the previous mode if the
-    // confirmation never arrives.
-    // The old transaction was already rolled back; the current mode is
-    // still the `previous` mode captured immediately before this attempt.
-    if let Err(error) = unsafe { change_mode(&target, &mode, CDS_TYPE(0)) } {
+    // Apply AND persist in one call (CDS_UPDATEREGISTRY), exactly how the
+    // CRU tool commits modes. Persisting the mode is a separate
+    // ChangeDisplaySettingsExW call that costs ~245ms and makes the shell
+    // react system-wide; doing it inside the apply hides that cost inside the
+    // mode switch the user is already watching, instead of surfacing it as a
+    // delayed hitch after they click Keep (confirm is now a no-op). The
+    // watchdog still restores + re-persists the previous mode if the
+    // confirmation never arrives, so the registry always matches the screen.
+    if let Err(error) = unsafe { change_mode(&target, &mode, CDS_UPDATEREGISTRY) } {
         if let Err(cleanup_error) = clear_recovery_record_for(token) {
             return Err(format!(
                 "{error}; recovery cleanup also failed: {cleanup_error}"
@@ -1468,7 +1519,7 @@ fn begin_mode_change(
         // Windows accepted the request, but the driver never made the exact
         // mode active. Restore the known-good mode before returning an error;
         // the frontend must not show a confirmation dialog for a false success.
-        let restore = unsafe { change_mode(&target, &previous, CDS_TYPE(0)) };
+        let restore = unsafe { change_mode(&target, &previous, CDS_UPDATEREGISTRY) };
         let restored = restore.is_ok() && wait_for_mode(&target, &previous).is_some();
         let cleanup_error = if restored {
             clear_recovery_record_for(token).err()
@@ -1533,7 +1584,7 @@ fn begin_mode_change(
                 log::error!("[display-info] automatic rollback refused: {error}");
                 return;
             }
-            match unsafe { change_mode(&entry.target, &entry.previous, CDS_TYPE(0)) } {
+            match unsafe { change_mode(&entry.target, &entry.previous, CDS_UPDATEREGISTRY) } {
                 Ok(()) if wait_for_mode(&entry.target, &entry.previous).is_some() => {
                     invalidate_mode_cache();
                     // Keep the in-memory transaction until recovery cleanup has
@@ -1569,7 +1620,7 @@ fn begin_mode_change(
         refresh_hz: mode.dmDisplayFrequency,
         // Use the same EDID-backed friendly name shown by get_display_info;
         // DeviceString alone may only say "Generic PnP Monitor".
-        monitor_name: edid_name_for_target(&target).unwrap_or(target.monitor_name),
+        monitor_name: cached_edid_monitor_name(&target).unwrap_or(target.monitor_name),
         confirmation_seconds: 15,
     })
 }
@@ -1627,13 +1678,14 @@ pub fn confirm_mode_change() -> Result<(), String> {
     // watchdog cannot restore the old mode while this guard is held, and the
     // recovery file cannot be deleted by a competing transaction.
     let _recovery_guard = lock_recovery_state()?;
-    // Test the requested mode, then verify the actual active mode before making
-    // the registry update permanent. All reads happen while the recovery lock
-    // is held, avoiding a stale pre-lock validation race.
+    // The requested mode was already applied AND persisted by begin_mode_change
+    // (CDS_UPDATEREGISTRY), so confirm no longer touches the display at all —
+    // there is nothing to persist. It only re-checks identity and that the
+    // display is still running the requested mode, then clears the recovery
+    // state. The same_mode check keeps the recovery path intact if the mode
+    // drifted externally during the confirmation window. All reads happen
+    // while the recovery lock is held, avoiding a stale pre-lock race.
     target_is_current(&target)?;
-    unsafe {
-        change_mode(&target, &requested, CDS_TEST)?;
-    }
     let active = current_devmode(&target.device_name)
         .ok_or_else(|| "unable to verify the active display mode".to_string())?;
     if !same_mode(&active, &requested) {
@@ -1647,22 +1699,8 @@ pub fn confirm_mode_change() -> Result<(), String> {
             requested.dmDisplayFrequency,
         ));
     }
-    unsafe {
-        // The requested mode is already active (verified above), so persist it
-        // to the registry WITHOUT re-applying it. A plain CDS_UPDATEREGISTRY
-        // call re-sets the same mode, which on HDMI/TV displays forces a
-        // full signal resync that freezes the entire desktop (including the
-        // cursor) for a moment. CDS_NORESET writes the settings to the
-        // registry but does not take effect, so nothing on screen changes.
-        change_mode(&target, &active, CDS_UPDATEREGISTRY | CDS_NORESET)?;
-    }
-    // Verify the persistent commit too. Keep the recovery record and pending
-    // transaction if the driver does not settle on the committed mode. Since
-    // CDS_NORESET did not change the mode, this confirms the previously
-    // verified mode is still active.
-    if wait_for_mode(&target, &active).is_none() {
-        return Err("the display mode was committed but could not be verified afterward; recovery state was kept".into());
-    }
+    // (Persisting here used to be the ~245ms registry write that hitched the
+    // desktop after Keep; it now lives inside the apply in begin_mode_change.)
     // Clearing recovery state is part of the commit. If it fails, leave the
     // transaction pending so a retry remains possible; safety is preferable
     // to silently allowing a stale watchdog record to be ignored.
@@ -1694,7 +1732,7 @@ pub fn rollback_mode_change() -> Result<(), String> {
     let _recovery_guard = lock_recovery_state()?;
     target_is_current(&entry.target)?;
     unsafe {
-        change_mode(&entry.target, &entry.previous, CDS_TYPE(0))?;
+        change_mode(&entry.target, &entry.previous, CDS_UPDATEREGISTRY)?;
     }
     if wait_for_mode(&entry.target, &entry.previous).is_none() {
         return Err("display driver did not restore the previous mode".into());

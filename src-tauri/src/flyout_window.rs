@@ -220,6 +220,12 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
         .map_err(|error| format!("could not read flyout size: {error}"))?;
     let (x, y) = taskbar_position(current_size.width as i32, current_size.height as i32)
         .ok_or_else(|| "could not determine final taskbar geometry".to_string())?;
+    // No SWP_NOACTIVATE on purpose: the confirmation dialog must take
+    // keyboard focus so Enter (revert) and Escape (revert) work immediately,
+    // like Windows' own display-mode confirm dialog. Showing with activation
+    // is safe here — the flyout is only ever shown while the main window is
+    // hidden in the tray (the visible-window path uses the in-app modal), so
+    // no other app window loses focus it needs.
     unsafe {
         SetWindowPos(
             HWND(hwnd.0),
@@ -228,10 +234,14 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
             y,
             0,
             0,
-            SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOZORDER,
         )
         .map_err(|error| format!("could not show flyout: {error}"))?;
     }
+    // Belt-and-braces: SetWindowPos activates the top-level window, but the
+    // WebView child needs the actual keyboard focus for the DOM buttons to
+    // receive key events. Runs after show so the window is already visible.
+    let _ = window.set_focus();
     match window.outer_position() {
         Ok(pos) => Ok((pos.x, pos.y)),
         Err(error) => Err(format!("could not read shown flyout position: {error}")),

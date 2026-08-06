@@ -42,8 +42,51 @@
   let exiting = $state(false); // plays the exit ease before the window hides
   let timer = null;
   let shownFallbackTimer = null; // safety net: never leave the modal stuck at opacity 0
+  let keepBtnEl = $state(null);
+  let revertBtnEl = $state(null);
 
   const win = getCurrentWindow();
+
+  // Keyboard handling, matching Windows' own display-mode confirm dialog:
+  // Revert is the safe default action, so it gets initial focus and Enter /
+  // Space on it (or Enter/Escape with no focused button) reverts immediately.
+  // Tab is trapped between the two buttons so focus can never wander out of
+  // the tiny window into the transparent webview behind it.
+  function onDialogKeydown(e) {
+    if (busy) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      rollback();
+    } else if (e.key === 'Enter') {
+      // A focused button handles Enter natively (fires its click); without
+      // one, Enter falls back to the default action.
+      if (e.target?.closest?.('button')) return;
+      e.preventDefault();
+      rollback();
+    } else if (e.key === 'Tab') {
+      const first = keepBtnEl;
+      const last = revertBtnEl;
+      if (!first || !last) return;
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
+  // Focus the default action (Revert) once the modal is actually visible on
+  // screen. The window activation itself is handled natively in Rust
+  // (finish_show drops SWP_NOACTIVATE); this moves focus to the button in
+  // the DOM so Enter/Space and the focus ring land on the right control.
+  $effect(() => {
+    if (visible && mode) {
+      const focusId = setTimeout(() => revertBtnEl?.focus(), 0);
+      return () => clearTimeout(focusId);
+    }
+  });
 
   function clearTimer() {
     if (timer) clearInterval(timer);
@@ -210,6 +253,10 @@
       // Dwell briefly after the window becomes visible, then play the
       // entrance animation so the user actually sees it.
       showWithEntranceDelay();
+      // The native window was activated in Rust (finish_show), but make sure
+      // the activation sticks for the WebView so keyboard input (Enter /
+      // Escape / Tab) reaches the dialog immediately.
+      win.setFocus().catch(() => {});
     }).then((stop) => { unlistenShown = stop; }).catch((e) => diag(`[flyout] listen(flyout-shown) failed: ${e}`));
     // Keep the accent (--accent-hdr vs --accent-sdr) in sync with the main
     // window's HDR/SDR status, same as the old set_flyout_hdr command did.
@@ -228,16 +275,16 @@
 
 {#if mode}
   <div class="modal-backdrop mode-confirm-backdrop flyout-backdrop" role="presentation">
-    <div class="modal mode-confirm-modal" class:flyout-visible={visible} class:flyout-exiting={exiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" tabindex="-1">
+    <div class="modal mode-confirm-modal" class:flyout-visible={visible} class:flyout-exiting={exiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" aria-describedby="mode-confirm-desc" tabindex="-1" onkeydown={onDialogKeydown}>
       <h2 id="mode-confirm-title" class="modal-title">Keep display mode?</h2>
-      <p class="modal-desc">
+      <p id="mode-confirm-desc" class="modal-desc">
         {mode.monitor_name || 'Current monitor'} is temporarily using
         <strong>{mode.width}×{mode.height} at {mode.refresh_hz} Hz</strong>.
         Confirm if the picture looks correct. It will automatically revert in {remaining}s.
       </p>
       <div class="modal-actions">
-        <button class="modal-btn" onclick={confirm} disabled={busy}>Keep this mode</button>
-        <button class="modal-btn modal-btn-cancel" onclick={rollback} disabled={busy}>Revert (<span class="modal-btn-countdown">{remaining}</span>s)</button>
+        <button bind:this={keepBtnEl} class="modal-btn" onclick={confirm} disabled={busy}>Keep this mode</button>
+        <button bind:this={revertBtnEl} class="modal-btn modal-btn-cancel" onclick={rollback} disabled={busy}>Revert (<span class="modal-btn-countdown">{remaining}</span>s)</button>
       </div>
     </div>
   </div>

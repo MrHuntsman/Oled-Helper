@@ -286,13 +286,20 @@ fn get_display_info() -> Option<display_info::DisplayInfo> {
     display_info::query_current_display()
 }
 
+// Async (not sync) commands: the apply now persists the mode to the registry
+// in the same ChangeDisplaySettingsExW call (CDS_UPDATEREGISTRY, ~245ms on
+// some driver stacks — the same cost the confirm used to carry). A sync
+// command would block the Tauri main thread for that duration while the mode
+// switch is happening. The async runtime keeps the main thread responsive.
+// The tray path already runs set_resolution/set_refresh_rate on its own
+// spawned thread; this makes the in-app path behave the same way.
 #[tauri::command]
-fn set_refresh_rate(hz: u32) -> Result<display_info::AppliedMode, String> {
+async fn set_refresh_rate(hz: u32) -> Result<display_info::AppliedMode, String> {
     display_info::set_refresh_rate(hz)
 }
 
 #[tauri::command]
-fn set_resolution(
+async fn set_resolution(
     width: u32,
     height: u32,
     preferred_hz: u32,
@@ -300,13 +307,19 @@ fn set_resolution(
     display_info::set_resolution(width, height, preferred_hz)
 }
 
+// Async (not sync) commands: confirm/rollback persist or restore the display
+// mode, which writes the user profile registry and can take hundreds of ms on
+// some driver stacks. A sync command runs on the Tauri main thread and would
+// freeze the whole app (tray, dimmer z-order repairs, WebView) for that
+// duration — the "hitch" seen after clicking Keep. Moving them onto the async
+// runtime keeps the main thread responsive.
 #[tauri::command]
-fn confirm_display_mode_change() -> Result<(), String> {
+async fn confirm_display_mode_change() -> Result<(), String> {
     display_info::confirm_mode_change()
 }
 
 #[tauri::command]
-fn rollback_display_mode_change() -> Result<(), String> {
+async fn rollback_display_mode_change() -> Result<(), String> {
     display_info::rollback_mode_change()
 }
 
