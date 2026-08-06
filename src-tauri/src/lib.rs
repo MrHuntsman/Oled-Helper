@@ -1,23 +1,102 @@
 mod config;
 mod display_info;
+mod flyout_window;
 mod gamma_ramp;
 mod hdr_toggle;
+mod hotkeys;
 mod taskbar_dimmer;
 mod window_icon;
 
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
 
 struct TrayState {
     enabled: AtomicBool,
+}
+
+#[cfg(target_os = "windows")]
+mod display_change_events {
+    use super::*;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_NCDESTROY, WM_SETTINGCHANGE,
+    };
+
+    const SUBCLASS_ID: usize = 0x4F4C_4449; // "OLDI"
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+
+    unsafe extern "system" fn window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        subclass_id: usize,
+        _ref_data: usize,
+    ) -> LRESULT {
+        match message {
+            // Global hotkeys registered by hotkeys.rs. wparam carries the
+            // hotkey id; this dispatch runs on the main thread (window
+            // subclass), where WM_HOTKEY messages are delivered.
+            WM_HOTKEY => {
+                crate::hotkeys::handle_hotkey(wparam.0 as i32);
+            }
+            WM_DISPLAYCHANGE => {
+                if let Some(app) = APP.get() {
+                    notify_display_changed(app, "WM_DISPLAYCHANGE");
+                }
+            }
+            WM_DEVICECHANGE => {
+                if let Some(app) = APP.get() {
+                    notify_display_changed(app, "WM_DEVICECHANGE");
+                }
+            }
+            // Display topology changes can also arrive as a settings
+            // broadcast, especially when a virtual display driver updates
+            // the active display configuration without changing the primary
+            // mode first. Treat it as a display invalidation rather than
+            // polling for changes.
+            WM_SETTINGCHANGE => {
+                if let Some(app) = APP.get() {
+                    notify_display_changed(app, "WM_SETTINGCHANGE");
+                }
+            }
+            WM_NCDESTROY => {
+                let _ = RemoveWindowSubclass(hwnd, Some(window_proc), subclass_id);
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+
+    fn notify_display_changed(app: &AppHandle, source: &str) {
+        let _ = app.emit("display-changed", source);
+        // Keep the tray menu's resolution/refresh-rate submenus in sync with
+        // the active display configuration. Coalesced because a single display
+        // change often arrives as a burst of several window messages.
+        crate::rebuild_tray_menu_throttled(app);
+    }
+
+    pub fn install(window_handle: isize, app: AppHandle) -> Result<(), String> {
+        let _ = APP.set(app);
+        let hwnd = HWND(window_handle as *mut std::ffi::c_void);
+        let installed = unsafe { SetWindowSubclass(hwnd, Some(window_proc), SUBCLASS_ID, 0) };
+        if installed.as_bool() {
+            Ok(())
+        } else {
+            Err("SetWindowSubclass failed".into())
+        }
+    }
 }
 
 // Gamma state — synchronous apply + periodic safety restore.
@@ -208,13 +287,32 @@ fn get_display_info() -> Option<display_info::DisplayInfo> {
 }
 
 #[tauri::command]
-fn set_refresh_rate(hz: u32) -> Result<(), String> {
+fn set_refresh_rate(hz: u32) -> Result<display_info::AppliedMode, String> {
     display_info::set_refresh_rate(hz)
 }
 
 #[tauri::command]
-fn set_resolution(width: u32, height: u32, preferred_hz: u32) -> Result<(), String> {
+fn set_resolution(
+    width: u32,
+    height: u32,
+    preferred_hz: u32,
+) -> Result<display_info::AppliedMode, String> {
     display_info::set_resolution(width, height, preferred_hz)
+}
+
+#[tauri::command]
+fn confirm_display_mode_change() -> Result<(), String> {
+    display_info::confirm_mode_change()
+}
+
+#[tauri::command]
+fn rollback_display_mode_change() -> Result<(), String> {
+    display_info::rollback_mode_change()
+}
+
+#[tauri::command]
+fn get_display_target() -> Option<display_info::DisplayTargetInfo> {
+    display_info::display_target_info()
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -224,6 +322,173 @@ fn show_main_window(app: &AppHandle) {
             let _ = app.emit("window-visibility", true);
         }
     }
+}
+
+// ── Tray menu with resolution / refresh-rate submenus ─────────────────────────
+// The tray context menu exposes the display's supported resolutions and
+// refresh rates in their own submenus, so the app's core display controls are
+// reachable without opening the window. Check menu items mark the currently
+// active mode. The menu is rebuilt whenever the display configuration changes
+// and after every tray-driven mode change.
+
+fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let show_item = MenuItem::with_id(app, "show", "Show OLED Helper", true, None::<&str>)?;
+    let restart_item = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+
+    let res_submenu = Submenu::new(app, "Resolution", true)?;
+    let hz_submenu = Submenu::new(app, "Refresh Rate", true)?;
+    let mut has_resolutions = false;
+    let mut has_refresh_rates = false;
+    if let Some(info) = display_info::query_current_display() {
+        for resolution in &info.resolutions {
+            has_resolutions = true;
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("res-{}x{}", resolution.width, resolution.height),
+                format!("{}×{}", resolution.width, resolution.height),
+                true,
+                info.width == resolution.width && info.height == resolution.height,
+                None::<&str>,
+            )?;
+            res_submenu.append(&item)?;
+        }
+        for hz in &info.refresh_rates {
+            has_refresh_rates = true;
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("hz-{hz}"),
+                format!("{hz} Hz"),
+                true,
+                *hz == info.refresh_hz,
+                None::<&str>,
+            )?;
+            hz_submenu.append(&item)?;
+        }
+    }
+    if !has_resolutions {
+        res_submenu.append(&MenuItem::with_id(
+            app,
+            "res-none",
+            "No resolutions available",
+            false,
+            None::<&str>,
+        )?)?;
+    }
+    if !has_refresh_rates {
+        hz_submenu.append(&MenuItem::with_id(
+            app,
+            "hz-none",
+            "No refresh rates available",
+            false,
+            None::<&str>,
+        )?)?;
+    }
+
+    Menu::with_items(
+        app,
+        &[
+            &show_item,
+            &res_submenu,
+            &hz_submenu,
+            &restart_item,
+            &quit_item,
+        ],
+    )
+}
+
+fn rebuild_tray_menu(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return;
+    };
+    match build_tray_menu(app) {
+        Ok(menu) => {
+            if let Err(error) = tray.set_menu(Some(menu)) {
+                log::warn!("[tray] could not update tray menu: {error}");
+            }
+        }
+        Err(error) => log::warn!("[tray] could not rebuild tray menu: {error}"),
+    }
+}
+
+// A single display topology change often arrives as a burst of window messages
+// (WM_DISPLAYCHANGE + WM_DEVICECHANGE + WM_SETTINGCHANGE, several of each).
+// Every rebuild runs a full display query on the main thread, so coalesce
+// notification-driven rebuilds. Tray-click paths call rebuild_tray_menu
+// directly and are never throttled.
+fn rebuild_tray_menu_throttled(app: &AppHandle) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_REBUILD: AtomicU64 = AtomicU64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    if now_ms.saturating_sub(LAST_REBUILD.load(Ordering::Relaxed)) < 300 {
+        return;
+    }
+    LAST_REBUILD.store(now_ms, Ordering::Relaxed);
+    rebuild_tray_menu(app);
+}
+
+fn parse_mode_id(value: &str) -> Option<(u32, u32)> {
+    let (width, height) = value.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
+}
+
+// Applies a mode picked from the tray menu. Always shows the small
+// always-on-top "flyout" WebviewWindow for this confirmation, never the
+// in-app modal — regardless of whether the main window happens to be open,
+// so a tray-driven change always surfaces its confirmation at the tray
+// rather than possibly popping the in-app dialog behind/inside a window the
+// user wasn't necessarily looking at. The in-app dropdowns (App.svelte's
+// changeResolution/changeRefreshRate) remain the only path that shows the
+// in-app modal, since those calls only happen while the window is visible
+// and focused.
+fn tray_display_mode_change(app: AppHandle, result: Result<display_info::AppliedMode, String>) {
+    match result {
+        Ok(mode) => {
+            // ChangeDisplaySettingsExW and wait_for_mode verify the new
+            // DEVMODE, but Windows updates DWM, the shell taskbar, and the
+            // monitor work area asynchronously afterward. Wait on this tray
+            // worker until the requested monitor size is observed and the
+            // monitor/work-area rectangles are stable across samples; never
+            // block the Tauri/UI thread while the shell catches up.
+            flyout_window::wait_for_display_geometry(mode.width, mode.height);
+
+            // Give Windows/DWM/WebView2 a moment to finish settling display
+            // and DPI changes before the flyout renders and positions itself.
+            // wait_for_display_geometry already confirms the monitor rect is
+            // stable, but downstream consumers (taskbar redraw, WebView2's
+            // own DPI-changed handling) can still be catching up for a bit
+            // longer; a fixed pause here is simpler and more predictable than
+            // chasing every one of those signals individually.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+
+            // Keep the handshake on this background worker. It waits for
+            // frontend readiness and schedules only the short native prepare
+            // and final-show operations on the Tauri thread; calling it from
+            // run_on_main_thread would deadlock that thread while JavaScript
+            // tries to deliver the readiness events.
+            let window_app = app.clone();
+            let shown_mode = mode.clone();
+            if let Err(error) = flyout_window::show_after_ready(&window_app, shown_mode.clone()) {
+                // The existing watchdog will safely restore the previous mode
+                // even if the flyout window fails to show.
+                log::error!(
+                    "[tray] mode flyout window failed; mode will auto-revert safely: {error}"
+                );
+            } else {
+                log::info!(
+                    "[tray] mode flyout window shown for {}x{}@{}Hz",
+                    shown_mode.width,
+                    shown_mode.height,
+                    shown_mode.refresh_hz
+                );
+            }
+        }
+        Err(error) => log::warn!("[tray] display mode change failed: {error}"),
+    }
+    rebuild_tray_menu(&app);
 }
 
 fn shutdown_gamma_worker(app: &AppHandle) {
@@ -243,6 +508,7 @@ fn shutdown_gamma_worker(app: &AppHandle) {
 
 fn request_shutdown_and_exit(app: &AppHandle) {
     taskbar_dimmer::shutdown();
+    hotkeys::shutdown();
     shutdown_gamma_worker(app);
     app.exit(0);
 }
@@ -344,9 +610,16 @@ fn wait_for_restart_parent(parent_pid: u32) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if std::env::args().any(|arg| arg == "--display-mode-watchdog") {
+        display_info::run_recovery_watchdog();
+        return;
+    }
+    display_info::launch_recovery_watchdog_if_needed();
+
     // Tray-restart child: let the old instance release the user-data folder
     // before we start WebView2. If the parent remains alive or its state cannot
     // be verified, abort this child rather than competing for the profile.
+    let is_restart_child = std::env::args().any(|arg| arg == "--restart-parent");
     #[cfg(target_os = "windows")]
     {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
@@ -363,7 +636,18 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    // Must be the first plugin registered (Tauri docs recommendation). Skip
+    // it for our own restart-child processes: the old instance is still
+    // alive (mid-shutdown) when the replacement launches, so the single-
+    // instance lock would still be held and this new process would just get
+    // forwarded to the dying instance and exit instead of taking over.
+    if !is_restart_child {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }));
+    }
+    builder
         .manage(GammaState {
             desired: Arc::new(AtomicI32::new(0)),
             shutdown: Arc::new(GammaShutdown {
@@ -383,11 +667,17 @@ pub fn run() {
             get_display_info,
             set_refresh_rate,
             set_resolution,
+            confirm_display_mode_change,
+            rollback_display_mode_change,
+            get_display_target,
             set_tray_enabled,
             config::load_config,
             config::save_config,
             config::reset_config,
+            config::open_config_folder,
             log_history::take_log_history,
+            hotkeys::set_hotkey,
+            hotkeys::reset_hotkeys,
             taskbar_dimmer::set_taskbar_dimmer,
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
             taskbar_dimmer::set_taskbar_dimmer_detection,
@@ -398,6 +688,10 @@ pub fn run() {
             hdr_toggle::get_windows_hdr_status,
             hdr_toggle::set_windows_hdr_enabled,
             hdr_toggle::get_hdr_luminance,
+            flyout_window::set_flyout_hdr,
+            flyout_window::flyout_frontend_ready,
+            flyout_window::flyout_layout_ready,
+            flyout_window::flyout_hidden,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -454,15 +748,21 @@ pub fn run() {
                     .build(),
             )?;
 
+            // The hidden-tray confirmation is a second small Tauri WebviewWindow
+            // ("flyout", see tauri.conf.json + flyout_window.rs) rendering the
+            // same Svelte modal markup as the in-app confirmation. Pre-warmed
+            // here (rather than lazily on first show()) so its WebView2
+            // controller exists well before any display-mode change can race
+            // its creation — see flyout_window::prewarm for why.
+            flyout_window::prewarm(app.handle());
+            log::info!("[tray] mode flyout window ready");
+
             let saved_config = config::load_config(app.handle().clone());
             app.state::<TrayState>()
                 .enabled
                 .store(saved_config.tray_enabled, Ordering::Relaxed);
 
-            let show_item = MenuItem::with_id(app, "show", "Show OLED Helper", true, None::<&str>)?;
-            let restart_item = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &restart_item, &quit_item])?;
+            let tray_menu = build_tray_menu(app.handle())?;
             let tray_image = window_icon::crisp_tray_image()
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
@@ -471,11 +771,74 @@ pub fn run() {
                 .icon(tray_image)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => show_main_window(app),
-                    "restart" => request_restart(app),
-                    "quit" => request_shutdown_and_exit(app),
-                    _ => {}
+                .on_menu_event(|app, event| {
+                    let id = event.id.as_ref();
+                    match id {
+                        "show" => show_main_window(app),
+                        "restart" => request_restart(app),
+                        "quit" => request_shutdown_and_exit(app),
+                        // "res-3840x2160" — apply keeping the current refresh
+                        // rate as the preferred one, mirroring the in-app
+                        // dropdown's behavior. The mode switch can blank the
+                        // screen for hundreds of ms, so it runs on a background
+                        // thread and the result is handed back via an event.
+                        _ if id.starts_with("res-") => {
+                            if let Some((width, height)) =
+                                id.strip_prefix("res-").and_then(parse_mode_id)
+                            {
+                                let already_active =
+                                    display_info::query_current_display().as_ref().is_some_and(
+                                        |info| info.width == width && info.height == height,
+                                    );
+                                if already_active {
+                                    // Clicking the active mode toggled its check
+                                    // mark — restore it without a mode change.
+                                    rebuild_tray_menu(app);
+                                    return;
+                                }
+                                // Do NOT show the main window here: the mode
+                                // change itself may open the mini confirmation
+                                // dialog, and forcing the full interface open
+                                // defeats that. tray_display_mode_change routes
+                                // the confirmation appropriately.
+                                let app_handle = app.clone();
+                                std::thread::spawn(move || {
+                                    let preferred_hz = display_info::query_current_display()
+                                        .map(|info| info.refresh_hz)
+                                        .unwrap_or(0);
+                                    tray_display_mode_change(
+                                        app_handle,
+                                        display_info::set_resolution(width, height, preferred_hz),
+                                    );
+                                });
+                            }
+                        }
+                        // "hz-144"
+                        _ if id.starts_with("hz-") => {
+                            if let Some(hz) = id
+                                .strip_prefix("hz-")
+                                .and_then(|text| text.parse::<u32>().ok())
+                            {
+                                let already_active = display_info::query_current_display()
+                                    .as_ref()
+                                    .is_some_and(|info| info.refresh_hz == hz);
+                                if already_active {
+                                    rebuild_tray_menu(app);
+                                    return;
+                                }
+                                // See the res- branch — never open the full
+                                // window from a tray mode change.
+                                let app_handle = app.clone();
+                                std::thread::spawn(move || {
+                                    tray_display_mode_change(
+                                        app_handle,
+                                        display_info::set_refresh_rate(hz),
+                                    );
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -495,7 +858,47 @@ pub fn run() {
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();
             if let Err(error) = taskbar_dimmer::create_overlay(app.handle(), &dimmer_state) {
-                log::warn!("taskbar dimmer overlay unavailable: {error}");
+                log::warn!("taskbar dimmer overlay unavailable: {error}; will retry in background");
+                // Startup-time overlay creation can transiently fail if the
+                // taskbar/shell hasn't settled yet (e.g. right after a tray
+                // restart, or during a resolution/refresh-rate change that
+                // briefly recreates Shell_TrayWnd). create_overlay only runs
+                // once here, so without a retry a transient failure disables
+                // the dimmer for the rest of the session. Retry a few times
+                // with a short delay instead of giving up immediately.
+                let retry_app = app.handle().clone();
+                std::thread::spawn(move || {
+                    const MAX_ATTEMPTS: u32 = 5;
+                    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+                    for attempt in 1..=MAX_ATTEMPTS {
+                        std::thread::sleep(RETRY_DELAY);
+                        let dimmer_state = retry_app.state::<taskbar_dimmer::TaskbarDimmerState>();
+                        match taskbar_dimmer::create_overlay(&retry_app, &dimmer_state) {
+                            Ok(()) => {
+                                log::info!(
+                                    "taskbar dimmer overlay created on retry attempt {attempt}"
+                                );
+                                // The frontend snapshots availability once at
+                                // startup (get_taskbar_dimmer_status inside
+                                // loadConfig) before this retry can possibly
+                                // finish, so without this event the Taskbar
+                                // Dimmer tab would keep showing "unavailable"
+                                // for the rest of the session even though the
+                                // overlay is now live.
+                                let _ = retry_app.emit("taskbar-dimmer-available", true);
+                                return;
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "taskbar dimmer overlay retry {attempt}/{MAX_ATTEMPTS} failed: {error}"
+                                );
+                            }
+                        }
+                    }
+                    log::error!(
+                        "taskbar dimmer overlay could not be created after {MAX_ATTEMPTS} attempts; dimmer disabled for this session"
+                    );
+                });
             }
 
             // Tauri's runtime window icon (titlebar/taskbar while running) is blurry
@@ -505,6 +908,18 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(hwnd) = window.hwnd() {
                     let hwnd_raw = hwnd.0 as isize;
+                    if let Err(error) =
+                        display_change_events::install(hwnd_raw, app.handle().clone())
+                    {
+                        log::warn!(
+                            "[display-info] could not install display-change event hook: {error}"
+                        );
+                    }
+                    // Global hotkeys share the main window: WM_HOTKEY is
+                    // delivered through the subclass above, and RegisterHotKey
+                    // targets the same HWND. Registered here (setup runs on the
+                    // main thread) from the persisted bindings.
+                    hotkeys::init(app.handle().clone(), hwnd_raw, &saved_config);
                     window_icon::apply_crisp_window_icon(hwnd_raw);
                     // WebView2 initialization can reset the icon shortly after; reapply once more.
                     std::thread::spawn(move || {
@@ -537,6 +952,7 @@ pub fn run() {
                     // worker shutdown so the display ramp is reset before the
                     // process exits.
                     taskbar_dimmer::shutdown();
+                    hotkeys::shutdown();
                     shutdown_gamma_worker(window.app_handle());
                 }
                 _ => {}

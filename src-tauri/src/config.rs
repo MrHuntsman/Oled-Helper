@@ -23,13 +23,18 @@ use windows::Win32::Storage::FileSystem::{
 pub struct AppConfig {
     #[serde(default)]
     pub black_lift: f64,
-    // New configs store one display-unit black level per refresh rate. An
-    // empty/missing map is valid for legacy configs and new refresh rates
-    // default to zero in the frontend.
+    // New configs store display-scoped keys in the form
+    // `monitor-id|WIDTHxHEIGHT|HZ`. Bare numeric keys are retained only for
+    // frontend migration from the previous per-Hz format.
     #[serde(default)]
     pub black_lift_profiles: HashMap<String, f64>,
     #[serde(default = "default_true")]
     pub black_enabled: bool,
+    // Hide the calibration strip interface (labels, controls) — right-click
+    // menu on the strip. The info tooltip and fullscreen slider only hide in
+    // fullscreen modes; the rest of the interface hides everywhere.
+    #[serde(default)]
+    pub hide_calibration_interface: bool,
     #[serde(default)]
     pub taskbar_dimmer_enabled: bool,
     #[serde(default = "default_dimmer_opacity")]
@@ -55,34 +60,46 @@ pub struct AppConfig {
     pub tray_enabled: bool,
     #[serde(default = "default_hover_detection")]
     pub taskbar_dimmer_hover_detection: String,
-    // The polling cadence is a real persisted setting — the frontend sends
-    // it in save_config, so it needs a matching field here or serde silently
-    // drops it and the value never survives a restart.
     #[serde(default = "default_poll_interval")]
     pub taskbar_dimmer_poll_interval_ms: u64,
+    #[serde(default = "default_resolution_sort")]
+    pub display_menu_resolution_sort: String,
+    #[serde(default = "default_resolution_group_by")]
+    pub display_menu_resolution_group_by: String,
+    #[serde(default = "default_true")]
+    pub display_menu_show_tags: bool,
+    #[serde(default = "default_refresh_rate_sort")]
+    pub display_menu_refresh_rate_sort: String,
+    // Global hotkey bindings: action name → combo string ("Ctrl+Alt+F9" or
+    // "None" for unbound). Registered via RegisterHotKey on startup and when
+    // the user changes a binding in the Hotkeys tab.
+    #[serde(default)]
+    pub hotkeys: HashMap<String, String>,
 }
 
 fn default_true() -> bool {
     true
 }
-
 fn default_dimmer_opacity() -> f64 {
     0.95
 }
-
 fn default_dimmer_ease_duration() -> u64 {
-    // Matches the frontend store's initial value and the dimmer tab's own
-    // "Restore Tab Defaults" (300 ms each way) — Rust is the single source
-    // of truth for reset-all, so it must agree with the UI's defaults.
     300
 }
-
 fn default_hover_detection() -> String {
     "event".to_string()
 }
-
 fn default_poll_interval() -> u64 {
     100
+}
+fn default_resolution_sort() -> String {
+    "desc".to_string()
+}
+fn default_resolution_group_by() -> String {
+    "none".to_string()
+}
+fn default_refresh_rate_sort() -> String {
+    "desc".to_string()
 }
 
 impl Default for AppConfig {
@@ -91,6 +108,7 @@ impl Default for AppConfig {
             black_lift: 0.0,
             black_lift_profiles: HashMap::new(),
             black_enabled: true,
+            hide_calibration_interface: false,
             taskbar_dimmer_enabled: false,
             taskbar_dimmer_opacity: default_dimmer_opacity(),
             taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),
@@ -98,14 +116,16 @@ impl Default for AppConfig {
             taskbar_dimmer_hover_detection: default_hover_detection(),
             taskbar_dimmer_poll_interval_ms: default_poll_interval(),
             tray_enabled: true,
+            display_menu_resolution_sort: default_resolution_sort(),
+            display_menu_resolution_group_by: default_resolution_group_by(),
+            display_menu_show_tags: true,
+            display_menu_refresh_rate_sort: default_refresh_rate_sort(),
+            hotkeys: HashMap::new(),
         }
     }
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    // app_data_dir() was observed resolving to %APPDATA% (Roaming) rather than
-    // %LOCALAPPDATA% in this Tauri version/setup, despite docs suggesting
-    // otherwise — so build the Local path explicitly instead of trusting it.
     let dir = local_app_dir(app)?;
     fs::create_dir_all(&dir).map_err(|e| format!("could not create app data dir: {e}"))?;
     Ok(dir.join("config.json"))
@@ -115,8 +135,7 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
 fn local_app_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let localappdata =
         std::env::var("LOCALAPPDATA").map_err(|e| format!("LOCALAPPDATA not set: {e}"))?;
-    let identifier = app.config().identifier.clone();
-    Ok(PathBuf::from(localappdata).join(identifier))
+    Ok(PathBuf::from(localappdata).join(app.config().identifier.clone()))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -124,6 +143,43 @@ fn local_app_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_data_dir()
         .map_err(|e| format!("could not resolve app data dir: {e}"))
+}
+
+#[tauri::command]
+pub fn open_config_folder(app: AppHandle) -> Result<(), String> {
+    let dir = local_app_dir(&app)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("could not create app data dir: {e}"))?;
+    #[cfg(target_os = "windows")]
+    {
+        let path = dir
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            windows::Win32::UI::Shell::ShellExecuteW(
+                None,
+                PCWSTR::null(),
+                PCWSTR(path.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let status = std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("file manager exited with {status}"))
+        }
+    }
 }
 
 #[tauri::command]
@@ -144,24 +200,17 @@ pub fn load_config(app: AppHandle) -> AppConfig {
             migrate_legacy_ease_duration(&text, &mut config);
             config
         }
-        Err(_) => AppConfig::default(), // file doesn't exist yet — first run
+        Err(_) => AppConfig::default(),
     }
 }
 
-// Pre-split configs stored one `taskbar_dimmer_ease_duration_ms` that applied
-// to both fade-in and fade-out. serde's #[serde(alias)] only lets one field
-// claim a given input key, so only fade_in_duration_ms picks it up
-// automatically (see the field comment in AppConfig above); this fills in
-// fade_out_duration_ms from the same legacy key by hand, but only when the
-// config predates the split (no explicit fade-out key present) so it never
-// clobbers a value the user has already set post-split.
 fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else {
         return;
     };
     let Some(obj) = value.as_object() else { return };
     if obj.contains_key("taskbar_dimmer_fade_out_duration_ms") {
-        return; // already on the split format
+        return;
     }
     if let Some(legacy) = obj
         .get("taskbar_dimmer_ease_duration_ms")
@@ -176,14 +225,11 @@ struct PendingConfigWrite {
     text: String,
     version: u64,
 }
-
 static CONFIG_WRITE_VERSION: AtomicU64 = AtomicU64::new(0);
 static CONFIG_WRITE_STOP: AtomicBool = AtomicBool::new(false);
 static CONFIG_WRITE_QUEUE: OnceLock<(Mutex<Option<PendingConfigWrite>>, Condvar)> = OnceLock::new();
 static CONFIG_WRITE_WORKER: OnceLock<Result<Mutex<Option<std::thread::JoinHandle<()>>>, String>> =
     OnceLock::new();
-// The worker runs on its own thread, so the only way to tell the frontend a
-// background write failed is an event (save_config returns before the write).
 static CONFIG_APP: OnceLock<AppHandle> = OnceLock::new();
 
 fn emit_config_write_failed(message: &str) {
@@ -191,7 +237,6 @@ fn emit_config_write_failed(message: &str) {
         let _ = app.emit("config-write-failed", message.to_string());
     }
 }
-
 fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -220,7 +265,6 @@ fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
         fs::rename(temp_path, path).map_err(|e| format!("could not replace {path:?}: {e}"))
     }
 }
-
 fn config_write_worker() {
     let Some((queue, wake)) = CONFIG_WRITE_QUEUE.get() else {
         return;
@@ -247,18 +291,10 @@ fn config_write_worker() {
         let Some(pending) = pending else {
             break;
         };
-
-        // A newer snapshot may have arrived while this write was waiting for
-        // the worker. Skip stale snapshots so rapid slider/mode changes cannot
-        // restore an older profile map after the latest save.
         if pending.version != CONFIG_WRITE_VERSION.load(Ordering::Acquire) {
             continue;
         }
-
         let temp_path = pending.path.with_extension("json.tmp");
-        // Re-check right before the disk I/O: a newer snapshot landing between
-        // dequeue and here would otherwise trigger a wasted temp-file write
-        // (the stale snapshot is skipped, but only after touching the disk).
         if pending.version != CONFIG_WRITE_VERSION.load(Ordering::Acquire) {
             continue;
         }
@@ -274,7 +310,6 @@ fn config_write_worker() {
         }
     }
 }
-
 fn ensure_config_worker() -> Result<(), String> {
     let worker = CONFIG_WRITE_WORKER.get_or_init(|| {
         std::thread::Builder::new()
@@ -289,15 +324,7 @@ fn ensure_config_worker() -> Result<(), String> {
         Err(error) => Err(error.clone()),
     }
 }
-
-// Enqueue a serialized config for the background write worker. Shared by
-// save_config and reset_config so both go through the same atomic pipeline
-// (temp file + MoveFileEx + versioned stale-write skipping).
 fn enqueue_config_write(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
-    // Write on a background thread and return immediately. File I/O on the
-    // IPC command thread would block every other command (including the
-    // high-frequency gamma ramp updates) for the duration of the write — and
-    // a slow disk/OneDrive can stall it for hundreds of milliseconds.
     let _ = CONFIG_APP.set(app.clone());
     let path = config_path(app)?;
     let text = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
@@ -321,18 +348,12 @@ fn enqueue_config_write(app: &AppHandle, config: &AppConfig) -> Result<(), Strin
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     enqueue_config_write(&app, &config)
 }
-
-// Wipes every persisted setting by writing AppConfig::default() through the
-// same atomic pipeline, then hands the defaults back so the frontend can
-// re-sync its stores from a single source of truth instead of duplicating
-// default values in JS.
 #[tauri::command]
 pub fn reset_config(app: AppHandle) -> Result<AppConfig, String> {
     let defaults = AppConfig::default();
     enqueue_config_write(&app, &defaults)?;
     Ok(defaults)
 }
-
 pub fn shutdown() {
     CONFIG_WRITE_STOP.store(true, Ordering::Release);
     if let Some((_, wake)) = CONFIG_WRITE_QUEUE.get() {
@@ -350,7 +371,6 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn sample_config() -> AppConfig {
         AppConfig {
             taskbar_dimmer_fade_in_duration_ms: 100,
@@ -358,7 +378,6 @@ mod tests {
             ..AppConfig::default()
         }
     }
-
     #[test]
     fn legacy_ease_duration_seeds_fade_out() {
         let raw = r#"{"taskbar_dimmer_ease_duration_ms": 400}"#;
@@ -366,7 +385,6 @@ mod tests {
         migrate_legacy_ease_duration(raw, &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 400);
     }
-
     #[test]
     fn split_format_is_not_overwritten() {
         let raw = r#"{"taskbar_dimmer_ease_duration_ms": 400, "taskbar_dimmer_fade_out_duration_ms": 350}"#;
@@ -374,7 +392,6 @@ mod tests {
         migrate_legacy_ease_duration(raw, &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
     }
-
     #[test]
     fn missing_legacy_key_is_noop() {
         let raw = r#"{"black_lift": 0.5}"#;
@@ -382,11 +399,45 @@ mod tests {
         migrate_legacy_ease_duration(raw, &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
     }
-
     #[test]
     fn invalid_json_is_noop() {
         let mut config = sample_config();
         migrate_legacy_ease_duration("not json", &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
+    }
+    #[test]
+    fn display_menu_prefs_round_trip() {
+        let config = AppConfig {
+            display_menu_resolution_sort: "asc".into(),
+            display_menu_resolution_group_by: "aspectRatio".into(),
+            display_menu_show_tags: false,
+            display_menu_refresh_rate_sort: "asc".into(),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.display_menu_resolution_sort, "asc");
+        assert_eq!(parsed.display_menu_resolution_group_by, "aspectRatio");
+        assert!(!parsed.display_menu_show_tags);
+        assert_eq!(parsed.display_menu_refresh_rate_sort, "asc");
+    }
+    #[test]
+    fn display_menu_prefs_default_when_missing() {
+        let parsed: AppConfig = serde_json::from_str(r#"{"black_lift": 0.5}"#).unwrap();
+        assert_eq!(parsed.display_menu_resolution_sort, "desc");
+        assert_eq!(parsed.display_menu_resolution_group_by, "none");
+        assert!(parsed.display_menu_show_tags);
+        assert_eq!(parsed.display_menu_refresh_rate_sort, "desc");
+        assert!(!parsed.hide_calibration_interface);
+    }
+    #[test]
+    fn hide_calibration_interface_round_trip() {
+        let config = AppConfig {
+            hide_calibration_interface: true,
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.hide_calibration_interface);
     }
 }

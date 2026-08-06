@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "OLED Helper",
         "width": 900,
         "height": 700,

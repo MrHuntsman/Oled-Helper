@@ -2,7 +2,7 @@
   // Inlined data URIs — see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
-  import { app, crush, adjustmentDisplay, blackLift, saveConfig } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, ctxMenuDismissTick } from './stores.svelte.js';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
   // duplicated in either destination.
@@ -539,7 +539,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let ctxMenuElement = $state(null);
   function openContextMenu(e) {
     e.preventDefault();
-    const menuW = 260, menuH = 210;
+    const menuW = 260, menuH = 300;
     const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
     const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
     ctxMenu = { open: true, x, y };
@@ -581,6 +581,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     return () => document.removeEventListener('fullscreenchange', onFSChange);
   });
 
+  // Another context menu (resolution / refresh rate in the status bar)
+  // opened, which stopPropagation()'s the contextmenu event so this menu's
+  // document listener never hears it — close via the shared dismiss tick.
+  $effect(() => {
+    void ctxMenuDismissTick.n;
+    // Read ctxMenu.open untracked so the effect only re-runs when the tick
+    // changes — otherwise opening the menu would immediately close it.
+    untrack(() => { if (ctxMenu.open) closeContextMenu(); });
+  });
   $effect(() => {
     if (!ctxMenu.open) return;
     // Move focus into the menu after it mounts so keyboard users can reach
@@ -604,6 +613,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       document.removeEventListener('keydown', onDocKey);
     };
   });
+
+  function toggleHideCalibrationInterface() {
+    setHideCalibrationInterface(!crush.hideCalibrationInterface);
+  }
 
   function restoreDefaults() {
     crush.adjustment = 0;
@@ -676,16 +689,40 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span>
     </span>
     <div class="fs-hint-sep"></div>
+    <div class="fs-controls-heading">Controls</div>
     <div class="fs-controls-block">
-      <div class="fs-controls-headers"><span>Action</span><span>Controls</span></div>
       {#if crush.fullscreen !== 'normal'}
-        <div class="fs-hint-row"><span class="fs-hint-val">Exit</span><span class="fs-hint-key">Esc<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="2.5" y="2.5" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 5.5L10.5 10.5M10.5 5.5L5.5 10.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span></div>
+        <div class="fs-hint-row">
+          <span class="fs-hint-val">Exit</span>
+          <span class="fs-hint-keys"><span class="fs-keycap">Esc</span></span>
+        </div>
       {/if}
-      <div class="fs-hint-row"><span class="fs-hint-val">±1</span><span class="fs-hint-key">Left / Right<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><path d="M6 4L2.5 8L6 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 4L13.5 8L10 12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
-      <div class="fs-hint-row"><span class="fs-hint-val">±0.1</span><span class="fs-hint-key">Up / Down<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><path d="M4 6L8 2.5L12 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 10L8 13.5L12 10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>
-      <div class="fs-hint-row"><span class="fs-hint-val">Cycle mode</span><span class="fs-hint-key">Double-click<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2.5V7" stroke="currentColor" stroke-width="1.2"/><path d="M8 7H3.5V6.5A3.5 3.5 0 0 1 7 3H8V7Z" fill="currentColor" fill-opacity="0.65" stroke="none"/></svg></span></div>
-      <div class="fs-hint-row"><span class="fs-hint-val">Menu</span><span class="fs-hint-key">Right-click<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2.5V7" stroke="currentColor" stroke-width="1.2"/><path d="M8 7H12.5V6.5A3.5 3.5 0 0 0 9 3H8V7Z" fill="currentColor" fill-opacity="0.65" stroke="none"/></svg></span></div>
-      <div class="fs-hint-row"><span class="fs-hint-val">Zoom</span><span class="fs-hint-key">Scroll<svg class="fs-hint-icon" viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 5.5V8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span></div>
+      <div class="fs-hint-row">
+        <span class="fs-hint-val">Adjust ±1</span>
+        <span class="fs-hint-keys">
+          <span class="fs-keycap fs-keycap-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M6 4L2.5 8L6 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+          <span class="fs-keycap fs-keycap-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M10 4L13.5 8L10 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        </span>
+      </div>
+      <div class="fs-hint-row">
+        <span class="fs-hint-val">Adjust ±0.1</span>
+        <span class="fs-hint-keys">
+          <span class="fs-keycap fs-keycap-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M4 6L8 2.5L12 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+          <span class="fs-keycap fs-keycap-icon"><svg viewBox="0 0 16 16" fill="none"><path d="M4 10L8 13.5L12 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        </span>
+      </div>
+      <div class="fs-hint-row">
+        <span class="fs-hint-val">Cycle mode</span>
+        <span class="fs-hint-keys"><span class="fs-keycap fs-keycap-mouse">Double-click<svg viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2.5V7" stroke="currentColor" stroke-width="1.2"/><path d="M8 7H3.5V6.5A3.5 3.5 0 0 1 7 3H8V7Z" fill="currentColor" fill-opacity="0.65" stroke="none"/></svg></span></span>
+      </div>
+      <div class="fs-hint-row">
+        <span class="fs-hint-val">Menu</span>
+        <span class="fs-hint-keys"><span class="fs-keycap fs-keycap-mouse">Right-click<svg viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2.5V7" stroke="currentColor" stroke-width="1.2"/><path d="M8 7H12.5V6.5A3.5 3.5 0 0 0 9 3H8V7Z" fill="currentColor" fill-opacity="0.65" stroke="none"/></svg></span></span>
+      </div>
+      <div class="fs-hint-row">
+        <span class="fs-hint-val">Zoom</span>
+        <span class="fs-hint-keys"><span class="fs-keycap fs-keycap-mouse">Scroll<svg viewBox="0 0 16 16" fill="none"><rect x="3.5" y="2.5" width="9" height="12" rx="3.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 5.5V8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></span></span>
+      </div>
     </div>
   {/snippet}
 
@@ -709,7 +746,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
       onclick={handleStripClick} onkeydown={handleStripKeydown} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0" aria-label="Calibration strip. Double-click or press Enter or Space to cycle fullscreen mode.">
       <canvas bind:this={canvas}></canvas>
-      {#if app.hdrStatus !== 'unknown'}
+      {#if app.hdrStatus !== 'unknown' && !crush.hideCalibrationInterface}
         <div class="square-labels" style="--sq-count:{crush.squareCount}">
           {#each Array(crush.squareCount) as _, i}
             {@const code = app.hdrStatus === 'hdr'
@@ -723,13 +760,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
           {/each}
         </div>
       {/if}
-      {#if crush.fullscreen !== 'normal'}
+      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface}
         <div class="fs-help-wrap">
           <button class="fs-help-btn" aria-label="About black calibration and strip controls" tabindex="0">Info</button>
           <div class="fs-help-tip">{@render calibrationTip()}</div>
         </div>
       {/if}
-      {#if crush.fullscreen !== 'normal'}
+      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface}
         <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, fsSliderInput, setBlackLevel, 5)}>
           <div class="slider-track-wrap">
             <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
@@ -760,14 +797,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   </div>
 
   {#if ctxMenu.open}
-    <div class="ctx-menu" bind:this={ctxMenuElement} style="left:{ctxMenu.x}px; top:{ctxMenu.y}px;" role="menu" aria-label="Calibration display mode" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleContextMenuKeydown} oncontextmenu={(e) => e.preventDefault()}>
-      <div class="ctx-menu-label">
-        Calibration Display Mode
-      </div>
-      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}>In-App Fullscreen</button>
-      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'monitor'} onclick={() => setMode('monitor')}>Monitor Fullscreen</button>
+    <div class="ctx-menu compact" bind:this={ctxMenuElement} style="left:{ctxMenu.x}px; top:{ctxMenu.y}px;" role="menu" aria-label="Calibration display mode" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleContextMenuKeydown} oncontextmenu={(e) => e.preventDefault()}>
+      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}><span class="ctx-radio-dot" aria-hidden="true"></span>In-App Fullscreen</button>
+      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'monitor'} onclick={() => setMode('monitor')}><span class="ctx-radio-dot" aria-hidden="true"></span>Monitor Fullscreen</button>
       <div class="ctx-menu-sep"></div>
       <button class="ctx-item" role="menuitem" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
+      <div class="ctx-menu-sep"></div>
+      <button class="ctx-item" role="menuitem" class:active={crush.hideCalibrationInterface} onclick={toggleHideCalibrationInterface}><span class="ctx-checkbox" aria-hidden="true"></span>Hide interface</button>
     </div>
   {/if}
 </div>

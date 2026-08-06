@@ -2,21 +2,29 @@
 // Browser APIs (window.screen) can report resolution but never expose the real
 // refresh rate or the complete set of supported display modes.
 
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, path::PathBuf, process::Command};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
     SetupDiGetDeviceInstanceIdW, SetupDiOpenDevRegKey, DICS_FLAG_GLOBAL, DIGCF_PRESENT, DIREG_DEV,
     SP_DEVINFO_DATA,
 };
+use windows::Win32::Foundation::{CloseHandle, HWND};
 use windows::Win32::Graphics::Gdi::{
-    ChangeDisplaySettingsW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY,
-    DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL,
-    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
-    ENUM_DISPLAY_SETTINGS_MODE,
+    ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_TEST, CDS_TYPE,
+    CDS_UPDATEREGISTRY, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
+    DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_QUERY_VALUE,
+};
+use windows::Win32::System::Threading::{
+    CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
 };
 
 use windows::core::{GUID, PCWSTR};
@@ -42,6 +50,9 @@ pub struct ResolutionInfo {
 pub struct DisplayInfo {
     pub width: u32,
     pub height: u32,
+    pub device_name: String,
+    pub monitor_name: String,
+    pub monitor_id: String,
     // The monitor's true native (EDID preferred timing) resolution, which is
     // what Windows marks as "(Recommended)". 0 when it could not be read.
     pub native_width: u32,
@@ -58,11 +69,355 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DisplayTargetInfo {
+    pub device_name: String,
+    pub monitor_name: String,
+    pub monitor_id: String,
+}
+
+#[derive(Clone)]
+struct DisplayTarget {
+    device_name: String,
+    monitor_name: String,
+    monitor_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecoveryRecord {
+    device_name: String,
+    #[serde(default)]
+    monitor_id: String,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    #[serde(default)]
+    bits_per_pixel: u32,
+    deadline_ms: u64,
+    #[serde(default)]
+    token: u64,
+}
+
+fn recovery_path() -> PathBuf {
+    std::env::temp_dir().join("oled-helper-display-mode-recovery.json")
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_recovery_record_until(
+    target: &DisplayTarget,
+    previous: &DEVMODEW,
+    deadline_ms: u64,
+    token: u64,
+) -> Result<(), String> {
+    let record = RecoveryRecord {
+        device_name: target.device_name.clone(),
+        monitor_id: target.monitor_id.clone(),
+        width: previous.dmPelsWidth,
+        height: previous.dmPelsHeight,
+        refresh_hz: previous.dmDisplayFrequency,
+        bits_per_pixel: previous.dmBitsPerPel,
+        deadline_ms,
+        token,
+    };
+    let path = recovery_path();
+    let temp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+    fs::write(&temp, data)
+        .map_err(|error| format!("could not save display recovery state: {error}"))?;
+    fs::rename(&temp, &path)
+        .map_err(|error| format!("could not publish display recovery state: {error}"))?;
+    Ok(())
+}
+
+fn write_recovery_record(
+    target: &DisplayTarget,
+    previous: &DEVMODEW,
+    token: u64,
+) -> Result<(), String> {
+    // Covers the maximum three-second mode stabilization window plus the
+    // fifteen-second user confirmation window and a small crash margin.
+    write_recovery_record_until(target, previous, now_ms() + 22_000, token)
+}
+
+struct RecoveryMutex {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl Drop for RecoveryMutex {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+fn lock_recovery_state() -> Result<RecoveryMutex, String> {
+    let name = wide("Local\\OLEDHelperDisplayRecovery");
+    let handle = unsafe {
+        CreateMutexW(None, false, PCWSTR(name.as_ptr()))
+            .map_err(|error| format!("could not create display recovery mutex: {error}"))?
+    };
+    let result = unsafe { WaitForSingleObject(handle, INFINITE) };
+    // WAIT_ABANDONED (0x80) still grants ownership after the previous
+    // process died; accepting it lets the new watchdog recover safely.
+    if result.0 != 0 && result.0 != 0x80 {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        return Err("could not lock display recovery state".into());
+    }
+    Ok(RecoveryMutex { handle })
+}
+
+fn quarantine_recovery_record() -> Result<(), String> {
+    let path = recovery_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let quarantine = path.with_file_name("oled-helper-display-mode-recovery.legacy.json");
+    fs::rename(&path, &quarantine).map_err(|error| {
+        format!("could not quarantine incomplete display recovery state: {error}")
+    })?;
+    let _ = fs::remove_file(path.with_extension("json.tmp"));
+    Ok(())
+}
+
+fn clear_recovery_record_for(token: u64) -> Result<(), String> {
+    let path = recovery_path();
+    if let Ok(data) = fs::read(&path) {
+        let record: RecoveryRecord = serde_json::from_slice(&data)
+            .map_err(|error| format!("display recovery state is invalid: {error}"))?;
+        if record.token != token {
+            return Err("display recovery state belongs to a different mode transaction".into());
+        }
+    }
+    let path = recovery_path();
+    let temp = path.with_extension("json.tmp");
+    let mut error = None;
+    if let Err(err) = fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            error = Some(err);
+        }
+    }
+    if let Err(err) = fs::remove_file(&temp) {
+        if err.kind() != std::io::ErrorKind::NotFound && error.is_none() {
+            error = Some(err);
+        }
+    }
+    if path.exists() || temp.exists() {
+        return Err("display recovery state could not be cleared".into());
+    }
+    error.map_or(Ok(()), |err| {
+        Err(format!(
+            "display recovery state could not be cleared: {err}"
+        ))
+    })
+}
+
+fn mode_operation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn restore_recovery_record(record: &RecoveryRecord) -> Result<(), String> {
+    let detected = primary_display_target()
+        .ok_or_else(|| "recovery could not detect the primary monitor".to_string())?;
+    if detected.device_name != record.device_name {
+        return Err(format!(
+            "recovery target changed from {} to {}",
+            record.device_name, detected.device_name
+        ));
+    }
+    if !record.monitor_id.is_empty()
+        && !detected.monitor_id.is_empty()
+        && !detected.monitor_id.eq_ignore_ascii_case(&record.monitor_id)
+    {
+        return Err("recovery target monitor identity changed; refusing to apply the old mode to a different monitor".into());
+    }
+    let current = current_devmode(&detected.device_name)
+        .ok_or_else(|| "recovery could not read the current display mode".to_string())?;
+    let mode = recovery_mode_for(
+        &detected,
+        &current,
+        record.width,
+        record.height,
+        record.refresh_hz,
+        record.bits_per_pixel,
+    )?;
+    unsafe {
+        change_mode(&detected, &mode, CDS_TYPE(0))?;
+    }
+    wait_for_mode(&detected, &mode)
+        .map(|_| ())
+        .ok_or_else(|| "recovery mode was not verified after apply".to_string())
+}
+
+pub fn run_recovery_watchdog() {
+    loop {
+        let path = recovery_path();
+        let Ok(data) = fs::read(&path) else {
+            return;
+        };
+        let Ok(record) = serde_json::from_slice::<RecoveryRecord>(&data) else {
+            let Ok(_recovery_guard) = lock_recovery_state() else {
+                log::error!(
+                    "[display-info] recovery watchdog could not lock invalid recovery state"
+                );
+                return;
+            };
+            let _ = quarantine_recovery_record();
+            log::error!("[display-info] recovery watchdog quarantined invalid recovery state; refusing automatic mode changes");
+            return;
+        };
+        if record.token == 0 || record.monitor_id.is_empty() {
+            let Ok(_recovery_guard) = lock_recovery_state() else {
+                log::error!(
+                    "[display-info] recovery watchdog could not lock legacy recovery state"
+                );
+                return;
+            };
+            let _ = quarantine_recovery_record();
+            log::error!("[display-info] recovery watchdog quarantined legacy or incomplete recovery state; refusing automatic mode changes");
+            return;
+        }
+        let now = now_ms();
+        if now < record.deadline_ms {
+            let wait_ms = (record.deadline_ms - now).min(500);
+            std::thread::sleep(Duration::from_millis(wait_ms));
+            continue;
+        }
+        // Serialize this check, mode restoration, and cleanup with confirmation
+        // and manual rollback. This is a cross-process named mutex, not merely
+        // the in-process operation mutex, so a confirmation cannot race the
+        // final watchdog decision.
+        let Ok(_recovery_guard) = lock_recovery_state() else {
+            log::error!("[display-info] recovery watchdog could not lock recovery state");
+            continue;
+        };
+        // The parent may have confirmed the mode after this watchdog read the
+        // record. Re-read while holding the named mutex and require the same
+        // token/deadline; deletion now cancels recovery atomically with the
+        // confirmation path.
+        let Ok(latest_data) = fs::read(&path) else {
+            return;
+        };
+        let Ok(latest) = serde_json::from_slice::<RecoveryRecord>(&latest_data) else {
+            return;
+        };
+        if latest.token != record.token || latest.deadline_ms != record.deadline_ms {
+            return;
+        }
+        match restore_recovery_record(&latest) {
+            Ok(()) => match clear_recovery_record_for(latest.token) {
+                Ok(()) => {
+                    log::warn!(
+                        "[display-info] recovery watchdog restored the unconfirmed display mode"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log::error!("[display-info] recovery watchdog restored the mode but could not clear recovery state: {error}");
+                }
+            },
+            Err(error) => {
+                log::error!("[display-info] recovery watchdog failed: {error}");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 fn fresh_devmode() -> DEVMODEW {
     DEVMODEW {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
     }
+}
+
+fn text(value: &[u16]) -> String {
+    String::from_utf16_lossy(value)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string()
+}
+
+fn primary_display_target() -> Option<DisplayTarget> {
+    unsafe {
+        let mut adapter = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        for index in 0.. {
+            if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut adapter, 0).as_bool() {
+                break;
+            }
+            if (adapter.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) == 0 {
+                continue;
+            }
+            let device_name = text(&adapter.DeviceName);
+            let device_name_wide = wide(&device_name);
+            let mut monitor = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            let mut monitor_found = false;
+            for monitor_index in 0.. {
+                let mut candidate = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if !EnumDisplayDevicesW(
+                    PCWSTR(device_name_wide.as_ptr()),
+                    monitor_index,
+                    &mut candidate,
+                    0,
+                )
+                .as_bool()
+                {
+                    break;
+                }
+                monitor = candidate;
+                if (monitor.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) != 0 {
+                    monitor_found = true;
+                    break;
+                }
+                if monitor_index == 0 {
+                    monitor_found = true;
+                }
+            }
+            let (monitor_name, monitor_id) = if monitor_found {
+                let id = text(&monitor.DeviceID);
+                let friendly = text(&monitor.DeviceString);
+                (
+                    if friendly.is_empty() {
+                        if id.is_empty() {
+                            device_name.clone()
+                        } else {
+                            id.clone()
+                        }
+                    } else {
+                        friendly
+                    },
+                    id,
+                )
+            } else {
+                (device_name.clone(), String::new())
+            };
+            return Some(DisplayTarget {
+                device_name,
+                monitor_name,
+                monitor_id,
+            });
+        }
+    }
+    None
 }
 
 fn mode_matches_display(mode: &DEVMODEW, current: &DEVMODEW) -> bool {
@@ -72,12 +427,13 @@ fn mode_matches_display(mode: &DEVMODEW, current: &DEVMODEW) -> bool {
         && mode.dmPelsHeight > 0
 }
 
-fn for_each_display_mode(mut callback: impl FnMut(&DEVMODEW) -> bool) {
+fn for_each_display_mode(device_name: &str, mut callback: impl FnMut(&DEVMODEW) -> bool) {
+    let device_name = wide(device_name);
     for mode_index in 0u32.. {
         let mut mode = fresh_devmode();
         let ok = unsafe {
             EnumDisplaySettingsW(
-                PCWSTR::null(),
+                PCWSTR(device_name.as_ptr()),
                 ENUM_DISPLAY_SETTINGS_MODE(mode_index),
                 &mut mode,
             )
@@ -90,6 +446,8 @@ fn for_each_display_mode(mut callback: impl FnMut(&DEVMODEW) -> bool) {
 
 #[derive(Clone)]
 struct CachedModeLists {
+    device_name: String,
+    monitor_id: String,
     width: u32,
     height: u32,
     bits_per_pixel: u32,
@@ -100,17 +458,21 @@ struct CachedModeLists {
 
 static MODE_CACHE: OnceLock<Mutex<Option<CachedModeLists>>> = OnceLock::new();
 
-fn mode_lists_for(current: &DEVMODEW) -> (Vec<u32>, Vec<ResolutionInfo>) {
+fn invalidate_mode_cache() {
+    if let Some(cache) = MODE_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+fn mode_lists_for(target: &DisplayTarget, current: &DEVMODEW) -> (Vec<u32>, Vec<ResolutionInfo>) {
     let cache = MODE_CACHE.get_or_init(|| Mutex::new(None));
-    // Hot path first: the cache is keyed by the current mode's width/height/
-    // bits-per-pixel, which the caller reads fresh from EnumDisplaySettingsW
-    // each time. A display-key check would force a full EnumDisplayDevicesW
-    // walk on every call, so the 2s TTL relies on the mode itself: a monitor
-    // swap almost always changes the mode, and any residual miss self-corrects
-    // on the next poll.
     if let Ok(guard) = cache.lock() {
         if let Some(cached) = guard.as_ref().filter(|cached| {
-            cached.width == current.dmPelsWidth
+            cached.device_name == target.device_name
+                && cached.monitor_id == target.monitor_id
+                && cached.width == current.dmPelsWidth
                 && cached.height == current.dmPelsHeight
                 && cached.bits_per_pixel == current.dmBitsPerPel
                 && cached.captured_at.elapsed() < Duration::from_secs(2)
@@ -120,39 +482,27 @@ fn mode_lists_for(current: &DEVMODEW) -> (Vec<u32>, Vec<ResolutionInfo>) {
     }
 
     let mut rates = Vec::new();
-    for_each_display_mode(|mode| {
-        // Keep the active resolution and colour depth fixed: changing only
-        // the frequency avoids accidentally switching pixel format, which is
-        // especially important while HDR is active.
-        if mode_matches_display(mode, current)
-            && mode.dmPelsWidth == current.dmPelsWidth
-            && mode.dmPelsHeight == current.dmPelsHeight
-        {
-            rates.push(mode.dmDisplayFrequency);
+    let mut resolutions = Vec::new();
+    for_each_display_mode(&target.device_name, |mode| {
+        if mode_matches_display(mode, current) {
+            if mode.dmPelsWidth == current.dmPelsWidth && mode.dmPelsHeight == current.dmPelsHeight
+            {
+                rates.push(mode.dmDisplayFrequency);
+            }
+            if !resolutions.iter().any(|resolution: &ResolutionInfo| {
+                resolution.width == mode.dmPelsWidth && resolution.height == mode.dmPelsHeight
+            }) {
+                resolutions.push(ResolutionInfo {
+                    width: mode.dmPelsWidth,
+                    height: mode.dmPelsHeight,
+                });
+            }
         }
         true
     });
     if current.dmDisplayFrequency > 0 {
         rates.push(current.dmDisplayFrequency);
     }
-    rates.sort_unstable();
-    rates.dedup();
-
-    let mut resolutions = Vec::new();
-    for_each_display_mode(|mode| {
-        if mode_matches_display(mode, current)
-            && !resolutions.iter().any(|resolution: &ResolutionInfo| {
-                resolution.width == mode.dmPelsWidth && resolution.height == mode.dmPelsHeight
-            })
-        {
-            resolutions.push(ResolutionInfo {
-                width: mode.dmPelsWidth,
-                height: mode.dmPelsHeight,
-            });
-        }
-        true
-    });
-
     if !resolutions.iter().any(|resolution| {
         resolution.width == current.dmPelsWidth && resolution.height == current.dmPelsHeight
     }) {
@@ -161,10 +511,14 @@ fn mode_lists_for(current: &DEVMODEW) -> (Vec<u32>, Vec<ResolutionInfo>) {
             height: current.dmPelsHeight,
         });
     }
+    rates.sort_unstable();
+    rates.dedup();
     resolutions.sort_unstable_by_key(|resolution| (resolution.width, resolution.height));
 
     if let Ok(mut guard) = cache.lock() {
         *guard = Some(CachedModeLists {
+            device_name: target.device_name.clone(),
+            monitor_id: target.monitor_id.clone(),
             width: current.dmPelsWidth,
             height: current.dmPelsHeight,
             bits_per_pixel: current.dmBitsPerPel,
@@ -182,18 +536,31 @@ fn mode_lists_for(current: &DEVMODEW) -> (Vec<u32>, Vec<ResolutionInfo>) {
 // which would otherwise surface in the UI as an empty refresh-rate dropdown.
 // Returns None when the mode never becomes readable so callers keep their
 // last known-good values.
-fn current_devmode() -> Option<DEVMODEW> {
+fn current_devmode_once(device_name: &str) -> Option<DEVMODEW> {
+    let device_name = wide(device_name);
+    unsafe {
+        let mut devmode = fresh_devmode();
+        let ok = EnumDisplaySettingsW(
+            PCWSTR(device_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut devmode,
+        );
+        if ok.as_bool()
+            && devmode.dmDisplayFrequency > 0
+            && devmode.dmPelsWidth > 0
+            && devmode.dmPelsHeight > 0
+        {
+            Some(devmode)
+        } else {
+            None
+        }
+    }
+}
+
+fn current_devmode(device_name: &str) -> Option<DEVMODEW> {
     for attempt in 0..5 {
-        unsafe {
-            let mut devmode = fresh_devmode();
-            let ok = EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut devmode);
-            if ok.as_bool()
-                && devmode.dmDisplayFrequency > 0
-                && devmode.dmPelsWidth > 0
-                && devmode.dmPelsHeight > 0
-            {
-                return Some(devmode);
-            }
+        if let Some(devmode) = current_devmode_once(device_name) {
+            return Some(devmode);
         }
         if attempt < 4 {
             std::thread::sleep(Duration::from_millis(150));
@@ -203,16 +570,19 @@ fn current_devmode() -> Option<DEVMODEW> {
 }
 
 pub fn query_current_display() -> Option<DisplayInfo> {
-    // PCWSTR::null() targets the primary/default display, matching the
-    // existing display-info behaviour in the frontend.
-    let devmode = current_devmode()?;
-    let (refresh_rates, resolutions) = mode_lists_for(&devmode);
+    let target = primary_display_target()?;
+    let devmode = current_devmode(&target.device_name)?;
+    let (refresh_rates, resolutions) = mode_lists_for(&target, &devmode);
     let (native_width, native_height, native_source) = native_resolution()
         .map(|(w, h, source)| (w, h, source.to_string()))
         .unwrap_or((0, 0, String::new()));
+    let monitor_name = edid_name_for_target(&target).unwrap_or(target.monitor_name);
     Some(DisplayInfo {
         width: devmode.dmPelsWidth,
         height: devmode.dmPelsHeight,
+        device_name: target.device_name,
+        monitor_name,
+        monitor_id: target.monitor_id,
         native_width,
         native_height,
         native_source,
@@ -252,6 +622,32 @@ fn decode_dtd(dtd: &[u8]) -> Option<(u32, u32)> {
     } else {
         None
     }
+}
+
+// The monitor's friendly Windows name is often stored in EDID descriptor
+// 0xFC. Drivers may still expose DeviceString as "Generic PnP Monitor", so
+// prefer the EDID product name whenever it is valid and printable.
+fn edid_monitor_name(edid: &[u8]) -> Option<String> {
+    if edid.len() < 128 {
+        return None;
+    }
+    for offset in [0x36usize, 0x48, 0x5A, 0x6C] {
+        let descriptor = &edid[offset..offset + 18];
+        if descriptor[0] == 0 && descriptor[1] == 0 && descriptor[2] == 0 && descriptor[3] == 0xFC {
+            let name: String = descriptor[5..18]
+                .iter()
+                .take_while(|&&byte| byte != 0 && byte != b'\n')
+                .filter(|&&byte| (0x20..=0x7E).contains(&byte))
+                .map(|&byte| byte as char)
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 // Maps the common CTA-861 VIC values used by modern TVs to active pixels.
@@ -470,38 +866,132 @@ struct CachedNative {
 }
 
 static NATIVE_CACHE: OnceLock<Mutex<Option<CachedNative>>> = OnceLock::new();
-
-fn primary_display_key() -> String {
+fn edid_name_for_target(target: &DisplayTarget) -> Option<String> {
     unsafe {
-        let mut adapter = DISPLAY_DEVICEW {
-            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
-            ..Default::default()
-        };
-        for index in 0.. {
-            if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut adapter, 0).as_bool() {
-                break;
-            }
-            if (adapter.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) == 0 {
-                continue;
-            }
-            let adapter_name = PCWSTR(adapter.DeviceName.as_ptr());
-            let mut monitor = DISPLAY_DEVICEW {
-                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+        let devices = SetupDiGetClassDevsW(
+            Some(&GUID_CLASS_MONITOR),
+            PCWSTR::null(),
+            None,
+            DIGCF_PRESENT,
+        )
+        .ok()?;
+        let mut sole_device = None;
+        let mut matched = None;
+        let mut index = 0u32;
+        loop {
+            let mut data = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
                 ..Default::default()
             };
-            if EnumDisplayDevicesW(adapter_name, 0, &mut monitor, 0).as_bool() {
-                let id = String::from_utf16_lossy(&monitor.DeviceID);
-                return id.trim_end_matches('\0').to_string();
+            if SetupDiEnumDeviceInfo(devices, index, &mut data).is_err() {
+                break;
             }
-            let name = String::from_utf16_lossy(&adapter.DeviceName);
-            return name.trim_end_matches('\0').to_string();
+            let mut buffer = [0u16; 256];
+            let mut required = 0u32;
+            if SetupDiGetDeviceInstanceIdW(devices, &data, Some(&mut buffer), Some(&mut required))
+                .is_ok()
+            {
+                let id = text(&buffer);
+                if sole_device.is_none() {
+                    sole_device = Some(data);
+                } else {
+                    sole_device = None;
+                }
+                if id.eq_ignore_ascii_case(&target.monitor_id)
+                    || compatible_monitor_id(&id, &target.monitor_id)
+                {
+                    matched = Some(data);
+                    break;
+                }
+            }
+            index += 1;
         }
+        let data = matched.or(sole_device)?;
+        let key = SetupDiOpenDevRegKey(
+            devices,
+            &data,
+            DICS_FLAG_GLOBAL.0,
+            0,
+            DIREG_DEV,
+            KEY_QUERY_VALUE.0,
+        )
+        .ok()?;
+        let result = read_name_from_registry_key(key);
+        let _ = RegCloseKey(key);
+        let _ = SetupDiDestroyDeviceInfoList(devices);
+        result
     }
-    String::new()
+}
+
+fn compatible_monitor_id(a: &str, b: &str) -> bool {
+    let manufacturer = |value: &str| value.split('\\').nth(1).map(str::to_ascii_uppercase);
+    manufacturer(a).is_some() && manufacturer(a) == manufacturer(b)
+}
+
+unsafe fn read_name_from_registry_key(key: HKEY) -> Option<String> {
+    let read = |key: HKEY| {
+        let edid_name = wide("EDID");
+        let mut required = 0u32;
+        if RegQueryValueExW(
+            key,
+            PCWSTR(edid_name.as_ptr()),
+            None,
+            None,
+            None,
+            Some(&mut required),
+        )
+        .0 != 0
+            || !(128..=4096).contains(&required)
+        {
+            return None;
+        }
+        let mut bytes = vec![0u8; required as usize];
+        let mut size = required;
+        if RegQueryValueExW(
+            key,
+            PCWSTR(edid_name.as_ptr()),
+            None,
+            None,
+            Some(bytes.as_mut_ptr()),
+            Some(&mut size),
+        )
+        .0 != 0
+        {
+            return None;
+        }
+        edid_monitor_name(&bytes[..(size as usize).min(bytes.len())])
+    };
+    read(key).or_else(|| {
+        let params_name = wide("Device Parameters");
+        let mut params = HKEY::default();
+        if RegOpenKeyExW(
+            key,
+            PCWSTR(params_name.as_ptr()),
+            Some(0),
+            KEY_QUERY_VALUE,
+            &mut params,
+        )
+        .0 == 0
+            && !params.is_invalid()
+        {
+            let result = read(params);
+            let _ = RegCloseKey(params);
+            result
+        } else {
+            None
+        }
+    })
 }
 
 fn native_resolution() -> Option<(u32, u32, &'static str)> {
-    let display_key = primary_display_key();
+    // Use the same target discovery as mode enumeration and the status bar;
+    // native EDID data must never silently come from a different monitor.
+    let target = primary_display_target()?;
+    let display_key = if target.monitor_id.is_empty() {
+        target.device_name.clone()
+    } else {
+        target.monitor_id.clone()
+    };
     let cache = NATIVE_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
         if let Some(cached) = guard.as_ref().filter(|cached| {
@@ -522,7 +1012,7 @@ fn native_resolution() -> Option<(u32, u32, &'static str)> {
             ));
         }
     }
-    let native = query_native_resolution();
+    let native = query_native_resolution(&target);
     if let Ok(mut guard) = cache.lock() {
         let (width, height, source) = native.unwrap_or((0, 0, ""));
         *guard = Some(CachedNative {
@@ -536,70 +1026,19 @@ fn native_resolution() -> Option<(u32, u32, &'static str)> {
     native
 }
 
-fn query_native_resolution() -> Option<(u32, u32, &'static str)> {
+fn query_native_resolution(target: &DisplayTarget) -> Option<(u32, u32, &'static str)> {
     unsafe {
-        // 1. Find the primary display adapter (the DISPLAY_DEVICE entry with
-        //    DISPLAY_DEVICE_PRIMARY_DEVICE set).
-        let mut disp = DISPLAY_DEVICEW {
-            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
-            ..Default::default()
-        };
-        let mut found_primary = false;
-        for index in 0.. {
-            let ok = EnumDisplayDevicesW(PCWSTR::null(), index, &mut disp, 0);
-            if !ok.as_bool() {
-                break;
-            }
-            if (disp.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) != 0 {
-                found_primary = true;
-                break;
-            }
-        }
-        if !found_primary {
-            log_edid(
-                "warn",
-                "EDID query: no primary display adapter found".into(),
-            );
-            return None;
-        }
-        let adapter_name = String::from_utf16_lossy(&disp.DeviceName)
-            .trim_end_matches('\0')
-            .to_string();
+        // The adapter and monitor identity were resolved once by
+        // primary_display_target(), which is also used by mode enumeration.
+        // Keep EDID lookup on that same target rather than independently
+        // assuming monitor index 0.
+        let instance_id = target.monitor_id.clone();
         log_edid(
             "info",
-            format!("EDID query: primary adapter '{adapter_name}'"),
-        );
-
-        // 2. Enumerate the monitors attached to the primary adapter. The
-        //    monitor's DeviceID is already the SetupAPI device instance id
-        //    (DISPLAY\\VID\\INST) — the documented pattern is a plain
-        //    enumeration here, NOT an EDD_GET_DEVICE_INTERFACE_NAME call on
-        //    the adapter (that returns the adapter's own interface, not the
-        //    monitor's). This was the earlier bug: the interface-path
-        //    conversion never matched, so the EDID was never read.
-        let mut mon = DISPLAY_DEVICEW {
-            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
-            ..Default::default()
-        };
-        let dev_name = PCWSTR(disp.DeviceName.as_ptr());
-        // The first monitor enumerated on the primary adapter is the primary
-        // monitor. Its DeviceID is the SetupAPI device instance id directly.
-        if !EnumDisplayDevicesW(dev_name, 0, &mut mon, 0).as_bool() {
-            log_edid(
-                "warn",
-                "EDID query: no monitor found on primary adapter".into(),
-            );
-            return None;
-        }
-        let instance_id = String::from_utf16_lossy(&mon.DeviceID)
-            .trim_end_matches('\0')
-            .to_string();
-        let monitor_name = String::from_utf16_lossy(&mon.DeviceName)
-            .trim_end_matches('\0')
-            .to_string();
-        log_edid(
-            "info",
-            format!("EDID query: primary monitor '{monitor_name}' instance id '{instance_id}'"),
+            format!(
+                "EDID query: target adapter '{}' monitor '{}' instance id '{}'",
+                target.device_name, target.monitor_name, instance_id
+            ),
         );
 
         // 3. Enumerate monitor-class devices, find the matching instance id
@@ -731,7 +1170,7 @@ fn query_native_resolution() -> Option<(u32, u32, &'static str)> {
                     "EDID query: enumerating monitor device '{id}' (looking for '{instance_id}')"
                 ),
                 );
-                if id == instance_id {
+                if id.eq_ignore_ascii_case(&instance_id) {
                     matched = true;
                     result = read_edid_from_device(devices, &dev_data);
                     break;
@@ -776,69 +1215,539 @@ fn query_native_resolution() -> Option<(u32, u32, &'static str)> {
     }
 }
 
-pub fn set_refresh_rate(hz: u32) -> Result<(), String> {
-    let mut devmode =
-        current_devmode().ok_or_else(|| "unable to read the current display mode".to_string())?;
-    if !mode_lists_for(&devmode).0.contains(&hz) {
-        return Err(format!(
-            "{hz} Hz is not available at the current resolution"
-        ));
-    }
-
-    devmode.dmDisplayFrequency = hz;
-    devmode.dmFields |= DM_DISPLAYFREQUENCY;
-    unsafe { apply_display_mode(&devmode) }
+#[derive(Clone, serde::Serialize)]
+pub struct AppliedMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+    pub monitor_name: String,
+    pub confirmation_seconds: u32,
 }
 
-pub fn set_resolution(width: u32, height: u32, preferred_hz: u32) -> Result<(), String> {
-    let current =
-        current_devmode().ok_or_else(|| "unable to read the current display mode".to_string())?;
-    if !mode_lists_for(&current)
-        .1
-        .iter()
-        .any(|resolution| resolution.width == width && resolution.height == height)
+#[derive(Clone)]
+struct PendingMode {
+    token: u64,
+    target: DisplayTarget,
+    previous: DEVMODEW,
+    requested: DEVMODEW,
+}
+
+static PENDING_MODE: OnceLock<Mutex<Option<PendingMode>>> = OnceLock::new();
+static MODE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn pending_mode() -> &'static Mutex<Option<PendingMode>> {
+    PENDING_MODE.get_or_init(|| Mutex::new(None))
+}
+
+// Used by the tray confirmation fallback to avoid reopening the main window
+// after the user has already confirmed or reverted the temporary mode.
+fn mode_error(code: i32, phase: &str) -> String {
+    format!("Windows rejected the {phase} display-mode change (code {code})")
+}
+
+fn target_is_current(target: &DisplayTarget) -> Result<(), String> {
+    let current = primary_display_target()
+        .ok_or_else(|| "the primary monitor is no longer available".to_string())?;
+    if current.device_name != target.device_name {
+        return Err("the display adapter changed while the mode was pending".into());
+    }
+    if !target.monitor_id.is_empty()
+        && !current.monitor_id.is_empty()
+        && !current.monitor_id.eq_ignore_ascii_case(&target.monitor_id)
     {
-        return Err(format!("{width}×{height} is not available on this display"));
+        return Err("the monitor changed while the mode was pending; refusing to apply the mode to a different monitor".into());
     }
-
-    let mut selected = None;
-    let mut fallback = None;
-    for_each_display_mode(|mode| {
-        if mode_matches_display(mode, &current)
-            && mode.dmPelsWidth == width
-            && mode.dmPelsHeight == height
-        {
-            if mode.dmDisplayFrequency == preferred_hz {
-                selected = Some(*mode);
-                return false;
-            }
-            if fallback.is_none() {
-                fallback = Some(*mode);
-            }
-        }
-        true
-    });
-
-    let mut target = selected
-        .or(fallback)
-        .ok_or_else(|| format!("no usable display mode found for {width}×{height}"))?;
-    // The enumerated DEVMODE is a complete mode, but explicitly mark the
-    // fields being changed so ChangeDisplaySettingsW applies both the
-    // resolution and its selected refresh rate.
-    target.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-    unsafe { apply_display_mode(&target) }
+    Ok(())
 }
 
-unsafe fn apply_display_mode(devmode: &DEVMODEW) -> Result<(), String> {
-    let result = ChangeDisplaySettingsW(Some(devmode as *const DEVMODEW), CDS_UPDATEREGISTRY);
+unsafe fn change_mode(
+    target: &DisplayTarget,
+    mode: &DEVMODEW,
+    flags: CDS_TYPE,
+) -> Result<(), String> {
+    let device = wide(&target.device_name);
+    let result = ChangeDisplaySettingsExW(
+        PCWSTR(device.as_ptr()),
+        Some(mode as *const DEVMODEW),
+        Some(HWND::default()),
+        flags,
+        None,
+    );
     if result == DISP_CHANGE_SUCCESSFUL {
         Ok(())
     } else {
-        Err(format!(
-            "Windows rejected the display-mode change (code {})",
-            result.0
+        Err(mode_error(
+            result.0,
+            if flags == CDS_TEST { "test" } else { "apply" },
         ))
     }
+}
+
+fn recovery_mode_for(
+    target: &DisplayTarget,
+    current: &DEVMODEW,
+    width: u32,
+    height: u32,
+    hz: u32,
+    preferred_bits_per_pixel: u32,
+) -> Result<DEVMODEW, String> {
+    // Recovery must not fail merely because the driver now reports a different
+    // color depth. Prefer the saved depth, then the current depth, then any
+    // enumerated mode with the exact saved timing. Every candidate still comes
+    // from Windows' mode list; no arbitrary mode is synthesized.
+    let mut candidates = Vec::new();
+    for_each_display_mode(&target.device_name, |mode| {
+        if mode.dmPelsWidth == width
+            && mode.dmPelsHeight == height
+            && mode.dmDisplayFrequency == hz
+            && mode.dmPelsWidth > 0
+            && mode.dmPelsHeight > 0
+            && mode.dmDisplayFrequency > 0
+        {
+            candidates.push(*mode);
+        }
+        true
+    });
+    candidates
+        .into_iter()
+        .min_by_key(|mode| {
+            if mode.dmBitsPerPel == preferred_bits_per_pixel {
+                0
+            } else if mode.dmBitsPerPel == current.dmBitsPerPel {
+                1
+            } else {
+                2
+            }
+        })
+        .map(|mut mode| {
+            mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+            mode
+        })
+        .ok_or_else(|| {
+            format!(
+                "recovery mode {}×{} at {} Hz is no longer available",
+                width, height, hz
+            )
+        })
+}
+
+fn complete_mode_for(
+    target: &DisplayTarget,
+    current: &DEVMODEW,
+    width: u32,
+    height: u32,
+    hz: u32,
+) -> Result<DEVMODEW, String> {
+    let mut exact = None;
+    for_each_display_mode(&target.device_name, |mode| {
+        if mode_matches_display(mode, current)
+            && mode.dmPelsWidth == width
+            && mode.dmPelsHeight == height
+            && mode.dmDisplayFrequency == hz
+        {
+            exact = Some(*mode);
+            false
+        } else {
+            true
+        }
+    });
+    let mut mode = exact.ok_or_else(|| {
+        format!("{width}×{height} at {hz} Hz is not an exact supported mode on this monitor")
+    })?;
+    mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    Ok(mode)
+}
+
+fn wait_for_mode(target: &DisplayTarget, requested: &DEVMODEW) -> Option<DEVMODEW> {
+    // Some drivers return from ChangeDisplaySettingsEx before the desktop
+    // mode reported by ENUM_CURRENT_SETTINGS has settled. Do not expose a
+    // confirmation dialog until the requested mode is actually active.
+    for attempt in 0..30 {
+        if let Some(active) = current_devmode_once(&target.device_name) {
+            if same_mode(&active, requested) {
+                return Some(active);
+            }
+            if attempt == 0 {
+                log::info!(
+                    "[display-info] mode transition pending: active={}x{}@{}Hz requested={}x{}@{}Hz",
+                    active.dmPelsWidth,
+                    active.dmPelsHeight,
+                    active.dmDisplayFrequency,
+                    requested.dmPelsWidth,
+                    requested.dmPelsHeight,
+                    requested.dmDisplayFrequency,
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+fn begin_mode_change(
+    target: DisplayTarget,
+    previous: DEVMODEW,
+    mode: DEVMODEW,
+) -> Result<AppliedMode, String> {
+    // Reserve the entire in-process mode transaction before any slow Win32
+    // calls. The guard is intentionally held until the pending transaction is
+    // installed, so two concurrent IPC requests cannot both pass the old
+    // check-before-apply race. Confirmation/rollback acquire the same lock.
+    let _operation_guard = mode_operation_lock()
+        .lock()
+        .map_err(|_| "display mode operation state was poisoned".to_string())?;
+    if pending_mode()
+        .lock()
+        .map_err(|_| "display mode state was poisoned".to_string())?
+        .is_some()
+    {
+        return Err("another display-mode change is awaiting confirmation".into());
+    }
+    let token = MODE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let _recovery_guard = lock_recovery_state()?;
+    // Check under the same named mutex used by the watchdog and confirmation;
+    // never overwrite another process's recovery record between check and write.
+    if recovery_path().exists() {
+        return Err("a display-mode recovery transaction is still active; resolve it before starting another change".into());
+    }
+    if target.monitor_id.is_empty() {
+        return Err("the current monitor identity could not be determined; refusing a mode change without crash recovery".into());
+    }
+    target_is_current(&target)?;
+    let locked_previous = current_devmode(&target.device_name)
+        .ok_or_else(|| "unable to re-read the current display mode".to_string())?;
+    if !same_mode(&locked_previous, &previous) {
+        return Err("the display mode changed while the request was queued; refusing to use stale rollback state".into());
+    }
+    // Re-enumerate the requested complete mode after taking both locks. This
+    // prevents a queued request from using a candidate selected before a
+    // topology or driver-mode change.
+    let mode = complete_mode_for(
+        &target,
+        &locked_previous,
+        mode.dmPelsWidth,
+        mode.dmPelsHeight,
+        mode.dmDisplayFrequency,
+    )?;
+    unsafe {
+        change_mode(&target, &mode, CDS_TEST)?;
+    }
+    // Persist the old mode before the temporary apply. A child watchdog owns
+    // the same recovery record, so a process crash cannot strand the user in a
+    // black-screen mode.
+    write_recovery_record(&target, &previous, token)?;
+    let watchdog = std::env::current_exe()
+        .map_err(|error| format!("could not locate recovery watchdog: {error}"))?;
+    if let Err(error) = Command::new(watchdog)
+        .arg("--display-mode-watchdog")
+        .spawn()
+    {
+        if let Err(cleanup_error) = clear_recovery_record_for(token) {
+            return Err(format!(
+                "could not start display recovery watchdog: {error}; recovery cleanup also failed: {cleanup_error}"
+            ));
+        }
+        return Err(format!(
+            "could not start display recovery watchdog: {error}"
+        ));
+    }
+    // Apply without CDS_UPDATEREGISTRY. The mode is only committed after the
+    // frontend confirms it, and a watchdog restores the previous mode if the
+    // confirmation never arrives.
+    // The old transaction was already rolled back; the current mode is
+    // still the `previous` mode captured immediately before this attempt.
+    if let Err(error) = unsafe { change_mode(&target, &mode, CDS_TYPE(0)) } {
+        if let Err(cleanup_error) = clear_recovery_record_for(token) {
+            return Err(format!(
+                "{error}; recovery cleanup also failed: {cleanup_error}"
+            ));
+        }
+        return Err(error);
+    }
+    if wait_for_mode(&target, &mode).is_none() {
+        // Windows accepted the request, but the driver never made the exact
+        // mode active. Restore the known-good mode before returning an error;
+        // the frontend must not show a confirmation dialog for a false success.
+        let restore = unsafe { change_mode(&target, &previous, CDS_TYPE(0)) };
+        let restored = restore.is_ok() && wait_for_mode(&target, &previous).is_some();
+        let cleanup_error = if restored {
+            clear_recovery_record_for(token).err()
+        } else {
+            None
+        };
+        invalidate_mode_cache();
+        return match restore {
+            Ok(()) if restored => match cleanup_error {
+                Some(cleanup_error) => Err(format!(
+                    "display driver did not activate {}×{} at {} Hz; the previous mode was restored, but recovery cleanup failed: {cleanup_error}",
+                    mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency
+                )),
+                None => Err(format!(
+                    "display driver did not activate {}×{} at {} Hz within 3 seconds; the previous mode was restored",
+                    mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency
+                )),
+            },
+            Ok(()) => Err(format!(
+                "display driver did not activate {}×{} at {} Hz, and the previous mode could not be verified after restore",
+                mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency
+            )),
+            Err(error) => Err(format!(
+                "display driver did not activate {}×{} at {} Hz, and restoring the previous mode failed: {error}",
+                mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency
+            )),
+        };
+    }
+    invalidate_mode_cache();
+    {
+        let mut guard = pending_mode()
+            .lock()
+            .map_err(|_| "display mode state was poisoned".to_string())?;
+        *guard = Some(PendingMode {
+            token,
+            target: target.clone(),
+            previous,
+            requested: mode,
+        });
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(15));
+        // Serialize the automatic rollback with confirmation and manual
+        // rollback. Without this guard, the timeout thread could restore the
+        // old mode while the user is simultaneously committing the new one.
+        let Ok(_operation_guard) = mode_operation_lock().lock() else {
+            log::error!(
+                "[display-info] automatic rollback could not acquire the mode operation lock"
+            );
+            return;
+        };
+        let Ok(_recovery_guard) = lock_recovery_state() else {
+            log::error!("[display-info] automatic rollback could not lock recovery state");
+            return;
+        };
+        let entry = pending_mode()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().filter(|entry| entry.token == token).cloned());
+        if let Some(entry) = entry {
+            if let Err(error) = target_is_current(&entry.target) {
+                log::error!("[display-info] automatic rollback refused: {error}");
+                return;
+            }
+            match unsafe { change_mode(&entry.target, &entry.previous, CDS_TYPE(0)) } {
+                Ok(()) if wait_for_mode(&entry.target, &entry.previous).is_some() => {
+                    invalidate_mode_cache();
+                    // Keep the in-memory transaction until recovery cleanup has
+                    // succeeded. If cleanup fails, the watchdog and manual
+                    // retry still retain the only recovery path.
+                    if let Err(error) = clear_recovery_record_for(token) {
+                        log::error!("[display-info] automatic rollback succeeded but recovery cleanup failed: {error}");
+                        return;
+                    }
+                    if let Ok(mut guard) = pending_mode().lock() {
+                        if guard.as_ref().is_some_and(|current| current.token == token) {
+                            guard.take();
+                        }
+                    }
+                    log::warn!(
+                        "[display-info] display mode confirmation timed out; restored previous mode"
+                    );
+                }
+                Ok(()) => {
+                    log::error!("[display-info] automatic display-mode rollback did not reach the previous mode; keeping recovery state");
+                }
+                Err(error) => {
+                    // Keep the pending transaction available for a manual
+                    // retry instead of silently losing the only recovery mode.
+                    log::error!("[display-info] automatic display-mode rollback failed: {error}");
+                }
+            }
+        }
+    });
+    Ok(AppliedMode {
+        width: mode.dmPelsWidth,
+        height: mode.dmPelsHeight,
+        refresh_hz: mode.dmDisplayFrequency,
+        // Use the same EDID-backed friendly name shown by get_display_info;
+        // DeviceString alone may only say "Generic PnP Monitor".
+        monitor_name: edid_name_for_target(&target).unwrap_or(target.monitor_name),
+        confirmation_seconds: 15,
+    })
+}
+
+pub fn set_refresh_rate(hz: u32) -> Result<AppliedMode, String> {
+    let target =
+        primary_display_target().ok_or_else(|| "no primary monitor was detected".to_string())?;
+    let current = current_devmode(&target.device_name)
+        .ok_or_else(|| "unable to read the current display mode".to_string())?;
+    let mode = complete_mode_for(
+        &target,
+        &current,
+        current.dmPelsWidth,
+        current.dmPelsHeight,
+        hz,
+    )?;
+    begin_mode_change(target, current, mode)
+}
+
+pub fn set_resolution(width: u32, height: u32, preferred_hz: u32) -> Result<AppliedMode, String> {
+    let target =
+        primary_display_target().ok_or_else(|| "no primary monitor was detected".to_string())?;
+    let current = current_devmode(&target.device_name)
+        .ok_or_else(|| "unable to read the current display mode".to_string())?;
+    // Validate the resolution and requested refresh rate together against one
+    // freshly enumerated complete DEVMODE. Never infer target-resolution Hz
+    // support from the rates of the resolution we are leaving.
+    let mode = complete_mode_for(&target, &current, width, height, preferred_hz)?;
+    begin_mode_change(target, current, mode)
+}
+
+fn same_mode(a: &DEVMODEW, b: &DEVMODEW) -> bool {
+    a.dmPelsWidth == b.dmPelsWidth
+        && a.dmPelsHeight == b.dmPelsHeight
+        && a.dmDisplayFrequency == b.dmDisplayFrequency
+        && a.dmBitsPerPel == b.dmBitsPerPel
+}
+
+pub fn confirm_mode_change() -> Result<(), String> {
+    let _operation_guard = mode_operation_lock()
+        .lock()
+        .map_err(|_| "display mode operation state was poisoned".to_string())?;
+    let guard = pending_mode()
+        .lock()
+        .map_err(|_| "display mode state was poisoned".to_string())?;
+    let Some(entry) = guard.as_ref() else {
+        return Err("no display mode change is awaiting confirmation".into());
+    };
+    let target = entry.target.clone();
+    let requested = entry.requested;
+    let token = entry.token;
+    drop(guard);
+
+    // Serialize the entire confirmation against the external watchdog. The
+    // watchdog cannot restore the old mode while this guard is held, and the
+    // recovery file cannot be deleted by a competing transaction.
+    let _recovery_guard = lock_recovery_state()?;
+    // Test the requested mode, then verify the actual active mode before making
+    // the registry update permanent. All reads happen while the recovery lock
+    // is held, avoiding a stale pre-lock validation race.
+    target_is_current(&target)?;
+    unsafe {
+        change_mode(&target, &requested, CDS_TEST)?;
+    }
+    let active = current_devmode(&target.device_name)
+        .ok_or_else(|| "unable to verify the active display mode".to_string())?;
+    if !same_mode(&active, &requested) {
+        return Err(format!(
+            "the monitor is running {}×{} at {} Hz, not the requested {}×{} at {} Hz; the temporary mode was kept for rollback",
+            active.dmPelsWidth,
+            active.dmPelsHeight,
+            active.dmDisplayFrequency,
+            requested.dmPelsWidth,
+            requested.dmPelsHeight,
+            requested.dmDisplayFrequency,
+        ));
+    }
+    unsafe {
+        change_mode(&target, &active, CDS_UPDATEREGISTRY)?;
+    }
+    // Verify the persistent commit too. Keep the recovery record and pending
+    // transaction if the driver does not settle on the committed mode.
+    if wait_for_mode(&target, &active).is_none() {
+        return Err("the display mode was committed but could not be verified afterward; recovery state was kept".into());
+    }
+    // Clearing recovery state is part of the commit. If it fails, leave the
+    // transaction pending so a retry remains possible; safety is preferable
+    // to silently allowing a stale watchdog record to be ignored.
+    clear_recovery_record_for(token)?;
+    invalidate_mode_cache();
+    // Remove the transaction only after verification and persistence succeed;
+    // otherwise the watchdog must remain able to restore the old mode.
+    let mut guard = pending_mode()
+        .lock()
+        .map_err(|_| "display mode state was poisoned".to_string())?;
+    if guard.as_ref().is_some_and(|entry| entry.token == token) {
+        guard.take();
+    }
+    Ok(())
+}
+
+pub fn rollback_mode_change() -> Result<(), String> {
+    let _operation_guard = mode_operation_lock()
+        .lock()
+        .map_err(|_| "display mode operation state was poisoned".to_string())?;
+    let entry = pending_mode()
+        .lock()
+        .map_err(|_| "display mode state was poisoned".to_string())?
+        .as_ref()
+        .cloned();
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    let _recovery_guard = lock_recovery_state()?;
+    target_is_current(&entry.target)?;
+    unsafe {
+        change_mode(&entry.target, &entry.previous, CDS_TYPE(0))?;
+    }
+    if wait_for_mode(&entry.target, &entry.previous).is_none() {
+        return Err("display driver did not restore the previous mode".into());
+    }
+    clear_recovery_record_for(entry.token)?;
+    invalidate_mode_cache();
+    let mut guard = pending_mode()
+        .lock()
+        .map_err(|_| "display mode state was poisoned".to_string())?;
+    if guard
+        .as_ref()
+        .is_some_and(|current| current.token == entry.token)
+    {
+        guard.take();
+    }
+    Ok(())
+}
+
+pub fn launch_recovery_watchdog_if_needed() {
+    let path = recovery_path();
+    if !path.exists() {
+        return;
+    }
+    // Keep validation and the decision to launch/quarantine under the same
+    // named mutex used by the watchdog and mode transactions. This prevents
+    // startup from validating one record while another instance replaces it.
+    let Ok(_recovery_guard) = lock_recovery_state() else {
+        log::error!("[display-info] could not lock display recovery state at startup");
+        return;
+    };
+    let Ok(data) = fs::read(&path) else {
+        return;
+    };
+    let usable = serde_json::from_slice::<RecoveryRecord>(&data)
+        .ok()
+        .is_some_and(|record| record.token != 0 && !record.monitor_id.is_empty());
+    if !usable {
+        // Legacy/incomplete records cannot be safely mapped to a monitor or
+        // cancelled with the transaction token. Quarantine the state under
+        // the lock, preserving it for diagnosis without launching a watchdog
+        // that cannot recover safely.
+        if let Err(error) = quarantine_recovery_record() {
+            log::error!(
+                "[display-info] could not quarantine incomplete display recovery state: {error}"
+            );
+        } else {
+            log::error!("[display-info] quarantined incomplete display recovery state");
+        }
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe).arg("--display-mode-watchdog").spawn();
+    }
+}
+
+pub fn display_target_info() -> Option<DisplayTargetInfo> {
+    primary_display_target().map(|target| DisplayTargetInfo {
+        device_name: target.device_name,
+        monitor_name: target.monitor_name,
+        monitor_id: target.monitor_id,
+    })
 }
 
 #[cfg(test)]

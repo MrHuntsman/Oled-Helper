@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>OLED Helper</title>
+    <style>
+      /* Fully transparent chrome: the .modal element itself paints the panel
+         background/border/shadow (see app.css), so the window behind it must
+         stay see-through on all four sides for the rounded corners to read
+         correctly instead of showing a square white/black window behind them. */
+      html, body, #flyout-app {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="flyout-app"></div>
+    <script type="module" src="/src/flyout-main.js"></script>
+  </body>
+</html>

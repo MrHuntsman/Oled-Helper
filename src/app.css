@@ -957,6 +957,11 @@ button {
 .modal-btn:hover,
 .modal-btn:focus-visible { background: var(--hover); border-color: var(--accent); outline: none; }
 .modal-btn-cancel { color: var(--text-weak); }
+.mode-confirm-backdrop { z-index: 11000; }
+.mode-confirm-modal { max-width: min(430px, calc(100vw - 32px)); }
+.mode-confirm-modal .modal-desc strong { color: var(--text); font-weight: 600; }
+.mode-confirm-modal .modal-error { margin-top: 8px; color: #e87575; font-size: 11px; line-height: 1.35; }
+
 .modal-btn-danger {
   color: #ff6b6b;
   border-color: color-mix(in srgb, #ff6b6b 40%, var(--divider));
@@ -1250,13 +1255,12 @@ button {
   margin-bottom: 2px;
 }
 .fs-controls-block {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 20px;
+  row-gap: 6px;
+  justify-content: center;
   align-items: center;
-  gap: 6px;
-}
-.fs-controls-block .fs-hint-row {
-  width: 200px;
 }
 .fs-controls-block .fs-hint-title { text-align: center; color: #fff; }
 .fs-controls-headers {
@@ -1277,14 +1281,26 @@ button {
   background: rgba(255,255,255,0.1);
   margin: 3px 0;
 }
+/* display:contents turns each row into a pass-through: its two children
+   (.fs-hint-val, .fs-hint-keys) become direct grid items of
+   .fs-controls-block, landing in that grid's two auto-sized columns. This
+   is what actually fixes the misalignment: a fixed-width row (the previous
+   approach) doesn't grow to fit content, so wider chips (the mouse-icon
+   badges: Double-click/Right-click/Scroll) simply overflowed the box by
+   different amounts per row — invisible at the small non-fullscreen chip
+   size, but obvious once fullscreen mode scales the chips up. Grid columns
+   size to their widest member automatically, so every row's key/chip lands
+   on the same right edge regardless of individual content width, and no
+   per-mode width override is needed. font-size/white-space still cascade
+   normally to the row's children even though the row itself no longer
+   generates a box. */
 .fs-hint-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 20px;
+  display: contents;
   font-size: 12px;
   white-space: nowrap;
 }
+.fs-hint-val { justify-self: start; }
+.fs-hint-keys { justify-self: end; }
 .fs-hint-line {
   display: flex;
   align-items: baseline;
@@ -1308,6 +1324,98 @@ button {
 .fs-hint-val {
   color: rgba(255,255,255,0.85);
   font-weight: 600;
+}
+
+/* Keycap chips for the controls list inside the calibration Info tooltip
+   (shared between the in-app tooltip and the fullscreen overlay help). The
+   .fs-keycap classes are used by the tooltip markup but had no styling, so
+   the SVGs rendered at natural size and overflowed the rows. */
+.fs-hint-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.fs-keycap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid rgba(255,255,255,0.16);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.75);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.fs-keycap svg {
+  display: block;
+  flex-shrink: 0;
+}
+/* Arrow glyphs: small square chips with centered icons. */
+.fs-keycap-icon {
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0;
+}
+.fs-keycap-icon svg {
+  width: 12px;
+  height: 12px;
+}
+/* Mouse glyphs: text + a small mouse icon beside it. */
+.fs-keycap-mouse {
+  height: 22px;
+  padding: 0 8px;
+  gap: 5px;
+}
+.fs-keycap-mouse svg {
+  width: auto;
+  height: 14px;
+}
+/* In-app fullscreen sits in a windowed browser context (not a full physical
+   display like monitor fullscreen), so it gets a smaller scale bump than
+   monitor fullscreen — closer to the base tooltip size instead of matching
+   monitor fullscreen's larger jump. */
+.strip-wrap.inapp-fullscreen .fs-keycap {
+  font-size: 12px;
+  height: 22px;
+  min-width: 22px;
+  border-radius: 5px;
+}
+.strip-wrap.monitor-fullscreen .fs-keycap {
+  font-size: 13px;
+  height: 26px;
+  min-width: 26px;
+  border-radius: 5px;
+}
+.strip-wrap.inapp-fullscreen .fs-keycap-icon svg {
+  width: 13px;
+  height: 13px;
+}
+.strip-wrap.monitor-fullscreen .fs-keycap-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.strip-wrap.inapp-fullscreen .fs-keycap-mouse {
+  height: 24px;
+  padding: 0 9px;
+}
+.strip-wrap.monitor-fullscreen .fs-keycap-mouse {
+  height: 28px;
+  padding: 0 10px;
+}
+.strip-wrap.inapp-fullscreen .fs-keycap-mouse svg {
+  width: auto;
+  height: 16px;
+}
+.strip-wrap.monitor-fullscreen .fs-keycap-mouse svg {
+  height: 18px;
 }
 
 /* ── Fullscreen black-level slider overlay (top-right) ────────────── */
@@ -1374,6 +1482,99 @@ button {
 /* ── GPU status / errors ──────────────────────────────────────────── */
 .gpu-status { color: var(--text-weak); margin: 8px 0; font-size: 13px; }
 .gpu-error { color: #E05555; margin: 4px 0; font-size: 12px; }
+
+/* ── Hotkeys tab ────────────────────────────────────────────────────── */
+.hotkey-section { margin-top: 16px; }
+.hotkey-section-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-weak);
+  margin-bottom: 6px;
+}
+.hotkey-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  background: var(--panel);
+}
+.hotkey-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.hotkey-row-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.hotkey-pill {
+  min-width: 132px;
+  padding: 5px 12px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: var(--nav-bg);
+  color: var(--text-weak);
+  font-size: 12px;
+  font-family: var(--font);
+  text-align: center;
+  white-space: nowrap;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.hotkey-pill.bound { color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--divider)); }
+.hotkey-pill:hover:not(:disabled),
+.hotkey-pill:focus-visible { border-color: var(--accent); color: var(--text); }
+.hotkey-pill.capturing {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--nav-bg));
+  animation: hotkey-pulse 1.1s ease-in-out infinite;
+}
+@keyframes hotkey-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 35%, transparent); }
+  50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+.hotkey-clear {
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: var(--nav-bg);
+  color: var(--text-weak);
+  font-size: 14px;
+  line-height: 1;
+  transition: color 0.12s, border-color 0.12s;
+}
+.hotkey-clear:hover:not(:disabled),
+.hotkey-clear:focus-visible { color: #E05555; border-color: #E05555; }
+.hotkey-clear:disabled { opacity: 0.35; cursor: default; }
+.hotkey-error {
+  margin: 8px 0 0;
+  color: #E05555;
+  font-size: 12px;
+}
+.hotkey-hint {
+  margin-top: 12px;
+  color: var(--text-weak);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 560px;
+}
+/* Hint sits at the top of the tab now (below the separator) — space it off
+   the first section instead of the old bottom placement. */
+.hotkey-hint-top {
+  margin: 0 0 10px;
+}
 .strip-heading { margin: 4px 0; font-size: 13px; }
 
 /* ── Square labels ────────────────────────────────────────────────── */
@@ -1407,13 +1608,15 @@ button {
 }
 .square-unit { font-size: 0.85em; color: var(--text-weak); }
 
-/* Match the compact size of the other tooltips outside fullscreen. */
+/* Match the compact size of the other tooltips outside fullscreen. In-app
+   fullscreen gets a smaller bump than monitor fullscreen (see the .fs-keycap
+   split above for why). */
 .fs-help-tip { font-size: 12px; }
-.strip-wrap.inapp-fullscreen .fs-help-tip,
+.strip-wrap.inapp-fullscreen .fs-help-tip { font-size: 13px; min-width: 280px; }
 .strip-wrap.monitor-fullscreen .fs-help-tip { font-size: 14px; min-width: 320px; }
 .strip-wrap.inapp-fullscreen .fs-hint-row,
+.strip-wrap.inapp-fullscreen .fs-hint-line { font-size: 13px; }
 .strip-wrap.monitor-fullscreen .fs-hint-row,
-.strip-wrap.inapp-fullscreen .fs-hint-line,
 .strip-wrap.monitor-fullscreen .fs-hint-line { font-size: 14px; }
 .strip-wrap.monitor-fullscreen .fs-help-btn { font-size: 13px; padding: 4px 16px; }
 .strip-wrap.monitor-fullscreen .fs-help-wrap { top: 24px; left: 24px; }
@@ -1423,25 +1626,30 @@ button {
   position: fixed;
   z-index: 10000;
   width: 260px;
+  max-height: 340px;
+  overflow-y: auto;
+  overflow-x: hidden;
   background: var(--panel);
   border: 1px solid var(--divider);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  padding: 6px;
+  padding: 4px;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 2px;
   user-select: none;
 }
 .ctx-menu-label {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
   color: var(--text-weak);
   text-transform: uppercase;
   letter-spacing: 0.4px;
-  padding: 4px 8px 6px;
+  padding: 6px 10px 3px;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 8px;
 }
 .ctx-menu-icon {
@@ -1451,35 +1659,141 @@ button {
   opacity: 0.8;
 }
 .ctx-item {
-  display: block;
+  display: flex;
+  align-items: center;
   width: 100%;
+  height: 32px;
+  flex: 0 0 20px;
+  box-sizing: border-box;
   text-align: left;
-  padding: 7px 8px 7px 16px;
+  padding: 0 10px;
   border-radius: 5px;
-  font-size: 13px;
+  font-size: 11px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
   color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   position: relative;
-  transition: background 0.08s, padding-left 0.08s;
+  transition: background 0.08s, color 0.08s, transform 0.08s;
 }
-.ctx-item:hover:not(:disabled):not(.active) { background: var(--hover); padding-left: 19px; }
+.ctx-item:hover:not(:disabled):not(.active) { background: var(--hover); color: #fff; transform: translateX(2px); }
 .ctx-item.active {
-  background: var(--hover);
-  color: var(--accent);
-  font-weight: 600;
-}
-.ctx-item.active::before {
-  content: '';
-  position: absolute;
-  left: 2px; top: 4px; bottom: 4px;
-  width: 3px;
-  border-radius: 2px;
-  background: var(--accent);
+  font-weight: 400;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 .ctx-item:disabled { color: var(--text-weak); cursor: default; opacity: 0.5; }
 .ctx-menu-sep { height: 1px; background: var(--divider); margin: 4px 2px; }
+/* Compact variant used by the status-bar dropdown context menus. Width
+   shrink-wraps the content instead of the fixed 260px, with tighter padding
+   and font sizes. The calibration strip's full-size .ctx-menu is untouched. */
+.ctx-menu.compact {
+  width: auto;
+  min-width: 170px;
+  padding: 4px;
+  gap: 1px;
+  border-radius: 6px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+.ctx-menu.compact .ctx-menu-label {
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  padding: 2px 6px 3px;
+  justify-content: center;
+  text-align: center;
+}
+.ctx-menu.compact .ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+.ctx-menu.compact .ctx-item:hover:not(:disabled):not(.active) { padding-left: 8px; background: var(--hover); }
+.ctx-menu.compact .ctx-menu-sep { margin: 2px 1px; }
+/* Sub-section labels within a compact menu (e.g. "Sort" / "Display"),
+   smaller and dimmer than the menu's own title so the hierarchy reads
+   title > subheading > item at a glance instead of one flat list mixing
+   an exclusive choice (sort direction) with independent on/off toggles
+   (current-first, grouping, tags) under a single undifferentiated header. */
+.ctx-menu.compact .ctx-menu-subheading {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-weak);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 4px 8px 2px;
+  text-align: center;
+}
+/* Radio dot for mutually-exclusive choices (sort direction) — distinct
+   shape from the checkbox below so exclusive picks and independent toggles
+   are visually different classes of control, not identical-looking rows. */
+.ctx-radio-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid var(--text-weak);
+  position: relative;
+  flex-shrink: 0;
+}
+.ctx-item.active .ctx-radio-dot { border-color: var(--accent); }
+.ctx-radio-dot::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: scale(0);
+  transition: transform 0.12s cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+.ctx-item.active .ctx-radio-dot::after { transform: scale(1); }
+/* Checkbox for independent on/off toggles. */
+.ctx-checkbox {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1.5px solid var(--text-weak);
+  position: relative;
+  flex-shrink: 0;
+}
+.ctx-item.active .ctx-checkbox { border-color: var(--accent); background: var(--accent); }
+.ctx-checkbox::after {
+  content: '';
+  position: absolute;
+  left: 2.5px; top: -0.5px;
+  width: 3px; height: 6px;
+  border: solid var(--bg);
+  border-width: 0 1.4px 1.4px 0;
+  transform: rotate(45deg) scale(0);
+  transition: transform 0.1s;
+}
+.ctx-item.active .ctx-checkbox::after { transform: rotate(45deg) scale(1); }
 
-/* ── Status bar ───────────────────────────────────────────────────── */
-.status-bar-right { display: flex; align-items: center; gap: 10px; }
+/* ── Status bar ───────────────────────────────────────────────────── */.status-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.current-monitor {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-weak);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  opacity: 0.9;
+}
+.current-monitor::before {
+  content: '▣';
+  margin-right: 5px;
+  color: var(--accent);
+  font-size: 9px;
+}
 .display-info { color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* Custom Hz dropdown — replaces the native <select> for refresh rate.
@@ -1500,7 +1814,7 @@ button {
   max-height: 340px;
   overflow-y: auto;
   overflow-x: hidden;
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
   background: var(--panel);
   border: 1px solid var(--divider);
   border-radius: 8px;
@@ -1508,6 +1822,7 @@ button {
   padding: 4px;
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 2px;
   user-select: none;
 }
@@ -1524,7 +1839,7 @@ button {
   padding: 0 10px;
   border-radius: 5px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
   color: var(--text);
   white-space: nowrap;
@@ -1533,7 +1848,7 @@ button {
   transition: background 0.08s, color 0.08s, transform 0.08s;
 }
 .hz-menu-item:hover { background: var(--hover); color: #fff; transform: translateX(2px); }
-.hz-menu-item.active { color: var(--accent); font-weight: 700; background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.hz-menu-item.active { color: var(--accent); font-weight: 400; background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .hz-profile-value {
   color: var(--text-weak);
   font-weight: 500;
@@ -1560,7 +1875,7 @@ button {
 .ultrawide-tag {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
   margin-left: -6px;
   color: inherit;
 }
@@ -1568,11 +1883,11 @@ button {
   line-height: 1;
 }
 .ultrawide-icon {
-  width: 23px;
+  width: 30px;
   height: 13px;
   flex-shrink: 0;
   color: inherit;
-  vertical-align: -2px;
+  vertical-align: middle;
 }
 .hz-menu-item:hover .ultrawide-icon { color: #fff; }
 .hz-menu-item.active .ultrawide-icon { color: var(--accent); }
@@ -1627,7 +1942,7 @@ button {
    width would resize the button on every such change and shift the HDR
    switch beside it in .status-bar-right. Fixed width absorbs that instead. */
 .refresh-rate-select {
-  width: 122px;
+
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -1749,6 +2064,7 @@ button {
   height: auto;
 }
 .diag-section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.diag-header-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .diag-runtime-heading { display: flex; align-items: center; gap: 12px; }
 .diag-verbose-toggle {
   display: inline-flex;
@@ -1793,7 +2109,7 @@ button {
 .diag-detection-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
   margin-bottom: 8px;
   padding: 6px 10px;
@@ -1805,9 +2121,14 @@ button {
   color: var(--text-weak);
   font-size: 10px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  margin-right: 2px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+.diag-detection-sep {
+  width: 1px;
+  height: 14px;
+  background: var(--divider);
+  flex-shrink: 0;
 }
 .diag-detection-toggle {
   display: inline-flex;
@@ -1817,6 +2138,8 @@ button {
   font-size: 11px;
   user-select: none;
   cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .diag-detection-toggle input {
   appearance: none;
@@ -1871,6 +2194,7 @@ button {
 }
 .copy-btn.success { color: #4CD964; }
 .copy-btn.error { color: #E05555; }
+.config-folder-btn { color: var(--accent); }
 .diag-rows { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
 .diag-row { display: flex; gap: 10px; }
 .diag-key { color: var(--text-weak); min-width: 180px; flex-shrink: 0; }

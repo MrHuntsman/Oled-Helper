@@ -781,6 +781,24 @@ mod platform {
         }
     }
 
+    // Shell_TrayWnd can be momentarily missing right after a tray restart
+    // while the shell settles. apply() and available() must not turn that
+    // transient hiccup into a hard failure — the frontend would then report
+    // the overlay unavailable and mis-handle the toggle as off — so retry the
+    // lookup briefly before giving up. The happy path still returns on the
+    // first attempt with zero added latency.
+    fn taskbar_info_retry(attempts: usize, retry_delay: Duration) -> Option<(HWND, RECT)> {
+        for attempt in 0..attempts {
+            if let Some(info) = taskbar_info() {
+                return Some(info);
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(retry_delay);
+            }
+        }
+        None
+    }
+
     // Windows popup menus, including the native Tauri tray menu, use the
     // standard #32768 window class. The taskbar overlay must sit below this
     // popup or it can cover the menu and intercept its visual surface.
@@ -791,8 +809,41 @@ mod platform {
         }
     }
 
+    // The "Keep display mode?" flyout (flyout_window.rs) is also an
+    // always-on-top popup, shown briefly right after a display mode change.
+    // HWND_TOPMOST does not merely keep a window "on top" — SetWindowPos with
+    // that handle inserts the window at the very FRONT of the whole topmost
+    // band, ahead of every other topmost window. This overlay's z-order
+    // repair runs on a continuous ~250ms timer (ZORDER_REPAIR_INTERVAL_MS)
+    // independent of the flyout's lifecycle, so a repair tick landing while
+    // the flyout is visible pushes the flyout behind this overlay — the
+    // flyout shows natively (per its own logs) but is never actually seen,
+    // hidden behind this fully opaque black overlay. flyout_window.rs
+    // publishes its HWND here whenever it is shown/hidden so this repair can
+    // insert itself just behind the flyout instead of in front of everything.
+    pub static FLYOUT_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    pub fn set_flyout_hwnd(raw: isize) {
+        FLYOUT_HWND.store(raw, Ordering::Release);
+    }
+
+    fn active_flyout_window() -> Option<HWND> {
+        let raw = FLYOUT_HWND.load(Ordering::Acquire);
+        if raw == 0 {
+            return None;
+        }
+        let hwnd = HWND(raw as *mut c_void);
+        unsafe { IsWindowVisible(hwnd).as_bool() }.then_some(hwnd)
+    }
+
     pub fn available() -> bool {
-        taskbar_info().is_some()
+        // A single FindWindowW snapshot can miss Shell_TrayWnd for a few
+        // hundred ms right after a tray restart while the shell settles — and
+        // the frontend latches a false negative as "overlay unavailable" for
+        // the whole session (its retry only fires on overlay-creation failure,
+        // which effectively never happens). Retry briefly so a transient shell
+        // hiccup can't produce that permanent false reading.
+        taskbar_info_retry(4, Duration::from_millis(150)).is_some()
     }
 
     // Returns the window class name of the given window, if any.
@@ -822,7 +873,22 @@ mod platform {
                 foreground,
                 Some(&mut process_id),
             );
-            if process_id == std::process::id() || process_id == 0 || IsIconic(foreground).as_bool()
+            if process_id == 0 || IsIconic(foreground).as_bool() {
+                return false;
+            }
+
+            // Fullscreen suppression is monitor-local. The foreground window
+            // may be fullscreen on a secondary display while this overlay is
+            // attached to another taskbar; in that case this overlay must stay
+            // visible. Do not reject our own process here: the calibration
+            // strip can be the fullscreen foreground window too, and the same
+            // geometry/style checks below distinguish it from the normal app
+            // window.
+            let foreground_monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
+            let overlay_monitor = MonitorFromWindow(overlay, MONITOR_DEFAULTTONEAREST);
+            if foreground_monitor.0.is_null()
+                || overlay_monitor.0.is_null()
+                || foreground_monitor != overlay_monitor
             {
                 return false;
             }
@@ -922,7 +988,13 @@ mod platform {
             // If a native popup menu is open, insert the overlay directly
             // below that menu instead of above every topmost window. Once the
             // menu closes, the next tick restores the normal topmost placement.
-            let insert_after = popup_menu.or(Some(HWND_TOPMOST));
+            // The mode-change flyout takes the next priority: while it is
+            // visible, insert the dimmer overlay just behind it so the
+            // continuous z-order repair here can never cover the flyout (see
+            // active_flyout_window above for why HWND_TOPMOST alone is
+            // unsafe to use whenever another topmost popup needs to stay
+            // above this one).
+            let insert_after = popup_menu.or_else(active_flyout_window).or(Some(HWND_TOPMOST));
             let visibility = if popup_menu.is_some() {
                 SET_WINDOW_POS_FLAGS(0)
             } else {
@@ -1225,7 +1297,10 @@ mod platform {
         // external fullscreen (but SUSPENDED — the app's own monitor-
         // fullscreen strip — still takes effect immediately).
         let fullscreen = if SUSPENDED.load(Ordering::Relaxed) {
-            true
+            // `SUSPENDED` is requested by the app's own monitor-fullscreen
+            // calibration mode. Resolve it through the same monitor-local
+            // detector instead of hiding every overlay globally.
+            fullscreen_app_active(hwnd)
         } else {
             let mut fade = state.lock().unwrap();
             // Event mode: the WinEvent hook is the sole fullscreen detector.
@@ -1708,7 +1783,14 @@ mod platform {
         fade_out_duration_ms: u64,
         immediate: bool,
     ) -> Result<(), String> {
-        let taskbar = taskbar_info().ok_or_else(|| "Windows taskbar was not found".to_string())?;
+        // Same transient-miss retry as available(): right after a tray restart
+        // set_taskbar_dimmer can be called (loadConfig applies the persisted
+        // toggle) during the brief window where Shell_TrayWnd is missing. A
+        // single-shot lookup would fail, the frontend would then treat the
+        // toggle as off, and the setting would never be persisted. Absorb the
+        // hiccup here so the apply always lands.
+        let taskbar = taskbar_info_retry(3, Duration::from_millis(100))
+            .ok_or_else(|| "Windows taskbar was not found".to_string())?;
         let rect = taskbar.1;
         let hwnd = HWND(raw as *mut c_void);
         let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round();
@@ -1792,9 +1874,13 @@ mod platform {
             } else {
                 SWP_HIDEWINDOW
             };
+            // Same flyout-priority reasoning as maintain_overlay_zorder: don't
+            // blindly claim the front of the topmost band if the mode-change
+            // flyout is currently showing.
+            let insert_after = active_flyout_window().unwrap_or(HWND_TOPMOST);
             SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                Some(insert_after),
                 rect.left,
                 rect.top,
                 rect.right - rect.left,
@@ -1827,6 +1913,7 @@ mod platform {
     pub fn set_hover_mode(_mode: &str) {}
     pub fn set_poll_interval_ms(_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
+    pub fn set_flyout_hwnd(_raw: isize) {}
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
@@ -1919,4 +2006,11 @@ pub fn create_overlay(app: &AppHandle, state: &TaskbarDimmerState) -> Result<(),
 
 pub fn shutdown() {
     platform::shutdown();
+}
+
+// Called by flyout_window.rs right after the flyout is shown (with its HWND)
+// and right before/after it is hidden (with 0), so the dimmer overlay's
+// z-order repair never fights the flyout for the front of the topmost band.
+pub fn set_flyout_hwnd(raw: isize) {
+    platform::set_flyout_hwnd(raw);
 }

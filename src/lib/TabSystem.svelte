@@ -56,6 +56,8 @@
       ['Display Type', displayType],
       // Peak luminance is only meaningful while HDR is active; hide it in SDR.
       ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
+      ['Current Monitor', app.displayInfo.monitorName || 'Detecting...'],
+      ['Monitor Device', app.displayInfo.deviceName || '—'],
       ['Native Resolution', nativeResolution],
       ['Screen Resolution', `${screen.width * devicePixelRatio}x${screen.height * devicePixelRatio}${app.displayInfo.refreshRateHz ? `@${app.displayInfo.refreshRateHz}Hz` : ''}`],
       ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],

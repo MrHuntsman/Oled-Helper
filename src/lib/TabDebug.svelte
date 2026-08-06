@@ -1,8 +1,20 @@
 <script>
-  import { gpuLogVersion, gpuLogSnapshot, clearGpuLog, runtimeLogSettings, setVerbosePeriodicLogging, dimmerDetections, setDimmerDetection } from './stores.svelte.js';
+  import { gpuLogVersion, gpuLogSnapshot, clearGpuLog, runtimeLogSettings, setVerbosePeriodicLogging, dimmerDetections, setDimmerDetection, debugSettings, setContextMenuEnabled } from './stores.svelte.js';
+  import { invoke } from '@tauri-apps/api/core';
 
   let logCopied = $state(false);
   let logCopyFailed = $state(false);
+  let configFolderError = $state('');
+
+  async function openConfigFolder() {
+    configFolderError = '';
+    try {
+      await invoke('open_config_folder');
+    } catch (error) {
+      configFolderError = String(error);
+      setTimeout(() => { configFolderError = ''; }, 2500);
+    }
+  }
 
   // Re-derive off the version counter so this stays in sync without deep-watching
   // the whole log array (which caused a startup hang — see stores.svelte.js).
@@ -79,8 +91,12 @@
           <input type="checkbox" checked={runtimeLogSettings.verbosePeriodic} onchange={(e) => setVerbosePeriodicLogging(e.currentTarget.checked)} />
           <span>Detailed logging</span>
         </label>
+        <label class="diag-verbose-toggle">
+          <input type="checkbox" checked={debugSettings.contextMenuEnabled} onchange={(e) => setContextMenuEnabled(e.currentTarget.checked)} />
+          <span>Allow right-click menu</span>
+        </label>
       </div>
-      <div style="display:flex; gap:6px;">
+      <div class="diag-header-actions">
         <button class="copy-btn" class:success={logCopied} class:error={logCopyFailed} onclick={copyGpuLog} title={logCopied ? 'Copied!' : logCopyFailed ? 'Copy failed' : 'Copy runtime log'} aria-label="Copy runtime log">
           {#if logCopied}
             <svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -91,11 +107,15 @@
         <button class="copy-btn" onclick={clearGpuLog} title="Clear log" aria-label="Clear log">
           <svg viewBox="0 0 16 16" fill="none"><path d="M3.5 4.5H12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M6 4.5V3.3C6 2.9 6.3 2.6 6.7 2.6H9.3C9.7 2.6 10 2.9 10 3.3V4.5" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 4.5L5 12.4C5 12.8 5.4 13.1 5.8 13.1H10.2C10.6 13.1 11 12.8 11 12.4L11.5 4.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
+        <button class="copy-btn config-folder-btn" class:error={configFolderError} onclick={openConfigFolder} title={configFolderError || 'Open config folder'} aria-label="Open config folder">
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 4.5C2.5 3.95 2.95 3.5 3.5 3.5H6.3L7.5 4.8H12.5C13.05 4.8 13.5 5.25 13.5 5.8V11.5C13.5 12.05 13.05 12.5 12.5 12.5H3.5C2.95 12.5 2.5 12.05 2.5 11.5V4.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M2.8 6H13.2" stroke="currentColor" stroke-width="1.3"/></svg>
+        </button>
       </div>
     </div>
 
     <div class="diag-detection-bar">
-      <span class="diag-detection-label">Detection toggles</span>
+      <span class="diag-detection-label">DETECTION TOGGLES</span>
+      <span class="diag-detection-sep" aria-hidden="true"></span>
       <label class="diag-detection-toggle">
         <input type="checkbox" checked={dimmerDetections.fullscreen} onchange={(e) => setDimmerDetection('fullscreen', e.currentTarget.checked)} />
         <span>Fullscreen</span>

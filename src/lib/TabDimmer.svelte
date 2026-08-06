@@ -210,7 +210,7 @@
         <span class="hover-detect-radio-dot" aria-hidden="true"></span>
         <span class="hover-detect-radio-text">
           <span class="hover-detect-radio-title">Event-driven</span>
-          <span class="hover-detect-radio-desc">Recommended — instant response, near-zero CPU. Falls back to polling for elevated (admin) windows.</span>
+          <span class="hover-detect-radio-desc">Recommended. Instant response. Falls back to polling for elevated (admin) windows.</span>
         </span>
       </button>
       <button type="button" class="hover-detect-radio-row dimmer-control" class:active={taskbarDimmer.hoverDetection === 'poll'}
@@ -220,7 +220,7 @@
         <span class="hover-detect-radio-dot" aria-hidden="true"></span>
         <span class="hover-detect-radio-text">
           <span class="hover-detect-radio-title">Polling</span>
-          <span class="hover-detect-radio-desc">Checks on a timer — more compatible, very low CPU use.</span>
+          <span class="hover-detect-radio-desc">Checks on a timer. Use it if Event-driven has problems, probably negligible CPU impact.</span>
           <span class="hover-detect-poll-rate" role="presentation" onclick={(e) => e.stopPropagation()}>
             <span class="hover-detect-poll-rate-label">Poll interval</span>
             <input type="range" min="16" max="200" step="1"

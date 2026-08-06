@@ -3,7 +3,7 @@ import './app.css'
 import App from './App.svelte'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { pushGpuLog } from './lib/stores.svelte.js'
+import { pushGpuLog, debugSettings, handleTaskbarDimmerAvailable } from './lib/stores.svelte.js'
 
 // The Rust tauri-plugin-log Webview target is the canonical fan-out path:
 // every record is written to stdout/file and emitted as `log://log`. We do not
@@ -121,6 +121,12 @@ listen('config-write-failed', (event) => {
   sendFrontendRecord('warn', `[config] disk save failed: ${event.payload}`);
 }).catch(() => {});
 
+// Rust's overlay-creation retry (see lib.rs setup()) emits this once the
+// taskbar dimmer overlay comes online after an initial startup failure.
+listen('taskbar-dimmer-available', () => {
+  handleTaskbarDimmerAvailable();
+}).catch(() => {});
+
 // Capture uncaught errors before Svelte mounts. They are sent to Rust and then
 // return through `log://log`, so each appears once in all three destinations.
 window.addEventListener('error', (event) => {
@@ -166,7 +172,7 @@ try {
   if (!target) throw new Error('#app not found');
 
   mount(App, { target });
-  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('contextmenu', e => { if (!debugSettings.contextMenuEnabled) e.preventDefault(); });
 } catch (e) {
   console.error('OLED Helper mount failed:', e);
   document.body.innerHTML = `<div style="color:#E05555;padding:20px;font:14px monospace;background:#0D0D0F;height:100vh;">

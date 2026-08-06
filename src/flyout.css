@@ -1,0 +1,23 @@
+/* flyout.css — re-asserts transparent window chrome for the flyout webview
+   AFTER app.css has loaded. app.css's `html, body, #app { background: var(--bg); ... }`
+   rule also matches plain `html, body` (that selector list applies to each
+   selector independently, #app-scoping only affects the third one), which
+   painted an opaque var(--bg) rectangle over the whole flyout window instead
+   of leaving it transparent outside .modal. Importing this file after
+   app.css in flyout-main.js lets its later cascade position win the tie
+   against equal-specificity selectors, without touching the main window's
+   shared app.css. */
+html, body, #flyout-app {
+  background: transparent !important;
+}
+
+/* .modal's box-shadow (app.css: 0 16px 40px rgba(0,0,0,0.5)) needs a truly
+   transparent canvas to blend its soft edge into. WebView2's transparent
+   window compositing on Windows does not correctly composite that kind of
+   semi-transparent blur falloff — it renders against opaque white instead,
+   producing a large white halo around the modal rather than a soft shadow.
+   Dropping the shadow for the flyout specifically avoids that artifact; the
+   modal's own border still gives it enough definition against the desktop. */
+.flyout-backdrop .modal {
+  box-shadow: none;
+}
