@@ -21,6 +21,17 @@
   --accent: var(--accent-sdr);
 }
 
+/* Respect OS-level reduced-motion preference: disable all animations and
+   transitions so users with vestibular disorders aren't exposed to motion.
+   Fade/scale entrance effects become instant snap-to-target. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 @font-face {
   font-family: 'Inter';
   src: url('/fonts/inter/Inter_18pt-Regular.ttf') format('truetype');
@@ -1602,7 +1613,7 @@ button {
   padding: 5px 12px;
   border: 1px solid var(--divider);
   border-radius: 6px;
-  background: var(--nav-bg);
+  background: #26262e;
   color: var(--text-weak);
   font-size: 12px;
   font-family: var(--font);
@@ -1628,7 +1639,7 @@ button {
   height: 24px;
   border: 1px solid var(--divider);
   border-radius: 6px;
-  background: var(--nav-bg);
+  background: #26262e;
   color: var(--text-weak);
   font-size: 14px;
   line-height: 1;
@@ -1805,7 +1816,7 @@ button {
   text-transform: uppercase;
   letter-spacing: 0.4px;
   padding: 4px 8px 2px;
-  text-align: center;
+  text-align: left;
 }
 /* Radio dot for mutually-exclusive choices (sort direction) — distinct
    shape from the checkbox below so exclusive picks and independent toggles
@@ -2278,3 +2289,53 @@ button {
 .diag-row { display: flex; gap: 10px; }
 .diag-key { color: var(--text-weak); min-width: 180px; flex-shrink: 0; }
 .diag-val { color: var(--text); word-break: break-all; }
+
+/* ── Accessibility ──────────────────────────────────────────────── */
+
+/* Global focus ring: any interactive element receives a visible
+   accent outline on focus. Scoped outline:none rules above all
+   provide their own visible focus indicators as replacements. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Skip-to-content link: hidden until focused by keyboard, then
+   slides in at the top. Standard WCAG 2.1 pattern for keyboard-only
+   users to bypass repetitive navigation. */
+.skip-to-content {
+  position: fixed;
+  top: -100px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  background: var(--panel);
+  color: var(--accent);
+  font-family: var(--font);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 10px 20px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  text-decoration: none;
+  transition: top 0.2s ease;
+}
+.skip-to-content:focus {
+  top: 12px;
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
+/* aria-live region: off-screen but visible to screen readers. Used
+   for dynamic updates like display mode changes and HDR status. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

@@ -12,14 +12,16 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
-    MOD_SHIFT, MOD_WIN,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+    MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
 };
+use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 // Hotkey IDs (WM_HOTKEY wparam). Stable per action — not persisted anywhere,
 // but kept distinct so multiple bindings never collide on one slot.
@@ -28,20 +30,57 @@ pub const HK_TOGGLE_CRUSH: i32 = 2;
 pub const HK_DECREASE: i32 = 4;
 pub const HK_INCREASE: i32 = 5;
 pub const HK_TOGGLE_HDR: i32 = 8;
+pub const HK_HOLD_COMPARE: i32 = 16;
 
 // action name → (hotkey id, auto-repeat). Auto-repeat bindings are registered
 // without MOD_NOREPEAT so the OS keeps sending WM_HOTKEY while the key is held.
-pub const ACTIONS: [(&str, i32, bool); 5] = [
+pub const ACTIONS: [(&str, i32, bool); 6] = [
     ("toggle_taskbar_dimmer", HK_TOGGLE_DIMMER, false),
     ("toggle_black_crush", HK_TOGGLE_CRUSH, false),
     ("decrease_black_crush", HK_DECREASE, true),
     ("increase_black_crush", HK_INCREASE, true),
     ("toggle_hdr", HK_TOGGLE_HDR, false),
+    ("hold_compare", HK_HOLD_COMPARE, false),
 ];
 
 static APP: OnceLock<AppHandle> = OnceLock::new();
 static MAIN_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static BINDINGS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static CURRENT_LIFT: OnceLock<Arc<AtomicI32>> = OnceLock::new();
+// Gamma writes can originate from the IPC command thread or the main-window
+// timer. Serialize them so a slider update cannot interleave with compare's
+// temporary linear ramp or its restoration.
+static GAMMA_WRITE_LOCK: Mutex<()> = Mutex::new(());
+// Hold-to-compare is owned by the main window's message loop. RegisterHotKey
+// detects the press; a short-lived timer checks the physical key state until
+// the user releases any required key. No system-wide keyboard hook is needed.
+static HOLD_CONFIG_VK: AtomicU32 = AtomicU32::new(0);
+static HOLD_CONFIG_MODS: AtomicU32 = AtomicU32::new(0);
+static HOLD_ACTIVE_VK: AtomicU32 = AtomicU32::new(0);
+static HOLD_ACTIVE_MODS: AtomicU32 = AtomicU32::new(0);
+static HOLD_RESTORE: AtomicI32 = AtomicI32::new(0);
+static HOLD_HAS_RESTORE: AtomicBool = AtomicBool::new(false);
+static HOLD_STATE: AtomicU32 = AtomicU32::new(0);
+const HOLD_IDLE: u32 = 0;
+const HOLD_ACTIVE: u32 = 1;
+const HOLD_RESTORING: u32 = 2;
+// Private timer id; WM_TIMER wParam carries this value.
+const HOLD_TIMER_ID: usize = 0x4F48;
+const HOLD_TIMER_INTERVAL_MS: u32 = 40;
+
+pub fn set_current_lift(lift: Arc<AtomicI32>) {
+    let _ = CURRENT_LIFT.set(lift);
+}
+
+pub fn is_hold_compare_active() -> bool {
+    HOLD_STATE.load(Ordering::Acquire) != HOLD_IDLE
+}
+
+pub fn gamma_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    GAMMA_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
 
 // ── parse_hotkey ──────────────────────────────────────────────────────────────
 // Parses "Ctrl+Alt+F9" → (modifiers, vk). Returns None for "None", empty, or
@@ -201,6 +240,7 @@ pub fn init(app: AppHandle, hwnd: isize, config: &crate::config::AppConfig) {
     if let Ok(mut bindings) = BINDINGS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         *bindings = config.hotkeys.clone();
     }
+    sync_hold_binding();
     if let Err(errors) = register_all() {
         log::warn!("[hotkeys] some bindings failed to register: {errors}");
     }
@@ -291,6 +331,11 @@ pub fn set_hotkey(action: String, combo: String) -> Result<(), String> {
         }
         previous
     };
+    // Keep an already-active gesture bound to its snapshotted key/modifiers.
+    // The timer will restore it on physical release even if this setting is
+    // edited while the combo is held; do not touch the main-window timer or
+    // gamma from this IPC command thread.
+    sync_hold_binding();
     // Roll back the in-memory binding if registration fails so the UI never
     // shows a combo that isn't actually live.
     if let Err(errors) = register_all() {
@@ -304,6 +349,8 @@ pub fn set_hotkey(action: String, combo: String) -> Result<(), String> {
                 }
             }
         }
+        sync_hold_binding();
+        let _ = register_all();
         return Err(errors);
     }
     Ok(())
@@ -314,6 +361,10 @@ pub fn reset_hotkeys() -> Result<(), String> {
     if let Ok(mut bindings) = BINDINGS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         bindings.clear();
     }
+    // An active gesture keeps its key/modifier snapshot and is released by
+    // the existing main-window timer; reset must not perform gamma work from
+    // the IPC command thread.
+    sync_hold_binding();
     register_all()
 }
 
@@ -323,7 +374,184 @@ pub fn handle_hotkey(id: i32) {
     let Some((action, _, _)) = ACTIONS.iter().find(|(_, hk, _)| *hk == id) else {
         return;
     };
-    emit("hotkey-pressed", action);
+    if id == HK_HOLD_COMPARE {
+        apply_hold_gamma();
+    } else {
+        emit("hotkey-pressed", action);
+    }
+}
+
+pub fn handle_timer(timer_id: usize) {
+    if timer_id == HOLD_TIMER_ID {
+        poll_hold_release();
+    }
+}
+
+fn sync_hold_binding() {
+    let combo = current_bindings().get("hold_compare").cloned();
+    let Some(combo) = combo else {
+        HOLD_CONFIG_VK.store(0, Ordering::Release);
+        HOLD_CONFIG_MODS.store(0, Ordering::Release);
+        return;
+    };
+    let Some((mods, vk)) = parse_hotkey(&combo) else {
+        HOLD_CONFIG_VK.store(0, Ordering::Release);
+        HOLD_CONFIG_MODS.store(0, Ordering::Release);
+        return;
+    };
+    HOLD_CONFIG_MODS.store(mods, Ordering::Release);
+    HOLD_CONFIG_VK.store(vk, Ordering::Release);
+}
+
+fn stop_hold_timer() {
+    if let Some(hwnd) = main_hwnd() {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), HOLD_TIMER_ID);
+        }
+    }
+}
+
+fn finish_hold_restore() -> bool {
+    let _gamma_guard = GAMMA_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let restore = HOLD_RESTORE.load(Ordering::Acquire);
+    if HOLD_HAS_RESTORE.load(Ordering::Acquire) {
+        let ramp = crate::gamma_ramp::build_ramp(restore);
+        let mut applied = false;
+        for attempt in 0..3 {
+            if unsafe { crate::gamma_ramp::set_display_ramp(&ramp) } {
+                applied = true;
+                break;
+            }
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        if !applied {
+            log::error!("[hotkeys] hold-to-compare gamma restore failed after 3 attempts; retrying on the safety tick");
+            return false;
+        }
+    }
+    HOLD_RESTORE.store(0, Ordering::Release);
+    HOLD_HAS_RESTORE.store(false, Ordering::Release);
+    HOLD_ACTIVE_VK.store(0, Ordering::Release);
+    HOLD_ACTIVE_MODS.store(0, Ordering::Release);
+    HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
+    true
+}
+
+fn restore_hold_gamma() {
+    if HOLD_STATE
+        .compare_exchange(
+            HOLD_ACTIVE,
+            HOLD_RESTORING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    // Keep the timer stopped before the gamma write. The state remains
+    // non-idle until the write completes, so the safety worker cannot race a
+    // new hold or overwrite the restored ramp in the middle of this operation.
+    stop_hold_timer();
+    let _ = finish_hold_restore();
+}
+
+fn apply_hold_gamma() {
+    {
+        let _gamma_guard = GAMMA_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if HOLD_STATE
+            .compare_exchange(HOLD_IDLE, HOLD_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(lift) = CURRENT_LIFT
+            .get()
+            .map(|value| value.load(Ordering::Acquire))
+            .filter(|value| *value != 0)
+        else {
+            HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
+            return;
+        };
+        HOLD_RESTORE.store(lift, Ordering::Release);
+        HOLD_HAS_RESTORE.store(true, Ordering::Release);
+        HOLD_ACTIVE_VK.store(HOLD_CONFIG_VK.load(Ordering::Acquire), Ordering::Release);
+        HOLD_ACTIVE_MODS.store(HOLD_CONFIG_MODS.load(Ordering::Acquire), Ordering::Release);
+        let neutral = crate::gamma_ramp::build_linear_ramp();
+        let applied = unsafe { crate::gamma_ramp::set_display_ramp(&neutral) };
+        if !applied {
+            log::warn!("[hotkeys] hold-to-compare could not apply the linear gamma ramp");
+            HOLD_RESTORE.store(0, Ordering::Release);
+            HOLD_HAS_RESTORE.store(false, Ordering::Release);
+            HOLD_ACTIVE_VK.store(0, Ordering::Release);
+            HOLD_ACTIVE_MODS.store(0, Ordering::Release);
+            HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
+            return;
+        }
+    }
+
+    // SetTimer is deliberately outside the gamma lock. This keeps the lock
+    // order consistent with restoration (KillTimer first, gamma write second)
+    // and avoids a future cross-thread deadlock.
+    let timer_failed = match main_hwnd() {
+        Some(hwnd) => unsafe {
+            SetTimer(Some(hwnd), HOLD_TIMER_ID, HOLD_TIMER_INTERVAL_MS, None) == 0
+        },
+        None => true,
+    };
+    if timer_failed {
+        log::warn!("[hotkeys] hold-to-compare timer could not be started");
+        restore_hold_gamma();
+    }
+}
+
+/// Called by the main window subclass for the short period while compare is
+/// active. GetAsyncKeyState checks the complete physical combo, including the
+/// bound key and every required modifier; releasing any one ends the gesture.
+pub(crate) fn update_hold_restore_locked(value: i32) {
+    if HOLD_STATE.load(Ordering::Acquire) != HOLD_IDLE {
+        HOLD_RESTORE.store(value, Ordering::Release);
+        HOLD_HAS_RESTORE.store(true, Ordering::Release);
+    }
+}
+
+pub fn recover_hold_restore() {
+    if HOLD_STATE.load(Ordering::Acquire) == HOLD_RESTORING {
+        let _ = finish_hold_restore();
+    }
+}
+
+pub fn poll_hold_release() {
+    if HOLD_STATE.load(Ordering::Acquire) != HOLD_ACTIVE {
+        stop_hold_timer();
+        return;
+    }
+    let vk = HOLD_ACTIVE_VK.load(Ordering::Acquire);
+    let mods = HOLD_ACTIVE_MODS.load(Ordering::Acquire);
+    if vk == 0 || !key_is_down(vk) || !modifiers_are_down(mods) {
+        restore_hold_gamma();
+    }
+}
+
+fn key_is_down(vk: u32) -> bool {
+    unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+fn modifiers_are_down(mods: u32) -> bool {
+    let control_down = key_is_down(0xA2) || key_is_down(0xA3) || key_is_down(0x11);
+    let alt_down = key_is_down(0xA4) || key_is_down(0xA5) || key_is_down(0x12);
+    let shift_down = key_is_down(0xA0) || key_is_down(0xA1) || key_is_down(0x10);
+    let win_down = key_is_down(0x5B) || key_is_down(0x5C);
+    (mods & MOD_CONTROL.0 == 0 || control_down)
+        && (mods & MOD_ALT.0 == 0 || alt_down)
+        && (mods & MOD_SHIFT.0 == 0 || shift_down)
+        && (mods & MOD_WIN.0 == 0 || win_down)
 }
 
 fn emit(event: &str, action: &str) {
@@ -339,6 +567,14 @@ pub fn shutdown() {
                 let _ = UnregisterHotKey(Some(hwnd), id);
             }
         }
+    }
+    stop_hold_timer();
+    match HOLD_STATE.load(Ordering::Acquire) {
+        HOLD_ACTIVE => restore_hold_gamma(),
+        HOLD_RESTORING => {
+            let _ = finish_hold_restore();
+        }
+        _ => {}
     }
 }
 

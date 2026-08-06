@@ -50,6 +50,20 @@
     resMenuOpen = false;
   }
   function pickResolution(width, height) {
+    // A press on the list while its context menu was open sets
+    // resCtxDismissClick (document capture guard below). If a click still
+    // fires despite preventDefault, swallow it here instead of applying the
+    // item under the cursor. Also covers keyboard activation — Enter on a
+    // focused item — where no pointer event precedes the click: dismiss the
+    // menu instead of applying the item underneath it.
+    if (resCtxDismissClick) {
+      resCtxDismissClick = false;
+      return;
+    }
+    if (resCtxMenu.open) {
+      closeResContextMenu();
+      return;
+    }
     closeResMenu();
     changeResolution({ currentTarget: { value: `${width}x${height}` } });
   }
@@ -98,6 +112,17 @@
     hzMenuOpen = false;
   }
   function pickHz(hz) {
+    // Same dismissal-first behavior as pickResolution: swallow a click that
+    // slipped through after a dismiss press, and dismiss the menu instead of
+    // applying the item for keyboard activation.
+    if (hzCtxDismissClick) {
+      hzCtxDismissClick = false;
+      return;
+    }
+    if (hzCtxMenu.open) {
+      closeHzContextMenu();
+      return;
+    }
     closeHzMenu();
     changeRefreshRate({ currentTarget: { value: hz } });
   }
@@ -126,6 +151,10 @@
   // dropdowns. Mirror the calibration strip's .ctx-menu pattern in TabCrush.
   let resCtxMenu = $state({ open: false, x: 0, y: 0 });
   let resCtxMenuEl = $state(null);
+  // Set when a press on the resolution list dismissed the context menu, so a
+  // click that still fires (despite preventDefault) is swallowed by
+  // pickResolution instead of applying the item under the cursor.
+  let resCtxDismissClick = false;
   // Position a context menu at the cursor, clamped to stay on screen. Shared
   // by the open and reposition paths (right-clicking the open menu moves it
   // to the new cursor position instead of closing it). The menuW/menuH
@@ -165,6 +194,7 @@
 
   let hzCtxMenu = $state({ open: false, x: 0, y: 0 });
   let hzCtxMenuEl = $state(null);
+  let hzCtxDismissClick = false;
   function openHzContextMenu(e) {
     e.preventDefault();
     e.stopPropagation();
@@ -184,6 +214,39 @@
   function closeHzContextMenu() {
     hzCtxMenu = { ...hzCtxMenu, open: false };
   }
+
+  // While a context menu overlays its dropdown, a press anywhere on the
+  // dropdown list should only dismiss the context menu — never pick the item
+  // under the cursor. This is a native capture-phase listener on document so
+  // it runs before any element-level or document bubble handler (including
+  // the context menu's own outside-click closers, which would otherwise close
+  // the menu before the click could be attributed to it). Only the primary
+  // button is intercepted: right-click keeps its open/reposition behavior.
+  // preventDefault suppresses the click Chromium would synthesize for the
+  // item button; the dismiss flags below are the safety net in case one still
+  // fires. The flags are consumed by the pick functions and cleared on every
+  // other press, so they can never block a legitimate pick.
+  $effect(() => {
+    function onDocPointerDownCapture(e) {
+      const onResList = !!resMenuEl?.contains(e.target) && !resCtxMenuEl?.contains(e.target);
+      const onHzList = !!hzMenuEl?.contains(e.target) && !hzCtxMenuEl?.contains(e.target);
+      const resSwallow = resCtxMenu.open && onResList;
+      const hzSwallow = hzCtxMenu.open && onHzList;
+      if (e.button === 0 && (resSwallow || hzSwallow)) {
+        resCtxDismissClick = resSwallow;
+        hzCtxDismissClick = hzSwallow;
+        e.preventDefault();
+        e.stopPropagation();
+        if (resSwallow) closeResContextMenu();
+        if (hzSwallow) closeHzContextMenu();
+      } else {
+        resCtxDismissClick = false;
+        hzCtxDismissClick = false;
+      }
+    }
+    document.addEventListener('pointerdown', onDocPointerDownCapture, true);
+    return () => document.removeEventListener('pointerdown', onDocPointerDownCapture, true);
+  });
 
   // Pressing on the context menu's chrome (scrollbar, padding, labels)
   // dismisses it; pressing on an option button keeps it open. mousedown is
@@ -823,6 +886,8 @@
   });
 </script>
 
+<a href="#main-content" class="skip-to-content">Skip to main content</a>
+
 <div class="app-shell">
   <div class="top-bar">
     <div class="top-bar-left">
@@ -855,7 +920,8 @@
     <div class="sidebar-spacer"></div>
   </nav>
 
-  <main class="content">
+  <main class="content" id="main-content">
+    <div class="sr-only" aria-live="polite" aria-atomic="true" id="sr-announcer"></div>
     {#if windowVisible}
       {#if app.activeTab === 'crush'}
         <TabCrush />
@@ -972,6 +1038,7 @@
         {/if}
         {#if hzCtxMenu.open}
           <div class="ctx-menu compact" bind:this={hzCtxMenuEl} style="left:{hzCtxMenu.x}px; top:{hzCtxMenu.y}px;" role="menu" aria-label="Refresh rate list options" tabindex="-1" onmousedown={(e) => ctxChromeDismiss(e, closeHzContextMenu)} onclick={(e) => e.stopPropagation()} onkeydown={(e) => handleCtxMenuKeydown(e, closeHzContextMenu)} oncontextmenu={repositionHzContextMenu}>
+            <div class="ctx-menu-subheading">Sort</div>
             <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.refreshRateSort === 'asc'} onclick={() => hzCtxAction(() => setRefreshRateSort('asc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Ascending</button>
             <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.refreshRateSort === 'desc'} onclick={() => hzCtxAction(() => setRefreshRateSort('desc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Descending</button>
           </div>

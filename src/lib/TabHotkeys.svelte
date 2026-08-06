@@ -9,12 +9,13 @@
     { key: 'toggle_black_crush', label: 'Toggle Black Crush', desc: 'Enable or disable the black level adjustment.' },
     { key: 'decrease_black_crush', label: 'Decrease Black Level', desc: 'Lower the black level. Hold to repeat.' },
     { key: 'increase_black_crush', label: 'Increase Black Level', desc: 'Raise the black level. Hold to repeat.' },
+    { key: 'hold_compare', label: 'Hold to Compare', desc: 'Temporarily disable black level while held. Restores on release.' },
     { key: 'toggle_taskbar_dimmer', label: 'Toggle Taskbar Dimmer', desc: 'Show or hide the taskbar overlay.' },
     { key: 'toggle_hdr', label: 'Toggle HDR/SDR', desc: 'Switch Windows HDR on or off.' },
   ];
 
   const SECTIONS = [
-    { title: 'Black Crush Tweak', keys: ['toggle_black_crush', 'decrease_black_crush', 'increase_black_crush'] },
+    { title: 'Black Crush Tweak', keys: ['toggle_black_crush', 'decrease_black_crush', 'increase_black_crush', 'hold_compare'] },
     { title: 'Taskbar Dimmer', keys: ['toggle_taskbar_dimmer'] },
     { title: 'System', keys: ['toggle_hdr'] },
   ];

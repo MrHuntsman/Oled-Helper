@@ -60,15 +60,34 @@
     resetAllConfirmOpen = false;
   }
 
-  // Confirm modal: close on outside click, Escape, or focus moves back to the
-  // trigger button after closing.
+  // Confirm modal: close on outside click, Escape, and trap Tab between
+  // the two buttons so focus never escapes to elements behind the backdrop.
+  function onResetAllKeydown(e) {
+    if (e.key === 'Escape') {
+      closeResetAllConfirm();
+      resetAllBtnEl?.focus();
+      return;
+    }
+    if (e.key === 'Tab') {
+      const cancel = resetAllConfirmEl?.querySelector('.modal-btn-cancel');
+      const confirm = resetAllConfirmEl?.querySelector('.modal-btn-danger');
+      if (!cancel || !confirm) return;
+      if (e.shiftKey && document.activeElement === cancel) {
+        e.preventDefault();
+        confirm.focus();
+      } else if (!e.shiftKey && document.activeElement === confirm) {
+        e.preventDefault();
+        cancel.focus();
+      }
+    }
+  }
   $effect(() => {
     if (!resetAllConfirmOpen) return;
     function onDocPointerDown(e) {
       if (resetAllConfirmEl?.contains(e.target) || resetAllBtnEl?.contains(e.target)) return;
       closeResetAllConfirm();
     }
-    function onKeydown(e) {
+    function onDocKey(e) {
       if (e.key === 'Escape') {
         closeResetAllConfirm();
         resetAllBtnEl?.focus();
@@ -78,11 +97,11 @@
     // predictably and screen readers announce it as a dialog.
     const focusId = setTimeout(() => resetAllConfirmEl?.querySelector('.modal-btn-cancel')?.focus(), 0);
     document.addEventListener('pointerdown', onDocPointerDown);
-    document.addEventListener('keydown', onKeydown);
+    document.addEventListener('keydown', onDocKey);
     return () => {
       clearTimeout(focusId);
       document.removeEventListener('pointerdown', onDocPointerDown);
-      document.removeEventListener('keydown', onKeydown);
+      document.removeEventListener('keydown', onDocKey);
     };
   });
 
@@ -164,7 +183,7 @@
 
   {#if resetAllConfirmOpen}
     <div class="modal-backdrop" role="presentation">
-      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reset-all-title" aria-describedby="reset-all-desc" bind:this={resetAllConfirmEl}>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reset-all-title" aria-describedby="reset-all-desc" tabindex="-1" onkeydown={onResetAllKeydown} bind:this={resetAllConfirmEl}>
         <div class="modal-title" id="reset-all-title">Reset all settings?</div>
         <p class="modal-desc" id="reset-all-desc">
           This restores every setting to its default and cannot be undone.

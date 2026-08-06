@@ -30,7 +30,7 @@ mod display_change_events {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_NCDESTROY, WM_SETTINGCHANGE,
+        WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_NCDESTROY, WM_SETTINGCHANGE, WM_TIMER,
     };
 
     const SUBCLASS_ID: usize = 0x4F4C_4449; // "OLDI"
@@ -50,6 +50,9 @@ mod display_change_events {
             // subclass), where WM_HOTKEY messages are delivered.
             WM_HOTKEY => {
                 crate::hotkeys::handle_hotkey(wparam.0 as i32);
+            }
+            WM_TIMER => {
+                crate::hotkeys::handle_timer(wparam.0);
             }
             WM_DISPLAYCHANGE => {
                 if let Some(app) = APP.get() {
@@ -149,6 +152,14 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
         }
         // A timeout is the normal two-second safety tick. The predicate also
         // closes the lost-notification race during shutdown.
+        // Hold-to-compare applies neutral gamma directly on the hardware
+        // without updating `desired`. Don't overwrite its comparison view.
+        if crate::hotkeys::is_hold_compare_active() {
+            // The main-window timer owns release detection and restoration.
+            // Never overwrite the temporary linear comparison ramp here.
+            crate::hotkeys::recover_hold_restore();
+            continue;
+        }
         let value = desired.load(Ordering::Relaxed);
         // When black lift is zero the system ramp is linear (OS default) —
         // nothing to restore. Skip the GDI call to keep the thread truly idle
@@ -256,12 +267,20 @@ fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), Str
     // Frontend clamps to ±150 already; clamp here too so a stray caller can
     // never drive the ramp math with an extreme value.
     let black_lift = black_lift.clamp(-150, 150);
-    let ramp = gamma_ramp::build_ramp(black_lift);
-    let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
-    if !applied {
-        return Err("SetDeviceGammaRamp failed".into());
+    // Hold the same gamma lock across the state check, desired-value update,
+    // and possible write. If release completes just before this command gets
+    // the lock, this path applies the newest value instead of leaving the
+    // linear compare ramp or an older restore value behind.
+    let _gamma_guard = crate::hotkeys::gamma_write_guard();
+    if !crate::hotkeys::is_hold_compare_active() {
+        let ramp = gamma_ramp::build_ramp(black_lift);
+        let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
+        if !applied {
+            return Err("SetDeviceGammaRamp failed".into());
+        }
     }
     state.desired.store(black_lift, Ordering::Relaxed);
+    crate::hotkeys::update_hold_restore_locked(black_lift);
     Ok(())
 }
 
@@ -660,9 +679,11 @@ pub fn run() {
             show_main_window(app);
         }));
     }
+    let gamma_desired = Arc::new(AtomicI32::new(0));
+    crate::hotkeys::set_current_lift(gamma_desired.clone());
     builder
         .manage(GammaState {
-            desired: Arc::new(AtomicI32::new(0)),
+            desired: gamma_desired,
             shutdown: Arc::new(GammaShutdown {
                 requested: AtomicBool::new(false),
                 wake: Condvar::new(),

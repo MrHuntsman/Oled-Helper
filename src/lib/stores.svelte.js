@@ -237,9 +237,7 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && (cfg.display_menu_refresh_rate_sort === 'asc' || cfg.display_menu_refresh_rate_sort === 'desc')) displayMenuPrefs.refreshRateSort = cfg.display_menu_refresh_rate_sort;
     if (cfg && cfg.hotkeys && typeof cfg.hotkeys === 'object') {
       for (const [action, combo] of Object.entries(cfg.hotkeys)) {
-        // Skip actions that no longer exist (e.g. the removed hold_compare
-        // bind) so stale combos never linger in the store or get re-saved.
-        if (action !== 'hold_compare' && typeof combo === 'string') hotkeys[action] = combo;
+        if (typeof combo === 'string') hotkeys[action] = combo;
       }
     }
     try {
