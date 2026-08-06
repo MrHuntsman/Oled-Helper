@@ -70,10 +70,10 @@ mod platform {
         SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
         GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT,
         HWND_TOPMOST, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-        WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT,
-        WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-        WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
+        SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP,
+        WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WNDCLASSW, WS_CAPTION,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
     };
 
     // One adaptive timer handles both cursor polling and animation. It runs
@@ -216,9 +216,6 @@ mod platform {
     // window exists is cleared so the overlay re-shows instead of staying
     // hidden forever.
     static MENU_POPUP_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
-    // HWND of the popup most recently promoted above the overlay. This keeps
-    // the WinEvent and fallback repair paths idempotent while a menu is open.
-    static PROMOTED_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
     // True when the foreground window is at a higher integrity level than
     // this process (e.g. an elevated admin prompt / game). WH_MOUSE_LL
     // still fires, but MSLLHOOKSTRUCT.pt is zeroed — the hook callback
@@ -480,7 +477,6 @@ mod platform {
             post_dimmer_repair();
         } else if event == EVENT_SYSTEM_MENUPOPUPEND {
             MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
-            PROMOTED_MENU_HWND.store(0, Ordering::Release);
             *MENU_POPUP_SINCE.lock().unwrap() = None;
             post_dimmer_repair();
         }
@@ -580,12 +576,7 @@ mod platform {
             // fires — the app becomes foreground first, THEN creates its
             // menu. Post a second repair 50ms later so the menu window
             // has time to appear before we scan for it.
-            let _ = std::thread::Builder::new()
-                .name("taskbar-dimmer-delayed-repair".into())
-                .spawn(|| {
-                    std::thread::sleep(Duration::from_millis(50));
-                    post_dimmer_repair();
-                });
+            post_dimmer_repair();
         }
     }
 
@@ -718,7 +709,6 @@ mod platform {
         // A menu could have been open when the hooks came down; clear the
         // flag so the repair's FindWindowW scan alone decides its z-order.
         MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
-        PROMOTED_MENU_HWND.store(0, Ordering::Release);
         *MENU_POPUP_SINCE.lock().unwrap() = None;
         ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
         ELEVATION_WINEVENT_THREAD_ID.store(0, Ordering::Relaxed);
@@ -764,7 +754,6 @@ mod platform {
         }
         ELEVATION_WINEVENT_HOOK.store(0, Ordering::Relaxed);
         MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
-        PROMOTED_MENU_HWND.store(0, Ordering::Release);
         *MENU_POPUP_SINCE.lock().unwrap() = None;
     }
 
@@ -927,17 +916,6 @@ mod platform {
             }
         }
         None
-    }
-
-    // Windows popup menus, including the native Tauri tray menu, use the
-    // standard #32768 window class. While one is tracked, z-order repair is
-    // paused so the overlay cannot be moved across the menu/taskbar boundary
-    // or demote the shell's topmost ownership relationship.
-    fn open_popup_menu() -> Option<HWND> {
-        unsafe {
-            let class = wide("#32768");
-            FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()).ok()
-        }
     }
 
     fn rects_intersect(a: RECT, b: RECT) -> bool {
@@ -1109,51 +1087,11 @@ mod platform {
         };
         unsafe {
             // Detect popup menus before changing ownership. If Explorer is
-            // rebuilding the taskbar while a menu is open, even a seemingly
-            // harmless owner update can disturb the menu/taskbar boundary.
-            let popup = open_popup_menu();
+            // While a system menu is open, pause repairs entirely.
+            // The GetTopWindow walk below catches visible menus when they
+            // exist; this flag covers the brief window where MENUPOPUPSTART
+            // has fired but the menu window isn't in the z-order yet.
             if MENU_POPUP_OPEN.load(Ordering::Relaxed) {
-                let since = *MENU_POPUP_SINCE.lock().unwrap();
-                if popup.is_none()
-                    && since.is_some_and(|t| t.elapsed() > Duration::from_millis(400))
-                {
-                    MENU_POPUP_OPEN.store(false, Ordering::Relaxed);
-                    *MENU_POPUP_SINCE.lock().unwrap() = None;
-                }
-            }
-            if let Some(popup) = popup {
-                let mut popup_rect = RECT::default();
-                let popup_intersects_taskbar = GetWindowRect(popup, &mut popup_rect).is_ok()
-                    && rects_intersect(popup_rect, rect);
-                if popup_intersects_taskbar {
-                    // Keep the dimmer visible, but put only the overlapping
-                    // native menu above it. Promoting unrelated #32768 menus
-                    // elsewhere on the desktop would unnecessarily alter
-                    // another application's window ordering.
-                    let popup_raw = popup.0 as isize;
-                    if PROMOTED_MENU_HWND.load(Ordering::Acquire) != popup_raw {
-                        let _ = SetWindowPos(
-                            popup,
-                            Some(HWND_TOPMOST),
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-                        );
-                        PROMOTED_MENU_HWND.store(popup_raw, Ordering::Release);
-                    }
-                } else {
-                    PROMOTED_MENU_HWND.store(0, Ordering::Release);
-                }
-                // In either case, pause repair while the menu is tracked.
-                return;
-            }
-            PROMOTED_MENU_HWND.store(0, Ordering::Release);
-            if MENU_POPUP_OPEN.load(Ordering::Relaxed) {
-                // A short-lived popup can disappear between the WinEvent and
-                // fallback snapshots. Keep repair paused until MENUPOPUPEND,
-                // but do not hide the overlay.
                 return;
             }
 
@@ -1238,46 +1176,6 @@ mod platform {
                 };
             if in_place {
                 return;
-            }
-
-            // Belt-and-suspenders: a menu can be spawned between the
-            // initial popup check above and this SetWindowPos (timing race:
-            // foreground event fires before MENUPOPUPSTART, so a repair
-            // message may execute while the menu window exists but
-            // MENU_POPUP_OPEN hasn't been set yet). Re-check right before
-            // committing so a newly created popup is never covered.
-            // Uses `forced` (pre-decrement) so the guard still fires on the
-            // last forced repair; also checks MENU_POPUP_OPEN in case it was
-            // set between entry and now but the window isn't findable yet.
-            let menu_flag_now = MENU_POPUP_OPEN.load(Ordering::Acquire);
-            if forced || menu_flag_now {
-                if let Some(late_popup) = open_popup_menu() {
-                    let mut late_rect = RECT::default();
-                    if GetWindowRect(late_popup, &mut late_rect).is_ok()
-                        && rects_intersect(late_rect, rect)
-                    {
-                        let late_raw = late_popup.0 as isize;
-                        if PROMOTED_MENU_HWND.load(Ordering::Acquire) != late_raw {
-                            let _ = SetWindowPos(
-                                late_popup,
-                                Some(HWND_TOPMOST),
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-                            );
-                            PROMOTED_MENU_HWND.store(late_raw, Ordering::Release);
-                        }
-                        return;
-                    }
-                }
-                if menu_flag_now {
-                    // MENUPOPUPSTART fired but the #32768 window isn't
-                    // findable yet. Stand down so the next repair cycle
-                    // (which will see the flag set at entry) can handle it.
-                    return;
-                }
             }
 
             if VERBOSE_LOGGING.load(Ordering::Relaxed) {
@@ -2208,8 +2106,7 @@ mod platform {
             // specially: apply() may be called while a menu is open, so keep
             // the move/size/show operation but explicitly preserve its current
             // z-order and let the menu-safe repair path handle ordering.
-            let popup_active =
-                open_popup_menu().is_some() || MENU_POPUP_OPEN.load(Ordering::Relaxed);
+            let popup_active = MENU_POPUP_OPEN.load(Ordering::Relaxed);
             let insert_after = active_flyout_window().unwrap_or(HWND_TOPMOST);
             let zorder_flags = if popup_active {
                 SWP_NOZORDER
