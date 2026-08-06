@@ -1998,6 +1998,21 @@ mod platform {
         stop_elevation_win_event();
     }
 
+    // Maps a user-facing opacity (0..1) to an 8-bit alpha value with a 1:1
+    // top half: 100%→255, 99%→254, …, 50%→205 — every integer percentage
+    // from 50 to 100 maps to its own distinct alpha level, so no two slider
+    // positions repeat a value. Below 50% there are more percentages than
+    // remaining alpha levels (0–50% → 0–205), so the curve skips levels to
+    // stay strictly increasing without repeats.
+    fn opacity_to_alpha(opacity: f64) -> f64 {
+        let pct = (opacity.clamp(0.0, 1.0) * 100.0).clamp(0.0, 100.0);
+        if pct >= 50.0 {
+            255.0 - (100.0 - pct)
+        } else {
+            pct / 50.0 * 205.0
+        }
+    }
+
     pub fn apply(
         raw: isize,
         enabled: bool,
@@ -2016,7 +2031,7 @@ mod platform {
             .ok_or_else(|| "Windows taskbar was not found".to_string())?;
         let rect = taskbar.1;
         let hwnd = HWND(raw as *mut c_void);
-        let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round();
+        let alpha = opacity_to_alpha(opacity);
         let hovered = enabled && cursor_over_rect(rect).0;
         // Seed the hook's hover cache + hit-test rect so it doesn't fire a
         // spurious poke for a state that predates its installation.

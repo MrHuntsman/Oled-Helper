@@ -26,10 +26,14 @@
     };
   });
 
-  // Snap to the nearest tick (every 10, 10–90) when the raw value lands
-  // within a few points of one, mirroring the Black Level slider's
-  // snap-to-zero (normalizeBlackLevel in TabCrush.svelte). 0 and 100 aren't
-  // included since the track's own ends already act as a natural stop there.
+  // Integer slider values map 1:1 to distinct alpha levels in the Rust
+  // curve (100%→255, 99%→254, … 50%→205; below 50% the curve skips levels
+  // to stay increasing), so every displayed percentage is unique — no two
+  // slider positions repeat a readout. Snap to the nearest tick (every 10,
+  // 10–90) when the raw value lands within a few points of one, mirroring
+  // the Black Level slider's snap-to-zero (normalizeBlackLevel in
+  // TabCrush.svelte). 0 and 100 aren't included since the track's own ends
+  // already act as a natural stop there.
   const TICKS = [10, 20, 30, 40, 50, 60, 70, 80, 90];
   const SNAP_TOLERANCE = 1;
   function normalizeOpacityValue(value) {
@@ -41,7 +45,11 @@
 
   function handleOpacityInput(event) {
     const raw = +event.currentTarget.value;
-    const normalized = normalizeOpacityValue(raw);
+    // Snap to nearby ticks only while actually dragging with the pointer.
+    // Keyboard arrows don't fire pointerdown, so they bypass the snap —
+    // otherwise pressing an arrow from a snapped position (e.g. 50) lands on
+    // 51, which is inside the tolerance band, and gets pulled straight back.
+    const normalized = opacityDragging ? normalizeOpacityValue(raw) : raw;
     if (raw !== normalized) event.currentTarget.value = normalized;
     setTaskbarDimmer(taskbarDimmer.enabled, normalized / 100, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeOutDurationMs, true, true);
   }
