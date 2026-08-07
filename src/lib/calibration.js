@@ -13,6 +13,74 @@ export const ALL_SDR_CODES = [
 ];
 
 export const GAP_FRACTION = 0.008;
+// High Nits is a spreadsheet-style grid rather than a single row of PQ/RGB
+// columns; the same 0.008 gap used for the black strip made the grid look
+// like it had visible seams between cells, so it renders edge-to-edge.
+export const HIGH_NITS_GAP_FRACTION = 0;
+
+// ── High Nits strip ─────────────────────────────────────────────────
+// A second calibration strip shown as a spreadsheet-style grid of solid
+// cells (rows × columns), each cell a different value. Reading order is
+// left→right, top→bottom, from lower to higher nits. In SDR it shows a
+// bright-RGB ramp instead.
+
+// Fixed nits ladder, ascending. Coarse at the top, fine at the bottom
+// (user: "go from 10000 to 4000 to 2000 to 1000, and then start slowing
+// down to get more granularity"). This is a placeholder the user will
+// refine — edit this single array.
+export const HIGH_NITS_LADDER = [
+  100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 800,
+  1000, 1200, 1500, 2000, 3000, 4000, 5000, 6000, 8000, 10000,
+];
+
+// SDR bright range: 255 down to 232, i.e. 24 values ascending (232..255),
+// same quantity as the SDR black codes. No midrange values.
+export const HIGH_SDR_RANGE = [];
+for (let c = 232; c <= 255; c++) HIGH_SDR_RANGE.push(c);
+
+// Strip registry — adding a third strip later is one new entry here.
+// `label` is the heading button / context-menu text; `title` its tooltip.
+export const STRIPS = [
+  {
+    id: 'black',
+    label: 'Black',
+    title: 'Black calibration strip — dark PQ/RGB ramp for black level tuning',
+  },
+  {
+    id: 'highNits',
+    label: 'High Nits',
+    title: 'High nits grid strip — ascending brightness cells to judge peak output',
+  },
+];
+
+// nits → scRGB (linear) relative to 80 nits = 1.0 reference white, matching
+// the black strip's PQ mapping convention (pqCodeToScrgb divides by 80).
+export function nitsToScrgb(nits) {
+  return nits / 80;
+}
+
+// Window into a ladder for a given square count. More cells = finer
+// (lower-nits) steps; fewer cells = coarser spread reaching the top.
+// Returns a contiguous slice; ordering stays ascending.
+export function highNitsWindow(ladder, squareCount) {
+  const M = ladder.length;
+  const n = Math.max(2, Math.min(squareCount, MAX_SQUARES));
+  if (M <= n) return ladder.slice(0, n);
+  const f = (n - 2) / (MAX_SQUARES - 2);
+  const start = Math.round((M - n) * (1 - f));
+  return ladder.slice(start, start + n);
+}
+
+// Render values for the High Nits strip. HDR: nits → scRGB → sRGB-encoded.
+// SDR: code/255 through the sRGB round-trip like the black SDR strip.
+export function computeHighNitsValues(squareCount, isHdr) {
+  const codes = highNitsWindow(isHdr ? HIGH_NITS_LADDER : HIGH_SDR_RANGE, squareCount);
+  return codes.map((code) => (
+    isHdr
+      ? linearToSrgb(nitsToScrgb(code))
+      : linearToSrgb(srgbToLinear(code / 255))
+  ));
+}
 
 export function srgbToLinear(c) {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);

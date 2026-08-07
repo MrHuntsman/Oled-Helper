@@ -2,14 +2,14 @@
   // Inlined data URIs — see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
-  import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, ctxMenuDismissTick } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick } from './stores.svelte.js';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
   // duplicated in either destination.
   const dlog = (msg) => { console.log('[gpu]', msg); };
   const dwarn = (msg) => { console.warn('[gpu]', msg); };
   const derr = (msg) => { console.error('[gpu]', msg); };
-  import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, computeHdrValues, computeSdrValues } from './calibration.js';
+  import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_NITS_LADDER, HIGH_SDR_RANGE, computeHdrValues, computeSdrValues, computeHighNitsValues, highNitsWindow } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
   import { onDestroy, untrack } from 'svelte';
 
@@ -33,6 +33,73 @@
   const HDR_VALUES = computeHdrValues();
   const SDR_VALUES = computeSdrValues();
 
+  // Heading title + square label helpers, driven by the active strip. The
+  // High Nits strip shows a windowed nits ladder (HDR) or bright RGB range
+  // (SDR); the black strip keeps the existing PQ/RGB code labels.
+  function stripTitle() {
+    const isHdr = app.hdrStatus === 'hdr';
+    if (crush.stripType === 'highNits') {
+      return isHdr ? 'HDR High Nits' : 'SDR High Nits';
+    }
+    return isHdr ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)';
+  }
+
+  function stripLabels() {
+    const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
+    const sq = activeSquareCount();
+    if (crush.stripType === 'highNits') {
+      const codes = highNitsWindow(isHdr ? HIGH_NITS_LADDER : HIGH_SDR_RANGE, sq);
+      return codes.map((code) => ({ code: String(code), unit: isHdr ? 'nits' : 'RGB' }));
+    }
+    const codes = isHdr ? ALL_PQ_CODES : ALL_SDR_CODES;
+    return codes.slice(0, sq).map((code, i) => ({
+      code: String(code),
+      unit: i === 0 ? 'Black' : (isHdr ? 'PQ' : 'RGB'),
+    }));
+  }
+
+  function labelCount() {
+    if (crush.stripType === 'highNits') {
+      const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
+      return highNitsWindow(isHdr ? HIGH_NITS_LADDER : HIGH_SDR_RANGE, activeSquareCount()).length;
+    }
+    return activeSquareCount();
+  }
+
+  // Grid geometry for the current strip, matching the shader exactly
+  // (cells, cols, rows). Black = one row of sq cells; high-nits = a
+  // spreadsheet grid that fills the whole strip area: cols/rows are chosen so
+  // the cells are as square as the container's aspect ratio allows, with a
+  // slight preference for layouts that use every slot (no empty rows — the
+  // grid always fills the strip, unlike a fixed 10-row layout which left a
+  // black block below the last filled row).
+  let stripGeom = $state({ cells: 12, cols: 12, rows: 1 });
+  function computeStripGeom() {
+    if (crush.stripType === 'highNits') {
+      const cells = labelCount();
+      const cw = canvas?.clientWidth || 0;
+      const ch = canvas?.clientHeight || 0;
+      const aspect = cw > 0 && ch > 0 ? cw / ch : 1.9;
+      let best = null;
+      let bestScore = Infinity;
+      const maxCols = Math.min(cells, 16);
+      for (let cols = 1; cols <= maxCols; cols++) {
+        const rows = Math.max(1, Math.ceil(cells / cols));
+        const empty = cols * rows - cells;
+        const score = Math.abs(Math.log((cols / rows) / aspect)) + empty * 0.02;
+        if (score < bestScore) { bestScore = score; best = { cells, cols, rows }; }
+      }
+      return best ?? { cells, cols: 1, rows: Math.max(1, cells) };
+    }
+    const sq = activeSquareCount();
+    return { cells: sq, cols: sq, rows: 1 };
+  }
+  function refreshStripGeom() { stripGeom = computeStripGeom(); }
+
+  // Uniform layout: values[24] cell colors, then counts = (cells, cols,
+  // rows, gap). Cells are laid out row-major (left→right, top→bottom) like a
+  // spreadsheet. The black strip is a single row (rows=1, cols=sq); the
+  // high-nits strip is a rows×cols grid.
   const SHADER = `struct Cb{values:array<vec4<f32>,6>,counts:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
 struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 @vertex fn vs(@builtin(vertex_index)i:u32)->VO{
@@ -41,11 +108,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   return VO(vec4f(p,0,1),p*vec2f(.5,-.5)+vec2f(.5,.5));
 }
 @fragment fn fs(vin:VO)->@location(0)vec4f{
-  let sq=i32(cb.counts.x);let gf=cb.counts.w;
-  let sw=(1-gf*f32(sq-1))/f32(sq);let cw=sw+gf;
-  let col=i32(floor(vin.uv.x/cw));let xf=fract(vin.uv.x/cw)*cw;
-  if(xf>sw||col>=sq){return vec4f(0);}
-  let g=col/4;return vec4f(cb.values[g][col%4]);
+  let cells=i32(cb.counts.x);let cols=i32(cb.counts.y);let rows=i32(cb.counts.z);let gf=cb.counts.w;
+  let sw=(1-gf*f32(cols-1))/f32(cols);let cw=sw+gf;
+  let sh=(1-gf*f32(rows-1))/f32(rows);let ch=sh+gf;
+  let col=i32(floor(vin.uv.x/cw));let row=i32(floor(vin.uv.y/ch));
+  let xf=fract(vin.uv.x/cw)*cw;let yf=fract(vin.uv.y/ch)*ch;
+  if(xf>sw||yf>sh||col>=cols||row>=rows){return vec4f(0);}
+  let idx=row*cols+col;
+  if(idx>=cells){return vec4f(0);}
+  let g=idx/4;return vec4f(cb.values[g][idx%4]);
 }`;
 
   let sliderDragging = $state(false);
@@ -271,6 +342,17 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   function render() {
     if (!ready || !device || !canvas) return;
     try {
+      // Keep the shader's grid geometry and the DOM label grid in sync — the
+      // aspect ratio (and therefore cols/rows) can change on every resize.
+      //
+      // untrack: refreshStripGeom() writes the stripGeom state and render()
+      // reads it below (high-nits branch). Both run inside the $effect that
+      // drives rendering, so without untrack the write registers that effect
+      // as a dependent of stripGeom → it re-runs → writes again (a fresh
+      // object each time) → effect_update_depth_exceeded. This only hit the
+      // high-nits strip because its branch actually reads stripGeom (the
+      // black strip builds grid inline and never tracked it).
+      untrack(() => refreshStripGeom());
       const dpr = devicePixelRatio || 1;
       const clientWidth = canvas.clientWidth;
       const clientHeight = canvas.clientHeight;
@@ -281,12 +363,26 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       const h = Math.round(clientHeight * dpr);
       if (w < 1 || h < 1) return;
       if (w !== canvas.width || h !== canvas.height) { canvas.width = w; canvas.height = h; }
-      const sq = crush.squareCount;
+      const sq = activeSquareCount();
       const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
-      const vals = isHdr ? HDR_VALUES : SDR_VALUES;
+      const highNits = crush.stripType === 'highNits';
+      // High Nits: render the windowed ladder/bright range (may be shorter
+      // than sq when the ladder is smaller than the chosen square count),
+      // laid out row-major across a spreadsheet grid.
+      let vals, grid;
+      if (highNits) {
+        vals = computeHighNitsValues(sq, isHdr);
+        grid = untrack(() => stripGeom);
+      } else {
+        vals = isHdr ? HDR_VALUES : SDR_VALUES;
+        grid = { cells: sq, cols: sq, rows: 1 };
+      }
       const data = new Float32Array(28);
-      for (let i = 0; i < 24; i++) data[i] = i < sq ? vals[i] : 0;
-      data[24] = sq; data[25] = sq; data[26] = 1; data[27] = GAP_FRACTION;
+      for (let i = 0; i < 24; i++) data[i] = i < grid.cells ? vals[i] : 0;
+      data[24] = grid.cells;
+      data[25] = grid.cols;
+      data[26] = grid.rows;
+      data[27] = highNits ? HIGH_NITS_GAP_FRACTION : (crush.blackStripGapEnabled ? GAP_FRACTION : 0);
       device.queue.writeBuffer(ub, 0, data);
 
       let tex;
@@ -312,7 +408,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     if (canvas && !initStarted) initGPU();
   });
   $effect(() => {
-    void crush.squareCount; void app.hdrStatus;
+    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void canvas;
+    // untrack the geometry write: stripGeom is a $state read by the template
+    // and by render() (high-nits grid). Writing it from inside this effect —
+    // whose render() call reads it — would re-schedule the effect on every
+    // run, tripping effect_update_depth_exceeded. The template still updates
+    // because untracked writes still notify its reactive dependents.
+    untrack(() => refreshStripGeom());
     if (ready) {
       reconfigureForFormat(app.hdrStatus === 'hdr' && !forceSdrRender);
       render();
@@ -332,6 +434,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       resizeRaf = requestAnimationFrame(() => {
         resizeRaf = 0;
+        refreshStripGeom();
         render();
       });
     });
@@ -524,6 +627,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     crush.fullscreen = mode;
     closeContextMenu();
   }
+  function selectStrip(type) {
+    setStripType(type);
+    closeContextMenu();
+  }
 
   // Mouse wheel over the strip changes the zoom (square count). Wheeling up
   // (negative deltaY) increases zoom, down decreases — matches typical
@@ -531,7 +638,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   function handleStripWheel(e) {
     e.preventDefault();
     const dir = e.deltaY < 0 ? 1 : -1;
-    crush.squareCount = Math.min(MAX_SQUARES, Math.max(2, crush.squareCount + dir));
+    crush.squareCounts[crush.stripType] = Math.min(MAX_SQUARES, Math.max(2, activeSquareCount() + dir));
   }
 
   // ── Right-click context menu on the strip ──────────────────────────
@@ -539,7 +646,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let ctxMenuElement = $state(null);
   function openContextMenu(e) {
     e.preventDefault();
-    const menuW = 260, menuH = 300;
+    const menuW = 260, menuH = 400;
     const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
     const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
     ctxMenu = { open: true, x, y };
@@ -618,10 +725,16 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     setHideCalibrationInterface(!crush.hideCalibrationInterface);
   }
 
+  function toggleBlackStripGap() {
+    setBlackStripGapEnabled(!crush.blackStripGapEnabled);
+  }
+
   function restoreDefaults() {
     crush.adjustment = 0;
     crush.blackEnabled = true;
-    crush.squareCount = 12;
+    crush.squareCounts = { black: 12, highNits: 8 };
+    crush.blackStripGapEnabled = true;
+    crush.stripType = 'black';
     crush.fullscreen = 'normal';
     saveConfig();
   }
@@ -683,11 +796,19 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   <div class="separator"></div>
 
   {#snippet calibrationTip()}
-    <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
-    <span class="info-tip-note">
-      <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
-      <span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span>
-    </span>
+    {#if crush.stripType === 'highNits'}
+      <span>Each cell is a different brightness, ordered left to right, top to bottom, from lower to higher. Find the highest nits you can still see as distinct — beyond that your display clips it to solid white.</span>
+      <span class="info-tip-note">
+        <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
+        <span>HDR shows a nits ladder up to {HIGH_NITS_LADDER[HIGH_NITS_LADDER.length - 1]} nits; SDR shows bright RGB {HIGH_SDR_RANGE[0]}…{HIGH_SDR_RANGE[HIGH_SDR_RANGE.length - 1]}.</span>
+      </span>
+    {:else}
+      <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
+      <span class="info-tip-note">
+        <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
+        <span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span>
+      </span>
+    {/if}
     <div class="fs-hint-sep"></div>
     <div class="fs-controls-heading">Controls</div>
     <div class="fs-controls-block">
@@ -731,9 +852,17 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <p class="gpu-status">Detecting HDR status...</p>
     {:else}
       <p class="strip-heading">
-        <strong>{app.hdrStatus === 'hdr' ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)'}</strong>
+        <span class="strip-switch" role="group" aria-label="Calibration strip">
+          {#each STRIPS as strip}
+            <button type="button" class="strip-switch-btn" class:active={crush.stripType === strip.id}
+              aria-pressed={crush.stripType === strip.id}
+              title={strip.title}
+              onclick={() => setStripType(strip.id)}>{strip.label}</button>
+          {/each}
+        </span>
+        <strong>{stripTitle()}</strong>
         <span class="info-tip-wrap">
-          <button class="info-tip-btn" aria-label="About black calibration and strip controls" tabindex="0">Info</button>
+          <button class="info-tip-btn" aria-label="About the calibration strip and controls" tabindex="0">Info</button>
           <span class="info-tip">{@render calibrationTip()}</span>
         </span>
       </p>
@@ -743,22 +872,30 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <p class="gpu-error">{gpuError}</p>
     {/if}
 
-    <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
+    <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} class:high-nits={crush.stripType === 'highNits'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
       onclick={handleStripClick} onkeydown={handleStripKeydown} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0" aria-label="Calibration strip. Double-click or press Enter or Space to cycle fullscreen mode.">
       <canvas bind:this={canvas}></canvas>
       {#if app.hdrStatus !== 'unknown' && !crush.hideCalibrationInterface}
-        <div class="square-labels" style="--sq-count:{crush.squareCount}">
-          {#each Array(crush.squareCount) as _, i}
-            {@const code = app.hdrStatus === 'hdr'
-              ? (i === 0 ? '64' : String(ALL_PQ_CODES[i]))
-              : (i === 0 ? '0' : String(ALL_SDR_CODES[i]))}
-            {@const unit = i === 0 ? 'Black' : (app.hdrStatus === 'hdr' ? 'PQ' : 'RGB')}
-            <div class="square-label">
-              <div>{code}</div>
-              <div class="square-unit">{unit}</div>
-            </div>
-          {/each}
-        </div>
+        {#if crush.stripType === 'highNits'}
+          {@const g = stripGeom}
+          <div class="grid-labels" style="--grid-cols:{g.cols}; --grid-rows:{g.rows}">
+            {#each stripLabels() as label, i}
+              <div class="grid-label">
+                <div>{label.code}</div>
+                <div class="square-unit">{label.unit}</div>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <div class="square-labels" style="--sq-count:{labelCount()}">
+            {#each stripLabels() as label, i}
+              <div class="square-label">
+                <div>{label.code}</div>
+                <div class="square-unit">{label.unit}</div>
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/if}
       {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface}
         <div class="fs-help-wrap">
@@ -786,13 +923,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       {/if}
     </div>
 
-    <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCount = value)}>
+    <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCounts[crush.stripType] = value)}>
       <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />
       <div class="slider-track-wrap zoom-track-compact">
-        <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCount} bind:this={zoomSliderInput}
-          style="--fill:{((crush.squareCount - 2) / (MAX_SQUARES - 2)) * 100}%" />
+        <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCounts[crush.stripType]} bind:this={zoomSliderInput}
+          style="--fill:{((activeSquareCount() - 2) / (MAX_SQUARES - 2)) * 100}%" />
       </div>
-      <span class="slider-val zoom-val-compact">{crush.squareCount}</span>
+      <span class="slider-val zoom-val-compact">{activeSquareCount()}</span>
     </div>
   </div>
 
@@ -804,6 +941,14 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <button class="ctx-item" role="menuitem" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
       <div class="ctx-menu-sep"></div>
       <button class="ctx-item" role="menuitem" class:active={crush.hideCalibrationInterface} onclick={toggleHideCalibrationInterface}><span class="ctx-checkbox" aria-hidden="true"></span>Hide interface</button>
+      {#if crush.stripType === 'black'}
+        <button class="ctx-item" role="menuitem" class:active={crush.blackStripGapEnabled} onclick={toggleBlackStripGap}><span class="ctx-checkbox" aria-hidden="true"></span>Gap between squares</button>
+      {/if}
+      <div class="ctx-menu-sep"></div>
+      <div class="ctx-menu-label">Calibration strip</div>
+      {#each STRIPS as strip}
+        <button class="ctx-item" role="menuitem" class:active={crush.stripType === strip.id} onclick={() => selectStrip(strip.id)}><span class="ctx-radio-dot" aria-hidden="true"></span>{strip.label}</button>
+      {/each}
     </div>
   {/if}
 </div>

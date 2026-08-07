@@ -35,6 +35,9 @@ pub struct AppConfig {
     // fullscreen modes; the rest of the interface hides everywhere.
     #[serde(default)]
     pub hide_calibration_interface: bool,
+    // Small gap between cells on the Black strip (right-click menu toggle).
+    #[serde(default = "default_true")]
+    pub black_strip_gap_enabled: bool,
     #[serde(default)]
     pub taskbar_dimmer_enabled: bool,
     #[serde(default = "default_dimmer_opacity")]
@@ -109,6 +112,7 @@ impl Default for AppConfig {
             black_lift_profiles: HashMap::new(),
             black_enabled: true,
             hide_calibration_interface: false,
+            black_strip_gap_enabled: true,
             taskbar_dimmer_enabled: false,
             taskbar_dimmer_opacity: default_dimmer_opacity(),
             taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),

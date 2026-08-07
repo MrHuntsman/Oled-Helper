@@ -982,6 +982,34 @@ button {
 .mode-confirm-modal .modal-desc strong { color: var(--text); font-weight: 600; }
 .mode-confirm-modal .modal-error { margin-top: 8px; color: #e87575; font-size: 11px; line-height: 1.35; }
 
+/* Reverse loading bar pinned to the modal's bottom edge, draining left→right
+   in sync with the auto-revert countdown. Shared by the in-app modal and the
+   tray flyout; its duration is set inline (animation-duration) from the same
+   confirmation_seconds the countdown uses, so the line always reaches 0
+   exactly when the mode would revert. The accent follows the HDR/SDR switch
+   (var(--accent)) like the rest of the app. */
+.mode-confirm-modal {
+  position: relative;
+  overflow: hidden; /* clip the bar inside the rounded corners */
+}
+.mode-confirm-timerbar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  width: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  /* scaleX instead of width so the drain animates on the compositor only —
+     no layout work every frame. Starts full, shrinks to 0. */
+  animation: mode-confirm-timerbar-shrink 15s linear forwards;
+  pointer-events: none;
+}
+@keyframes mode-confirm-timerbar-shrink {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
 /* ── "Keep display mode?" confirm modal animations ────────────────────
    Shared with the tray flyout (Flyout.svelte). The timings below are the
    single source of truth referenced by BOTH windows: app.css is imported by
@@ -1266,7 +1294,9 @@ button {
   overflow: hidden;
   margin: 6px 0;
   outline: none;
-  container-type: inline-size;
+  /* container-type: size lets the square/grid labels size their font with cqw
+     (width) units so they scale with the strip in every mode. */
+  container-type: size;
 }
 .strip-wrap canvas {
   position: absolute;
@@ -1667,6 +1697,40 @@ button {
 }
 .strip-heading { margin: 4px 0; font-size: 13px; }
 
+/* Strip switcher — segmented button row inside the strip heading. */
+.strip-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 8px;
+  padding: 2px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--hover) 55%, transparent);
+  border: 1px solid var(--divider);
+  vertical-align: middle;
+}
+.strip-switch-btn {
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-weak);
+  background: transparent;
+  border: 1px solid transparent;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.strip-switch-btn:hover { color: var(--text); background: var(--hover); }
+.strip-switch-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.strip-switch-btn.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
 /* ── Square labels ────────────────────────────────────────────────── */
 /* Must match the shader's column math exactly (calibration.js GAP_FRACTION):
    square width = (1 - gf*(sq-1)) / sq, gap = gf, both as fractions of strip
@@ -1689,6 +1753,72 @@ button {
 }
 .strip-wrap.monitor-fullscreen .square-labels { font-size: clamp(9px, calc((100cqw / var(--sq-count, 12)) * 0.22 * 1.2), 30px); }
 .strip-wrap.inapp-fullscreen .square-labels { font-size: clamp(9px, calc((100cqw / var(--sq-count, 12)) * 0.22 * 1.2), 20px); }
+/* High Nits grid labels — each cell is a spreadsheet-style box with the
+   number centered. Grid geometry (--grid-cols/--grid-rows) must match the
+   shader's row-major cell layout exactly, and the 0.8% gap matches
+   GAP_FRACTION. Font scales with column width since nits values (up to
+   5 digits) are wider than the 2-3 digit PQ/RGB codes. */
+.grid-labels {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(var(--grid-cols, 1), 1fr);
+  grid-template-rows: repeat(var(--grid-rows, 1), 1fr);
+  gap: 0.8%; /* GAP_FRACTION */
+  /* Font scales with cell width only — same visual language as the black
+     strip's labels, with tabular digits so 100 and 10000 stay evenly spaced
+     and crisp. The grid now always fills the strip area (rows are computed
+     from the container's aspect ratio), so cells are tall enough that the
+     two-line label fits without a height clamp. The 0.26 multiplier fits the
+     widest 5-digit value ("10000") inside its cell with no clipping. */
+  font-size: clamp(9px, calc((100cqw / var(--grid-cols, 1)) * 0.26), 22px);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  z-index: 5;
+}
+.strip-wrap.monitor-fullscreen .grid-labels { font-size: clamp(12px, calc((100cqw / var(--grid-cols, 1)) * 0.3), 40px); }
+.strip-wrap.inapp-fullscreen .grid-labels { font-size: clamp(11px, calc((100cqw / var(--grid-cols, 1)) * 0.28), 28px); }
+.grid-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.15;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  padding: 1px;
+}
+/* High Nits cells are bright (up to 10,000 nits / RGB 255), so the light
+   --text color would vanish — use a single solid dark ink for the number
+   and its unit. A blurred text-shadow was avoided here before because it
+   softens the glyph edges, but that's also exactly why dark text on the
+   brightest cells (near-white/10000 nits) reads as thinner and lower
+   contrast than the same text on a dark cell — the near-white background
+   compresses the perceived contrast of anti-aliased dark edges, and OLED/HDR
+   panels can bloom slightly into dark text sitting on very bright regions.
+   A zero-blur multi-directional outline (four 0.5px offset copies, no blur
+   radius) counteracts that by thickening the glyph silhouette by about half
+   a pixel on every side — it stays crisp because there's no blur, just a
+   sharper repeated copy of the same edge. */
+.grid-label {
+  color: rgba(13, 13, 15, 0.92);
+  text-shadow:
+    0.5px 0 0 rgba(255, 255, 255, 0.55),
+    -0.5px 0 0 rgba(255, 255, 255, 0.55),
+    0 0.5px 0 rgba(255, 255, 255, 0.55),
+    0 -0.5px 0 rgba(255, 255, 255, 0.55);
+}
+.grid-label .square-unit {
+  color: rgba(13, 13, 15, 0.92);
+  text-shadow:
+    0.5px 0 0 rgba(255, 255, 255, 0.55),
+    -0.5px 0 0 rgba(255, 255, 255, 0.55),
+    0 0.5px 0 rgba(255, 255, 255, 0.55),
+    0 -0.5px 0 rgba(255, 255, 255, 0.55);
+}
 .square-label {
   flex: 0 0 calc((100% - (var(--sq-count, 12) - 1) * 0.8%) / var(--sq-count, 12));
   text-align: center;

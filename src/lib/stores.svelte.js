@@ -14,13 +14,29 @@ export const crush = $state({
   adjustment: 0,
   blackProfiles: {},
   blackEnabled: true,
-  squareCount: 12,
+  // Which calibration strip is active ('black' | 'highNits'). Session-only
+  // (never persisted) — every launch starts on Black.
+  stripType: 'black',
+  // Per-strip square counts (zoom), session-only like squareCount was.
+  squareCounts: { black: 12, highNits: 8 },
   fullscreen: 'normal',
   // Hide the calibration strip interface (labels, controls) — right-click
   // menu on the strip. The info tooltip and fullscreen slider only hide in
   // fullscreen modes; the rest of the interface hides everywhere.
   hideCalibrationInterface: false,
+  // Small gap between cells on the Black strip (right-click menu toggle).
+  // On by default, matching the strip's existing look; the High Nits grid
+  // is always edge-to-edge regardless of this setting.
+  blackStripGapEnabled: true,
 });
+
+export function activeSquareCount() {
+  return crush.squareCounts[crush.stripType] ?? 12;
+}
+
+export function setStripType(type) {
+  if (type === 'black' || type === 'highNits') crush.stripType = type;
+}
 
 let legacyBlackLift = null;
 // Legacy configs used one profile per Hz. Keep those values as a fallback while
@@ -164,6 +180,7 @@ export function blackLevelDisplayForRefreshRate(hz) {
   return `${value > 0 ? '+' : ''}${(value / 10).toFixed(1)}`;
 }
 export function setHideCalibrationInterface(enabled) { crush.hideCalibrationInterface = enabled; saveConfig(); }
+export function setBlackStripGapEnabled(enabled) { crush.blackStripGapEnabled = enabled; saveConfig(); }
 export function persistCurrentBlackLevelProfile() {
   const key = profileKey(app.displayInfo.refreshRateHz);
   if (key) crush.blackProfiles[key] = clampAdjustment(crush.adjustment);
@@ -217,6 +234,7 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.hide_calibration_interface === 'boolean') crush.hideCalibrationInterface = cfg.hide_calibration_interface;
     // Legacy migration: the old calibration_text flag meant "show text".
     else if (typeof cfg.calibration_text === 'boolean') crush.hideCalibrationInterface = !cfg.calibration_text;
+    if (cfg && typeof cfg.black_strip_gap_enabled === 'boolean') crush.blackStripGapEnabled = cfg.black_strip_gap_enabled;
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
@@ -278,6 +296,7 @@ export function saveConfig() {
     black_lift_profiles: blackLiftProfiles,
     black_enabled: crush.blackEnabled,
     hide_calibration_interface: crush.hideCalibrationInterface,
+    black_strip_gap_enabled: crush.blackStripGapEnabled,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
     taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
@@ -412,8 +431,10 @@ function scheduleDimmerAvailabilityRecheck(attemptsLeft, epoch) {
 export async function restoreAllDefaults() {
   const defaults = await invoke('reset_config');
   await loadConfig(defaults);
-  crush.squareCount = 12;
+  crush.squareCounts = { black: 12, highNits: 8 };
+  crush.stripType = 'black';
   crush.fullscreen = 'normal';
+  crush.blackStripGapEnabled = true;
   await resetHotkeys();
   invoke('set_tray_enabled', { enabled: true }).catch((e) => console.warn('[restore-all] tray update failed', e));
   invoke('apply_gamma_ramp', { blackLift: 0 }).catch(() => {});

@@ -37,6 +37,10 @@
 
   let mode = $state(null); // { width, height, refresh_hz, monitor_name, confirmation_seconds }
   let remaining = $state(0);
+  // Total confirmation duration — drives the bottom timer bar's drain. Kept
+  // separately from `remaining` because the bar animates over the full span
+  // while `remaining` only holds the whole seconds left.
+  let totalSeconds = $state(15);
   let busy = $state(false);
   let visible = $state(false); // becomes true only after Rust confirms the native window is shown
   let exiting = $state(false); // plays the exit ease before the window hides
@@ -128,6 +132,7 @@
     clearTimer();
     const started = startedAtMs || Date.now();
     remaining = seconds;
+    totalSeconds = Math.max(1, seconds);
     timer = setInterval(() => {
       const left = Math.max(0, seconds - Math.ceil((Date.now() - started) / 1000));
       remaining = left;
@@ -286,6 +291,7 @@
         <button bind:this={keepBtnEl} class="modal-btn" onclick={confirm} disabled={busy}>Keep this mode</button>
         <button bind:this={revertBtnEl} class="modal-btn modal-btn-cancel" onclick={rollback} disabled={busy}>Revert (<span class="modal-btn-countdown">{remaining}</span>s)</button>
       </div>
+      <div class="mode-confirm-timerbar" style="animation-duration: {totalSeconds}s" role="presentation" aria-hidden="true"></div>
     </div>
   </div>
 {/if}

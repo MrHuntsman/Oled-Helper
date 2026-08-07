@@ -443,7 +443,7 @@
     // to Keep this mode, and re-capturing the Revert button as the restore
     // target just before it unmounts.
     modeConfirmLastFocused = document.activeElement;
-    pendingModeConfirmation = { ...result, remaining: seconds };
+    pendingModeConfirmation = { ...result, remaining: seconds, totalSeconds: seconds };
     // Windows' display-confirm dialogs default to Revert: focus it as the
     // safe action (after the modal is in the DOM, so the ref is bound).
     setTimeout(() => modeConfirmRevertBtnEl?.focus(), 0);
@@ -1077,6 +1077,7 @@
           <button bind:this={modeConfirmKeepBtnEl} class="modal-btn" onclick={confirmModeChange} disabled={modeConfirmationBusy}>Keep this mode</button>
           <button bind:this={modeConfirmRevertBtnEl} class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert (<span class="modal-btn-countdown">{pendingModeConfirmation.remaining}</span>s)</button>
         </div>
+        <div class="mode-confirm-timerbar" style="animation-duration: {pendingModeConfirmation.totalSeconds || 15}s" role="presentation" aria-hidden="true"></div>
       </div>
     </div>
   {/if}
