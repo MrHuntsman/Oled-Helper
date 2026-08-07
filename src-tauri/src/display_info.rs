@@ -33,6 +33,9 @@ use windows::core::{GUID, PCWSTR};
 // targets fan that same record out to stdout, the rotating file, and the
 // frontend `log://log` event consumed by the Debug tab and DevTools bridge.
 fn log_edid(level: &str, message: String) {
+    if level != "warn" && level != "error" && !crate::detailed_logging_enabled() {
+        return;
+    }
     match level {
         "warn" => log::warn!("[display-info] {message}"),
         "error" => log::error!("[display-info] {message}"),
@@ -67,6 +70,9 @@ pub struct DisplayInfo {
     pub color_format: String,
     pub bits_per_channel: u32,
     pub desktop_bits: u32,
+    pub dynamic_range: String,
+    pub vrr: String,
+    pub reference_mode: bool,
     pub refresh_hz: u32,
     pub refresh_rates: Vec<u32>,
     pub resolutions: Vec<ResolutionInfo>,
@@ -594,10 +600,22 @@ pub fn query_current_display() -> Option<DisplayInfo> {
         native_width,
         native_height,
         native_source,
-        connector: output.as_ref().map(|o| o.connector.clone()).unwrap_or_default(),
-        color_format: output.as_ref().map(|o| o.color_format.clone()).unwrap_or_default(),
+        connector: output
+            .as_ref()
+            .map(|o| o.connector.clone())
+            .unwrap_or_default(),
+        color_format: output
+            .as_ref()
+            .map(|o| o.color_format.clone())
+            .unwrap_or_default(),
         bits_per_channel: output.as_ref().map(|o| o.bits_per_channel).unwrap_or(0),
         desktop_bits: output.as_ref().map(|o| o.desktop_bits).unwrap_or(0),
+        dynamic_range: output
+            .as_ref()
+            .map(|o| o.dynamic_range.clone())
+            .unwrap_or_default(),
+        vrr: output.as_ref().map(|o| o.vrr.clone()).unwrap_or_default(),
+        reference_mode: output.as_ref().map(|o| o.reference_mode).unwrap_or(false),
         refresh_hz: devmode.dmDisplayFrequency,
         refresh_rates,
         resolutions,

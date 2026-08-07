@@ -41,27 +41,30 @@
   });
 
   // Depends on envTick (bumped on tab mount) so the table refreshes each time
-  // this tab is opened — navigator.*/screen.* are plain globals Svelte can't
-  // track on its own.
+  // this tab is opened.
   let rows = $derived.by(() => {
     void envTick.n;
-    // screen.colorDepth/pixelDepth report combined bits across R+G+B (e.g. 30
-    // for a 10-bit HDR panel), which is the browser/OS convention but not
-    // what people usually mean by "10-bit display". Show per-channel bits
-    // instead, since that's the number normally advertised for monitors.
-    const perChannelBits = screen.colorDepth ? Math.round(screen.colorDepth / 3) : null;
     return [
       ['Browser / WebView', navigator.userAgent],
       ['WebGPU Support', navigator.gpu ? 'Available' : 'Not available'],
+      ['Current Display', app.displayInfo.monitorName || 'Detecting...'],
       ['Display Type', displayType],
       // Peak luminance is only meaningful while HDR is active; hide it in SDR.
       ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
-      ['Current Monitor', app.displayInfo.monitorName || 'Detecting...'],
-      ['Monitor Device', app.displayInfo.deviceName || '—'],
+      // These fields are also exposed in the compact monitor tooltip. Keep
+      // them here as the canonical, copyable system report, while avoiding a
+      // duplicate "Current" row because Screen Resolution already includes
+      // the active resolution and refresh rate.
+      ['Connector', app.displayInfo.connector || '—'],
+      ['Color Format', `${app.displayInfo.colorFormat || '—'}${app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}`],
+      ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '—'],
+      ['Dynamic Range', app.displayInfo.dynamicRange || '—'],
+      ['VRR', app.displayInfo.vrr || '—'],
       ['Native Resolution', nativeResolution],
-      ['Screen Resolution', `${screen.width * devicePixelRatio}x${screen.height * devicePixelRatio}${app.displayInfo.refreshRateHz ? `@${app.displayInfo.refreshRateHz}Hz` : ''}`],
+      ['Screen Resolution', app.displayInfo.width && app.displayInfo.height
+        ? `${app.displayInfo.width}×${app.displayInfo.height}${app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}`
+        : 'Detecting...'],
       ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
-      ['Color Depth', perChannelBits ? `${perChannelBits}-bit per channel` : '?'],
     ];
   });
 

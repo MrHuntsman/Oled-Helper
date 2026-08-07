@@ -240,17 +240,28 @@ pub struct DisplayOutputInfo {
     // GetDeviceCaps(BITSPIXEL) on the screen DC — 32 on virtually every
     // modern setup (True Color), regardless of the panel's signal bit depth.
     pub desktop_bits: u32,
+    // Output dynamic range — driver-internal setting (NVIDIA/AMD control
+    // panel). Queried via vendor DLLs (NVAPI/ADL/IGCL). Empty string when
+    // the vendor DLL couldn't be loaded or the query failed.
+    pub dynamic_range: String,
+    // Variable refresh rate status — G-Sync/FreeSync/Adaptive-Sync.
+    // Queried via vendor DLLs. Empty string on failure.
+    pub vrr: String,
+    // NVIDIA-only driver control state. False for non-NVIDIA GPUs and when
+    // the optional vendor query/registry key is unavailable.
+    pub reference_mode: bool,
 }
 
 fn connector_label(tech: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> &'static str {
     use windows::Win32::Devices::Display::{
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL,
-        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
-        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
-        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
-        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
-        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL,
     };
     match tech {
         DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15 => "VGA",
@@ -335,7 +346,9 @@ pub fn query_display_output_info(primary_monitor_name: &str) -> Option<DisplayOu
     let (paths, _modes) = query_active_paths().ok()?;
     let mut selected: Option<&DISPLAYCONFIG_PATH_INFO> = None;
     for path in &paths {
-        let Some(name) = target_device_name(path) else { continue; };
+        let Some(name) = target_device_name(path) else {
+            continue;
+        };
         if !primary_monitor_name.is_empty() && target_monitor_name(&name) == primary_monitor_name {
             selected = Some(path);
             break;
@@ -356,6 +369,10 @@ pub fn query_display_output_info(primary_monitor_name: &str) -> Option<DisplayOu
         info.bits_per_channel = aci.bitsPerColorChannel;
     }
     info.desktop_bits = query_desktop_bits();
+    let vendor = crate::vendor_info::query_vendor_display_info();
+    info.dynamic_range = vendor.dynamic_range;
+    info.vrr = vendor.vrr;
+    info.reference_mode = vendor.reference_mode;
     Some(info)
 }
 

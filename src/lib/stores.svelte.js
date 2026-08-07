@@ -6,7 +6,7 @@ export const app = $state({
   activeTab: 'crush',
   hdrStatus: 'unknown',
   hdrLuminance: null,
-  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, refreshRateHz: null, refreshRates: [], resolutions: [] },
+  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, dynamicRange: '', vrr: '', referenceMode: false, refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
 });
@@ -562,6 +562,26 @@ export function pollHDRStatus() {
 export function pollHDRLuminance() {
   invoke('get_hdr_luminance').then((info) => { app.hdrLuminance = info ? { maxNits: info.max_nits ?? null } : null; }).catch(() => { app.hdrLuminance = null; });
 }
+
+// Driver control panels can change dynamic range or VRR without emitting a
+// Windows display-topology notification. Refresh only the small vendor-info
+// payload; do not re-enumerate modes, EDID, and connector data each time.
+let vendorDisplayRefreshInFlight = false;
+let vendorDisplayRefreshSequence = 0;
+export function refreshVendorDisplayInfo() {
+  if (vendorDisplayRefreshInFlight) return Promise.resolve();
+  vendorDisplayRefreshInFlight = true;
+  const sequence = ++vendorDisplayRefreshSequence;
+  return invoke('refresh_vendor_display_info').then((info) => {
+    if (sequence !== vendorDisplayRefreshSequence || !info) return;
+    app.displayInfo.dynamicRange = typeof info.dynamic_range === 'string' ? info.dynamic_range : '';
+    app.displayInfo.vrr = typeof info.vrr === 'string' ? info.vrr : '';
+    app.displayInfo.referenceMode = info.reference_mode === true;
+  }).catch(() => {}).finally(() => {
+    vendorDisplayRefreshInFlight = false;
+  });
+}
+
 let displayPollSequence = 0;
 let displayInfoRetryCount = 0;
 let displayInfoRefreshTimer = null;
@@ -598,7 +618,10 @@ export function pollDisplayInfo() {
   const prevColorFormat = app.displayInfo.colorFormat;
   const prevBitsPerChannel = app.displayInfo.bitsPerChannel;
   const prevDesktopBits = app.displayInfo.desktopBits;
-  app.displayInfo = { width: Math.round(s.width * dpr), height: Math.round(s.height * dpr), deviceName: prevDeviceName, monitorName: prevMonitorName, monitorId: prevMonitorId, nativeWidth: prevNativeWidth, nativeHeight: prevNativeHeight, nativeSource: prevNativeSource, connector: prevConnector, colorFormat: prevColorFormat, bitsPerChannel: prevBitsPerChannel, desktopBits: prevDesktopBits, refreshRateHz: prevRefreshRateHz, refreshRates: prevRefreshRates, resolutions: prevResolutions };
+  const prevDynamicRange = app.displayInfo.dynamicRange;
+  const prevVrr = app.displayInfo.vrr;
+  const prevReferenceMode = app.displayInfo.referenceMode;
+  app.displayInfo = { width: Math.round(s.width * dpr), height: Math.round(s.height * dpr), deviceName: prevDeviceName, monitorName: prevMonitorName, monitorId: prevMonitorId, nativeWidth: prevNativeWidth, nativeHeight: prevNativeHeight, nativeSource: prevNativeSource, connector: prevConnector, colorFormat: prevColorFormat, bitsPerChannel: prevBitsPerChannel, desktopBits: prevDesktopBits, dynamicRange: prevDynamicRange, vrr: prevVrr, referenceMode: prevReferenceMode, refreshRateHz: prevRefreshRateHz, refreshRates: prevRefreshRates, resolutions: prevResolutions };
   invoke('get_display_info').then((info) => {
     if (requestSequence !== displayPollSequence) return;
     if (!info) { scheduleDisplayInfoRetry(); return; }
@@ -620,7 +643,7 @@ export function pollDisplayInfo() {
       // the scoped profile for the newly detected display/mode.
       persistCurrentBlackLevelProfile();
     }
-    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
+    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, dynamicRange: typeof info.dynamic_range === 'string' ? info.dynamic_range : '', vrr: typeof info.vrr === 'string' ? info.vrr : '', referenceMode: info.reference_mode === true, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
     if (nextRefreshRate && (nextRefreshRate !== previousRefreshRate || displayOrModeChanged)) applyBlackLevelProfileForRefreshRate(nextRefreshRate);
   }).catch(() => scheduleDisplayInfoRetry());
 }

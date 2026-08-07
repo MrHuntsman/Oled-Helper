@@ -159,6 +159,9 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   let sliderDragging = $state(false);
   let sliderHovering = $state(false);
+  let blackMasterAttention = $state(false);
+  let blackMasterAttentionTimer = null;
+  let blackMasterAttentionRaf = 0;
   let fsSliderDragging = $state(false);
   let fsSliderHovering = $state(false);
   let mainSliderInput = $state(null);
@@ -486,6 +489,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   // gamma resets (fullscreen games, driver mode switches).
   let gammaRampDestroyed = false;
   let gammaRampLastValue = null;
+  let gammaReferenceModeLast = false;
 
   // Send the latest value to the Rust worker. Returns immediately; the worker
   // picks up the newest value on its own loop, so even a slow invoke response
@@ -493,6 +497,12 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   function requestGammaRamp() {
     if (gammaRampDestroyed) return;
     const value = blackLift();
+    if (app.displayInfo.referenceMode) {
+      // NVIDIA Reference Mode/Color Accuracy Mode makes GDI gamma-ramp
+      // writes ineffective. Avoid repeatedly issuing writes while the driver
+      // setting is active; the backend still owns the authoritative warning.
+      return;
+    }
     // Slider events frequently normalize to the same effective value (the
     // -4..4 dead zone snaps to 0, and trackpad/wheel drags repeat positions).
     // Skip redundant sends so a drag doesn't spam the IPC channel.
@@ -521,10 +531,25 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       // debounce window expires (for example during a rapid tab switch).
       saveConfig();
     }
+    clearTimeout(blackMasterAttentionTimer);
+    cancelAnimationFrame(blackMasterAttentionRaf);
   });
 
   $effect(() => {
-    void crush.adjustment; void crush.blackEnabled;
+    void crush.adjustment; void crush.blackEnabled; void app.displayInfo.referenceMode;
+    if (app.displayInfo.referenceMode !== gammaReferenceModeLast) {
+      // Allow the first write after Reference Mode is disabled. Otherwise the
+      // same slider value would remain in gammaRampLastValue and no restore
+      // write would be sent when the driver becomes writable again.
+      gammaRampLastValue = null;
+      gammaReferenceModeLast = app.displayInfo.referenceMode;
+    }
+    if (!crush.blackEnabled) {
+      sliderDragging = false;
+      fsSliderDragging = false;
+      sliderHovering = false;
+      fsSliderHovering = false;
+    }
     requestGammaRamp();
     // No config save here: the adjustment changes on every pointer event
     // during a drag, and saving is now tied to discrete events only (drag
@@ -567,7 +592,44 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   function toggleBlackEnabled() {
     crush.blackEnabled = !crush.blackEnabled;
+    if (!crush.blackEnabled) {
+      sliderDragging = false;
+      fsSliderDragging = false;
+      sliderHovering = false;
+      fsSliderHovering = false;
+    }
     scheduleConfigSave();
+  }
+
+  // Disabled controls stay discoverable, but an attempted interaction should
+  // explain why nothing happened instead of silently doing nothing. The
+  // heading pulse is deliberately short and retriggerable for repeated clicks.
+  function flashBlackMasterSwitch() {
+    blackMasterAttention = false;
+    cancelAnimationFrame(blackMasterAttentionRaf);
+    blackMasterAttentionRaf = requestAnimationFrame(() => { blackMasterAttention = true; });
+    clearTimeout(blackMasterAttentionTimer);
+    blackMasterAttentionTimer = setTimeout(() => { blackMasterAttention = false; }, 850);
+  }
+
+  function handleDisabledBlackInteraction(e) {
+    if (crush.blackEnabled) return;
+    // Preserve normal keyboard navigation; only activation/adjustment keys
+    // count as an attempted interaction with the disabled section.
+    if (e.type === 'keydown' && !['Enter', ' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    flashBlackMasterSwitch();
+  }
+
+  function handleBlackLevelWheel(e) {
+    if (!crush.blackEnabled) {
+      e.preventDefault();
+      e.stopPropagation();
+      flashBlackMasterSwitch();
+      return;
+    }
+    handleSliderWheel(e, mainSliderInput, setBlackLevel, 5);
   }
 
   function handleBlackLevelInput(e) {
@@ -958,7 +1020,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
 <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
-    <div class="tab-heading-toggle" role="button" tabindex="0" onclick={toggleBlackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBlackEnabled(); } }} title="Enable Black Level" aria-label="Enable Black Level" aria-pressed={crush.blackEnabled}>
+    <div class="tab-heading-toggle" class:attention-pulse={blackMasterAttention} role="button" tabindex="0" onclick={toggleBlackEnabled} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBlackEnabled(); } }} title="Enable Black Level" aria-label="Enable Black Level" aria-pressed={crush.blackEnabled}>
       <img class="tab-icon" src={tabCrushIcon} alt="" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
@@ -971,9 +1033,13 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     </div>
     <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore Tab Defaults</button>
   </div>
-  <div class="separator"></div>
-
-  <div class="dimmer-control" class:disabled={!crush.blackEnabled} onwheel={(e) => handleSliderWheel(e, mainSliderInput, setBlackLevel, 5)}>
+  <div class="separator"></div>    <div class="dimmer-control" class:disabled={!crush.blackEnabled} onwheel={handleBlackLevelWheel}>
+      {#if app.displayInfo.referenceMode}
+        <p class="gamma-warning" role="alert">⚠ NVIDIA Reference Mode is enabled. <br>To use Black Crush Tweak disable “Override to reference mode” in your NVIDIA driver settings under "System → Displays → Colour".</p>
+      {/if}
+    {#if !crush.blackEnabled}
+      <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Black Level disabled" onclick={handleDisabledBlackInteraction}></button>
+    {/if}
     <div class="dimmer-control-heading">
       <span class="settings-row-label">Black Level</span>
       <span class="slider-val">{adjustmentDisplay()}</span>
@@ -986,7 +1052,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         onpointerdown={() => sliderDragging = true}
         onpointerup={() => { sliderDragging = false; scheduleConfigSave(); }}
         onpointercancel={() => { sliderDragging = false; scheduleConfigSave(); }}
-        onpointerenter={() => sliderHovering = true}
+        onpointerenter={() => { if (crush.blackEnabled) sliderHovering = true; }}
         onpointerleave={() => sliderHovering = false}
         disabled={!crush.blackEnabled} />
       <div class="slider-tooltip" class:visible={sliderDragging || sliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
@@ -1113,7 +1179,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
         </div>
       {/if}
       {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface && crush.stripType !== 'highNits'}
-        <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, fsSliderInput, setBlackLevel, 5)}>
+        <div class="fs-black-slider" class:disabled={!crush.blackEnabled} onwheel={(e) => {
+          if (!crush.blackEnabled) { e.preventDefault(); e.stopPropagation(); flashBlackMasterSwitch(); return; }
+          handleSliderWheel(e, fsSliderInput, setBlackLevel, 5);
+        }}>
           <div class="slider-track-wrap" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, fsSliderInput, (v) => fsSliderDragging = v)}>
             <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
               class="has-ticks"
@@ -1122,12 +1191,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
               onpointerdown={() => fsSliderDragging = true}
               onpointerup={() => { fsSliderDragging = false; scheduleConfigSave(); }}
               onpointercancel={() => { fsSliderDragging = false; scheduleConfigSave(); }}
-              onpointerenter={() => fsSliderHovering = true}
+              onpointerenter={() => { if (crush.blackEnabled) fsSliderHovering = true; }}
               onpointerleave={() => fsSliderHovering = false}
               disabled={!crush.blackEnabled} />
             <div class="slider-tooltip" class:visible={fsSliderDragging || fsSliderHovering} style="left:calc(9px + ({((crush.adjustment + 150) / 300)} * (100% - 18px)))">{adjustmentDisplay()}</div>
           </div>
           <span class="slider-val">{adjustmentDisplay()}</span>
+          {#if !crush.blackEnabled}
+            <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Black Level disabled" onclick={handleDisabledBlackInteraction}></button>
+          {/if}
         </div>
       {/if}
       {#if crush.stripType === 'highNits' && hoverCell >= 0}

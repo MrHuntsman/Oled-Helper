@@ -548,7 +548,7 @@ button {
   transition: height 0.12s;
   position: relative;
 }
-.slider-track-wrap:hover input[type=range] { height: 8px; }
+.slider-track-wrap:hover input[type=range]:not(:disabled) { height: 8px; }
 .slider-track-wrap input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 18px; height: 18px;
@@ -558,6 +558,7 @@ button {
   transition: transform 0.08s;
 }
 .slider-track-wrap input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.15); }
+.slider-track-wrap input[type=range]:disabled::-webkit-slider-thumb:hover { transform: none; }
 .slider-track-wrap input[type=range]:disabled {
   opacity: 0.35;
 }
@@ -571,7 +572,7 @@ button {
 .slider-track-wrap-sm input[type=range].slider-sm {
   height: 4px;
 }
-.slider-track-wrap-sm:hover input[type=range].slider-sm { height: 5px; }
+.slider-track-wrap-sm:hover input[type=range].slider-sm:not(:disabled) { height: 5px; }
 .slider-track-wrap-sm input[type=range].slider-sm::-webkit-slider-thumb {
   width: 12px; height: 12px;
 }
@@ -591,7 +592,7 @@ button {
 .zoom-track-compact input[type=range] {
   height: 4px;
 }
-.zoom-track-compact:hover input[type=range] { height: 5px; }
+.zoom-track-compact:hover input[type=range]:not(:disabled) { height: 5px; }
 .zoom-track-compact input[type=range]::-webkit-slider-thumb {
   width: 12px; height: 12px;
 }
@@ -759,10 +760,34 @@ button {
 /* ── Taskbar dimmer ───────────────────────────────────────────────── */
 .dimmer-toggle-row { margin-top: 4px; }
 .dimmer-control-group {
+  position: relative;
   margin-top: 8px;
   transition: opacity 0.12s;
 }
+/* Keep disabled groups visually inert without removing them from the layout.
+   The capture handler on the component provides the explanatory pulse; this
+   shield prevents descendant hover/focus styles and native controls from
+   responding before that handler runs. */
+.dimmer-control-group.disabled,
+.dimmer-hover-section.disabled,
+.dimmer-control.disabled,
+.fs-black-slider.disabled {
+  cursor: not-allowed;
+}
+.dimmer-control-group.disabled::after,
+.dimmer-hover-section.disabled::after,
+.dimmer-control.disabled::after,
+.fs-black-slider.disabled::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  cursor: not-allowed;
+  background: transparent;
+}
+.dimmer-hover-section { position: relative; }
 .dimmer-control {
+  position: relative;
   padding: 10px 12px;
   border: 1px solid var(--divider);
   border-radius: 8px;
@@ -791,7 +816,44 @@ button {
 .crush-slider-group.disabled {
   opacity: 0.5;
 }
-.dimmer-control-group.disabled { opacity: 0.5; }
+.dimmer-control-group.disabled,
+.dimmer-control.disabled,
+.fs-black-slider.disabled { opacity: 0.5; }
+.dimmer-control-group.disabled .slider-tooltip,
+.dimmer-hover-section.disabled .slider-tooltip,
+.dimmer-control.disabled .slider-tooltip,
+.fs-black-slider.disabled .slider-tooltip { opacity: 0 !important; transform: translateX(-50%) translateY(4px) scale(0.92); }
+.disabled-section-hit-area {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  cursor: not-allowed;
+}
+.dimmer-control-group.disabled .dimmer-chain-btn { pointer-events: none; }
+
+/* A brief accent pulse points back to the master switch after an attempted
+   interaction with a disabled section. box-shadow is used instead of layout
+   properties so the heading never shifts. */
+.tab-heading-toggle.attention-pulse {
+  animation: master-switch-attention 0.85s ease-out;
+}
+.tab-heading-toggle.attention-pulse .pill {
+  animation: master-switch-pill-attention 0.85s ease-out;
+}
+@keyframes master-switch-attention {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+  18% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 32%, transparent); }
+  45% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
+}
+@keyframes master-switch-pill-attention {
+  0%, 100% { filter: brightness(1); }
+  18% { filter: brightness(1.55); }
+  45% { filter: brightness(1.2); }
+}
 .dimmer-control-heading {
   display: flex;
   align-items: center;
@@ -880,7 +942,7 @@ button {
   color: var(--text-weak);
   transition: color 0.15s, background 0.15s;
 }
-.dimmer-chain-btn:hover { color: var(--text); background: none; }
+.dimmer-chain-btn:hover:not(:disabled) { color: var(--text); background: none; }
 .dimmer-chain-btn.linked { color: var(--accent); }
 .dimmer-chain-btn svg { width: 20px; height: 20px; overflow: visible; }
 .chain-hook {
@@ -1184,7 +1246,11 @@ button {
    pattern of the fade-duration row above it (margin-top: 16px) rather than
    the bordered .settings-row-2line wrapper used when this lived in Settings. */
 .dimmer-hover-section { margin-top: 16px; }
-.dimmer-hover-section.disabled { opacity: 0.5; pointer-events: none; }
+/* Keep the section hit-testable while disabled so its interaction shield can
+   explain that the master switch is off. The shield below prevents changes
+   and the native controls remain disabled; only `pointer-events: none` would
+   make an attempted click disappear before the feedback handler runs. */
+.dimmer-hover-section.disabled { opacity: 0.5; }
 .dimmer-section-heading { display: block; margin-bottom: 8px; }
 .dimmer-section-desc { display: block; margin-bottom: 8px; }
 
@@ -1208,7 +1274,7 @@ button {
   background: rgba(0, 0, 0, 0.12);
   transition: background 0.1s, border-color 0.1s;
 }
-.hover-detect-opt:hover { background: var(--hover); border-color: color-mix(in srgb, var(--accent) 30%, var(--divider)); }
+.hover-detect-opt:hover:not(:disabled) { background: var(--hover); border-color: color-mix(in srgb, var(--accent) 30%, var(--divider)); }
 .hover-detect-opt.active {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 8%, rgba(0, 0, 0, 0.12));
@@ -1257,7 +1323,7 @@ button {
   background: color-mix(in srgb, var(--accent) 8%, rgba(0, 0, 0, 0.12));
   border-color: color-mix(in srgb, var(--accent) 35%, var(--divider));
 }
-.hover-detect-radio-row:hover:not(.active) { background: var(--hover); }
+.hover-detect-radio-row:hover:not(.active):not(:disabled) { background: var(--hover); }
 .hover-detect-radio-dot {
   flex-shrink: 0;
   width: 16px;
@@ -1327,7 +1393,7 @@ button {
   cursor: pointer;
   transition: height 0.12s;
 }
-.hover-detect-poll-rate input[type=range]:hover { height: 5px; }
+.hover-detect-poll-rate input[type=range]:hover:not(:disabled) { height: 5px; }
 .hover-detect-poll-rate input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
   width: 12px;
@@ -1338,6 +1404,7 @@ button {
   transition: transform 0.08s;
 }
 .hover-detect-poll-rate input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.15); }
+.hover-detect-poll-rate input[type=range]:disabled::-webkit-slider-thumb:hover { transform: none; }
 .hover-detect-poll-rate-val {
   font-size: 11px;
   font-weight: 600;
@@ -1678,6 +1745,16 @@ button {
 /* ── GPU status / errors ──────────────────────────────────────────── */
 .gpu-status { color: var(--text-weak); margin: 8px 0; font-size: 13px; }
 .gpu-error { color: #E05555; margin: 4px 0; font-size: 12px; }
+.gamma-warning {
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, #e0a84b 42%, var(--divider));
+  border-radius: 6px;
+  background: color-mix(in srgb, #e0a84b 8%, transparent);
+  color: #e0b96a;
+  font-size: 12px;
+  line-height: 1.4;
+}
 
 /* ── Hotkeys tab ────────────────────────────────────────────────────── */
 .hotkey-section { margin-top: 16px; }

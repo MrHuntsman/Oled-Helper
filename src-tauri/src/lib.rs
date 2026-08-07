@@ -5,6 +5,7 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
+mod vendor_info;
 mod window_icon;
 
 #[cfg(target_os = "windows")]
@@ -22,6 +23,19 @@ use tauri::{
 
 struct TrayState {
     enabled: AtomicBool,
+}
+
+// Shared by the Debug tab's "Detailed logging" toggle. Diagnostic info from
+// the vendor/EDID paths is intentionally quiet by default because those paths
+// are refreshed periodically; warnings and errors remain visible regardless.
+static DETAILED_LOGGING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn detailed_logging_enabled() -> bool {
+    DETAILED_LOGGING.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_detailed_logging_enabled(enabled: bool) {
+    DETAILED_LOGGING.store(enabled, Ordering::Relaxed);
 }
 
 #[cfg(target_os = "windows")]
@@ -105,7 +119,7 @@ mod display_change_events {
 // Gamma state — synchronous apply + periodic safety restore.
 // The frontend calls apply_gamma_ramp on every slider change; the ramp is
 // applied immediately (no polling thread, no IPC round-trip delay). A
-// lightweight safety thread re-applies every 2 seconds so another app
+// lightweight safety thread re-applies every 5 seconds so another app
 // resetting the system gamma (fullscreen games, driver updates) is
 // corrected without user interaction.
 struct GammaShutdown {
@@ -143,28 +157,32 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
             .unwrap_or_else(|error| error.into_inner());
         let (_guard, _timeout) = shutdown
             .wake
-            .wait_timeout_while(guard, std::time::Duration::from_secs(2), |_| {
+            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |_| {
                 !shutdown.requested.load(Ordering::Acquire)
             })
             .unwrap_or_else(|error| error.into_inner());
         if shutdown.requested.load(Ordering::Acquire) {
             break;
         }
-        // A timeout is the normal two-second safety tick. The predicate also
+        // A timeout is the normal five-second safety tick. The predicate also
         // closes the lost-notification race during shutdown.
         // Hold-to-compare applies neutral gamma directly on the hardware
         // without updating `desired`. Don't overwrite its comparison view.
         if crate::hotkeys::is_hold_compare_active() {
-            // The main-window timer owns release detection and restoration.
-            // Never overwrite the temporary linear comparison ramp here.
+            if crate::vendor_info::nvidia_reference_mode_enabled() {
+                continue;
+            }
             crate::hotkeys::recover_hold_restore();
             continue;
         }
         let value = desired.load(Ordering::Relaxed);
         // When black lift is zero the system ramp is linear (OS default) —
-        // nothing to restore. Skip the GDI call to keep the thread truly idle
-        // while black crush is disabled or set to OFF.
+        // nothing to restore. Skip both the reference-mode check and the GDI
+        // call to keep the thread truly idle while black crush is disabled.
         if value == 0 {
+            continue;
+        }
+        if crate::vendor_info::nvidia_reference_mode_enabled() {
             continue;
         }
         let ramp = gamma_ramp::build_ramp(value);
@@ -177,7 +195,7 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
 // Applies the gamma ramp synchronously — the display update happens on the
 // caller's thread (the Tauri command thread) and returns immediately. No
 // background polling, no IPC delay. A separate safety thread re-applies at
-// 2-second intervals to recover from external gamma resets.
+// 5-second intervals to recover from external gamma resets.
 // ── Pre-WebView log history ────────────────────────────────────────────────
 // tauri-plugin-log's Webview target only forwards records while the frontend
 // listener is attached; records logged before then (setup, config load, tray
@@ -267,6 +285,9 @@ fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), Str
     // Frontend clamps to ±150 already; clamp here too so a stray caller can
     // never drive the ramp math with an extreme value.
     let black_lift = black_lift.clamp(-150, 150);
+    if crate::vendor_info::nvidia_reference_mode_enabled() {
+        return Err("NVIDIA Override to reference mode is enabled; disable it in your NVIDIA driver settings under System → Displays to use Black Crush Tweak".into());
+    }
     // Hold the same gamma lock across the state check, desired-value update,
     // and possible write. If release completes just before this command gets
     // the lock, this path applies the newest value instead of leaving the
@@ -303,6 +324,11 @@ fn log_frontend(level: String, message: String) {
 #[tauri::command]
 fn get_display_info() -> Option<display_info::DisplayInfo> {
     display_info::query_current_display()
+}
+
+#[tauri::command]
+fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
+    vendor_info::query_vendor_display_info_fresh()
 }
 
 // Async (not sync) commands: the apply now persists the mode to the registry
@@ -699,6 +725,7 @@ pub fn run() {
             apply_gamma_ramp,
             log_frontend,
             get_display_info,
+            refresh_vendor_display_info,
             set_refresh_rate,
             set_resolution,
             confirm_display_mode_change,
@@ -732,7 +759,7 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            // Gamma safety thread: re-applies the last known ramp every 2
+            // Gamma safety thread: re-applies the last known ramp every 5
             // seconds so another app resetting the system gamma (fullscreen
             // games, driver mode switches) is corrected automatically.
             {

@@ -4,12 +4,52 @@
   import { taskbarDimmer, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs } from './stores.svelte.js';
 
   function toggleDimmer() {
-    setTaskbarDimmer(!taskbarDimmer.enabled);
+    const next = !taskbarDimmer.enabled;
+    if (!next) {
+      opacityDragging = false;
+      opacityHovering = false;
+      fadeInDragging = false;
+      fadeInHovering = false;
+      fadeOutDragging = false;
+      fadeOutHovering = false;
+    }
+    setTaskbarDimmer(next);
+  }
+
+  // Disabled settings should explain themselves. A short pulse on the master
+  // switch gives the user a clear target without changing any setting.
+  function flashDimmerMasterSwitch() {
+    dimmerMasterAttention = false;
+    cancelAnimationFrame(dimmerMasterAttentionRaf);
+    dimmerMasterAttentionRaf = requestAnimationFrame(() => { dimmerMasterAttention = true; });
+    clearTimeout(dimmerMasterAttentionTimer);
+    dimmerMasterAttentionTimer = setTimeout(() => { dimmerMasterAttention = false; }, 850);
+  }
+
+  function handleDisabledDimmerInteraction(e) {
+    if (!taskbarDimmer.available || taskbarDimmer.enabled) return;
+    // Do not interfere with Tab navigation. Activation and arrow keys are
+    // treated as attempts to use a disabled setting and trigger the cue.
+    if (e.type === 'keydown' && !['Enter', ' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    flashDimmerMasterSwitch();
+  }
+
+  function handleDisabledDimmerWheel(e) {
+    if (taskbarDimmer.available && !taskbarDimmer.enabled) {
+      e.preventDefault();
+      e.stopPropagation();
+      flashDimmerMasterSwitch();
+    }
   }
 
   let fadeLinked = $state(true);
   let opacityDragging = $state(false);
   let opacityHovering = $state(false);
+  let dimmerMasterAttention = $state(false);
+  let dimmerMasterAttentionTimer = null;
+  let dimmerMasterAttentionRaf = 0;
   let fadeInDragging = $state(false);
   let fadeInHovering = $state(false);
   let fadeOutDragging = $state(false);
@@ -24,6 +64,23 @@
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
     };
+  });
+
+  $effect(() => {
+    if (taskbarDimmer.enabled) return;
+    // Covers external disable actions (hotkey/backend availability), not just
+    // clicking this tab's master switch. Never leave a stale tooltip visible.
+    opacityDragging = false;
+    opacityHovering = false;
+    fadeInDragging = false;
+    fadeInHovering = false;
+    fadeOutDragging = false;
+    fadeOutHovering = false;
+  });
+
+  $effect(() => () => {
+    clearTimeout(dimmerMasterAttentionTimer);
+    cancelAnimationFrame(dimmerMasterAttentionRaf);
   });
 
   // Integer slider values map 1:1 to distinct alpha levels in the Rust
@@ -101,7 +158,7 @@
 
 <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
-    <div class="tab-heading-toggle" class:disabled={!taskbarDimmer.available} role="button" tabindex="0" onclick={() => { if (taskbarDimmer.available) toggleDimmer(); }} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && taskbarDimmer.available) { e.preventDefault(); toggleDimmer(); } }} title="Enable Taskbar Dimmer" aria-label="Enable Taskbar Dimmer" aria-pressed={taskbarDimmer.enabled}>
+    <div class="tab-heading-toggle" class:disabled={!taskbarDimmer.available} class:attention-pulse={dimmerMasterAttention} role="button" tabindex="0" onclick={() => { if (taskbarDimmer.available) toggleDimmer(); }} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && taskbarDimmer.available) { e.preventDefault(); toggleDimmer(); } }} title="Enable Taskbar Dimmer" aria-label="Enable Taskbar Dimmer" aria-pressed={taskbarDimmer.enabled}>
       <img class="tab-icon" src={tabDimmerIcon} alt="" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
@@ -117,6 +174,9 @@
   <div class="separator"></div>
 
   <div class="dimmer-control-group" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
+    {#if !taskbarDimmer.available || !taskbarDimmer.enabled}
+      <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Taskbar Dimmer controls disabled" onclick={handleDisabledDimmerInteraction} onwheel={handleDisabledDimmerWheel}></button>
+    {/if}
     <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="settings-row-label">Overlay opacity</span>
@@ -170,7 +230,7 @@
       </div>
 
       <div class="dimmer-chain-btn-wrap">
-        <button class="dimmer-chain-btn" class:linked={fadeLinked} class:suppress-hover={chainSuppressHover} onclick={toggleFadeLinked} onpointerleave={() => chainSuppressHover = false} title={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={fadeLinked}>
+        <button class="dimmer-chain-btn" class:linked={fadeLinked} disabled={!taskbarDimmer.available || !taskbarDimmer.enabled} class:suppress-hover={chainSuppressHover} onclick={toggleFadeLinked} onpointerleave={() => chainSuppressHover = false} title={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={fadeLinked}>
           <svg viewBox="0 0 24 24" fill="none">
             <path class="chain-bar" d="M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             <path class="chain-hook chain-hook-a" d="M11 6.5L12.5 5C14.4 3.1 17.5 3.1 19.4 5C21.3 6.9 21.3 10 19.4 11.9L17.9 13.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -208,6 +268,9 @@
   </div>
 
   <div class="dimmer-hover-section" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
+    {#if !taskbarDimmer.available || !taskbarDimmer.enabled}
+      <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Detection Method disabled" onclick={handleDisabledDimmerInteraction} onwheel={handleDisabledDimmerWheel}></button>
+    {/if}
     <span class="settings-row-label dimmer-section-heading">Detection Method</span>
     <span class="settings-row-desc dimmer-section-desc">How the app detects the cursor, fullscreen mode, and taskbar changes.</span>
     <div class="hover-detect-radios" role="radiogroup" aria-label="Detection method">

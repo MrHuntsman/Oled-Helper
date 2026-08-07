@@ -412,6 +412,15 @@ fn stop_hold_timer() {
 }
 
 fn finish_hold_restore() -> bool {
+    if crate::vendor_info::nvidia_reference_mode_enabled() {
+        log::warn!("[hotkeys] skipped hold-to-compare gamma restore because NVIDIA reference mode is enabled");
+        HOLD_RESTORE.store(0, Ordering::Release);
+        HOLD_HAS_RESTORE.store(false, Ordering::Release);
+        HOLD_ACTIVE_VK.store(0, Ordering::Release);
+        HOLD_ACTIVE_MODS.store(0, Ordering::Release);
+        HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
+        return true;
+    }
     let _gamma_guard = GAMMA_WRITE_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -461,6 +470,12 @@ fn restore_hold_gamma() {
 }
 
 fn apply_hold_gamma() {
+    if crate::vendor_info::nvidia_reference_mode_enabled() {
+        log::warn!(
+            "[hotkeys] hold-to-compare unavailable because NVIDIA reference mode is enabled"
+        );
+        return;
+    }
     {
         let _gamma_guard = GAMMA_WRITE_LOCK
             .lock()

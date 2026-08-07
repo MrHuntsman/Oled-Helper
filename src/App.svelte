@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, pollHDRStatus, pollHDRLuminance, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
@@ -813,10 +813,9 @@
     let unlistenHotkeyPressed;
     let unlistenTrayMode;
     // The Rust window subclass forwards WM_DISPLAYCHANGE and WM_DEVICECHANGE.
-    // Query only in response to those native notifications; there is no
-    // periodic display poll. Sunshine/virtual-display attach and detach events
-    // therefore refresh the monitor identity, mode lists, resolution, and Hz
-    // while this process remains open.
+    // Full display-info queries remain event-driven. Vendor control panels can
+    // silently change range/VRR, so a separate low-frequency vendor-only
+    // refresh below handles that case without touching mode lists or EDID.
     listen('display-changed', () => {
       scheduleDisplayInfoRefresh();
     }).then((stop) => { unlistenDisplayChanged = stop; }).catch(() => {});
@@ -873,6 +872,17 @@
     return () => {
       try { mq.removeEventListener('change', onHdrChange); } catch {}
     };
+  });
+
+  // Driver-level range/VRR settings may change without a Windows display
+  // notification. Refresh only those two fields while the app window is
+  // visible, at a gentle 5-second cadence. The full display query remains
+  // event-driven, so this does not repeatedly enumerate modes or read EDID.
+  $effect(() => {
+    if (!windowVisible) return;
+    refreshVendorDisplayInfo();
+    const timer = setInterval(() => refreshVendorDisplayInfo(), 5000);
+    return () => clearInterval(timer);
   });
 
   // HDR luminance is a DXGI call; only refresh while the System Info tab is
@@ -962,6 +972,8 @@
             <span class="monitor-tip-row"><span>Connector</span><strong>{app.displayInfo.connector || '—'}</strong></span>
             <span class="monitor-tip-row"><span>Color format</span><strong>{app.displayInfo.colorFormat || '—'}{app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}</strong></span>
             <span class="monitor-tip-row"><span>Desktop color</span><strong>{desktopColorDepth()}</strong></span>
+            <span class="monitor-tip-row"><span>Dynamic range</span><strong>{app.displayInfo.dynamicRange || '—'}</strong></span>
+            <span class="monitor-tip-row"><span>VRR</span><strong>{app.displayInfo.vrr || '—'}</strong></span>
             <span class="monitor-tip-row"><span>Current</span><strong>{app.displayInfo.width}×{app.displayInfo.height}{app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}</strong></span>
           </span>
         </span>
