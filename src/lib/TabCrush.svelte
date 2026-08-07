@@ -2,14 +2,14 @@
   // Inlined data URIs — see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
-  import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax } from './stores.svelte.js';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
   // duplicated in either destination.
   const dlog = (msg) => { console.log('[gpu]', msg); };
   const dwarn = (msg) => { console.warn('[gpu]', msg); };
   const derr = (msg) => { console.error('[gpu]', msg); };
-  import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_NITS_LADDER, HIGH_SDR_RANGE, computeHdrValues, computeSdrValues, computeHighNitsValues, highNitsWindow } from './calibration.js';
+  import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_SDR_RANGE, HIGH_NITS_CELLS, HIGH_NITS_COLS, HIGH_NITS_ROWS, HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_MAX_STOPS, highNitsGridCodes, highNitsSdrCodes, computeHdrValues, computeSdrValues, computeHighNitsValues } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
   import { onDestroy, untrack } from 'svelte';
 
@@ -39,7 +39,7 @@
   function stripTitle() {
     const isHdr = app.hdrStatus === 'hdr';
     if (crush.stripType === 'highNits') {
-      return isHdr ? 'HDR High Nits' : 'SDR High Nits';
+      return isHdr ? 'HDR Brightness' : 'SDR Brightness';
     }
     return isHdr ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)';
   }
@@ -48,8 +48,22 @@
     const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
     const sq = activeSquareCount();
     if (crush.stripType === 'highNits') {
-      const codes = highNitsWindow(isHdr ? HIGH_NITS_LADDER : HIGH_SDR_RANGE, sq);
-      return codes.map((code) => ({ code: String(code), unit: isHdr ? 'nits' : 'RGB' }));
+      // Fixed 3×7 grid (21 cells) in normal mode, no zoom; in fullscreen the
+      // grid grows to the aspect-fit cell count (up to 40) so every slot has
+      // a value. HDR shows region-stepped round nits values ending exactly
+      // at the user's Max (1000-step above 5000, 500-step from 1000–5000,
+      // 100-step below, finer when needed); SDR shows the bright RGB range
+      // sampled over the same number of cells. Only HDR cells are true nits
+      // values, so the 2000-nits outline threshold below never applies to
+      // SDR.
+      if (isHdr) {
+        return highNitsGridCodes(crush.highNitsMax, stripGeom.cells).map((code) => ({
+          code: String(code),
+          unit: 'nits',
+          bright: code >= 2000,
+        }));
+      }
+      return highNitsSdrCodes(stripGeom.cells).map((code) => ({ code: String(code), unit: 'RGB', bright: false }));
     }
     const codes = isHdr ? ALL_PQ_CODES : ALL_SDR_CODES;
     return codes.slice(0, sq).map((code, i) => ({
@@ -59,48 +73,72 @@
   }
 
   function labelCount() {
-    if (crush.stripType === 'highNits') {
-      const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
-      return highNitsWindow(isHdr ? HIGH_NITS_LADDER : HIGH_SDR_RANGE, activeSquareCount()).length;
-    }
+    if (crush.stripType === 'highNits') return stripGeom.cells;
     return activeSquareCount();
   }
 
   // Grid geometry for the current strip, matching the shader exactly
-  // (cells, cols, rows). Black = one row of sq cells; high-nits = a
-  // spreadsheet grid that fills the whole strip area: cols/rows are chosen so
-  // the cells are as square as the container's aspect ratio allows, with a
-  // slight preference for layouts that use every slot (no empty rows — the
-  // grid always fills the strip, unlike a fixed 10-row layout which left a
-  // black block below the last filled row).
-  let stripGeom = $state({ cells: 12, cols: 12, rows: 1 });
+  // (cells, cols, rows). Black = one row of sq cells; high-nits = the fixed
+  // 3×7 spreadsheet grid (7 columns across, 3 rows down — 21 cells) in
+  // normal mode. In fullscreen the canvas fills the whole screen, so the
+  // fixed 3×7 would stretch the cells into rectangles on a 16:9 (or wider)
+  // panel — instead the grid is recomputed from the canvas aspect ratio to
+  // keep every cell as close to a square as possible. The grid is also
+  // allowed to grow past 21 cells so every slot shows a real nits value
+  // (no empty black cells): the value generators accept the cell count.
+  // Initialized from computeStripGeom() (hoisted below) so the very first
+  // frame already matches the active strip — stripLabels() derives its
+  // label count from this, and a stale 12-cell default would briefly
+  // misalign the high-nits labels before the render effect corrects it.
+  let stripGeom = $state(computeStripGeom());
+  // Upper bound for the fullscreen high-nits grid. Searching without a cap
+  // would pick absurdly dense layouts for aspect ratios that divide exactly
+  // (16:9 could become 16×9 = 144 cells); 40 keeps cells comfortably large
+  // and readable while still fitting any common aspect ratio within ~5% of
+  // square.
+  const HIGH_NITS_MAX_GRID_CELLS = 40;
+  // Best-fit square-ish grid on a canvas of the given aspect ratio: search
+  // every rows×cols layout whose cell count is between the fixed 21 and the
+  // 40-cell cap, keep the layout whose cells come closest to 1:1 (width vs
+  // height). Every slot gets a real value — the value generators accept the
+  // returned cell count, so nothing renders black.
+  function bestFitGrid(canvasW, canvasH) {
+    if (canvasW < 1 || canvasH < 1) return { cells: HIGH_NITS_CELLS, cols: HIGH_NITS_COLS, rows: HIGH_NITS_ROWS };
+    let best = null;
+    let bestDiff = Infinity;
+    for (let rows = 1; rows <= HIGH_NITS_MAX_GRID_CELLS; rows++) {
+      for (let cols = 1; cols <= HIGH_NITS_MAX_GRID_CELLS; cols++) {
+        const cells = rows * cols;
+        if (cells < HIGH_NITS_CELLS || cells > HIGH_NITS_MAX_GRID_CELLS) continue;
+        const cellW = canvasW / cols;
+        const cellH = canvasH / rows;
+        const diff = Math.abs(cellW - cellH);
+        if (diff < bestDiff) { bestDiff = diff; best = { cells, cols, rows }; }
+      }
+    }
+    return best ?? { cells: HIGH_NITS_CELLS, cols: HIGH_NITS_COLS, rows: HIGH_NITS_ROWS };
+  }
   function computeStripGeom() {
     if (crush.stripType === 'highNits') {
-      const cells = labelCount();
-      const cw = canvas?.clientWidth || 0;
-      const ch = canvas?.clientHeight || 0;
-      const aspect = cw > 0 && ch > 0 ? cw / ch : 1.9;
-      let best = null;
-      let bestScore = Infinity;
-      const maxCols = Math.min(cells, 16);
-      for (let cols = 1; cols <= maxCols; cols++) {
-        const rows = Math.max(1, Math.ceil(cells / cols));
-        const empty = cols * rows - cells;
-        const score = Math.abs(Math.log((cols / rows) / aspect)) + empty * 0.02;
-        if (score < bestScore) { bestScore = score; best = { cells, cols, rows }; }
+      if (crush.fullscreen !== 'normal') {
+        // Fullscreen: derive cols/rows from the live canvas aspect ratio so
+        // cells stay ~square instead of stretching with the screen, growing
+        // past 21 cells as needed so no slot is left empty.
+        return bestFitGrid(canvas?.clientWidth || 0, canvas?.clientHeight || 0);
       }
-      return best ?? { cells, cols: 1, rows: Math.max(1, cells) };
+      return { cells: HIGH_NITS_CELLS, cols: HIGH_NITS_COLS, rows: HIGH_NITS_ROWS };
     }
     const sq = activeSquareCount();
     return { cells: sq, cols: sq, rows: 1 };
   }
   function refreshStripGeom() { stripGeom = computeStripGeom(); }
 
-  // Uniform layout: values[24] cell colors, then counts = (cells, cols,
+  // Uniform layout: values[48] cell colors, then counts = (cells, cols,
   // rows, gap). Cells are laid out row-major (left→right, top→bottom) like a
   // spreadsheet. The black strip is a single row (rows=1, cols=sq); the
-  // high-nits strip is a rows×cols grid.
-  const SHADER = `struct Cb{values:array<vec4<f32>,6>,counts:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
+  // high-nits strip is a rows×cols grid. 48 slots give headroom for the
+  // fullscreen aspect-fit grid, which can grow past the fixed 21 cells.
+  const SHADER = `struct Cb{values:array<vec4<f32>,12>,counts:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
 struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 @vertex fn vs(@builtin(vertex_index)i:u32)->VO{
   let pos=array(vec2f(-1,1),vec2f(3,1),vec2f(-1,-3));
@@ -259,7 +297,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       } catch (e) { dwarn(`getCurrentTexture threw: ${e.message}`); }
 
       dlog('creating uniform buffer + bind group...');
-      ub = device.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      ub = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       const bgl = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
       bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: ub } }] });
       const sh = device.createShaderModule({ code: SHADER });
@@ -366,23 +404,23 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       const sq = activeSquareCount();
       const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
       const highNits = crush.stripType === 'highNits';
-      // High Nits: render the windowed ladder/bright range (may be shorter
-      // than sq when the ladder is smaller than the chosen square count),
+      // High Nits: render the aspect-fit grid values (21 cells in normal
+      // mode, up to 40 in fullscreen — one value per slot, no empty cells),
       // laid out row-major across a spreadsheet grid.
       let vals, grid;
       if (highNits) {
-        vals = computeHighNitsValues(sq, isHdr);
         grid = untrack(() => stripGeom);
+        vals = computeHighNitsValues(crush.highNitsMax, isHdr, grid.cells);
       } else {
         vals = isHdr ? HDR_VALUES : SDR_VALUES;
         grid = { cells: sq, cols: sq, rows: 1 };
       }
-      const data = new Float32Array(28);
-      for (let i = 0; i < 24; i++) data[i] = i < grid.cells ? vals[i] : 0;
-      data[24] = grid.cells;
-      data[25] = grid.cols;
-      data[26] = grid.rows;
-      data[27] = highNits ? HIGH_NITS_GAP_FRACTION : (crush.blackStripGapEnabled ? GAP_FRACTION : 0);
+      const data = new Float32Array(52);
+      for (let i = 0; i < 48; i++) data[i] = i < grid.cells ? vals[i] : 0;
+      data[48] = grid.cells;
+      data[49] = grid.cols;
+      data[50] = grid.rows;
+      data[51] = highNits ? HIGH_NITS_GAP_FRACTION : (crush.blackStripGapEnabled ? GAP_FRACTION : 0);
       device.queue.writeBuffer(ub, 0, data);
 
       let tex;
@@ -408,7 +446,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     if (canvas && !initStarted) initGPU();
   });
   $effect(() => {
-    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void canvas;
+    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void canvas;
     // untrack the geometry write: stripGeom is a $state read by the template
     // and by render() (high-nits grid). Writing it from inside this effect —
     // whose render() call reads it — would re-schedule the effect on every
@@ -493,6 +531,23 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     // release, wheel, keyboard, toggle, restore defaults).
   });
 
+  // The black level slider ticks are drawn at multiples of this many
+  // adjustment units (see .slider-track-wrap input[type=range].has-ticks):
+  // a -150..150 range divided into 6 equal steps. Grabbing the thumb or
+  // clicking the track snaps to a tick ONLY when within this many units of
+  // one — in RAW units. The displayed value is adjustment/10, so this 2 raw
+  // is the same 0.2 the user asked for (and matches the ±2 dead zone at 0
+  // in normalizeBlackLevel below). Anything farther stays where it is, so
+  // the slider isn't forced onto every tick. Wheel and keyboard keep fine
+  // control (see below).
+  const BLACK_LEVEL_TICK_STEP = 50;
+  const BLACK_LEVEL_TICK_SNAP_DIST = 2; // 0.2 on the displayed value
+
+  function snapToBlackLevelTick(value) {
+    const nearest = Math.round(value / BLACK_LEVEL_TICK_STEP) * BLACK_LEVEL_TICK_STEP;
+    return Math.abs(value - nearest) <= BLACK_LEVEL_TICK_SNAP_DIST ? nearest : value;
+  }
+
   // Lets a drag start anywhere in the slider's expanded vertical buffer zone
   // (see .slider-track-wrap-half::before), not just on the thin native input.
   // Can't hand this off to the native input via a synthetic pointerdown —
@@ -500,9 +555,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   // dispatched PointerEvent starts the drag visually but doesn't continue
   // tracking subsequent moves. Instead we drive the whole drag manually here:
   // compute value from cursor X on down and on every move, write it directly
-  // to crush.adjustment, and stop on pointerup/cancel.
+  // to crush.adjustment, and stop on pointerup/cancel. The value snaps to
+  // the nearest tick and the near-zero dead zone (-2..2) snaps to 0.
   function normalizeBlackLevel(value) {
-    return (value !== 0 && Math.abs(value) <= 4) ? 0 : value;
+    return (value !== 0 && Math.abs(value) <= 2) ? 0 : value;
   }
 
   function setBlackLevel(value) {
@@ -516,7 +572,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   function handleBlackLevelInput(e) {
     const value = +e.target.value;
-    const normalized = normalizeBlackLevel(value);
+    // Snap to a tick when within tolerance (native thumb drags and keyboard
+    // both land here — track clicks already snapped in their pointerdown
+    // handler, and this re-applies harmlessly since the value is unchanged).
+    const normalized = normalizeBlackLevel(snapToBlackLevelTick(value));
     crush.adjustment = normalized;
     if (value !== normalized) e.target.value = normalized;
   }
@@ -535,32 +594,33 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     const direction = e.deltaY < 0 ? 1 : -1;
     const rawNext = Math.min(max, Math.max(min, current + direction * step));
     let next = setValue === setBlackLevel ? normalizeBlackLevel(rawNext) : rawNext;
-    // The black-level slider intentionally snaps values from -4..4 to zero.
-    // Jump across that dead zone so the first wheel tick always changes it.
-    if (next === current && current === 0) next = direction > 0 ? 5 : -5;
+    // The black-level slider intentionally snaps values from -2..2 (-0.2..0.2)
+    // to zero. Jump across that dead zone so the first wheel tick always
+    // changes it.
+    if (next === current && current === 0) next = direction > 0 ? 3 : -3;
     setValue(next);
     // Wheel changes are discrete inputs (not drags), so persist them.
     if (setValue === setBlackLevel) scheduleConfigSave();
   }
 
-  function handleTrackWrapPointerdown(e, inputEl) {
+  function handleTrackWrapPointerdown(e, inputEl, setDragging) {
     if (e.target === inputEl) return; // already on the real input, let it handle itself
     e.preventDefault();
     const min = +inputEl.min, max = +inputEl.max;
     const applyFromClientX = (clientX) => {
       const rect = inputEl.getBoundingClientRect();
       const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
-      const raw = Math.round(min + frac * (max - min));
-      crush.adjustment = (raw !== 0 && Math.abs(raw) <= 4) ? 0 : raw;
+      crush.adjustment = normalizeBlackLevel(snapToBlackLevelTick(min + frac * (max - min)));
     };
     applyFromClientX(e.clientX);
     inputEl.focus();
-    sliderDragging = true;
+    setDragging(true);
     function onMove(ev) { applyFromClientX(ev.clientX); }
     function onUp() {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
+      setDragging(false);
       // The drag (or click on the track) ended — persist the final value.
       // Saved directly in this handler (not in an $effect) because the
       // effect's window listener may not be registered yet for fast clicks.
@@ -634,11 +694,147 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   // Mouse wheel over the strip changes the zoom (square count). Wheeling up
   // (negative deltaY) increases zoom, down decreases — matches typical
-  // scroll-to-zoom conventions (maps, image viewers).
+  // scroll-to-zoom conventions (maps, image viewers). The High Nits grid is
+  // fixed at 3×7, so wheel does nothing there (the range steppers below are
+  // the High Nits equivalent).
   function handleStripWheel(e) {
     e.preventDefault();
+    if (crush.stripType === 'highNits') return;
     const dir = e.deltaY < 0 ? 1 : -1;
     crush.squareCounts[crush.stripType] = Math.min(MAX_SQUARES, Math.max(2, activeSquareCount() + dir));
+  }
+
+  // ── High Nits Max slider ─────────────────────────────────────
+  // The user only drags Max, which snaps to HIGH_NITS_MAX_STOPS. Step is
+  // derived in stores.svelte.js from the Max via the region rule (1000 above
+  // 5000, 500 from 1000–5000, 100 below), and the grid always ends exactly
+  // at the Max (see calibration.js highNitsGridCodes).
+  //
+  // The slider is NON-LINEAR: it maps to the stop index (0..22), so each of
+  // the 23 stops occupies an equal slice of the track regardless of its nits
+  // value. That makes the visual steps match the requested stops exactly
+  // (100, 200, … 1000, 1500, … 5000, 6000, … 10000 all evenly spaced) and
+  // keeps every stop clickable — a linear 100→10000 scale would cram the
+  // 100–1000 stops into the left 9% of the track. The readout and the strip
+  // still use the true nits value.
+  function highNitsStopIndex() {
+    const idx = HIGH_NITS_MAX_STOPS.indexOf(highNitsMaxValue());
+    return idx < 0 ? HIGH_NITS_MAX_STOPS.length - 1 : idx;
+  }
+
+  // Background for the Max slider: one tick mark per stop (evenly spaced,
+  // matching the index-based thumb positions) layered over the accent fill.
+  function nitsSliderBackground() {
+    const n = HIGH_NITS_MAX_STOPS.length;
+    const idx = highNitsStopIndex();
+    const fill = (idx / (n - 1)) * 100;
+    const ticks = [];
+    for (let i = 0; i < n; i++) {
+      const pos = (i / (n - 1)) * 100;
+      ticks.push(`transparent calc(${pos}% - 0.75px), rgba(255,255,255,0.45) calc(${pos}% - 0.75px), rgba(255,255,255,0.45) calc(${pos}% + 0.75px), transparent calc(${pos}% + 0.75px)`);
+    }
+    return `linear-gradient(to right, ${ticks.join(',')}), linear-gradient(to right, var(--accent) 0%, var(--accent) ${fill}%, #31313f ${fill}%, #31313f 100%)`;
+  }
+
+  // Wheel over the Max slider nudges to the adjacent stop (the native range
+  // input only responds to wheel when focused; driving it directly keeps the
+  // behavior consistent whether hovered or focused).
+  function handleNitsWheel(e) {
+    if (e.deltaY === 0) return;
+    e.preventDefault();
+    const dir = e.deltaY < 0 ? 1 : -1;
+    const idx = HIGH_NITS_MAX_STOPS.indexOf(highNitsMaxValue());
+    if (idx < 0) return; // defensive: value is always a stop after snapping
+    const next = Math.min(HIGH_NITS_MAX_STOPS.length - 1, Math.max(0, idx + dir));
+    setHighNitsMax(HIGH_NITS_MAX_STOPS[next]);
+  }
+
+  // Arrow/Page/Home/End keys step through the slider stops instead of the
+  // native 1-nits step (which would snap back to the same stop and feel
+  // dead — value+1 rounds back to the current stop).
+  function handleNitsSliderKeydown(e) {
+    let idx = HIGH_NITS_MAX_STOPS.indexOf(highNitsMaxValue());
+    if (idx < 0) {
+      // Defensive: not on a stop yet — snap to the nearest one first.
+      const value = highNitsMaxValue();
+      let best = 0;
+      let bestDist = Infinity;
+      HIGH_NITS_MAX_STOPS.forEach((stop, i) => {
+        const dist = Math.abs(stop - value);
+        if (dist < bestDist) { bestDist = dist; best = i; }
+      });
+      idx = best;
+    }
+    const last = HIGH_NITS_MAX_STOPS.length - 1;
+    let target = null;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') target = HIGH_NITS_MAX_STOPS[Math.min(last, idx + 1)];
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') target = HIGH_NITS_MAX_STOPS[Math.max(0, idx - 1)];
+    else if (e.key === 'PageUp') target = HIGH_NITS_MAX_STOPS[Math.min(last, idx + 5)];
+    else if (e.key === 'PageDown') target = HIGH_NITS_MAX_STOPS[Math.max(0, idx - 5)];
+    else if (e.key === 'Home') target = HIGH_NITS_MAX_STOPS[0];
+    else if (e.key === 'End') target = HIGH_NITS_MAX_STOPS[last];
+    if (target !== null) {
+      e.preventDefault();
+      setHighNitsMax(target);
+    }
+  }
+
+  // ── Hover tooltip on the High Nits grid ───────────────────────────
+  // Shows the nits/RGB value of the square under the cursor. The labels in
+  // each cell are always visible, but this makes values readable in
+  // fullscreen or when the interface is hidden. Cell index is computed from
+  // the live grid geometry (stripGeom: fixed 7×3 normally, aspect-fit up to
+  // 40 cells in fullscreen), so it's cheap per mousemove; the tooltip
+  // position is only written when it actually moves ≥1px.
+  let hoverCell = $state(-1);
+  let hoverTip = $state({ x: 0, y: 0 });
+  let lastHoverIdx = -1;
+  let lastTipX = -1;
+  let lastTipY = -1;
+  const HOVER_TIP_H = 22;
+
+  function handleStripHover(e) {
+    if (crush.stripType !== 'highNits') {
+      if (hoverCell !== -1) { hoverCell = -1; lastHoverIdx = -1; }
+      return;
+    }
+    const rect = canvas?.getBoundingClientRect();
+    if (!rect || rect.width < 1 || rect.height < 1) return;
+    // Use the live grid geometry (fixed 3×7 normally, aspect-fit in
+    // fullscreen) so the hovered cell always matches what's rendered.
+    const cols = stripGeom.cols;
+    const rows = stripGeom.rows;
+    const col = Math.floor(((e.clientX - rect.left) / rect.width) * cols);
+    const row = Math.floor(((e.clientY - rect.top) / rect.height) * rows);
+    if (col < 0 || col >= cols || row < 0 || row >= rows) {
+      if (hoverCell !== -1) { hoverCell = -1; lastHoverIdx = -1; }
+      return;
+    }
+    const idx = row * cols + col;
+    if (idx !== lastHoverIdx) { lastHoverIdx = idx; hoverCell = idx; }
+    // Sit on the right side of the cursor with its top edge aligned to the
+    // cursor's Y. Never flips sides — it just follows the cursor even at the
+    // screen edges (only the vertical position clamps to keep it on-screen).
+    const off = 12;
+    const x = e.clientX + off;
+    const y = Math.max(8, Math.min(e.clientY, window.innerHeight - HOVER_TIP_H - 8));
+    if (Math.abs(x - lastTipX) > 1 || Math.abs(y - lastTipY) > 1) {
+      lastTipX = x;
+      lastTipY = y;
+      hoverTip = { x, y };
+    }
+  }
+  function handleStripHoverEnd() {
+    if (hoverCell !== -1) { hoverCell = -1; lastHoverIdx = -1; }
+  }
+  // Value shown in the tooltip for the hovered cell (nits in HDR, RGB in
+  // SDR). Only called when hoverCell >= 0 (the template guards on it). The
+  // HDR value comes from the actual grid codes (region-stepped), so it stays
+  // in sync with the cell's label.
+  function hoverLabel() {
+    const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
+    if (isHdr) return { code: String(highNitsGridCodes(crush.highNitsMax, stripGeom.cells)[hoverCell]), unit: 'nits' };
+    return { code: String(highNitsSdrCodes(stripGeom.cells)[hoverCell]), unit: 'RGB' };
   }
 
   // ── Right-click context menu on the strip ──────────────────────────
@@ -646,6 +842,8 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let ctxMenuElement = $state(null);
   function openContextMenu(e) {
     e.preventDefault();
+    // Don't leave the hover tooltip floating over the open menu.
+    handleStripHoverEnd();
     const menuW = 260, menuH = 400;
     const x = Math.min(e.clientX, window.innerWidth - menuW - 8);
     const y = Math.min(e.clientY, window.innerHeight - menuH - 8);
@@ -733,6 +931,9 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     crush.adjustment = 0;
     crush.blackEnabled = true;
     crush.squareCounts = { black: 12, highNits: 8 };
+    crush.highNitsMin = HIGH_NITS_DEFAULT_MIN;
+    crush.highNitsMax = HIGH_NITS_DEFAULT_MAX;
+    crush.highNitsStep = HIGH_NITS_DEFAULT_STEP;
     crush.blackStripGapEnabled = true;
     crush.stripType = 'black';
     crush.fullscreen = 'normal';
@@ -777,7 +978,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <span class="settings-row-label">Black Level</span>
       <span class="slider-val">{adjustmentDisplay()}</span>
     </div>
-    <div class="slider-track-wrap dimmer-slider-track" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput)}>
+    <div class="slider-track-wrap dimmer-slider-track" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput, (v) => sliderDragging = v)}>
       <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={mainSliderInput}
         class="has-ticks"
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
@@ -797,10 +998,10 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 
   {#snippet calibrationTip()}
     {#if crush.stripType === 'highNits'}
-      <span>Each cell is a different brightness, ordered left to right, top to bottom, from lower to higher. Find the highest nits you can still see as distinct — beyond that your display clips it to solid white.</span>
+      <span>Each cell is a different brightness, low to high. Find the highest nits you can still distinguish — above that, your display clips to white.</span>
       <span class="info-tip-note">
         <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
-        <span>HDR shows a nits ladder up to {HIGH_NITS_LADDER[HIGH_NITS_LADDER.length - 1]} nits; SDR shows bright RGB {HIGH_SDR_RANGE[0]}…{HIGH_SDR_RANGE[HIGH_SDR_RANGE.length - 1]}.</span>
+        <span>HDR: nits up to {highNitsMaxValue()} · SDR: RGB {HIGH_SDR_RANGE[0]}–{HIGH_SDR_RANGE[HIGH_SDR_RANGE.length - 1]}</span>
       </span>
     {:else}
       <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
@@ -852,6 +1053,17 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
       <p class="gpu-status">Detecting HDR status...</p>
     {:else}
       <p class="strip-heading">
+        <!-- Title + Info group sizes to its content so the Info button always
+             sits right next to the title text; the Black/Brightness switch is
+             anchored to the heading's right edge (margin-left:auto) and never
+             moves when the title length changes. -->
+        <span class="strip-heading-title">
+          <strong>{stripTitle()}</strong>
+          <span class="info-tip-wrap">
+            <button class="info-tip-btn" aria-label="About the calibration strip and controls" tabindex="0">Info</button>
+            <span class="info-tip">{@render calibrationTip()}</span>
+          </span>
+        </span>
         <span class="strip-switch" role="group" aria-label="Calibration strip">
           {#each STRIPS as strip}
             <button type="button" class="strip-switch-btn" class:active={crush.stripType === strip.id}
@@ -859,11 +1071,6 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
               title={strip.title}
               onclick={() => setStripType(strip.id)}>{strip.label}</button>
           {/each}
-        </span>
-        <strong>{stripTitle()}</strong>
-        <span class="info-tip-wrap">
-          <button class="info-tip-btn" aria-label="About the calibration strip and controls" tabindex="0">Info</button>
-          <span class="info-tip">{@render calibrationTip()}</span>
         </span>
       </p>
     {/if}
@@ -873,14 +1080,16 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
     {/if}
 
     <div class="strip-wrap" class:monitor-fullscreen={crush.fullscreen === 'monitor'} class:inapp-fullscreen={crush.fullscreen === 'inApp'} class:high-nits={crush.stripType === 'highNits'} style={crush.fullscreen !== 'normal' ? 'position:fixed;inset:0;z-index:9999;border-radius:0;margin:0;' : ''}
-      onclick={handleStripClick} onkeydown={handleStripKeydown} oncontextmenu={openContextMenu} onwheel={handleStripWheel} role="button" tabindex="0" aria-label="Calibration strip. Double-click or press Enter or Space to cycle fullscreen mode.">
+      onclick={handleStripClick} onkeydown={handleStripKeydown} oncontextmenu={openContextMenu} onwheel={handleStripWheel}
+      onmousemove={handleStripHover} onmouseleave={handleStripHoverEnd}
+      role="button" tabindex="0" aria-label="Calibration strip. Double-click or press Enter or Space to cycle fullscreen mode.">
       <canvas bind:this={canvas}></canvas>
       {#if app.hdrStatus !== 'unknown' && !crush.hideCalibrationInterface}
         {#if crush.stripType === 'highNits'}
           {@const g = stripGeom}
           <div class="grid-labels" style="--grid-cols:{g.cols}; --grid-rows:{g.rows}">
             {#each stripLabels() as label, i}
-              <div class="grid-label">
+              <div class="grid-label" class:grid-label-bright={label.bright}>
                 <div>{label.code}</div>
                 <div class="square-unit">{label.unit}</div>
               </div>
@@ -897,15 +1106,15 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
           </div>
         {/if}
       {/if}
-      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface}
+      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface && crush.stripType !== 'highNits'}
         <div class="fs-help-wrap">
           <button class="fs-help-btn" aria-label="About black calibration and strip controls" tabindex="0">Info</button>
           <div class="fs-help-tip">{@render calibrationTip()}</div>
         </div>
       {/if}
-      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface}
+      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface && crush.stripType !== 'highNits'}
         <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, fsSliderInput, setBlackLevel, 5)}>
-          <div class="slider-track-wrap">
+          <div class="slider-track-wrap" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, fsSliderInput, (v) => fsSliderDragging = v)}>
             <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
               class="has-ticks"
               style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
@@ -921,16 +1130,52 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
           <span class="slider-val">{adjustmentDisplay()}</span>
         </div>
       {/if}
+      {#if crush.stripType === 'highNits' && hoverCell >= 0}
+        {@const tip = hoverLabel()}
+        <div class="nits-hover-tip" role="tooltip" style="left:{hoverTip.x}px; top:{hoverTip.y}px">
+          <strong>{tip.code}</strong><span>{tip.unit}</span>
+        </div>
+      {/if}
     </div>
 
-    <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCounts[crush.stripType] = value)}>
-      <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />
-      <div class="slider-track-wrap zoom-track-compact">
-        <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCounts[crush.stripType]} bind:this={zoomSliderInput}
-          style="--fill:{((activeSquareCount() - 2) / (MAX_SQUARES - 2)) * 100}%" />
+    {#if crush.stripType === 'highNits'}
+      <!-- Fixed 3×7 grid — the user picks only the top of the nits range   -->
+      <!-- with a single Max slider; Min is fixed and the nits-per-cell step -->
+      <!-- is derived silently as (max − min) / 20 (setHighNitsMax in        -->
+      <!-- stores.svelte.js), not shown as its own control. The slider only -->
+      <!-- rests on HIGH_NITS_MAX_STOPS. In SDR the strip shows a fixed RGB  -->
+      <!-- ramp, so the nits range doesn't apply — greyed out (still         -->
+      <!-- configurable once in HDR).                                       -->
+      <div class="nits-range-control" class:sdr-disabled={app.hdrStatus !== 'hdr' || forceSdrRender} title={app.hdrStatus === 'hdr' && !forceSdrRender ? 'Nits range shown on the strip' : 'Nits range only applies in HDR'}>
+        <!-- SDR: the ramp is a fixed RGB range, so disable the control -->
+        <div class="nits-slider-group" onwheel={handleNitsWheel}>
+          <span class="nits-range-label">Max</span>
+          <div class="slider-track-wrap zoom-track-compact">
+            <!-- The input is index-based (0..22 = one per stop): native arrow
+                 keys step one stop at a time and the thumb/ticks are evenly
+                 spaced. oninput maps the raw index to its stop value. -->
+            <input type="range" min="0" max={HIGH_NITS_MAX_STOPS.length - 1} step="1"
+              value={highNitsStopIndex()}
+              oninput={(e) => setHighNitsMax(HIGH_NITS_MAX_STOPS[+e.target.value])}
+              onkeydown={handleNitsSliderKeydown}
+              style="background:{nitsSliderBackground()}"
+              aria-label="Maximum nits"
+              aria-valuetext={`${highNitsMaxValue()} nits`} />
+          </div>
+          <span class="nits-slider-val">{highNitsMaxValue()}</span>
+        </div>
+        <span class="nits-range-unit">nits · step {crush.highNitsStep}</span>
       </div>
-      <span class="slider-val zoom-val-compact">{activeSquareCount()}</span>
-    </div>
+    {:else}
+      <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCounts[crush.stripType] = value)}>
+        <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />
+        <div class="slider-track-wrap zoom-track-compact">
+          <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCounts[crush.stripType]} bind:this={zoomSliderInput}
+            style="--fill:{((activeSquareCount() - 2) / (MAX_SQUARES - 2)) * 100}%" />
+        </div>
+        <span class="slider-val zoom-val-compact">{activeSquareCount()}</span>
+      </div>
+    {/if}
   </div>
 
   {#if ctxMenu.open}

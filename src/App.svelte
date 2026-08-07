@@ -566,6 +566,14 @@
     return resolutionNames.get(`${app.displayInfo.width}x${app.displayInfo.height}`) || '';
   }
 
+  // Desktop color depth as Windows' classic Display Properties reports it
+  // (GetDeviceCaps BITSPIXEL on the screen DC — 32 on modern setups). The
+  // browser's screen.colorDepth reports 30 on 10-bit panels, which is the
+  // signal bit depth, not the desktop color mode.
+  function desktopColorDepth() {
+    return app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '—';
+  }
+
   // Anything wider than a standard 16:9 panel (1.9 gives headroom above
   // 16:9's 1.78 without also catching it) is treated as ultrawide.
   function isUltrawide(width, height) {
@@ -945,8 +953,17 @@
     <span>v0.1.0</span>
     <div class="status-bar-right">
       {#if app.displayInfo.monitorName}
-        <span class="current-monitor" title={`${app.displayInfo.monitorName}${app.displayInfo.monitorId ? ` · ${app.displayInfo.monitorId}` : ''}`}>
-          {app.displayInfo.monitorName}
+        <span class="monitor-tip-wrap" tabindex="0" aria-label={`Monitor info: ${app.displayInfo.monitorName}`}>
+          <span class="current-monitor">
+            {app.displayInfo.monitorName}
+          </span>
+          <span class="monitor-tip" role="tooltip">
+            <span class="monitor-tip-title">{app.displayInfo.monitorName}</span>
+            <span class="monitor-tip-row"><span>Connector</span><strong>{app.displayInfo.connector || '—'}</strong></span>
+            <span class="monitor-tip-row"><span>Color format</span><strong>{app.displayInfo.colorFormat || '—'}{app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}</strong></span>
+            <span class="monitor-tip-row"><span>Desktop color</span><strong>{desktopColorDepth()}</strong></span>
+            <span class="monitor-tip-row"><span>Current</span><strong>{app.displayInfo.width}×{app.displayInfo.height}{app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}</strong></span>
+          </span>
         </span>
       {/if}
       <div class="resolution-wrap">

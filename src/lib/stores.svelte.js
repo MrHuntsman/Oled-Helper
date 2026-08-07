@@ -1,11 +1,12 @@
 // Svelte 5 runes stores — $state object pattern
 import { invoke } from '@tauri-apps/api/core';
+import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_CELLS, HIGH_NITS_MAX_CEILING, HIGH_NITS_MAX_STOPS, highNitsStepForMax } from './calibration.js';
 
 export const app = $state({
   activeTab: 'crush',
   hdrStatus: 'unknown',
   hdrLuminance: null,
-  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', refreshRateHz: null, refreshRates: [], resolutions: [] },
+  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
 });
@@ -18,7 +19,16 @@ export const crush = $state({
   // (never persisted) — every launch starts on Black.
   stripType: 'black',
   // Per-strip square counts (zoom), session-only like squareCount was.
+  // Only the Black strip zooms — the High Nits grid is always fixed.
   squareCounts: { black: 12, highNits: 8 },
+  // High Nits strip range. The grid is always a fixed 3 rows × 7 columns
+  // (21 cells) with no zoom; Min is fixed and the user picks Max via a
+  // single slider. Step (nits between neighboring cells) derives silently
+  // from Max on a round-number ladder (50/100/250/500/1000/...) below.
+  // Persisted in the config file.
+  highNitsMin: HIGH_NITS_DEFAULT_MIN,
+  highNitsMax: HIGH_NITS_DEFAULT_MAX,
+  highNitsStep: HIGH_NITS_DEFAULT_STEP,
   fullscreen: 'normal',
   // Hide the calibration strip interface (labels, controls) — right-click
   // menu on the strip. The info tooltip and fullscreen slider only hide in
@@ -36,6 +46,68 @@ export function activeSquareCount() {
 
 export function setStripType(type) {
   if (type === 'black' || type === 'highNits') crush.stripType = type;
+}
+
+// High Nits range editing. The grid is a fixed 21 cells ending exactly at
+// the Max, with region steps (see calibration.js highNitsGridCodes): 1000-
+// step above 5000, 500-step from 1000 to 5000, 100-step below (finer when
+// the Max is too low for 21 distinct round values). The user controls a
+// single Max slider that rests on HIGH_NITS_MAX_STOPS; Step is derived from
+// Max via the region rule (highNitsStepForMax) — never dragged directly.
+const NITS_MIN_FLOOR = HIGH_NITS_DEFAULT_MIN;
+
+function nearestStop(value) {
+  let best = HIGH_NITS_MAX_STOPS[0];
+  let bestDist = Infinity;
+  for (const stop of HIGH_NITS_MAX_STOPS) {
+    const dist = Math.abs(stop - value);
+    if (dist < bestDist) { bestDist = dist; best = stop; }
+  }
+  return best;
+}
+
+export function highNitsMaxValue() {
+  return crush.highNitsMax;
+}
+
+// Kept only so any remaining caller (e.g. an old persisted config shape)
+// has somewhere safe to land — Min is no longer user-editable. Silently a
+// no-op besides re-deriving step/max, since Min is always NITS_MIN_FLOOR.
+export function setHighNitsMin(_value) {
+  crush.highNitsMin = NITS_MIN_FLOOR;
+  crush.highNitsStep = highNitsStepForMax(crush.highNitsMax);
+  scheduleNitsRangeSave();
+}
+export function setHighNitsMax(value) {
+  const raw = Math.max(HIGH_NITS_MAX_STOPS[0], Math.min(HIGH_NITS_MAX_CEILING, Number(value) || HIGH_NITS_MAX_CEILING));
+  // Snap directly to the nearest slider stop — the slider only ever rests on
+  // a stop, so every position is a clean round Max (100/500/1000-step).
+  crush.highNitsMax = nearestStop(raw);
+  crush.highNitsStep = highNitsStepForMax(crush.highNitsMax);
+  scheduleNitsRangeSave();
+}
+// Re-clamps max/step against the stops and fixes Min to the floor — used
+// after loading a persisted config, since an old save (from the previous
+// uniform-step design, or a future manual edit of the config file) could
+// have Min away from the floor or a Max that isn't on a slider stop.
+function clampHighNitsRange() {
+  crush.highNitsMin = NITS_MIN_FLOOR;
+  const raw = Math.max(HIGH_NITS_MAX_STOPS[0], Math.min(HIGH_NITS_MAX_CEILING, crush.highNitsMax || HIGH_NITS_MAX_CEILING));
+  crush.highNitsMax = nearestStop(raw);
+  crush.highNitsStep = highNitsStepForMax(crush.highNitsMax);
+}
+// Debounced like setPollIntervalMs below: a slider fires many oninput events
+// per drag (unlike the old +/- buttons, which only ever fired on discrete
+// clicks or wheel ticks), so saving on every one would spam the config-file
+// write. crush.highNitsMin/Step update immediately above — only the disk
+// write and the invoke() call wait for the drag to settle.
+let nitsRangeSaveTimer = null;
+function scheduleNitsRangeSave() {
+  clearTimeout(nitsRangeSaveTimer);
+  nitsRangeSaveTimer = setTimeout(() => {
+    nitsRangeSaveTimer = null;
+    saveConfig();
+  }, 400);
 }
 
 let legacyBlackLift = null;
@@ -235,6 +307,15 @@ export async function loadConfig(prefetchedCfg = null) {
     // Legacy migration: the old calibration_text flag meant "show text".
     else if (typeof cfg.calibration_text === 'boolean') crush.hideCalibrationInterface = !cfg.calibration_text;
     if (cfg && typeof cfg.black_strip_gap_enabled === 'boolean') crush.blackStripGapEnabled = cfg.black_strip_gap_enabled;
+    if (cfg && typeof cfg.high_nits_min === 'number' && Number.isFinite(cfg.high_nits_min)) crush.highNitsMin = cfg.high_nits_min;
+    if (cfg && typeof cfg.high_nits_max === 'number' && Number.isFinite(cfg.high_nits_max)) crush.highNitsMax = cfg.high_nits_max;
+    else if (cfg && typeof cfg.high_nits_step === 'number' && Number.isFinite(cfg.high_nits_step)) {
+      // Migrating an older config that only stored min/step: derive max the
+      // way the old 3-slider design did, so existing users see the same
+      // range they had before this control was simplified to min/max.
+      crush.highNitsMax = crush.highNitsMin + cfg.high_nits_step * (HIGH_NITS_CELLS - 1);
+    }
+    clampHighNitsRange();
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
@@ -297,6 +378,9 @@ export function saveConfig() {
     black_enabled: crush.blackEnabled,
     hide_calibration_interface: crush.hideCalibrationInterface,
     black_strip_gap_enabled: crush.blackStripGapEnabled,
+    high_nits_min: crush.highNitsMin,
+    high_nits_max: crush.highNitsMax,
+    high_nits_step: crush.highNitsStep,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
     taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
@@ -432,6 +516,9 @@ export async function restoreAllDefaults() {
   const defaults = await invoke('reset_config');
   await loadConfig(defaults);
   crush.squareCounts = { black: 12, highNits: 8 };
+  crush.highNitsMin = HIGH_NITS_DEFAULT_MIN;
+  crush.highNitsMax = HIGH_NITS_DEFAULT_MAX;
+  crush.highNitsStep = HIGH_NITS_DEFAULT_STEP;
   crush.stripType = 'black';
   crush.fullscreen = 'normal';
   crush.blackStripGapEnabled = true;
@@ -507,7 +594,11 @@ export function pollDisplayInfo() {
   const prevNativeWidth = app.displayInfo.nativeWidth;
   const prevNativeHeight = app.displayInfo.nativeHeight;
   const prevNativeSource = app.displayInfo.nativeSource;
-  app.displayInfo = { width: Math.round(s.width * dpr), height: Math.round(s.height * dpr), deviceName: prevDeviceName, monitorName: prevMonitorName, monitorId: prevMonitorId, nativeWidth: prevNativeWidth, nativeHeight: prevNativeHeight, nativeSource: prevNativeSource, refreshRateHz: prevRefreshRateHz, refreshRates: prevRefreshRates, resolutions: prevResolutions };
+  const prevConnector = app.displayInfo.connector;
+  const prevColorFormat = app.displayInfo.colorFormat;
+  const prevBitsPerChannel = app.displayInfo.bitsPerChannel;
+  const prevDesktopBits = app.displayInfo.desktopBits;
+  app.displayInfo = { width: Math.round(s.width * dpr), height: Math.round(s.height * dpr), deviceName: prevDeviceName, monitorName: prevMonitorName, monitorId: prevMonitorId, nativeWidth: prevNativeWidth, nativeHeight: prevNativeHeight, nativeSource: prevNativeSource, connector: prevConnector, colorFormat: prevColorFormat, bitsPerChannel: prevBitsPerChannel, desktopBits: prevDesktopBits, refreshRateHz: prevRefreshRateHz, refreshRates: prevRefreshRates, resolutions: prevResolutions };
   invoke('get_display_info').then((info) => {
     if (requestSequence !== displayPollSequence) return;
     if (!info) { scheduleDisplayInfoRetry(); return; }
@@ -529,7 +620,7 @@ export function pollDisplayInfo() {
       // the scoped profile for the newly detected display/mode.
       persistCurrentBlackLevelProfile();
     }
-    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
+    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
     if (nextRefreshRate && (nextRefreshRate !== previousRefreshRate || displayOrModeChanged)) applyBlackLevelProfileForRefreshRate(nextRefreshRate);
   }).catch(() => scheduleDisplayInfoRetry());
 }

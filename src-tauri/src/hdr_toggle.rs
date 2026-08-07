@@ -28,11 +28,17 @@
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO,
+    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Graphics::Gdi::{
+    DISPLAYCONFIG_COLOR_ENCODING, DISPLAYCONFIG_COLOR_ENCODING_INTENSITY,
+    DISPLAYCONFIG_COLOR_ENCODING_RGB, DISPLAYCONFIG_COLOR_ENCODING_YCBCR420,
+    DISPLAYCONFIG_COLOR_ENCODING_YCBCR422, DISPLAYCONFIG_COLOR_ENCODING_YCBCR444,
+};
 
 #[derive(serde::Serialize, Clone, Copy, PartialEq, Eq)]
 pub struct HdrCapability {
@@ -215,6 +221,144 @@ pub struct HdrLuminance {
 // NOTE: the CCD/DisplayConfig API used by the HDR toggle above does NOT
 // expose nit values (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 in wingdi.h has
 // no luminance fields) — DXGI_OUTPUT_DESC1 is the correct source.
+// ── Output info (connector + color format/depth) ─────────────────────────
+// The status-bar tooltip on the monitor chip shows how the primary display
+// is physically connected and what color pipeline it is running. Both come
+// from the same CCD path walk used for the HDR toggle above:
+//   • connector   — DISPLAYCONFIG_TARGET_DEVICE_NAME.outputTechnology
+//   • color       — DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO.colorEncoding +
+//                   bitsPerColorChannel (total RGB bits → per channel / 3)
+// Output dynamic range (Full/Limited) and VRR/G-Sync state are NOT exposed
+// by any public Win32 API (driver-internal), so they are intentionally
+// omitted rather than guessed.
+#[derive(serde::Serialize, Clone, Default)]
+pub struct DisplayOutputInfo {
+    pub connector: String,
+    pub color_format: String,
+    pub bits_per_channel: u32,
+    // Desktop color depth as Windows' classic Display Properties reports it:
+    // GetDeviceCaps(BITSPIXEL) on the screen DC — 32 on virtually every
+    // modern setup (True Color), regardless of the panel's signal bit depth.
+    pub desktop_bits: u32,
+}
+
+fn connector_label(tech: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY) -> &'static str {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL,
+    };
+    match tech {
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15 => "VGA",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI => "DVI",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI => "HDMI",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS => "LVDS",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL => "DisplayPort",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED => "eDP",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL => "USB-C DisplayPort",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EXTERNAL => "UDI",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED => "Embedded UDI",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_SDTVDONGLE => "TV dongle",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST => "Miracast",
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL => "Internal",
+        _ => "Unknown",
+    }
+}
+
+fn color_encoding_label(enc: DISPLAYCONFIG_COLOR_ENCODING) -> &'static str {
+    match enc {
+        DISPLAYCONFIG_COLOR_ENCODING_RGB => "RGB",
+        DISPLAYCONFIG_COLOR_ENCODING_YCBCR444 => "YCbCr 4:4:4",
+        DISPLAYCONFIG_COLOR_ENCODING_YCBCR422 => "YCbCr 4:2:2",
+        DISPLAYCONFIG_COLOR_ENCODING_YCBCR420 => "YCbCr 4:2:0",
+        DISPLAYCONFIG_COLOR_ENCODING_INTENSITY => "Intensity",
+        _ => "Unknown",
+    }
+}
+
+// Friendly monitor name from a CCD target (trimmed UTF-16, no padding).
+fn target_monitor_name(name: &DISPLAYCONFIG_TARGET_DEVICE_NAME) -> String {
+    let end = name
+        .monitorFriendlyDeviceName
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(name.monitorFriendlyDeviceName.len());
+    String::from_utf16_lossy(&name.monitorFriendlyDeviceName[..end])
+}
+
+fn target_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_TARGET_DEVICE_NAME> {
+    unsafe {
+        let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        let result = DisplayConfigGetDeviceInfo(&mut name.header);
+        if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
+            return None;
+        }
+        Some(name)
+    }
+}
+
+// Desktop color depth via the screen DC — matches the classic Windows
+// Display Properties "32-bit" entry. Fallback 0 when the DC can't be made.
+fn query_desktop_bits() -> u32 {
+    use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, BITSPIXEL};
+    use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+    unsafe {
+        let dc = GetDC(Some(GetDesktopWindow()));
+        if dc.0.is_null() {
+            return 0;
+        }
+        let bits = GetDeviceCaps(Some(dc), BITSPIXEL) as u32;
+        let _ = ReleaseDC(Some(GetDesktopWindow()), dc);
+        bits
+    }
+}
+
+// Queries connector + color format/depth for the primary display, matching
+// the CCD target against the primary monitor's EDID-backed friendly name
+// (the same string the app shows in the status bar). Falls back to the
+// first active path when the name lookup fails (e.g. single-display setups,
+// or a mismatch between CCD and the EDID name). Returns None only when
+// there are no active paths at all.
+pub fn query_display_output_info(primary_monitor_name: &str) -> Option<DisplayOutputInfo> {
+    let (paths, _modes) = query_active_paths().ok()?;
+    let mut selected: Option<&DISPLAYCONFIG_PATH_INFO> = None;
+    for path in &paths {
+        let Some(name) = target_device_name(path) else { continue; };
+        if !primary_monitor_name.is_empty() && target_monitor_name(&name) == primary_monitor_name {
+            selected = Some(path);
+            break;
+        }
+    }
+    let path = selected.or_else(|| paths.first())?;
+    let mut info = DisplayOutputInfo::default();
+    if let Some(name) = target_device_name(path) {
+        info.connector = connector_label(name.outputTechnology).to_string();
+    }
+    if let Some(aci) = get_advanced_color_info(path) {
+        info.color_format = color_encoding_label(aci.colorEncoding).to_string();
+        // bitsPerColorChannel is already bits-per-channel (10 for a 10-bit
+        // panel) on Windows 11 24H2+ — report it as-is. (The older
+        // DISPLAYCONFIG_COLOR_DEPTH values 24/30/36/48 were total RGB bits,
+        // but the field in DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO is per
+        // channel, confirmed against a 10-bit panel returning 10.)
+        info.bits_per_channel = aci.bitsPerColorChannel;
+    }
+    info.desktop_bits = query_desktop_bits();
+    Some(info)
+}
+
 pub fn query_hdr_luminance() -> Option<HdrLuminance> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput6};

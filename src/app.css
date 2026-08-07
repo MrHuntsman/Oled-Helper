@@ -443,6 +443,11 @@ button {
 
 /* ── Info tooltip (? icon) ─────────────────────────────────── */
 .info-tip-wrap { position: relative; display: inline-flex; align-items: center; vertical-align: middle; margin-left: 4px; }
+/* Inside .strip-heading-title the wrap needs no extra left margin — the
+   fixed-width container is the spacing authority, and the heading's flex gap
+   separates it from the switch. (The generic rule above keeps margin-left
+   for any other use, e.g. the old standalone placement.) */
+.strip-heading-title .info-tip-wrap { margin-left: 6px; }
 .info-tip-btn {
   flex-shrink: 0;
   padding: 2px 8px;
@@ -594,6 +599,77 @@ button {
   font-size: 12px;
   min-width: 22px;
   text-align: left;
+}
+
+/* High Nits range controls — replaces the zoom slider for the fixed 3×7
+   grid: three labelled sliders (Min / Step / Max) in the same compact
+   style as the zoom row below the strip. */
+.nits-range-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 8px;
+  padding: 4px 0;
+}
+.nits-range-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-weak);
+}
+.nits-slider-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.nits-slider-val {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  min-width: 34px;
+  text-align: left;
+}
+.nits-range-unit {
+  font-size: 12px;
+  color: var(--text-weak);
+}
+/* In SDR the High Nits strip shows a fixed RGB ramp, so the nits range is
+   not applicable — grey the row out (still configurable once in HDR). */
+.nits-range-control.sdr-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* Hover tooltip on the High Nits grid — follows the cursor and shows the
+   value of the square underneath. pointer-events: none so it never steals
+   clicks/wheel from the strip, and fixed positioning keeps it glued to the
+   cursor even in fullscreen. */
+.nits-hover-tip {
+  position: fixed;
+  z-index: 60;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 5px;
+  /* Nearly opaque black backdrop keeps the chip readable over any cell
+     brightness (pure white, HDR blowouts, or the dark panel). */
+  background: rgba(8, 8, 10, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity 90ms ease;
+}
+.nits-hover-tip strong {
+  color: #fff;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
 .slider-track-wrap input[type=range].has-ticks {
@@ -1695,14 +1771,40 @@ button {
 .hotkey-hint-top {
   margin: 0 0 10px;
 }
-.strip-heading { margin: 4px 0; font-size: 13px; }
+.strip-heading {
+  margin: 4px 0;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Title + Info button group: sizes to its content so the Info button always
+   sits right next to the title text, whatever the title length. The strip
+   switch is anchored to the heading's right edge (margin-left:auto) so it
+   never moves when switching strips. No overflow:hidden here — the Info
+   tooltip drops below and must stay visible; only the title text
+   ellipsizes. */
+.strip-heading-title {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.strip-heading-title strong {
+  flex-shrink: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-/* Strip switcher — segmented button row inside the strip heading. */
+/* Strip switcher — segmented button row anchored to the heading's right
+   edge (margin-left:auto) so it stays in place when switching strips. */
 .strip-switch {
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  margin-right: 8px;
+  margin-left: auto;
   padding: 2px;
   border-radius: 6px;
   background: color-mix(in srgb, var(--hover) 55%, transparent);
@@ -1764,21 +1866,28 @@ button {
   display: grid;
   grid-template-columns: repeat(var(--grid-cols, 1), 1fr);
   grid-template-rows: repeat(var(--grid-rows, 1), 1fr);
-  gap: 0.8%; /* GAP_FRACTION */
+  /* High Nits cells render edge-to-edge (HIGH_NITS_GAP_FRACTION = 0), so the
+     label tracks must match — a CSS gap here would offset the labels from
+     the rendered cells. */
+  gap: 0;
   /* Font scales with cell width only — same visual language as the black
      strip's labels, with tabular digits so 100 and 10000 stay evenly spaced
-     and crisp. The grid now always fills the strip area (rows are computed
-     from the container's aspect ratio), so cells are tall enough that the
-     two-line label fits without a height clamp. The 0.26 multiplier fits the
-     widest 5-digit value ("10000") inside its cell with no clipping. */
-  font-size: clamp(9px, calc((100cqw / var(--grid-cols, 1)) * 0.26), 22px);
+     and crisp. The grid is a fixed 3 rows × 7 columns in normal mode; in
+     fullscreen it grows to the aspect-fit count (up to 8×5 = 40 cells) so
+     every slot shows a value. The 0.26 multiplier fits the widest 5-digit
+     value ("10000") inside its cell with no clipping. */
+  font-size: clamp(8px, calc((100cqw / var(--grid-cols, 1)) * 0.26), 12px);
   color: var(--text);
   font-variant-numeric: tabular-nums;
   pointer-events: none;
   z-index: 5;
 }
-.strip-wrap.monitor-fullscreen .grid-labels { font-size: clamp(12px, calc((100cqw / var(--grid-cols, 1)) * 0.3), 40px); }
-.strip-wrap.inapp-fullscreen .grid-labels { font-size: clamp(11px, calc((100cqw / var(--grid-cols, 1)) * 0.28), 28px); }
+/* Smaller fullscreen label font: the grid grows to the aspect-fit cell
+   count in fullscreen, so the labels must stay subtle and not compete with
+   the bright cells — smaller multiplier and a lower clamp ceiling than the
+   in-app strip. */
+.strip-wrap.monitor-fullscreen .grid-labels { font-size: clamp(10px, calc((100cqw / var(--grid-cols, 1)) * 0.22), 26px); }
+.strip-wrap.inapp-fullscreen .grid-labels { font-size: clamp(9px, calc((100cqw / var(--grid-cols, 1)) * 0.2), 20px); }
 .grid-label {
   display: flex;
   flex-direction: column;
@@ -1806,10 +1915,10 @@ button {
 .grid-label {
   color: rgba(13, 13, 15, 0.92);
   text-shadow:
-    0.5px 0 0 rgba(255, 255, 255, 0.55),
-    -0.5px 0 0 rgba(255, 255, 255, 0.55),
-    0 0.5px 0 rgba(255, 255, 255, 0.55),
-    0 -0.5px 0 rgba(255, 255, 255, 0.55);
+    0.2px 0 0 rgba(255, 255, 255, 0.55),
+    -0.2px 0 0 rgba(255, 255, 255, 0.55),
+    0 0.2px 0 rgba(255, 255, 255, 0.55),
+    0 -0.2px 0 rgba(255, 255, 255, 0.55);
 }
 .grid-label .square-unit {
   color: rgba(13, 13, 15, 0.92);
@@ -1997,6 +2106,12 @@ button {
   align-items: center;
   gap: 10px;
 }
+.monitor-tip-wrap {
+  position: relative;
+  display: inline-flex;
+  max-width: 180px;
+  outline: none;
+}
 .current-monitor {
   max-width: 180px;
   overflow: hidden;
@@ -2007,12 +2122,72 @@ button {
   font-weight: 500;
   letter-spacing: 0.01em;
   opacity: 0.9;
+  cursor: help;
 }
 .current-monitor::before {
   content: '▣';
   margin-right: 5px;
   color: var(--accent);
   font-size: 9px;
+}
+/* Display-info tooltip on the monitor chip (status bar). Opens upward since
+   the status bar hugs the bottom edge; shown on hover or keyboard focus. */
+.monitor-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 240px;
+  max-width: 340px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(15, 15, 18, 0.97);
+  border: 1px solid var(--divider);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(4px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms;
+  pointer-events: none;
+  z-index: 70;
+}
+.monitor-tip-wrap:hover .monitor-tip,
+.monitor-tip-wrap:focus-visible .monitor-tip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+.monitor-tip-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  padding-bottom: 4px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--divider);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.monitor-tip-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.monitor-tip-row span:first-child {
+  color: var(--text-weak);
+  flex-shrink: 0;
+}
+.monitor-tip-row strong {
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  word-break: break-word;
 }
 .display-info { color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 

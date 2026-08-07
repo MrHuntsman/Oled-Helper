@@ -60,6 +60,13 @@ pub struct DisplayInfo {
     // Which EDID location supplied the native resolution ("CEA-861",
     // "base EDID", or "") — diagnostic info for the Debug tab.
     pub native_source: String,
+    // Physical connector ("HDMI", "DisplayPort", ...) and the current color
+    // pipeline (format + bits per channel) — queried via the CCD API. Empty
+    // strings / 0 when the query failed.
+    pub connector: String,
+    pub color_format: String,
+    pub bits_per_channel: u32,
+    pub desktop_bits: u32,
     pub refresh_hz: u32,
     pub refresh_rates: Vec<u32>,
     pub resolutions: Vec<ResolutionInfo>,
@@ -577,6 +584,7 @@ pub fn query_current_display() -> Option<DisplayInfo> {
         .map(|(w, h, source)| (w, h, source.to_string()))
         .unwrap_or((0, 0, String::new()));
     let monitor_name = cached_edid_monitor_name(&target).unwrap_or(target.monitor_name);
+    let output = crate::hdr_toggle::query_display_output_info(&monitor_name);
     Some(DisplayInfo {
         width: devmode.dmPelsWidth,
         height: devmode.dmPelsHeight,
@@ -586,6 +594,10 @@ pub fn query_current_display() -> Option<DisplayInfo> {
         native_width,
         native_height,
         native_source,
+        connector: output.as_ref().map(|o| o.connector.clone()).unwrap_or_default(),
+        color_format: output.as_ref().map(|o| o.color_format.clone()).unwrap_or_default(),
+        bits_per_channel: output.as_ref().map(|o| o.bits_per_channel).unwrap_or(0),
+        desktop_bits: output.as_ref().map(|o| o.desktop_bits).unwrap_or(0),
         refresh_hz: devmode.dmDisplayFrequency,
         refresh_rates,
         resolutions,

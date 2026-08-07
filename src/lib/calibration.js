@@ -24,14 +24,192 @@ export const HIGH_NITS_GAP_FRACTION = 0;
 // left→right, top→bottom, from lower to higher nits. In SDR it shows a
 // bright-RGB ramp instead.
 
-// Fixed nits ladder, ascending. Coarse at the top, fine at the bottom
-// (user: "go from 10000 to 4000 to 2000 to 1000, and then start slowing
-// down to get more granularity"). This is a placeholder the user will
-// refine — edit this single array.
-export const HIGH_NITS_LADDER = [
-  100, 150, 200, 250, 300, 350, 400, 500, 600, 700, 800,
-  1000, 1200, 1500, 2000, 3000, 4000, 5000, 6000, 8000, 10000,
-];
+// The High Nits grid is a FIXED 3 rows × 7 columns (21 cells) — no zoom.
+// The user picks the minimum nits and the step between neighboring cells
+// (granularity); the maximum derives as min + step × 20. Only two of the
+// three are independent, and stores.svelte.js keeps them in sync.
+export const HIGH_NITS_COLS = 7;
+export const HIGH_NITS_ROWS = 3;
+export const HIGH_NITS_CELLS = HIGH_NITS_COLS * HIGH_NITS_ROWS; // 21
+export const HIGH_NITS_DEFAULT_MIN = 100;
+// Max slider stops — the ONLY positions the Max slider rests on: 100-step
+// from 400 to 1000, 500-step from 1000 to 5000, then 1000-step to the
+// 10000 ceiling. Every stop is a value in the region-stepped ladder, so the
+// grid can always end exactly on it. Stops start at 400 (not 100) because a
+// 21-cell grid can't honor the minimum floor (HIGH_NITS_GRID_MIN_FLOOR = 300)
+// for any Max below 400.
+export const HIGH_NITS_MAX_STOPS = (() => {
+  const stops = [];
+  for (let v = 400; v <= 1000; v += 100) stops.push(v);
+  for (let v = 1500; v <= 5000; v += 500) stops.push(v);
+  for (let v = 6000; v <= 10000; v += 1000) stops.push(v);
+  return stops;
+})();
+export const HIGH_NITS_DEFAULT_MAX = 2000;
+// Step readout for the default Max follows the region rule (see
+// highNitsStepForMax): 2000 falls in the 1000–5000 band → 500.
+export const HIGH_NITS_DEFAULT_STEP = 500;
+// Nits above the HDR spec ceiling are meaningless, so every control clamps
+// so the derived max never exceeds it.
+export const HIGH_NITS_MAX_CEILING = 10000;
+
+// Round steps used to fill the grid below 1000 when the Max is too low for
+// 21 distinct region-ladder values. Coarsest first — the grid prefers the
+// biggest round step that still fits 21 distinct values ending at the Max
+// (Max 10000 → 100s, Max 2000 → 25s, Max 500 → 10s, …).
+const NICE_FILL_STEPS = [100, 50, 25, 20, 10, 5, 2, 1];
+
+// The grid never shows nits below this. A full 21-cell grid can't start at
+// exactly 300 for every Max (the span 300→1000 only divides evenly into a
+// nice step for Max 4000 and 10000), so the fill uses the closest round
+// start ≥ this floor — the minimum is always ≥ 300 (e.g. Max 900 → 400,
+// Max 1000 → 500, Max 10000 → 300), never 0. This is only the *natural*
+// floor per Max; monotonicFloorForStop below then raises it so the minimum
+// never decreases as the Max slider moves up.
+const HIGH_NITS_GRID_MIN_FLOOR = 300;
+
+// Largest nice round step that keeps `count` values ending at `end` with
+// every value at/above `floor`. Used to build the natural (round) grid.
+function naturalFillStep(end, count, floor) {
+  return NICE_FILL_STEPS.find((st) => end - st * (count - 1) >= floor) ?? NICE_FILL_STEPS[NICE_FILL_STEPS.length - 1];
+}
+
+// The natural (round, floor-300) grid minimum for a Max — the start value the
+// current design would use before monotonicity is enforced. `cells` lets a
+// fullscreen grid grow past the fixed 21 (e.g. 28 cells on 16:9) while still
+// honoring the 300-nits floor.
+function naturalGridMin(max, cells = HIGH_NITS_CELLS) {
+  const top = regionValues(max);
+  if (max < 1000) {
+    return max - naturalFillStep(max, cells, HIGH_NITS_GRID_MIN_FLOOR) * (cells - 1);
+  }
+  const belowCount = cells - top.length;
+  return 1000 - naturalFillStep(1000, belowCount, HIGH_NITS_GRID_MIN_FLOOR) * (belowCount - 1);
+}
+
+// The region values above 1000 for a Max (500-step 1500…5000, then 1000-step
+// 6000… up to Max). Shared by the grid builder and the natural-min helper so
+// they can never disagree about how many cells the region consumes.
+function regionValues(max) {
+  const top = [];
+  for (let v = 1500; v <= Math.min(5000, max); v += 500) top.push(v);
+  for (let v = 6000; v <= max; v += 1000) top.push(v);
+  return top;
+}
+
+// The grid minimum for a Max when the fill starts at `floor`. The step is
+// the largest whole step that keeps all cells ascending, ending at Max and
+// staying at/above the floor (a fine/non-round step when the natural round
+// one would dip below the floor). Shared by the floor precompute and the
+// grid builder so the precomputed minimum always matches the built grid.
+function gridMinForFloor(max, floor, cells = HIGH_NITS_CELLS) {
+  const top = regionValues(max);
+  if (max < 1000) {
+    const s = Math.floor((max - floor) / (cells - 1));
+    return floor; // step <= span/20 keeps the start exactly at the floor
+  }
+  const belowCount = cells - top.length;
+  const s = Math.floor((1000 - floor) / (belowCount - 1));
+  return 1000 - (belowCount - 1) * s;
+}
+
+// Monotonic minimum floor per slider stop. As the Max slider moves up, the
+// grid minimum must NEVER decrease (a higher Max showing a lower min than a
+// lower Max is exactly the inconsistency reported). Stops are walked in
+// ascending order; each stop's floor is the highest minimum achieved so far
+// (its own natural minimum, or the previous stop's carried *grid* minimum —
+// the grid can start above its floor when the fill step rounds, so carrying
+// the natural floor alone could still let a later grid dip). When the
+// natural round grid would dip below the carried floor (Max 4000/10000
+// consume so many region cells that the round fill bottoms out at 300), the
+// fill switches to a fine non-round step anchored at the carried floor — the
+// user accepted non-round low values as the price of a monotonic minimum.
+const HIGH_NITS_STOP_FLOORS = new Map();
+(() => {
+  let carried = 0;
+  for (const stop of HIGH_NITS_MAX_STOPS) {
+    const floor = Math.max(carried, naturalGridMin(stop));
+    const gridMin = gridMinForFloor(stop, floor);
+    HIGH_NITS_STOP_FLOORS.set(stop, gridMin);
+    carried = gridMin;
+  }
+})();
+
+// The monotonic floor for any Max. Slider stops look it up directly; an
+// off-stop value (e.g. an old persisted Max before snapping) uses the first
+// stop at or above it, falling back to its natural minimum. Off-stop grids
+// are a transient fallback only — the frontend always snaps the Max to a
+// slider stop before rendering, so in practice the grid is only built from
+// an exact stop and always ends exactly at the Max.
+function monotonicFloorForMax(max) {
+  const exact = HIGH_NITS_STOP_FLOORS.get(max);
+  if (exact !== undefined) return exact;
+  for (const stop of HIGH_NITS_MAX_STOPS) {
+    if (stop >= max) {
+      const floor = HIGH_NITS_STOP_FLOORS.get(stop);
+      if (floor !== undefined) return floor;
+      break;
+    }
+  }
+  return naturalGridMin(max);
+}
+
+// The grid values for a given Max and cell count, ending EXACTLY at Max.
+// Above 1000 the region steps are used (500-step 1500…5000, 1000-step above
+// 5000). Below 1000, the fill starts at the monotonic floor
+// (monotonicFloorForMax) and uses the largest step that keeps all cells
+// ascending and ending at Max; when the natural round step would put the
+// minimum below the carried floor, the step becomes fine/non-round (e.g.
+// Max 4000 → 636, 662, 688…; Max 10000 → 664, 712, 760…).
+//
+// `cells` defaults to the fixed 21 (3×7) normal-mode grid. Fullscreen passes
+// a larger count (the aspect-fit grid, e.g. 28 on 16:9) so every slot shows
+// a real value — the extra cells simply make the below-1000 fill finer.
+export function highNitsGridCodes(max, cells = HIGH_NITS_CELLS) {
+  // The monotonic floor map is only valid for the fixed 21-cell grid (the
+  // slider's source of truth). Larger fullscreen grids use the natural
+  // 300-nits floor for their own cell count instead.
+  const floor = cells === HIGH_NITS_CELLS ? monotonicFloorForMax(max) : naturalGridMin(max, cells);
+  const top = regionValues(max);
+  if (max < 1000) {
+    // Entire grid below 1000: step = biggest step that keeps `cells` values
+    // ending at max at/above the floor (e.g. Max 400 → 300..400 @ 5).
+    const s = Math.max(1, Math.floor((max - floor) / (cells - 1)));
+    return Array.from({ length: cells }, (_, i) => floor + i * s);
+  }
+  // Bridge from the floor up to 1000 (fine step when needed), then the
+  // region steps above.
+  const belowCount = Math.max(2, cells - top.length);
+  const s = Math.max(1, Math.floor((1000 - floor) / (belowCount - 1)));
+  const start = 1000 - (belowCount - 1) * s;
+  const below = Array.from({ length: belowCount }, (_, i) => start + i * s);
+  return below.concat(top);
+}
+
+// The step readout for a Max, following the region rule the user described:
+// 1000-step above 5000, 500-step from 1000 to 5000, 100-step below 1000.
+export function highNitsStepForMax(max) {
+  if (max > 5000) return 1000;
+  if (max > 1000) return 500;
+  return 100;
+}
+
+// Evenly samples `count` integer values across [start, end] (inclusive).
+// In SDR the 24-value bright RGB range (232..255) is spread over the fixed
+// 21-cell grid instead of being sliced (a plain slice would drop 255).
+export function sampleRange(start, end, count) {
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(Math.round(start + (i * (end - start)) / (count - 1)));
+  return out;
+}
+
+// SDR label/render codes for a grid of `cells` (default: the fixed 21-cell
+// grid). Single source of truth so the DOM labels and the shader values can
+// never drift apart. Larger fullscreen grids sample the bright RGB range
+// more finely.
+export function highNitsSdrCodes(cells = HIGH_NITS_CELLS) {
+  return sampleRange(HIGH_SDR_RANGE[0], HIGH_SDR_RANGE[HIGH_SDR_RANGE.length - 1], cells);
+}
 
 // SDR bright range: 255 down to 232, i.e. 24 values ascending (232..255),
 // same quantity as the SDR black codes. No midrange values.
@@ -48,8 +226,8 @@ export const STRIPS = [
   },
   {
     id: 'highNits',
-    label: 'High Nits',
-    title: 'High nits grid strip — ascending brightness cells to judge peak output',
+    label: 'Brightness',
+    title: 'Brightness grid strip — ascending nits cells to judge peak output',
   },
 ];
 
@@ -59,22 +237,13 @@ export function nitsToScrgb(nits) {
   return nits / 80;
 }
 
-// Window into a ladder for a given square count. More cells = finer
-// (lower-nits) steps; fewer cells = coarser spread reaching the top.
-// Returns a contiguous slice; ordering stays ascending.
-export function highNitsWindow(ladder, squareCount) {
-  const M = ladder.length;
-  const n = Math.max(2, Math.min(squareCount, MAX_SQUARES));
-  if (M <= n) return ladder.slice(0, n);
-  const f = (n - 2) / (MAX_SQUARES - 2);
-  const start = Math.round((M - n) * (1 - f));
-  return ladder.slice(start, start + n);
-}
-
-// Render values for the High Nits strip. HDR: nits → scRGB → sRGB-encoded.
-// SDR: code/255 through the sRGB round-trip like the black SDR strip.
-export function computeHighNitsValues(squareCount, isHdr) {
-  const codes = highNitsWindow(isHdr ? HIGH_NITS_LADDER : HIGH_SDR_RANGE, squareCount);
+// Render values for the High Nits strip. HDR: the region-stepped grid codes
+// (see highNitsGridCodes) → scRGB → sRGB-encoded. SDR: the bright RGB range
+// sampled over the same number of cells, through the sRGB round-trip like
+// the black SDR strip. `cells` defaults to the fixed 21; fullscreen passes
+// the aspect-fit count so no slot is left empty.
+export function computeHighNitsValues(max, isHdr, cells = HIGH_NITS_CELLS) {
+  const codes = isHdr ? highNitsGridCodes(max, cells) : highNitsSdrCodes(cells);
   return codes.map((code) => (
     isHdr
       ? linearToSrgb(nitsToScrgb(code))

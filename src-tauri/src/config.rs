@@ -38,6 +38,19 @@ pub struct AppConfig {
     // Small gap between cells on the Black strip (right-click menu toggle).
     #[serde(default = "default_true")]
     pub black_strip_gap_enabled: bool,
+    // High Nits strip range: the grid is a fixed 3×7 (21 cells) with no
+    // zoom; the user picks Min and Max directly (independently of each
+    // other) and Step (nits between neighboring cells) is derived on the
+    // frontend as (max − min) / 20. high_nits_max is optional so older
+    // config files (from before Max was a stored field, when only min/step
+    // were saved and max was derived) still parse; the frontend derives max
+    // from min/step as a migration fallback when this is absent.
+    #[serde(default = "default_high_nits_min")]
+    pub high_nits_min: u32,
+    #[serde(default)]
+    pub high_nits_max: Option<u32>,
+    #[serde(default = "default_high_nits_step")]
+    pub high_nits_step: u32,
     #[serde(default)]
     pub taskbar_dimmer_enabled: bool,
     #[serde(default = "default_dimmer_opacity")]
@@ -86,6 +99,12 @@ fn default_true() -> bool {
 fn default_dimmer_opacity() -> f64 {
     0.95
 }
+fn default_high_nits_min() -> u32 {
+    100
+}
+fn default_high_nits_step() -> u32 {
+    100
+}
 fn default_dimmer_ease_duration() -> u64 {
     300
 }
@@ -113,6 +132,9 @@ impl Default for AppConfig {
             black_enabled: true,
             hide_calibration_interface: false,
             black_strip_gap_enabled: true,
+            high_nits_min: default_high_nits_min(),
+            high_nits_max: None,
+            high_nits_step: default_high_nits_step(),
             taskbar_dimmer_enabled: false,
             taskbar_dimmer_opacity: default_dimmer_opacity(),
             taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),
@@ -443,5 +465,26 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.hide_calibration_interface);
+    }
+    #[test]
+    fn high_nits_range_round_trip() {
+        let config = AppConfig {
+            high_nits_min: 200,
+            high_nits_max: Some(1200),
+            high_nits_step: 50,
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.high_nits_min, 200);
+        assert_eq!(parsed.high_nits_max, Some(1200));
+        assert_eq!(parsed.high_nits_step, 50);
+    }
+    #[test]
+    fn high_nits_range_defaults_when_missing() {
+        let parsed: AppConfig = serde_json::from_str(r#"{"black_lift": 0.5}"#).unwrap();
+        assert_eq!(parsed.high_nits_min, 100);
+        assert_eq!(parsed.high_nits_max, None);
+        assert_eq!(parsed.high_nits_step, 100);
     }
 }
