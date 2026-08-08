@@ -749,6 +749,8 @@ pub fn run() {
             hdr_toggle::get_windows_hdr_status,
             hdr_toggle::set_windows_hdr_enabled,
             hdr_toggle::get_hdr_luminance,
+            hdr_toggle::get_sdr_white_level,
+            hdr_toggle::set_sdr_brightness_nits,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,

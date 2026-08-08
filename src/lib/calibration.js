@@ -259,6 +259,34 @@ export function linearToSrgb(c) {
   return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
 }
 
+// ITU-R BT.2400 reference/diffuse white for HDR (nits). At this SDR white
+// level, Chromium tone-maps HDR screenshots with their intended brightness,
+// and the SDR/HDR comparison rows in the Experimental tab align exactly.
+// Shared by TabExperimental (reset default) and SdrHdrCompare (HDR row).
+export const HDR_REFERENCE_NITS = 203;
+
+// The cell-grid shader used by the calibration strip (TabCrush.svelte). Also
+// reused verbatim by the Experimental tab's SDR-vs-HDR comparison canvas so
+// the two renderers can never drift apart.
+export const CELL_GRID_SHADER = `struct Cb{values:array<vec4<f32>,12>,counts:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
+struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
+@vertex fn vs(@builtin(vertex_index)i:u32)->VO{
+  let pos=array(vec2f(-1,1),vec2f(3,1),vec2f(-1,-3));
+  let p=pos[i];
+  return VO(vec4f(p,0,1),p*vec2f(.5,-.5)+vec2f(.5,.5));
+}
+@fragment fn fs(vin:VO)->@location(0)vec4f{
+  let cells=i32(cb.counts.x);let cols=i32(cb.counts.y);let rows=i32(cb.counts.z);let gf=cb.counts.w;
+  let sw=(1-gf*f32(cols-1))/f32(cols);let cw=sw+gf;
+  let sh=(1-gf*f32(rows-1))/f32(rows);let ch=sh+gf;
+  let col=i32(floor(vin.uv.x/cw));let row=i32(floor(vin.uv.y/ch));
+  let xf=fract(vin.uv.x/cw)*cw;let yf=fract(vin.uv.y/ch)*ch;
+  if(xf>sw||yf>sh||col>=cols||row>=rows){return vec4f(0);}
+  let idx=row*cols+col;
+  if(idx>=cells){return vec4f(0);}
+  let g=idx/4;return vec4f(cb.values[g][idx%4]);
+}`;
+
 export function pqCodeToScrgb(code) {
   if (code <= 64) return 0;
   const v = Math.max(0, Math.min(1, (code - 64) / 876));

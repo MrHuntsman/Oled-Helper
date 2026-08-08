@@ -28,12 +28,18 @@
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-    DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
     DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
-use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR,
+};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
+};
 use windows::Win32::Graphics::Gdi::{
     DISPLAYCONFIG_COLOR_ENCODING, DISPLAYCONFIG_COLOR_ENCODING_INTENSITY,
     DISPLAYCONFIG_COLOR_ENCODING_RGB, DISPLAYCONFIG_COLOR_ENCODING_YCBCR420,
@@ -205,6 +211,182 @@ pub fn get_windows_hdr_status() -> Result<Option<HdrCapability>, String> {
 #[tauri::command]
 pub fn set_windows_hdr_enabled(enabled: bool) -> Result<(), String> {
     set_windows_hdr(enabled)
+}
+
+#[derive(serde::Serialize, Clone, Copy)]
+pub struct SdrWhiteLevel {
+    pub raw: u32,
+    pub nits: f32,
+}
+
+fn text(value: &[u16]) -> String {
+    String::from_utf16_lossy(value)
+        .trim_end_matches('\0')
+        .to_string()
+}
+
+fn primary_gdi_device_name() -> Option<String> {
+    unsafe {
+        for index in 0.. {
+            let mut device = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            if !EnumDisplayDevicesW(windows::core::PCWSTR::null(), index, &mut device, 0).as_bool()
+            {
+                break;
+            }
+            if (device.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) != 0 {
+                return Some(text(&device.DeviceName));
+            }
+        }
+    }
+    None
+}
+
+fn source_gdi_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+    unsafe {
+        let mut source = windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<
+                    windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+                >() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        let result = DisplayConfigGetDeviceInfo(&mut source.header);
+        if WIN32_ERROR(result as u32) == ERROR_SUCCESS {
+            Some(text(&source.viewGdiDeviceName))
+        } else {
+            None
+        }
+    }
+}
+
+fn primary_hdr_path() -> Result<Option<DISPLAYCONFIG_PATH_INFO>, String> {
+    let (paths, _modes) = query_active_paths()?;
+    let primary = primary_gdi_device_name();
+    Ok(paths.into_iter().find(|path| {
+        let is_primary = primary
+            .as_deref()
+            .zip(source_gdi_device_name(path).as_deref())
+            .map(|(want, actual)| want.eq_ignore_ascii_case(actual))
+            .unwrap_or(false);
+        is_primary
+            && get_advanced_color_info(path)
+                .map(|info| advanced_color_supported(&info) && advanced_color_enabled(&info))
+                .unwrap_or(false)
+    }))
+}
+
+fn query_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
+    let Some(path) = primary_hdr_path()? else {
+        return Ok(None);
+    };
+    unsafe {
+        let mut level = DISPLAYCONFIG_SDR_WHITE_LEVEL {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+                size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        let result = DisplayConfigGetDeviceInfo(&mut level.header);
+        if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
+            return Err(format!(
+                "DisplayConfigGetDeviceInfo(SDR white level) failed: {result:?}"
+            ));
+        }
+        Ok(Some(SdrWhiteLevel {
+            raw: level.SDRWhiteLevel,
+            nits: level.SDRWhiteLevel as f32 * 80.0 / 1000.0,
+        }))
+    }
+}
+
+// Undocumented CCD device info type for SET SDR white level. The standard
+// windows-rs crate only exposes the GET variant; this SET constant (matching
+// the ledoge/set_maxtml reference implementation) is committed through
+// DisplayConfigSetDeviceInfo.
+const DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL_I: i32 = -18; // 0xFFFFFFEE
+
+// The SET form carries an extra `finalValue` byte beyond the GET struct
+// (DISPLAYCONFIG_SDR_WHITE_LEVEL). Must be #[repr(C)] so the FFI call sees
+// the expected layout.
+#[repr(C)]
+#[allow(non_snake_case)]
+struct DISPLAYCONFIG_SET_SDR_WHITE_LEVEL_INTERNAL {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    SDRWhiteLevel: u32,
+    finalValue: u8,
+}
+
+/// Sets the SDR white level through the proper CCD (Connecting and Configuring
+/// Display) API — the same mechanism Windows Settings uses. This updates the
+/// full display pipeline including hardware video planes (MPO/overlays),
+/// unlike DwmpSDRToHDRBoost which only updates DWM's composition surface.
+///
+/// The CCD API is clamped to roughly 480 nits (matching Windows Settings);
+/// for values above that the caller should fall back to the DWM ordinal.
+fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
+    if !nits.is_finite() || nits < 80.0 {
+        return Err("SDR white level must be at least 80 nits".into());
+    }
+    let Some(path) = primary_hdr_path()? else {
+        return Err("Windows HDR is not enabled on the primary display".into());
+    };
+    let raw = (nits * 1000.0 / 80.0).round() as u32;
+    unsafe {
+        let params = DISPLAYCONFIG_SET_SDR_WHITE_LEVEL_INTERNAL {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_TYPE(
+                    DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL_I,
+                ),
+                size: std::mem::size_of::<DISPLAYCONFIG_SET_SDR_WHITE_LEVEL_INTERNAL>() as u32,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            SDRWhiteLevel: raw,
+            finalValue: 1,
+        };
+        let result = DisplayConfigSetDeviceInfo(&params.header);
+        if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
+            return Err(format!(
+                "DisplayConfigSetDeviceInfo(SDR white level) failed: {result:?}"
+            ));
+        }
+    }
+    Ok(SdrWhiteLevel { raw, nits })
+}
+
+#[tauri::command]
+pub fn get_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
+    query_sdr_white_level()
+}
+
+/// Sets the SDR white level through the CCD (Connecting and Configuring
+/// Display) API — the same mechanism Windows Settings uses. This commits
+/// through the proper display config pipeline, so DWM AND hardware video
+/// planes (MPO/overlays) both pick up the new SDR white level.
+/// Capped at 480 nits, matching Windows Settings' own range.
+pub fn set_sdr_white_level(nits: f32) -> Result<SdrWhiteLevel, String> {
+    if !nits.is_finite() || !(80.0..=480.0).contains(&nits) {
+        return Err("SDR white level must be between 80 and 480 nits".into());
+    }
+    if primary_hdr_path()?.is_none() {
+        return Err("Windows HDR is not enabled on the primary display".into());
+    }
+    set_sdr_white_level_ccd(nits)
+}
+
+#[tauri::command]
+pub fn set_sdr_brightness_nits(nits: f32) -> Result<SdrWhiteLevel, String> {
+    set_sdr_white_level(nits)
 }
 
 #[derive(serde::Serialize, Clone, Copy)]

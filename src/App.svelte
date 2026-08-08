@@ -6,6 +6,7 @@
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
+  import TabExperimental from './lib/TabExperimental.svelte';
   import TabDebug from './lib/TabDebug.svelte';
   import TabSystem from './lib/TabSystem.svelte';
   import TabSettings from './lib/TabSettings.svelte';
@@ -931,6 +932,9 @@
     <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
       <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
     </button>
+    <button class="nav-btn" class:active={app.activeTab === 'experimental'} onclick={() => app.activeTab = 'experimental'}>
+      <span class="nav-icon experimental-nav-icon" aria-hidden="true">⚗</span> Experimental
+    </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
@@ -947,6 +951,8 @@
         <TabDimmer />
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
+      {:else if app.activeTab === 'experimental'}
+        <TabExperimental />
       {:else if app.activeTab === 'debug'}
         <TabDebug />
       {:else if app.activeTab === 'system'}
