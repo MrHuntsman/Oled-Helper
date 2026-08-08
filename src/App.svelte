@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
@@ -24,6 +24,10 @@
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
 
   let windowVisible = $state(true);
+  // Coalesces the display-changed burst (hotplug/mode change emits several
+  // WM_DISPLAYCHANGE/WM_DEVICECHANGE messages) into a single SDR-white base
+  // re-capture, and gives the OS a beat to settle before the new value is read.
+  let sdrWhiteBaseRecaptureTimer = null;
 
   // Keep the native tray flyout's accent in sync with the main UI: push the
   // current HDR/SDR status to Rust so the flyout's Keep button matches
@@ -753,6 +757,12 @@
     try {
       await invoke('set_windows_hdr_enabled', { enabled: next });
       windowsHdrError = '';
+      // Enabling HDR makes the WebView re-read the display and its frozen SDR
+      // white level, so the Brightness strip's base must follow or it drifts
+      // (the user's "toggling HDR messes up the calibration" report). Harmless
+      // when disabling HDR (strip renders SDR then), but re-capturing always
+      // also covers a subsequent re-enable.
+      refreshSdrWhiteLevel(true);
     } catch (e) {
       windowsHdrError = String(e);
       app.hdrStatus = previous;
@@ -808,6 +818,9 @@
     // explicitly afterward — there is no periodic poll on the main thread.
     pollDisplayInfo();
     pollHDRStatus();
+    // Seed the SDR white level used by the Brightness strip compensation
+    // (Chromium maps the HDR calibration canvas relative to this value).
+    refreshSdrWhiteLevel();
 
     let unlisten;
     let unlistenDisplayChanged;
@@ -819,6 +832,18 @@
     // refresh below handles that case without touching mode lists or EDID.
     listen('display-changed', () => {
       scheduleDisplayInfoRefresh();
+      // Display topology changes (incl. HDR toggles, resolution/hotplug)
+      // make the WebView re-read its display info — including the SDR white
+      // level it froze at startup — so re-capture the strip's base to match.
+      // Debounced: hotplug emits a burst of WM_* messages, and waiting lets
+      // the OS settle before the new value is read. A plain SDR-brightness
+      // slider move does NOT emit this event, so the base stays frozen there
+      // (exactly what keeps the strip stable).
+      clearTimeout(sdrWhiteBaseRecaptureTimer);
+      sdrWhiteBaseRecaptureTimer = setTimeout(() => {
+        sdrWhiteBaseRecaptureTimer = null;
+        refreshSdrWhiteLevel(true);
+      }, 150);
     }).then((stop) => { unlistenDisplayChanged = stop; }).catch(() => {});
     listen('window-visibility', (event) => {
       const visible = event.payload !== false;
@@ -829,6 +854,7 @@
         // stale or empty from a transitional query during wake; this makes
         // it self-heal without a periodic poll.
         pollDisplayInfo();
+        refreshSdrWhiteLevel();
       }
     }).then((stop) => { unlisten = stop; }).catch(() => {});
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
@@ -883,6 +909,19 @@
     if (!windowVisible) return;
     refreshVendorDisplayInfo();
     const timer = setInterval(() => refreshVendorDisplayInfo(), 5000);
+    return () => clearInterval(timer);
+  });
+
+  // The Windows SDR white level can be changed from Settings or other tools
+  // with no display-topology event. Re-read it periodically (2s, only while
+  // the window is visible) to keep System Info and the Experimental tab fresh.
+  // The Brightness strip does NOT follow this live value: Chromium/WebView2
+  // froze the SDR white level at WebView startup, so the strip encodes against
+  // the first-read base (app.sdrWhiteBaseNits) captured here instead.
+  $effect(() => {
+    if (!windowVisible) return;
+    refreshSdrWhiteLevel();
+    const timer = setInterval(() => refreshSdrWhiteLevel(), 2000);
     return () => clearInterval(timer);
   });
 

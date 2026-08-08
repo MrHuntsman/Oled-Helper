@@ -6,10 +6,40 @@ export const app = $state({
   activeTab: 'crush',
   hdrStatus: 'unknown',
   hdrLuminance: null,
+  // Windows SDR white level in nits (80–480), read live for System Info and
+  // the Experimental tab.
+  sdrWhiteNits: 80,
+  // The SDR white level the browser's HDR compositor captured at WebView
+  // startup and froze for the session. The Brightness strip must encode
+  // against THIS frozen value — Chromium/WebView2 scales the HDR canvas
+  // relative to it and only re-reads it on restart, so compensating against
+  // the live slider makes the strip drift whenever the SDR brightness moves.
+  // Captured on the first successful read (null → fallback 80).
+  sdrWhiteBaseNits: null,
   displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, dynamicRange: '', vrr: '', referenceMode: false, refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
+  // Actual canvas rendering path reported by the WebGPU calibration surfaces.
+  // This is diagnostic state only; it never controls HDR status or rendering.
+  gpuRendering: {
+    main: {},
+    comparison: {},
+  },
 });
+
+// Keep diagnostics per canvas. The main calibration canvas and the
+// Experimental comparison canvas can initialize at different times; a single
+// shared record would make System Info report whichever one initialized last.
+export function setGpuRenderingInfo(source, info = {}) {
+  if (source !== 'main' && source !== 'comparison') return;
+  const target = app.gpuRendering[source];
+  for (const key of ['api', 'runtime', 'adapter', 'format', 'colorSpace', 'toneMapping', 'hdrPath']) {
+    if (typeof info[key] === 'string') target[key] = info[key];
+  }
+}
+export function clearGpuRenderingInfo(source) {
+  if (source === 'main' || source === 'comparison') app.gpuRendering[source] = {};
+}
 
 export const crush = $state({
   adjustment: 0,
@@ -561,6 +591,34 @@ export function pollHDRStatus() {
 }
 export function pollHDRLuminance() {
   invoke('get_hdr_luminance').then((info) => { app.hdrLuminance = info ? { maxNits: info.max_nits ?? null } : null; }).catch(() => { app.hdrLuminance = null; });
+}
+
+// Read the Windows SDR white level and publish it to the shared store.
+// Chromium/WebView2 renders the HDR calibration canvas relative to this
+// value, so the Brightness strip compensates for it (see calibration.js).
+// Falls back to 80 nits when the display is in SDR or the query fails.
+export function refreshSdrWhiteLevel(asBase = false) {
+  invoke('get_sdr_white_level')
+    .then((info) => {
+      const nits = Number(info?.nits);
+      // Match the backend's accepted range (see hdr_toggle.rs: 80..=480).
+      if (Number.isFinite(nits) && nits >= 80 && nits <= 480) {
+        app.sdrWhiteNits = nits;
+        // The first successful read captures the browser's frozen base. Keep it
+        // frozen for the whole session — the WebView still scales the canvas
+        // with that value while the Windows slider moves, so re-capturing on
+        // slider changes would drift the strip again. asBase re-captures after
+        // an event that DID make the WebView re-read its display info (HDR
+        // toggle, display topology change), keeping the base matched to it.
+        if (asBase || app.sdrWhiteBaseNits === null) app.sdrWhiteBaseNits = nits;
+      }
+    })
+    .catch(() => {});
+}
+
+export function setSdrWhiteNits(nits) {
+  const v = Number(nits);
+  if (Number.isFinite(v) && v >= 80 && v <= 480) app.sdrWhiteNits = v;
 }
 
 // Driver control panels can change dynamic range or VRR without emitting a

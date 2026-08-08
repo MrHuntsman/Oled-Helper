@@ -12,6 +12,7 @@
   import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_SDR_RANGE, HIGH_NITS_CELLS, HIGH_NITS_COLS, HIGH_NITS_ROWS, HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_MAX_STOPS, highNitsGridCodes, highNitsSdrCodes, computeHdrValues, computeSdrValues, computeHighNitsValues, CELL_GRID_SHADER } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
   import { onDestroy, untrack } from 'svelte';
+  import { setGpuRenderingInfo, refreshSdrWhiteLevel } from './stores.svelte.js';
 
   let canvas = $state(null);
   let device = $state(null);
@@ -29,6 +30,34 @@
   // written by App.svelte's poll timer, and writing to it here caused an
   // infinite render ↔ fallback ↔ poll loop (Svelte's max update depth error).
   let forceSdrRender = $state(false);
+
+  function runtimeLabel() {
+    if (window.chrome?.webview) {
+      const chromium = navigator.userAgent.match(/(?:Chrome|Edg|Chromium)\/(\d+)/)?.[1];
+      return chromium ? `WebView2 (Chromium ${chromium})` : 'WebView2';
+    }
+    return 'Browser WebView';
+  }
+
+  // Keep the original Crush canvas configuration. The extended tone-mapping
+  // experiment changed the browser's HDR presentation path and caused the
+  // Brightness strip's previously calibrated values to clip at the wrong
+  // luminance. The Experimental comparison owns its separate HDR experiment.
+  function configureContext(format, colorSpace) {
+    ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
+    return 'browser default';
+  }
+
+  function recordMainGpuRenderingInfo(format, colorSpace) {
+    setGpuRenderingInfo('main', {
+      api: 'WebGPU',
+      runtime: runtimeLabel(),
+      format,
+      colorSpace,
+      toneMapping: 'browser default',
+      hdrPath: format === 'rgba16float' ? 'HDR canvas (browser-managed)' : 'SDR canvas',
+    });
+  }
 
   const HDR_VALUES = computeHdrValues();
   const SDR_VALUES = computeSdrValues();
@@ -194,6 +223,9 @@
     ready = false;
   }
 
+  // Keep the last successful main-canvas diagnostics in the session store.
+  // The calibration canvas is destroyed when leaving this tab, but System Info
+  // should not forget that the renderer initialized successfully.
   onDestroy(releaseGpuResources);
 
   async function initGPU() {
@@ -220,10 +252,14 @@
       // Adapter info (may not exist in older WebView2)
       try {
         if (adapter.info) {
-          dlog(`adapter.info: vendor=${adapter.info.vendor || '?'} device=${adapter.info.device || '?'} arch=${adapter.info.architecture || '?'}`);
+          const adapterLabel = `${adapter.info.vendor || '?'} / ${adapter.info.device || '?'} / ${adapter.info.architecture || '?'}`;
+          dlog(`adapter.info: ${adapterLabel}`);
+          setGpuRenderingInfo('main', { adapter: adapterLabel });
         } else if (adapter.requestAdapterInfo) {
           const info = await adapter.requestAdapterInfo();
-          dlog(`requestAdapterInfo: vendor=${info.vendor || '?'} device=${info.device || '?'} arch=${info.architecture || '?'}`);
+          const adapterLabel = `${info.vendor || '?'} / ${info.device || '?'} / ${info.architecture || '?'}`;
+          dlog(`requestAdapterInfo: ${adapterLabel}`);
+          setGpuRenderingInfo('main', { adapter: adapterLabel });
         } else {
           dwarn('adapter.info / requestAdapterInfo not available (older WebView2)');
         }
@@ -258,16 +294,16 @@
       let colorSpace = wantHdr ? 'display-p3' : 'srgb';
       dlog(`configure: format=${format} colorSpace=${colorSpace} (hdrStatus=${app.hdrStatus})`);
       try {
-        ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
-        dlog('configure SUCCESS');
+        const toneMapping = configureContext(format, colorSpace);
+        dlog(`configure SUCCESS: ${format}/${colorSpace}/${toneMapping}`);
       } catch (e) {
         dwarn(`configure FAILED: ${e.message}`);
-        // Fall back to safe SDR format regardless of what matchMedia said
+        // Fall back to safe SDR format regardless of what matchMedia said.
         format = 'rgba8unorm';
         colorSpace = 'srgb';
         dlog(`configure fallback: format=${format} colorSpace=${colorSpace}`);
         try {
-          ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
+          configureContext(format, colorSpace);
           dlog('fallback configure SUCCESS');
           if (wantHdr) { dwarn('matchMedia said HDR but GPU rejected rgba16float — using SDR locally'); forceSdrRender = true; }
         } catch (e2) {
@@ -297,6 +333,7 @@
         primitive: { topology: 'triangle-list' },
       });
       dlog(`pipeline created with target format: ${format}`);
+      recordMainGpuRenderingInfo(format, colorSpace);
       if (generation !== gpuGeneration) {
         releaseGpuResources();
         return;
@@ -334,13 +371,14 @@
     if (format === currentFormat) return;
     dlog(`reconfiguring: format=${format} colorSpace=${colorSpace} (hdrStatus=${app.hdrStatus})`);
     try {
-      ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
+      const toneMapping = configureContext(format, colorSpace);
+      dlog(`reconfigure SUCCESS: ${format}/${colorSpace}/${toneMapping}`);
     } catch (e) {
       dwarn(`reconfigure FAILED: ${e.message} — falling back to SDR`);
       format = 'rgba8unorm';
       colorSpace = 'srgb';
       try {
-        ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
+        configureContext(format, colorSpace);
         if (wantHdr) forceSdrRender = true;
       } catch (e2) {
         derr(`reconfigure fallback FAILED: ${e2.message}`);
@@ -355,7 +393,14 @@
         primitive: { topology: 'triangle-list' },
       });
       currentFormat = format;
+      recordMainGpuRenderingInfo(format, colorSpace);
       dlog(`pipeline rebuilt with target format: ${format}`);
+      // Entering HDR means the browser just created a fresh HDR surface and
+      // re-read its frozen SDR white level — re-capture the strip's base so
+      // it matches (covers HDR toggles that don't emit a display-changed
+      // event, e.g. from Settings). The base change re-renders the strip via
+      // the render effect.
+      if (format === 'rgba16float') refreshSdrWhiteLevel(true);
     } catch (error) {
       gpuError = `GPU pipeline rebuild failed: ${error?.message || String(error)}`;
       derr(`GPU pipeline rebuild failed: ${error?.message || String(error)}`);
@@ -396,7 +441,12 @@
       let vals, grid;
       if (highNits) {
         grid = untrack(() => stripGeom);
-        vals = computeHighNitsValues(crush.highNitsMax, isHdr, grid.cells);
+        // Pass the browser's frozen SDR white base (captured at WebView
+        // startup). Chromium scales the HDR canvas relative to that frozen
+        // value and never re-reads it mid-session, so encoding against the
+        // same frozen base keeps the cells physically stable as the Windows
+        // SDR brightness changes.
+        vals = computeHighNitsValues(crush.highNitsMax, isHdr, grid.cells, app.sdrWhiteBaseNits ?? 80);
       } else {
         vals = isHdr ? HDR_VALUES : SDR_VALUES;
         grid = { cells: sq, cols: sq, rows: 1 };
@@ -432,7 +482,7 @@
     if (canvas && !initStarted) initGPU();
   });
   $effect(() => {
-    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void canvas;
+    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void app.sdrWhiteBaseNits; void canvas;
     // untrack the geometry write: stripGeom is a $state read by the template
     // and by render() (high-nits grid). Writing it from inside this effect —
     // whose render() call reads it — would re-schedule the effect on every

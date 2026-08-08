@@ -40,15 +40,63 @@
     return `${d.nativeWidth}×${d.nativeHeight}${source ? ` · ${source}` : ''}`;
   });
 
+  function runtimeLabel() {
+    if (window.chrome?.webview) {
+      const chromium = navigator.userAgent.match(/(?:Chrome|Edg|Chromium)\/(\d+)/)?.[1];
+      return chromium ? `WebView2 (Chromium ${chromium})` : 'WebView2';
+    }
+    return 'Browser WebView';
+  }
+
   // Depends on envTick (bumped on tab mount) so the table refreshes each time
-  // this tab is opened.
+  // this tab is opened. GPU rendering fields are retained after a canvas tab is
+  // closed, because the renderer is intentionally tab-scoped. The labels below
+  // distinguish a last successful initialization from a canvas currently
+  // mounted in the active tab.
   let rows = $derived.by(() => {
     void envTick.n;
+    const gpu = app.gpuRendering.main;
+    const comparisonGpu = app.gpuRendering.comparison;
+    const runtime = gpu.runtime || comparisonGpu.runtime || runtimeLabel();
+    const api = gpu.api || comparisonGpu.api || (navigator.gpu ? 'WebGPU' : 'Not available');
+    const hdr = app.hdrStatus === 'hdr';
+    // The calibration canvases are intentionally tab-scoped so they do not
+    // consume a GPU device while the app is sitting in the tray or another
+    // tab. Before either canvas has been opened, report the known rendering
+    // path and explain that the detailed context probe is lazy instead of
+    // showing a misleading wall of "Not initialized" values.
+    const mainActive = app.activeTab === 'crush';
+    const comparisonActive = app.activeTab === 'experimental';
+    const canvas = gpu.format
+      ? `${gpu.format}${gpu.colorSpace ? ` · ${gpu.colorSpace}` : ''} (last initialized${mainActive ? ', active' : ''})`
+      : navigator.gpu
+        ? `WebGPU canvas (${hdr ? 'rgba16float · display-p3' : 'rgba8unorm · srgb'}; initializes in Black Crush)`
+        : 'WebGPU unavailable';
+    const adapter = gpu.adapter || comparisonGpu.adapter || (navigator.gpu ? 'Queried when a calibration canvas opens' : 'Unavailable');
+    const toneMapping = gpu.toneMapping || comparisonGpu.toneMapping
+      || (navigator.gpu ? (hdr ? 'Extended HDR requested when canvas initializes' : 'Standard SDR') : 'Unavailable');
+    const renderingPath = gpu.hdrPath || (navigator.gpu
+      ? `${runtime} → WebGPU ${hdr ? 'HDR' : 'SDR'} canvas (lazy initialization)`
+      : 'Unavailable');
+    const comparisonPath = comparisonGpu.format
+      ? `${comparisonGpu.format} · ${comparisonGpu.toneMapping || 'standard'} (last initialized${comparisonActive ? ', active' : ''})`
+      : 'Initializes when Experimental opens';
     return [
-      ['Browser / WebView', navigator.userAgent],
-      ['WebGPU Support', navigator.gpu ? 'Available' : 'Not available'],
+      ['Browser / WebView', runtime],
+      ['User agent', navigator.userAgent],
+      ['WebGPU Support', api],
+      ['GPU Canvas', canvas],
+      ['GPU Adapter', adapter],
+      ['Tone Mapping', toneMapping],
+      ['Rendering Path', renderingPath],
+      ['Comparison Canvas', comparisonPath],
       ['Current Display', app.displayInfo.monitorName || 'Detecting...'],
       ['Display Type', displayType],
+      // SDR white level is used as the reference for the Brightness strip's
+      // HDR cells. Chromium froze the value at WebView startup, so the strip
+      // encodes against that frozen base (app.sdrWhiteBaseNits), not the live
+      // slider — show the base so the row matches what the strip renders.
+      ...(app.hdrStatus === 'hdr' ? [['SDR White Level', `${Math.round(app.sdrWhiteBaseNits ?? app.sdrWhiteNits)} nits`]] : []),
       // Peak luminance is only meaningful while HDR is active; hide it in SDR.
       ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
       // These fields are also exposed in the compact monitor tooltip. Keep

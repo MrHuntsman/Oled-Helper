@@ -231,22 +231,23 @@ export const STRIPS = [
   },
 ];
 
-// nits → scRGB (linear) relative to 80 nits = 1.0 reference white, matching
-// the black strip's PQ mapping convention (pqCodeToScrgb divides by 80).
-export function nitsToScrgb(nits) {
-  return nits / 80;
-}
-
-// Render values for the High Nits strip. HDR: the region-stepped grid codes
-// (see highNitsGridCodes) → scRGB → sRGB-encoded. SDR: the bright RGB range
-// sampled over the same number of cells, through the sRGB round-trip like
-// the black SDR strip. `cells` defaults to the fixed 21; fullscreen passes
-// the aspect-fit count so no slot is left empty.
-export function computeHighNitsValues(max, isHdr, cells = HIGH_NITS_CELLS) {
+// Render values for the High Nits strip. HDR follows the original Crush
+// renderer's nits → scRGB → sRGB path. SDR uses the existing sRGB round-trip.
+// `cells` defaults to the fixed 21; fullscreen passes the aspect-fit count so
+// no slot is left empty.
+//
+// `sdrWhiteBaseNits` is the SDR white level the browser's HDR compositor
+// captured at WebView startup and froze for the session. Chromium/WebView2
+// scales the HDR canvas relative to that frozen value — a live reference
+// crushed/reverse-crushed the strip whenever the Windows SDR brightness moved
+// while the app was open. Encoding each cell against the same frozen value
+// keeps physical luminance stable no matter where the Windows SDR slider sits,
+// and matches the calibration the app renders after a restart.
+export function computeHighNitsValues(max, isHdr, cells = HIGH_NITS_CELLS, sdrWhiteBaseNits = 80) {
   const codes = isHdr ? highNitsGridCodes(max, cells) : highNitsSdrCodes(cells);
   return codes.map((code) => (
     isHdr
-      ? linearToSrgb(nitsToScrgb(code))
+      ? linearToSrgb(code / sdrWhiteBaseNits)
       : linearToSrgb(srgbToLinear(code / 255))
   ));
 }

@@ -1,7 +1,7 @@
 <script>
   import { onMount, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { app, pollHDRLuminance } from './stores.svelte.js';
+  import { app, pollHDRLuminance, setSdrWhiteNits } from './stores.svelte.js';
   import SdrHdrCompare from './SdrHdrCompare.svelte';
 
   let currentNits = $state(null);
@@ -36,6 +36,10 @@
       // by the poll. Callers that must not clobber a fresh user edit (the
       // poll) guard via sliderDragging/applying/applyTimer before calling.
       currentNits = detectedNits;
+      // Publish to the shared store so the Crush Brightness strip compensates
+      // for the live SDR white level (Chromium maps the HDR canvas relative
+      // to this value).
+      if (detectedNits != null) setSdrWhiteNits(detectedNits);
     } catch (e) { error = String(e); }
   }
   async function apply() {
@@ -47,6 +51,7 @@
       const result = await invoke('set_sdr_brightness_nits', { nits: requestedNits });
       if (Number(currentNits) !== requestedNits) applyQueued = true;
       if (result?.nits && Number(currentNits) === requestedNits) currentNits = Number(result.nits);
+      setSdrWhiteNits(currentNits);
     } catch (e) { error = String(e); }
     finally {
       applying = false;
