@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::PCSTR;
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_DESC, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{
@@ -61,6 +61,12 @@ fn log_vendor_warn(message: &str) {
 
 #[derive(Clone, Default, serde::Serialize)]
 pub struct VendorDisplayInfo {
+    // The primary adapter's full model name from DXGI (e.g. "NVIDIA GeForce
+    // RTX 3080") — vendor-agnostic, so it works for NVIDIA, AMD, Intel and
+    // any other vendor without a driver SDK. The WebGPU adapter info that
+    // feeds the System Info GPU Adapter row leaves its device field blank on
+    // Windows WebView2, so this is the authoritative model name.
+    pub gpu_model: String,
     pub dynamic_range: String,
     pub vrr: String,
     // NVIDIA's Control Panel "Override to reference mode" (also called
@@ -196,7 +202,26 @@ pub fn nvidia_reference_mode_enabled() -> bool {
     enabled
 }
 
-fn primary_gpu_vendor() -> Option<u32> {
+// DXGI_ADAPTER_DESC.Description is a fixed 128-wide-char buffer.
+fn adapter_description(desc: &DXGI_ADAPTER_DESC) -> String {
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..end])
+        .trim()
+        .to_string()
+}
+
+// Finds the DXGI adapter driving the primary display and returns its vendor
+// ID plus full model name. DXGI adapter order is not the same thing as the
+// adapter driving the primary monitor on hybrid laptops/docks — match the
+// primary HMONITOR first, then retain adapter 0 as a last-resort fallback.
+// The model name is vendor-agnostic (NVIDIA/AMD/Intel alike), which is why
+// the System Info GPU Adapter row prefers it over the WebGPU device field
+// (left blank by WebView2 on Windows).
+fn primary_adapter_info() -> Option<(u32, String)> {
     unsafe {
         let Ok(factory): windows::core::Result<IDXGIFactory1> = CreateDXGIFactory1() else {
             log_vendor_warn("CreateDXGIFactory1 failed");
@@ -210,9 +235,7 @@ fn primary_gpu_vendor() -> Option<u32> {
             let Ok(desc) = adapter.GetDesc() else {
                 continue;
             };
-            // DXGI adapter order is not the same thing as the adapter driving
-            // the primary monitor on hybrid laptops/docks. Match the primary
-            // HMONITOR first, then retain adapter 0 as a last-resort fallback.
+            let model = adapter_description(&desc);
             for output_index in 0u32.. {
                 let Ok(output) = adapter.EnumOutputs(output_index) else {
                     break;
@@ -220,19 +243,19 @@ fn primary_gpu_vendor() -> Option<u32> {
                 if let Ok(output_desc) = output.GetDesc() {
                     if output_desc.Monitor == primary_monitor {
                         log_vendor(&format!(
-                            "primary display GPU vendor=0x{:04X} adapter={adapter_index}",
+                            "primary display GPU vendor=0x{:04X} adapter={adapter_index} model='{model}'",
                             desc.VendorId
                         ));
-                        return Some(desc.VendorId);
+                        return Some((desc.VendorId, model));
                     }
                 }
             }
             if adapter_index == 0 {
                 log_vendor(&format!(
-                    "primary display GPU fallback vendor=0x{:04X} adapter=0",
+                    "primary display GPU fallback vendor=0x{:04X} adapter=0 model='{model}'",
                     desc.VendorId
                 ));
-                return Some(desc.VendorId);
+                return Some((desc.VendorId, model));
             }
         }
         log_vendor_warn("no DXGI adapter found for the primary display");
@@ -240,9 +263,14 @@ fn primary_gpu_vendor() -> Option<u32> {
     }
 }
 
+fn primary_gpu_vendor() -> Option<u32> {
+    primary_adapter_info().map(|(vendor, _)| vendor)
+}
+
 struct CachedVendorInfo {
     info: VendorDisplayInfo,
     vendor_id: u32,
+    gpu_model: String,
     captured_at: Instant,
 }
 
@@ -259,8 +287,8 @@ pub fn query_vendor_display_info() -> VendorDisplayInfo {
 
 fn query_vendor_display_info_locked() -> VendorDisplayInfo {
     log_vendor("query_vendor_display_info called");
-    let vendor_id = match primary_gpu_vendor() {
-        Some(id) => id,
+    let (vendor_id, gpu_model) = match primary_adapter_info() {
+        Some(info) => info,
         None => return VendorDisplayInfo::default(),
     };
 
@@ -272,7 +300,10 @@ fn query_vendor_display_info_locked() -> VendorDisplayInfo {
             } else {
                 Duration::from_secs(60)
             };
-            if cached.vendor_id == vendor_id && cached.captured_at.elapsed() < max_age {
+            if cached.vendor_id == vendor_id
+                && cached.gpu_model == gpu_model
+                && cached.captured_at.elapsed() < max_age
+            {
                 log_vendor("returning cached vendor info");
                 return cached.info.clone();
             }
@@ -288,6 +319,7 @@ fn query_vendor_display_info_locked() -> VendorDisplayInfo {
             VendorDisplayInfo::default()
         }
     };
+    info.gpu_model = gpu_model.clone();
     if vendor_id == VENDOR_NVIDIA {
         info.reference_mode = nvidia_reference_mode_enabled();
         log_vendor(&format!(
@@ -304,6 +336,7 @@ fn query_vendor_display_info_locked() -> VendorDisplayInfo {
         *guard = Some(CachedVendorInfo {
             info: info.clone(),
             vendor_id,
+            gpu_model,
             captured_at: Instant::now(),
         });
     }

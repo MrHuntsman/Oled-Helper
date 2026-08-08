@@ -161,7 +161,7 @@
         <div class="tab-heading-title-row">
           <h2>SDR Content Brightness</h2>
         </div>
-        <span class="subtitle">Adjusts regular SDR content while Windows HDR is enabled.</span>
+        <span class="subtitle">Adjusts Windows SDR brightness while HDR is enabled.</span>
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
@@ -212,12 +212,11 @@
           <span>{MAX_NITS} nits</span>
         </div>
       </div>
+      {#if hdrAvailable}
+        <SdrHdrCompare sdrWhiteNits={currentNits ?? detectedNits ?? 203} hdrActive={hdrAvailable} />
+      {/if}
     </div>
   </div>
-
-  {#if hdrAvailable}
-    <SdrHdrCompare sdrWhiteNits={currentNits ?? detectedNits ?? 203} hdrActive={hdrAvailable} />
-  {/if}
 
   {#if !hdrAvailable}
     <p class="gpu-error">Enable Windows HDR to use this control.</p>

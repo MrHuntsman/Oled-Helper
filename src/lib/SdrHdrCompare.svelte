@@ -300,77 +300,10 @@
     </div>
   </div>
   <div class="sdr-hdr-row-labels">
-    <span>SDR white</span>
-    <span>HDR ref</span>
+    <span>SDR</span>
+    <span>HDR</span>
   </div>
   {#if gpuError}
     <p class="gpu-error">{gpuError}</p>
   {/if}
 </div>
-
-<style>
-  .sdr-hdr-compare {
-    display: flex;
-    gap: var(--sdr-label-gap, 10px);
-    margin: 18px 0;
-    padding: 12px 12px 32px;
-    border: 1px solid var(--divider);
-    border-radius: 10px;
-    background: color-mix(in srgb, var(--panel) 88%, #fff 12%);
-  }
-  /* Row labels sit to the RIGHT of the canvas (--sdr-label-w is shared with
-     the slider's .exp-track-block right inset in app.css, so the canvas
-     keeps exactly the same width as the slider track). */
-  .sdr-hdr-row-labels {
-    position: relative;
-    flex: 0 0 var(--sdr-label-w, 58px);
-    width: var(--sdr-label-w, 58px);
-    height: 64px; /* must match the canvas height so 25%/75% hit the row centers */
-  }
-  .sdr-hdr-row-labels span {
-    position: absolute;
-    left: 0;
-    transform: translateY(-50%);
-    font-size: 11px;
-    color: var(--text-weak);
-    text-align: left;
-    white-space: nowrap;
-  }
-  .sdr-hdr-row-labels span:first-child { top: 25%; }
-  .sdr-hdr-row-labels span:last-child { top: 75%; }
-  .sdr-hdr-canvas-wrap {
-    position: relative;
-    flex: 1 1 auto;
-    min-width: 0;
-    /* 9px horizontal padding on each side mirrors the slider thumb's travel
-       inset [9px, 100% - 9px], so the canvas's UV x-space is exactly the
-       slider's tick space and squares align with ticks at the same nits. */
-    padding: 0 9px;
-  }
-  .sdr-hdr-canvas-wrap canvas {
-    display: block;
-    width: 100%;
-    height: 64px;
-    border-radius: 6px;
-    background: #000;
-  }
-  .sdr-hdr-column-labels {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: calc(100% + 6px);
-    height: 0;
-    font-size: 10px;
-    font-variant-numeric: tabular-nums;
-    color: var(--text-weak);
-  }
-  .sdr-hdr-column-labels span {
-    position: absolute;
-    transform: translateX(-50%);
-    white-space: nowrap;
-  }
-  .sdr-hdr-column-labels span.sdr-hdr-reference-col {
-    color: var(--accent);
-    font-weight: 600;
-  }
-</style>

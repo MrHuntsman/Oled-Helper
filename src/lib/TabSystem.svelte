@@ -53,7 +53,9 @@
   // closed, because the renderer is intentionally tab-scoped. The labels below
   // distinguish a last successful initialization from a canvas currently
   // mounted in the active tab.
-  let rows = $derived.by(() => {
+  // Grouped into logical sections so the panel reads as Browser / GPU &
+  // Rendering / Display instead of one flat list of environment rows.
+  let sections = $derived.by(() => {
     void envTick.n;
     const gpu = app.gpuRendering.main;
     const comparisonGpu = app.gpuRendering.comparison;
@@ -72,7 +74,14 @@
       : navigator.gpu
         ? `WebGPU canvas (${hdr ? 'rgba16float · display-p3' : 'rgba8unorm · srgb'}; initializes in Black Crush)`
         : 'WebGPU unavailable';
-    const adapter = gpu.adapter || comparisonGpu.adapter || (navigator.gpu ? 'Queried when a calibration canvas opens' : 'Unavailable');
+    // The GPU model comes from DXGI (vendor-agnostic, available at startup)
+    // and is preferred over the WebGPU adapter label — WebView2 leaves the
+    // adapter's device field blank on Windows, which is where the old
+    // "nvidia / ? / ampere" came from.
+    const gpuModel = (app.displayInfo.gpuModel || '').trim();
+    const adapter = gpuModel
+      ? gpuModel
+      : (gpu.adapter || comparisonGpu.adapter || (navigator.gpu ? 'Queried when a calibration canvas opens' : 'Unavailable'));
     const toneMapping = gpu.toneMapping || comparisonGpu.toneMapping
       || (navigator.gpu ? (hdr ? 'Extended HDR requested when canvas initializes' : 'Standard SDR') : 'Unavailable');
     const renderingPath = gpu.hdrPath || (navigator.gpu
@@ -82,37 +91,57 @@
       ? `${comparisonGpu.format} · ${comparisonGpu.toneMapping || 'standard'} (last initialized${comparisonActive ? ', active' : ''})`
       : 'Initializes when Experimental opens';
     return [
-      ['Browser / WebView', runtime],
-      ['User agent', navigator.userAgent],
-      ['WebGPU Support', api],
-      ['GPU Canvas', canvas],
-      ['GPU Adapter', adapter],
-      ['Tone Mapping', toneMapping],
-      ['Rendering Path', renderingPath],
-      ['Comparison Canvas', comparisonPath],
-      ['Current Display', app.displayInfo.monitorName || 'Detecting...'],
-      ['Display Type', displayType],
-      // SDR white level is used as the reference for the Brightness strip's
-      // HDR cells. Chromium froze the value at WebView startup, so the strip
-      // encodes against that frozen base (app.sdrWhiteBaseNits), not the live
-      // slider — show the base so the row matches what the strip renders.
-      ...(app.hdrStatus === 'hdr' ? [['SDR White Level', `${Math.round(app.sdrWhiteBaseNits ?? app.sdrWhiteNits)} nits`]] : []),
-      // Peak luminance is only meaningful while HDR is active; hide it in SDR.
-      ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
-      // These fields are also exposed in the compact monitor tooltip. Keep
-      // them here as the canonical, copyable system report, while avoiding a
-      // duplicate "Current" row because Screen Resolution already includes
-      // the active resolution and refresh rate.
-      ['Connector', app.displayInfo.connector || '—'],
-      ['Color Format', `${app.displayInfo.colorFormat || '—'}${app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}`],
-      ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '—'],
-      ['Dynamic Range', app.displayInfo.dynamicRange || '—'],
-      ['VRR', app.displayInfo.vrr || '—'],
-      ['Native Resolution', nativeResolution],
-      ['Screen Resolution', app.displayInfo.width && app.displayInfo.height
-        ? `${app.displayInfo.width}×${app.displayInfo.height}${app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}`
-        : 'Detecting...'],
-      ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
+      {
+        title: 'Browser',
+        rows: [
+          ['Browser / WebView', runtime],
+          ['User agent', navigator.userAgent],
+          ['WebGPU Support', api],
+        ],
+      },
+      {
+        title: 'GPU / Rendering',
+        rows: [
+          // The adapter, then how the calibration canvases are driven on it.
+          ['GPU Adapter', adapter],
+          ['GPU Canvas', canvas],
+          ['Rendering Path', renderingPath],
+          ['Tone Mapping', toneMapping],
+          ['Comparison Canvas', comparisonPath],
+        ],
+      },
+      {
+        title: 'Display',
+        rows: [
+          // Identity and mode first: what the panel is and how it's driven.
+          ['Current Display', app.displayInfo.monitorName || 'Detecting...'],
+          ['Display Type', displayType],
+          ['Native Resolution', nativeResolution],
+          ['Screen Resolution', app.displayInfo.width && app.displayInfo.height
+            ? `${app.displayInfo.width}×${app.displayInfo.height}${app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}`
+            : 'Detecting...'],
+          ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
+          // Signal path: how the pixels travel from the GPU to the panel.
+          // These fields are also exposed in the compact monitor tooltip;
+          // keeping them here makes the report canonical and copyable (and
+          // avoids a duplicate "Current" row — Screen Resolution already
+          // includes the active resolution and refresh rate).
+          ['Connector', app.displayInfo.connector || '—'],
+          ['Color Format', `${app.displayInfo.colorFormat || '—'}${app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}`],
+          ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '—'],
+          ['Dynamic Range', app.displayInfo.dynamicRange || '—'],
+          ['VRR', app.displayInfo.vrr || '—'],
+          // HDR output specifics — only shown while HDR is active. Peak
+          // luminance is only meaningful then; hide it in SDR.
+          ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
+          // SDR white level is used as the reference for the Brightness
+          // strip's HDR cells. Chromium froze the value at WebView startup,
+          // so the strip encodes against that frozen base
+          // (app.sdrWhiteBaseNits), not the live slider — show the base so
+          // the row matches what the strip renders.
+          ...(app.hdrStatus === 'hdr' ? [['SDR White Level', `${Math.round(app.sdrWhiteBaseNits ?? app.sdrWhiteNits)} nits`]] : []),
+        ],
+      },
     ];
   });
 
@@ -124,7 +153,7 @@
   });
 
   async function copySystemInfo() {
-    const lines = rows.map(([k, v]) => `${k}: ${v}`).join('\n');
+    const lines = sections.flatMap((section) => section.rows).map(([k, v]) => `${k}: ${v}`).join('\n');
     const text = `OLED Helper — System Info\n${'='.repeat(28)}\n${lines}`;
     try {
       await navigator.clipboard.writeText(text);
@@ -149,7 +178,7 @@
 
   <div class="diag-section">
     <div class="diag-section-header">
-      <h3>Browser / Environment</h3>
+      <h3>System Info</h3>
       <button class="copy-btn" class:success={copied} class:error={copyFailed} onclick={copySystemInfo} title={copied ? 'Copied!' : copyFailed ? 'Copy failed' : 'Copy system info'} aria-label="Copy system info">
         {#if copied}
           <svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -158,10 +187,13 @@
         {/if}
       </button>
     </div>
-    <div class="diag-rows">
-      {#each rows as [key, value]}
-        <div class="diag-row"><span class="diag-key">{key}</span><span class="diag-val">{value}</span></div>
-      {/each}
-    </div>
+    {#each sections as section}
+      <h4 class="diag-subheading">{section.title}</h4>
+      <div class="diag-rows">
+        {#each section.rows as [key, value]}
+          <div class="diag-row"><span class="diag-key">{key}</span><span class="diag-val">{value}</span></div>
+        {/each}
+      </div>
+    {/each}
   </div>
 </div>

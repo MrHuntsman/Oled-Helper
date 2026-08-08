@@ -787,6 +787,121 @@
     hotkeySaveTimer = setTimeout(() => saveConfig(), 400);
   }
 
+  // ── Persistent HDR presentation layer ─────────────────────────────
+  // The WebView window is composited through ONE of two paths depending on
+  // whether the DOM contains an HDR WebGPU surface: with one present,
+  // Chromium presents the whole window via the HDR path (the SDR chrome is
+  // scaled by the frozen SDR-white reference); without one, the window is a
+  // plain SDR swapchain and Windows scales the chrome by the LIVE SDR
+  // slider. The calibration tabs own HDR canvases (Crush, Experimental), and
+  // leaving those tabs destroys them via onDestroy — so the window flips to
+  // SDR presentation and the whole interface visibly brightens. This
+  // always-mounted 1×1 HDR canvas keeps the window in the HDR path for the
+  // entire session, making the chrome brightness uniform across all tabs.
+  const HDR_LAYER_SHADER = `struct VO{@builtin(position)p:vec4f}
+  @vertex fn vs(@builtin(vertex_index)i:u32)->VO{
+    let pos=array(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));
+    return VO(vec4f(pos[i],0,1));
+  }
+  @fragment fn fs()->@location(0)vec4f{return vec4f(1.5,1.5,1.5,1.0);}`;
+
+  let hdrLayerCanvas = $state(null);
+  let hdrLayerInitStarted = false;
+  let hdrLayerDevice = null;
+  let hdrLayerCtx = null;
+  let hdrLayerModule = null;
+  let hdrLayerLayout = null;
+  let hdrLayerBg = null;
+  let hdrLayerPipe = null;
+  let hdrLayerFormat = null;
+  let hdrLayerRetryCount = 0;
+
+  async function initHdrLayer() {
+    if (hdrLayerInitStarted) return;
+    hdrLayerInitStarted = true;
+    try {
+      if (!navigator.gpu) return;
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) return;
+      hdrLayerDevice = await adapter.requestDevice();
+      const ctx = hdrLayerCanvas.getContext('webgpu');
+      if (!ctx) { hdrLayerDevice.destroy(); hdrLayerDevice = null; return; }
+      hdrLayerCtx = ctx;
+      hdrLayerModule = hdrLayerDevice.createShaderModule({ code: HDR_LAYER_SHADER });
+      const bgl = hdrLayerDevice.createBindGroupLayout({ entries: [] });
+      hdrLayerLayout = hdrLayerDevice.createPipelineLayout({ bindGroupLayouts: [bgl] });
+      hdrLayerBg = hdrLayerDevice.createBindGroup({ layout: bgl, entries: [] });
+      // Transient device losses (driver reset, GPU re-init) would silently
+      // drop the persistent layer — the exact failure this feature exists to
+      // prevent. Tear down and re-init once the hardware recovers (bounded
+      // retries so a permanently lost GPU can't spawn a retry loop).
+      hdrLayerDevice.lost.then((info) => {
+        console.warn('[gpu] persistent HDR layer device lost', info?.message || '');
+        hdrLayerDevice = null;
+        hdrLayerCtx = null;
+        hdrLayerFormat = null;
+        hdrLayerPipe = null;
+        if (hdrLayerRetryCount < 2) {
+          hdrLayerRetryCount++;
+          hdrLayerInitStarted = false;
+          setTimeout(() => { if (hdrLayerCanvas) initHdrLayer(); }, 1000);
+        }
+      }).catch(() => {});
+      configureHdrLayer();
+    } catch (e) {
+      console.warn('[gpu] persistent HDR layer init failed', e);
+    }
+  }
+
+  function configureHdrLayer() {
+    if (!hdrLayerDevice || !hdrLayerCtx) return;
+    try {
+      const wantHdr = app.hdrStatus === 'hdr';
+      let format = wantHdr ? 'rgba16float' : 'rgba8unorm';
+      let colorSpace = wantHdr ? 'display-p3' : 'srgb';
+      if (format !== hdrLayerFormat) {
+        try {
+          hdrLayerCtx.configure({ device: hdrLayerDevice, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
+        } catch (e) {
+          if (!wantHdr) throw e;
+          format = 'rgba8unorm';
+          colorSpace = 'srgb';
+          hdrLayerCtx.configure({ device: hdrLayerDevice, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
+        }
+        hdrLayerFormat = format;
+        hdrLayerPipe = hdrLayerDevice.createRenderPipeline({
+          layout: hdrLayerLayout,
+          vertex: { module: hdrLayerModule, entryPoint: 'vs' },
+          fragment: { module: hdrLayerModule, entryPoint: 'fs', targets: [{ format }] },
+          primitive: { topology: 'triangle-list' },
+        });
+      }
+      // Render a bright extended-range pixel once so the surface genuinely
+      // carries HDR content — a transparent/black 1×1 could be optimized away.
+      hdrLayerCanvas.width = 1;
+      hdrLayerCanvas.height = 1;
+      const tex = hdrLayerCtx.getCurrentTexture();
+      const enc = hdrLayerDevice.createCommandEncoder();
+      const pass = enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] });
+      pass.setPipeline(hdrLayerPipe); pass.setBindGroup(0, hdrLayerBg); pass.draw(3); pass.end();
+      hdrLayerDevice.queue.submit([enc.finish()]);
+    } catch (e) {
+      console.warn('[gpu] persistent HDR layer configure failed', e);
+    }
+  }
+
+  $effect(() => {
+    if (hdrLayerCanvas && !hdrLayerInitStarted) initHdrLayer();
+  });
+  // Follow HDR toggles (and the initial unknown→hdr transition) so the
+  // persistent layer tracks the same format/colorSpace as the calibration
+  // canvases. Re-renders when the window becomes visible again too — the
+  // swapchain can be recreated while the app is hidden in the tray.
+  $effect(() => {
+    void app.hdrStatus; void windowVisible;
+    if (hdrLayerCanvas && hdrLayerInitStarted) configureHdrLayer();
+  });
+
   function handleHotkeyAction(action) {
     switch (action) {
       case 'toggle_black_crush':
@@ -1156,3 +1271,8 @@
     </div>
   {/if}
 </div>
+
+<!-- Persistent 1×1 HDR surface (see initHdrLayer): keeps the window in the
+     HDR presentation path for the whole session so chrome brightness is
+     uniform across tabs. Invisible — 1px, near-zero opacity, no pointer events. -->
+<canvas class="hdr-layer" bind:this={hdrLayerCanvas} aria-hidden="true" tabindex="-1"></canvas>

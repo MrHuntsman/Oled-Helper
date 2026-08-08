@@ -415,6 +415,10 @@ pub struct HdrLuminance {
 // omitted rather than guessed.
 #[derive(serde::Serialize, Clone, Default)]
 pub struct DisplayOutputInfo {
+    // Full GPU model name of the adapter driving the primary display (DXGI
+    // adapter description, e.g. "NVIDIA GeForce RTX 3080"). Vendor-agnostic
+    // and available without a driver SDK — see vendor_info.rs.
+    pub gpu_model: String,
     pub connector: String,
     pub color_format: String,
     pub bits_per_channel: u32,
@@ -552,6 +556,7 @@ pub fn query_display_output_info(primary_monitor_name: &str) -> Option<DisplayOu
     }
     info.desktop_bits = query_desktop_bits();
     let vendor = crate::vendor_info::query_vendor_display_info();
+    info.gpu_model = vendor.gpu_model;
     info.dynamic_range = vendor.dynamic_range;
     info.vrr = vendor.vrr;
     info.reference_mode = vendor.reference_mode;

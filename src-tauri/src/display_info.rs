@@ -63,6 +63,9 @@ pub struct DisplayInfo {
     // Which EDID location supplied the native resolution ("CEA-861",
     // "base EDID", or "") — diagnostic info for the Debug tab.
     pub native_source: String,
+    // Full GPU model name of the adapter driving the primary display (DXGI
+    // adapter description). Vendor-agnostic; see vendor_info.rs.
+    pub gpu_model: String,
     // Physical connector ("HDMI", "DisplayPort", ...) and the current color
     // pipeline (format + bits per channel) — queried via the CCD API. Empty
     // strings / 0 when the query failed.
@@ -600,6 +603,10 @@ pub fn query_current_display() -> Option<DisplayInfo> {
         native_width,
         native_height,
         native_source,
+        gpu_model: output
+            .as_ref()
+            .map(|o| o.gpu_model.clone())
+            .unwrap_or_default(),
         connector: output
             .as_ref()
             .map(|o| o.connector.clone())

@@ -790,11 +790,14 @@
   // Mouse wheel over the strip changes the zoom (square count). Wheeling up
   // (negative deltaY) increases zoom, down decreases — matches typical
   // scroll-to-zoom conventions (maps, image viewers). The High Nits grid is
-  // fixed at 3×7, so wheel does nothing there (the range steppers below are
-  // the High Nits equivalent).
+  // fixed at 3×7, so wheel instead steps the Max slider through its stops
+  // (same behavior as wheeling over the Max control itself).
   function handleStripWheel(e) {
     e.preventDefault();
-    if (crush.stripType === 'highNits') return;
+    if (crush.stripType === 'highNits') {
+      handleNitsWheel(e);
+      return;
+    }
     const dir = e.deltaY < 0 ? 1 : -1;
     crush.squareCounts[crush.stripType] = Math.min(MAX_SQUARES, Math.max(2, activeSquareCount() + dir));
   }
@@ -817,18 +820,13 @@
     return idx < 0 ? HIGH_NITS_MAX_STOPS.length - 1 : idx;
   }
 
-  // Background for the Max slider: one tick mark per stop (evenly spaced,
-  // matching the index-based thumb positions) layered over the accent fill.
+  // Background for the Max slider: just the accent fill over the track
+  // (the per-stop tick marks were removed).
   function nitsSliderBackground() {
     const n = HIGH_NITS_MAX_STOPS.length;
     const idx = highNitsStopIndex();
     const fill = (idx / (n - 1)) * 100;
-    const ticks = [];
-    for (let i = 0; i < n; i++) {
-      const pos = (i / (n - 1)) * 100;
-      ticks.push(`transparent calc(${pos}% - 0.75px), rgba(255,255,255,0.45) calc(${pos}% - 0.75px), rgba(255,255,255,0.45) calc(${pos}% + 0.75px), transparent calc(${pos}% + 0.75px)`);
-    }
-    return `linear-gradient(to right, ${ticks.join(',')}), linear-gradient(to right, var(--accent) 0%, var(--accent) ${fill}%, #31313f ${fill}%, #31313f 100%)`;
+    return `linear-gradient(to right, var(--accent) 0%, var(--accent) ${fill}%, #31313f ${fill}%, #31313f 100%)`;
   }
 
   // Wheel over the Max slider nudges to the adjacent stop (the native range
@@ -1097,11 +1095,7 @@
 
   {#snippet calibrationTip()}
     {#if crush.stripType === 'highNits'}
-      <span>Each cell is a different brightness, low to high. Find the highest nits you can still distinguish — above that, your display clips to white.</span>
-      <span class="info-tip-note">
-        <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
-        <span>HDR: nits up to {highNitsMaxValue()} · SDR: RGB {HIGH_SDR_RANGE[0]}–{HIGH_SDR_RANGE[HIGH_SDR_RANGE.length - 1]}</span>
-      </span>
+      <span>Find the max nits value you can still distinguish.</span>
     {:else}
       <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
       <span class="info-tip-note">
@@ -1269,7 +1263,6 @@
           </div>
           <span class="nits-slider-val">{highNitsMaxValue()}</span>
         </div>
-        <span class="nits-range-unit">nits · step {crush.highNitsStep}</span>
       </div>
     {:else}
       <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCounts[crush.stripType] = value)}>
