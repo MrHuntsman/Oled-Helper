@@ -4,7 +4,7 @@
   // Two rows of gray patches on a small WebGPU canvas:
   //   • TOP row (SDR)     — the same nits levels shown the way SDR content
   //     renders at the CURRENT SDR white level. Content is scaled by the
-  //     white level relative to the BT.2400 reference (203 nits), and SDR
+  //     white level relative to the BT.2408 reference (203 nits), and SDR
   //     content can't get brighter than its white point, so columns above it
   //     flatten to pure white. The whole row brightens/darkens as the slider
   //     moves — exactly how Windows' SDR-vs-HDR comparison behaves.
@@ -20,7 +20,7 @@
   // true nits regardless of the startup slider, matching the Brightness
   // strip's compensation in TabCrush (see patchValue).
   import { onDestroy } from 'svelte';
-  import { CELL_GRID_SHADER, linearToSrgb, HDR_REFERENCE_NITS } from './calibration.js';
+  import { COMPARE_RAMP_SHADER, linearToSrgb, HDR_REFERENCE_NITS, COMPARISON_NITS } from './calibration.js';
   import { app, setGpuRenderingInfo, refreshSdrWhiteLevel } from './stores.svelte.js';
 
   let { sdrWhiteNits, hdrActive } = $props();
@@ -40,21 +40,36 @@
   let gpuError = $state('');
   let generation = 0;
 
-  // Column ramp: everyday SDR levels up to the BT.2400 reference white, then
-  // bright HDR steps ending at the CCD cap. 203 is centered.
-  const COLUMN_NITS = [50, 100, 150, 203, 300, 400, 480];
+  // Column ramp: 8 EQUAL-WIDTH squares on an evenly-spaced (arithmetic)
+  // grid. Because the values are evenly spaced, each square can be centered
+  // EXACTLY on its value's slider position — every square is the same width,
+  // its number sits dead-center under it, and that same number aligns with
+  // the slider tick. 203 (the BT.2408 reference) is the middle anchor; 80/480
+  // are deliberately excluded since an edge square can't be centered without
+  // hanging off the canvas.
+  const COLUMN_NITS = COMPARISON_NITS;
   const COLS = COLUMN_NITS.length;
   const ROWS = 2;
-  const GAP = 0.005;
-  // The shader derives cell geometry from the gap (sw = (1-gf*(cols-1))/cols,
-  // cw = sw+gf), so the shader's column centers sit at i*cw + sw/2, NOT at the
-  // naive (i+0.5)/cols a CSS grid would give. Compute the same positions for
-  // the DOM column labels so every number sits exactly under its cell.
-  const CELL_SW = (1 - GAP * (COLS - 1)) / COLS;
-  const CELL_CW = CELL_SW + GAP;
-  function columnCenterPct(i) {
-    return ((i * CELL_CW + CELL_SW / 2) * 100).toFixed(3);
-  }
+  const MIN_NITS = 80;
+  const MAX_NITS = 480;
+  // Linear position (0..1) of a nits value on the shared slider/canvas scale.
+  const nitsFrac = (nits) => (nits - MIN_NITS) / (MAX_NITS - MIN_NITS);
+  // Vertical hairline gap between the two rows (fraction of height). The
+  // squares themselves are edge-to-edge — no horizontal gap.
+  const VGAP = 0.006;
+  // Square centers sit exactly on their values' slider positions; the uniform
+  // value step makes the widths identical. The FIRST and LAST squares are
+  // extended to the canvas edges so the strip fills the full width, flush with
+  // the slider's 80/480 extremes — without this the strip would end ~3px
+  // short of the right edge (its value range covers 78–478 nits, not 480).
+  const COLUMN_CENTERS = COLUMN_NITS.map((nits) => nitsFrac(nits));
+  const COLUMN_WIDTH = COLUMN_CENTERS[1] - COLUMN_CENTERS[0];
+  const COLUMN_RECTS = COLUMN_CENTERS.map((c, i) => [
+    i === 0 ? 0 : c - COLUMN_WIDTH / 2,
+    i === COLUMN_CENTERS.length - 1 ? 1 : c + COLUMN_WIDTH / 2,
+  ]);
+  // Column labels sit at their squares' centers (= their slider tick).
+  const colLabelFrac = (i) => COLUMN_CENTERS[i];
 
   const derr = (msg) => { console.error('[gpu]', msg); };
 
@@ -157,10 +172,11 @@
         }
       }
 
-      ub = device.createBuffer({ size: 208, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      // 24 colors (vec4) + 24 rects (vec4) + cfg (vec4) = 784 bytes.
+      ub = device.createBuffer({ size: 784, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       const bgl = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }] });
       bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: ub } }] });
-      const sh = device.createShaderModule({ code: CELL_GRID_SHADER });
+      const sh = device.createShaderModule({ code: COMPARE_RAMP_SHADER });
       shaderModule = sh;
       pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
       currentFormat = format;
@@ -217,17 +233,22 @@
       if (w < 1 || h < 1) return;
       if (w !== canvas.width || h !== canvas.height) { canvas.width = w; canvas.height = h; }
 
-      const data = new Float32Array(52);
+      // The HDR reference row (row 1) is computed from the frozen base, not
+      // the live slider — it stays fixed while the SDR row reacts to it.
+      const data = new Float32Array(196);
       for (let col = 0; col < COLS; col++) {
-        // The HDR reference row (row 1) is computed from the frozen base, not
-        // the live slider — it stays fixed while the SDR row reacts to it.
-        data[col] = patchValue(COLUMN_NITS[col], 0);
-        data[COLS + col] = patchValue(COLUMN_NITS[col], 1);
+        for (let row = 0; row < ROWS; row++) {
+          const idx = row * COLS + col;
+          const c = patchValue(COLUMN_NITS[col], row);
+          data[idx * 4] = c; data[idx * 4 + 1] = c; data[idx * 4 + 2] = c; data[idx * 4 + 3] = 1;
+          const [x0, x1] = COLUMN_RECTS[col];
+          const base = 96 + idx * 4; // rects start after the 24 color vec4s
+          data[base] = x0; data[base + 1] = x1;
+          data[base + 2] = row === 0 ? 0 : 0.5 + VGAP / 2;
+          data[base + 3] = row === 0 ? 0.5 - VGAP / 2 : 1;
+        }
       }
-      data[48] = COLS * ROWS; // cells
-      data[49] = COLS;       // cols
-      data[50] = ROWS;       // rows
-      data[51] = GAP;
+      data[192] = COLS * ROWS; // cfg.x = cell count
       device.queue.writeBuffer(ub, 0, data);
 
       let tex;
@@ -266,19 +287,21 @@
 </script>
 
 <div class="sdr-hdr-compare">
-  <div class="sdr-hdr-row-labels">
-    <span>SDR white</span>
-    <span>HDR ref</span>
-  </div>
   <div class="sdr-hdr-canvas-wrap">
     <canvas
       bind:this={canvas}
       aria-label="SDR white level comparison ramp: top row SDR content, bottom row HDR reference, over shared nits levels"></canvas>
     <div class="sdr-hdr-column-labels">
       {#each COLUMN_NITS as nits, i}
-        <span class:sdr-hdr-reference-col={nits === HDR_REFERENCE_NITS} style="left: {columnCenterPct(i)}%">{nits}</span>
+        <!-- Labels sit at their square's center, which is also the exact
+             slider-tick position (evenly spaced values). -->
+        <span class:sdr-hdr-reference-col={nits === HDR_REFERENCE_NITS} style="left: calc(9px + (100% - 18px) * {colLabelFrac(i).toFixed(4)})">{nits}</span>
       {/each}
     </div>
+  </div>
+  <div class="sdr-hdr-row-labels">
+    <span>SDR white</span>
+    <span>HDR ref</span>
   </div>
   {#if gpuError}
     <p class="gpu-error">{gpuError}</p>
@@ -288,26 +311,29 @@
 <style>
   .sdr-hdr-compare {
     display: flex;
-    gap: 10px;
+    gap: var(--sdr-label-gap, 10px);
     margin: 18px 0;
     padding: 12px 12px 32px;
     border: 1px solid var(--divider);
     border-radius: 10px;
     background: color-mix(in srgb, var(--panel) 88%, #fff 12%);
   }
+  /* Row labels sit to the RIGHT of the canvas (--sdr-label-w is shared with
+     the slider's .exp-track-block right inset in app.css, so the canvas
+     keeps exactly the same width as the slider track). */
   .sdr-hdr-row-labels {
     position: relative;
-    flex: 0 0 auto;
-    width: 58px;
+    flex: 0 0 var(--sdr-label-w, 58px);
+    width: var(--sdr-label-w, 58px);
     height: 64px; /* must match the canvas height so 25%/75% hit the row centers */
   }
   .sdr-hdr-row-labels span {
     position: absolute;
-    right: 0;
+    left: 0;
     transform: translateY(-50%);
     font-size: 11px;
     color: var(--text-weak);
-    text-align: right;
+    text-align: left;
     white-space: nowrap;
   }
   .sdr-hdr-row-labels span:first-child { top: 25%; }
@@ -316,6 +342,10 @@
     position: relative;
     flex: 1 1 auto;
     min-width: 0;
+    /* 9px horizontal padding on each side mirrors the slider thumb's travel
+       inset [9px, 100% - 9px], so the canvas's UV x-space is exactly the
+       slider's tick space and squares align with ticks at the same nits. */
+    padding: 0 9px;
   }
   .sdr-hdr-canvas-wrap canvas {
     display: block;

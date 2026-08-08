@@ -260,11 +260,22 @@ export function linearToSrgb(c) {
   return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
 }
 
-// ITU-R BT.2400 reference/diffuse white for HDR (nits). At this SDR white
-// level, Chromium tone-maps HDR screenshots with their intended brightness,
-// and the SDR/HDR comparison rows in the Experimental tab align exactly.
-// Shared by TabExperimental (reset default) and SdrHdrCompare (HDR row).
+// ITU-R BT.2408 reference/diffuse white for HDR (nits) — the industry
+// standard diffuse-white level, which Chromium also hardcodes as its default
+// SDR white level (ui/gfx/color_space.cc kDefaultSDRWhiteLevel). At this SDR
+// white level, Chromium tone-maps HDR screenshots with their intended
+// brightness, and the SDR/HDR comparison rows in the Experimental tab align
+// exactly. Shared by TabExperimental (reset default) and SdrHdrCompare (HDR
+// row).
 export const HDR_REFERENCE_NITS = 203;
+
+// The SDR/HDR comparison strip's square values (Experimental tab). An
+// arithmetic progression centered on the BT.2408 reference, so every square
+// is equal-width AND its center lands exactly on the slider position for its
+// value (a non-uniform value set can only have one of the two). 203 is the
+// middle anchor; the extremes (80/480) are deliberately excluded because an
+// edge square can't be centered without hanging off the canvas.
+export const COMPARISON_NITS = [103, 153, 203, 253, 303, 353, 403, 453];
 
 // The cell-grid shader used by the calibration strip (TabCrush.svelte). Also
 // reused verbatim by the Experimental tab's SDR-vs-HDR comparison canvas so
@@ -286,6 +297,32 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let idx=row*cols+col;
   if(idx>=cells){return vec4f(0);}
   let g=idx/4;return vec4f(cb.values[g][idx%4]);
+}`;
+
+// Variable-width rectangle ramp for the Experimental tab's SDR-vs-HDR
+// comparison. Unlike CELL_GRID_SHADER (a uniform grid), each cell is an
+// explicit UV rectangle, so columns can sit at arbitrary nits positions on the
+// slider's linear scale. Buffer layout: 24 colors (vec4) + 24 rects (vec4,
+// x0,x1,y0,y1 in UV) + cfg (vec4, x = cell count) = 784 bytes. NOTE: the
+// struct field is named `cfg` — `meta` is a reserved keyword in WGSL and
+// fails compilation.
+export const COMPARE_RAMP_SHADER = `struct Cb{colors:array<vec4<f32>,24>,rects:array<vec4<f32>,24>,cfg:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
+struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
+@vertex fn vs(@builtin(vertex_index)i:u32)->VO{
+  let pos=array(vec2f(-1,1),vec2f(3,1),vec2f(-1,-3));
+  let p=pos[i];
+  return VO(vec4f(p,0,1),p*vec2f(.5,-.5)+vec2f(.5,.5));
+}
+@fragment fn fs(vin:VO)->@location(0)vec4f{
+  let cells=i32(cb.cfg.x);
+  for(var i=0;i<24;i=i+1){
+    if(i>=cells){break;}
+    let r=cb.rects[i];
+    if(vin.uv.x>=r.x&&vin.uv.x<r.y&&vin.uv.y>=r.z&&vin.uv.y<r.w){
+      return vec4f(cb.colors[i]);
+    }
+  }
+  return vec4f(0);
 }`;
 
 export function pqCodeToScrgb(code) {

@@ -2,6 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { app, pollHDRLuminance, setSdrWhiteNits } from './stores.svelte.js';
+  import { COMPARISON_NITS } from './calibration.js';
   import SdrHdrCompare from './SdrHdrCompare.svelte';
 
   let currentNits = $state(null);
@@ -14,14 +15,14 @@
   let sliderHovering = $state(false);
   const MIN_NITS = 80;
   const MAX_NITS = 480;
-  // ITU-R BT.2400 reference white for HDR — the standard diffuse white level
+  // ITU-R BT.2408 reference white for HDR — the standard diffuse white level
   // that Chromium uses when tone-mapping HDR screenshots to SDR. At this value
   // screenshots from Chromium browsers render with their intended brightness.
   const DEFAULT_NITS = 203;
-  // Tick marks land on round nits values, with the BT.2400 reference (203
-  // nits) included and highlighted — the exact position the Reset button
-  // targets. 200 is deliberately skipped so it can't crowd 203.
-  const TICKS_NITS = [100, 150, DEFAULT_NITS, 250, 300, 350, 400, 450];
+  // Tick marks sit on the SAME evenly-spaced grid as the comparison squares
+  // below (COMPARISON_NITS), so every tick lands exactly under a square's
+  // center — the slider and the ramp share one aligned scale.
+  const TICKS_NITS = COMPARISON_NITS;
   // Drag lands within this many nits of the reference white → snap to it,
   // so the alignment point (203) is easy to hit by feel.
   const SNAP_RANGE_NITS = 2;
@@ -44,7 +45,6 @@
   let lastHdrStatus = app.hdrStatus;
   let lastMonitorIdentity = app.displayInfo.monitorId || app.displayInfo.deviceName;
   let hdrAvailable = $derived(app.hdrStatus === 'hdr');
-  let monitorName = $derived(app.displayInfo.monitorName || 'Detecting monitor...');
 
   function formatNits(value) {
     return value == null || !Number.isFinite(Number(value)) ? '—' : `${Math.round(Number(value))} nits`;
@@ -169,45 +169,53 @@
   </div>
   <div class="separator"></div>
 
+  {#if hdrAvailable}
+    <div class="experimental-section-note">
+      Compares SDR content (top row) with true HDR luminance (bottom row) at the same
+      nits levels. Both rows match at 203 nits — the industry reference for SDR white
+      in HDR. Below 203, SDR renders dimmer; above it, SDR clips to white.
+    </div>
+  {/if}
+
   <div class="dimmer-control-group" class:disabled={!hdrAvailable || currentNits === null}>
     <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="settings-row-label">SDR white level</span>
         <span class="slider-val">{formatNits(currentNits)}</span>
       </div>
-      <div class="slider-track-wrap dimmer-slider-track">
-        <input
-          class="dimmer-opacity has-ticks-sdr-white"
-          type="range"
-          min={MIN_NITS}
-          max={MAX_NITS}
-          step="1"
-          value={Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS)}
-          style="--fill:{((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS)) * 100}%;--tick-bg:linear-gradient(to right,{ticksBackground})"
-          disabled={!hdrAvailable || currentNits === null}
-          oninput={onSliderInput}
-          onpointerdown={() => sliderDragging = true}
-          onpointerup={() => sliderDragging = false}
-          onpointerenter={() => sliderHovering = true}
-          onpointerleave={() => sliderHovering = false} />
-        <div class="slider-tooltip" class:visible={sliderDragging || sliderHovering} style="left:calc(9px + ({((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS))} * (100% - 18px)))">{formatNits(currentNits)}</div>
+      <!-- The track + scale block shrinks from the RIGHT by the comparison's
+           label column (--sdr-label-block), so the slider's ticks and the
+           comparison squares share one horizontal x-scale and align exactly.
+           Only when the comparison is actually shown (HDR on); with HDR off
+           the slider keeps its full width. -->
+      <div class:exp-track-block={hdrAvailable}>
+        <div class="slider-track-wrap dimmer-slider-track">
+          <input
+            class="dimmer-opacity has-ticks-sdr-white"
+            type="range"
+            min={MIN_NITS}
+            max={MAX_NITS}
+            step="1"
+            value={Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS)}
+            style="--fill:{((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS)) * 100}%;--tick-bg:linear-gradient(to right,{ticksBackground})"
+            disabled={!hdrAvailable || currentNits === null}
+            oninput={onSliderInput}
+            onpointerdown={() => sliderDragging = true}
+            onpointerup={() => sliderDragging = false}
+            onpointerenter={() => sliderHovering = true}
+            onpointerleave={() => sliderHovering = false} />
+          <div class="slider-tooltip" class:visible={sliderDragging || sliderHovering} style="left:calc(9px + ({((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS))} * (100% - 18px)))">{formatNits(currentNits)}</div>
+        </div>
+        <div class="dimmer-scale">
+          <span>{MIN_NITS} nits</span>
+          <span class="dimmer-scale-mid" style="left:{referenceLabelLeft}">{DEFAULT_NITS} nits</span>
+          <span>{MAX_NITS} nits</span>
+        </div>
       </div>
-      <div class="dimmer-scale">
-        <span>{MIN_NITS} nits</span>
-        <span class="dimmer-scale-mid" style="left:{referenceLabelLeft}">{DEFAULT_NITS} nits</span>
-        <span>{MAX_NITS} nits</span>
-      </div>
-    </div>
-
-    <div class="experimental-monitor-rows">
-      <div class="experimental-monitor-row"><span>Current display</span><strong>{monitorName}</strong></div>
-      <div class="experimental-monitor-row"><span>HDR peak luminance</span><strong>{formatNits(app.hdrLuminance?.maxNits)}</strong></div>
-      <div class="experimental-monitor-row"><span>Current SDR white</span><strong>{formatNits(currentNits ?? detectedNits)}</strong></div>
     </div>
   </div>
 
   {#if hdrAvailable}
-    <div class="experimental-section-note">Compare SDR white against true HDR luminance. Top row shows each level as SDR content at the current white point (clips to white above it); bottom row shows the same levels as fixed HDR luminance. Align the rows by setting the slider to 203 nits.</div>
     <SdrHdrCompare sdrWhiteNits={currentNits ?? detectedNits ?? 203} hdrActive={hdrAvailable} />
   {/if}
 

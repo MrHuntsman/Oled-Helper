@@ -369,7 +369,22 @@ button {
 }
 
 /* ── Content / Tab heading ────────────────────────────────────────── */
-.tab-body { padding: 16px; display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.tab-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  /* Experimental tab: the SDR white slider and the comparison canvas share
+     one horizontal x-scale. The comparison's row labels (SDR white / HDR ref)
+     sit to the RIGHT of the canvas, so the slider's track block shrinks from
+     the right by the same amount (label column + gap) to keep every tick
+     aligned with the square for the same nits. */
+  --sdr-label-w: 58px;
+  --sdr-label-gap: 10px;
+  --sdr-label-block: calc(var(--sdr-label-w) + var(--sdr-label-gap));
+}
 .tab-heading {
   display: flex;
   align-items: center;
@@ -926,6 +941,14 @@ button {
     ),
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
+/* SDR white slider block (Experimental tab): shrinks from the right by the
+   comparison's label column so the track and the comparison canvas share one
+   width — the canvas has the same 9px thumb-travel inset, so slider ticks and
+   comparison squares land at the same x for the same nits. */
+.exp-track-block {
+  margin-right: var(--sdr-label-block, 68px);
+}
+
 .dimmer-scale {
   position: relative;
   display: flex;
@@ -2700,12 +2723,7 @@ button {
 
 /* ── Experimental HDR controls ─────────────────────────────────────── */
 .experimental-tab-icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); border-radius: 8px; color: var(--accent); font-size: 18px; flex-shrink: 0; }
-.experimental-monitor-rows { margin-top: 16px; }
-.experimental-section-note { margin-top: 18px; color: var(--text-weak); font-size: 11px; line-height: 1.55; max-width: 640px; }
-.experimental-monitor-row { display: flex; justify-content: space-between; gap: 18px; padding: 6px 0; border-bottom: 1px solid color-mix(in srgb, var(--divider) 70%, transparent); font-size: 12px; }
-.experimental-monitor-row:last-child { border-bottom: none; }
-.experimental-monitor-row span { color: var(--text-weak); }
-.experimental-monitor-row strong { color: var(--text); font-weight: 500; text-align: right; }
+.experimental-section-note { margin: 16px 0 4px; color: var(--text-weak); font-size: 11px; line-height: 1.55; max-width: 640px; }
 
 
 /* ── Accessibility ──────────────────────────────────────────────── */
