@@ -18,6 +18,29 @@
   // that Chromium uses when tone-mapping HDR screenshots to SDR. At this value
   // screenshots from Chromium browsers render with their intended brightness.
   const DEFAULT_NITS = 203;
+  // Tick marks land on round nits values, with the BT.2400 reference (203
+  // nits) included and highlighted — the exact position the Reset button
+  // targets. 200 is deliberately skipped so it can't crowd 203.
+  const TICKS_NITS = [100, 150, DEFAULT_NITS, 250, 300, 350, 400, 450];
+  // Drag lands within this many nits of the reference white → snap to it,
+  // so the alignment point (203) is easy to hit by feel.
+  const SNAP_RANGE_NITS = 2;
+  const sliderFraction = (nits) => (nits - MIN_NITS) / (MAX_NITS - MIN_NITS);
+  const ticksBackground =
+    TICKS_NITS.map((nits) => {
+      const f = sliderFraction(nits).toFixed(4);
+      const edge = (sign) => `calc((100% - 18px) * ${f} + 9px ${sign} 0.75px)`;
+      // The 203 tick uses full white instead of the accent so it stays visible
+      // in every thumb position: the accent fill sits to its left (slider
+      // below 203) or covers it entirely (slider above 203 — accent-on-accent
+      // was invisible). White reads against both the fill and the dark track.
+      const color = nits === DEFAULT_NITS ? '#fff' : 'rgba(255,255,255,0.45)';
+      return `transparent ${edge('-')}, ${color} ${edge('-')}, ${color} ${edge('+')}, transparent ${edge('+')}`;
+    }).join(',\n      ');
+  // Left offset for the "203 nits" caption under the track — matches the
+  // thumb/tick coordinate space (thumb travel is [9px, 100% - 9px]).
+  const referenceLabelLeft =
+    `calc(9px + (100% - 18px) * ${sliderFraction(DEFAULT_NITS).toFixed(4)})`;
   let lastHdrStatus = app.hdrStatus;
   let lastMonitorIdentity = app.displayInfo.monitorId || app.displayInfo.deviceName;
   let hdrAvailable = $derived(app.hdrStatus === 'hdr');
@@ -62,8 +85,18 @@
     clearTimeout(applyTimer);
     applyTimer = setTimeout(() => { applyTimer = null; void apply(); }, 60);
   }
+  // Snap to the reference white only while actually dragging with the
+  // pointer, mirroring the other ticked sliders (Black Level in TabCrush,
+  // opacity in TabDimmer): write the corrected value back to the input so
+  // the thumb lands exactly on the tick (otherwise the native control keeps
+  // the raw position and visibly fights the snapped value), and let keyboard
+  // arrows bypass the snap so they never feel stuck inside the band.
   function onSliderInput(event) {
-    currentNits = Math.min(Number(event.currentTarget.value), MAX_NITS);
+    const raw = Math.min(Number(event.currentTarget.value), MAX_NITS);
+    const normalized =
+      sliderDragging && Math.abs(raw - DEFAULT_NITS) <= SNAP_RANGE_NITS ? DEFAULT_NITS : raw;
+    if (raw !== normalized) event.currentTarget.value = normalized;
+    currentNits = normalized;
     scheduleApply();
   }
   async function reset() {
@@ -144,13 +177,13 @@
       </div>
       <div class="slider-track-wrap dimmer-slider-track">
         <input
-          class="dimmer-opacity has-ticks-dimmer"
+          class="dimmer-opacity has-ticks-sdr-white"
           type="range"
           min={MIN_NITS}
           max={MAX_NITS}
           step="1"
           value={Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS)}
-          style="--fill:{((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS)) * 100}%"
+          style="--fill:{((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS)) * 100}%;--tick-bg:linear-gradient(to right,{ticksBackground})"
           disabled={!hdrAvailable || currentNits === null}
           oninput={onSliderInput}
           onpointerdown={() => sliderDragging = true}
@@ -159,7 +192,11 @@
           onpointerleave={() => sliderHovering = false} />
         <div class="slider-tooltip" class:visible={sliderDragging || sliderHovering} style="left:calc(9px + ({((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS))} * (100% - 18px)))">{formatNits(currentNits)}</div>
       </div>
-      <div class="dimmer-scale"><span>{MIN_NITS} nits</span><span>{MAX_NITS} nits</span></div>
+      <div class="dimmer-scale">
+        <span>{MIN_NITS} nits</span>
+        <span class="dimmer-scale-mid" style="left:{referenceLabelLeft}">{DEFAULT_NITS} nits</span>
+        <span>{MAX_NITS} nits</span>
+      </div>
     </div>
 
     <div class="experimental-monitor-rows">

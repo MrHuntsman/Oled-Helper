@@ -900,6 +900,19 @@ button {
     ),
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
+/* SDR white slider (Experimental tab) — same thumb-travel tick math, but the
+   ticks layer is supplied at runtime via --tick-bg (always set inline on that
+   slider). A dedicated class is used instead of a var() fallback on the shared
+   .has-ticks-dimmer rule: Chromium drops the whole background declaration when
+   a var() fallback is a complex multi-stop gradient and the variable is
+   undefined (the fallback is never parsed into a valid <image>), which
+   silently removed the Dimmer tab's opacity track. */
+.dimmer-slider-track input[type=range].has-ticks-sdr-white {
+  background:
+    var(--tick-bg, none),
+    linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
+}
+
 /* Fade sliders use half the tick density of the opacity slider (4 ticks at
    20/40/60/80% instead of 9 at 10–90%) — same valid calc() pattern as
    .has-ticks-dimmer above. */
@@ -914,11 +927,23 @@ button {
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
 .dimmer-scale {
+  position: relative;
   display: flex;
   justify-content: space-between;
   margin-top: 3px;
   color: var(--text-weak);
   font-size: 11px;
+}
+/* Reference-mark caption (e.g. "203 nits" on the SDR white slider) pinned to
+   the same coordinate space as the thumb/tick positions: the track's thumb
+   travel is [9px, 100% - 9px], so an inline left: calc(9px + (100% - 18px) *
+   <frac>) aligns the caption's centre with the tick it describes. */
+.dimmer-scale-mid {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* Chain-link toggle button sitting centered in the gap between the two
