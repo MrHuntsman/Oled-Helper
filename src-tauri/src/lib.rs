@@ -1,5 +1,6 @@
 mod config;
 mod display_info;
+mod dwm_eotf;
 mod flyout_window;
 mod gamma_ramp;
 mod hdr_toggle;
@@ -11,7 +12,7 @@ mod window_icon;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI32, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
@@ -30,12 +31,41 @@ struct TrayState {
 // are refreshed periodically; warnings and errors remain visible regardless.
 static DETAILED_LOGGING: AtomicBool = AtomicBool::new(false);
 
+// ── DWM EOTF auto-reapply state ───────────────────────────────────────────
+// The gamma override lives in DWM's memory, so any DWM restart (resolution
+// change, driver update, crash, sleep/resume) silently reverts it to the
+// original sRGB shaders. A background watcher compares the current dwm.exe
+// PID against the instance we last patched and, when it differs and a profile
+// is persisted (config.dwm_eotf_profile + dwm_eotf_auto_reapply), runs the
+// full restart+patch flow again. The apply command and the watcher share the
+// same "last applied PID" so a manual apply never trips the watcher.
+static LAST_APPLIED_DWM_PID: AtomicU32 = AtomicU32::new(0);
+static LAST_AUTO_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+static DWM_APPLY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static DWM_WATCHER_STOP: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub(crate) fn detailed_logging_enabled() -> bool {
     DETAILED_LOGGING.load(Ordering::Relaxed)
 }
 
 pub(crate) fn set_detailed_logging_enabled(enabled: bool) {
     DETAILED_LOGGING.store(enabled, Ordering::Relaxed);
+}
+
+// Toggles the vendor/EDID detailed diagnostics independently of the taskbar
+// dimmer's own verbose switch (set_taskbar_dimmer_verbose_logging). The two
+// were previously coupled through platform::set_verbose_logging, so enabling
+// one flooded the log with the other's periodic chatter.
+#[tauri::command]
+fn set_detailed_logging(enabled: bool) {
+    set_detailed_logging_enabled(enabled);
 }
 
 #[cfg(target_os = "windows")]
@@ -98,6 +128,16 @@ mod display_change_events {
 
     fn notify_display_changed(app: &AppHandle, source: &str) {
         let _ = app.emit("display-changed", source);
+        // The vendor caches (primary-GPU adapter info, NVAPI context and its
+        // display ID, and the DRS session) are all derived from the display
+        // topology. A change can reorder or replace the primary adapter or
+        // display, so invalidate them to force the next vendor query to
+        // re-enumerate promptly.
+        vendor_info::invalidate_display_caches();
+        // The cached primary-HDR target used by get/set_sdr_white_level is
+        // also derived from the display topology — a change can move it to a
+        // different adapter/target, so invalidate it too.
+        hdr_toggle::invalidate_hdr_target_cache();
         // Keep the tray menu's resolution/refresh-rate submenus in sync with
         // the active display configuration. Coalesced because a single display
         // change often arrives as a burst of several window messages.
@@ -327,6 +367,77 @@ fn get_display_info() -> Option<display_info::DisplayInfo> {
 }
 
 #[tauri::command]
+async fn scan_dwm_eotf() -> Result<dwm_eotf::DwmEotfScanResult, String> {
+    // The scanner performs bounded process-memory reads. Keep them off the
+    // Tauri/WebView event loop so a slow protected-page read cannot stutter
+    // the UI or taskbar handling.
+    tauri::async_runtime::spawn_blocking(dwm_eotf::scan)
+        .await
+        .map_err(|error| format!("DWM scan worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn scan_dwm_eotf_debug_priv() -> Result<dwm_eotf::DwmEotfScanResult, String> {
+    tauri::async_runtime::spawn_blocking(dwm_eotf::scan_with_debug_privilege)
+        .await
+        .map_err(|error| format!("DWM scan worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn scan_dwm_shaders() -> Result<dwm_eotf::DwmEotfScanResult, String> {
+    tauri::async_runtime::spawn_blocking(dwm_eotf::scan_dwm_shaders)
+        .await
+        .map_err(|error| format!("DWM shader scan worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn scan_dwm_dry_run(profile: String) -> Result<dwm_eotf::DwmEotfScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || dwm_eotf::scan_dwm_dry_run(&profile))
+        .await
+        .map_err(|error| format!("DWM dry run worker failed: {error}"))
+}
+
+// Captures every DXBC container digest in dwmcore so the shader whitelist can
+// grow to cover other Windows builds. Read-only (same permission set as the
+// dry run) and run off the event loop.
+#[tauri::command]
+async fn dump_dwm_shader_digests() -> Result<dwm_eotf::DwmShaderDigestDump, String> {
+    tauri::async_runtime::spawn_blocking(dwm_eotf::dump_shader_digests)
+        .await
+        .map_err(|error| format!("DWM digest worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn apply_dwm_patch(profile: String) -> Result<dwm_eotf::DwmEotfScanResult, String> {
+    // Claim the apply guard atomically. The auto-reapply watcher holds the
+    // same flag while it restarts+patches DWM (which can take ~10–25 s), so a
+    // click during that window must not start a second concurrent
+    // TerminateProcess/NtSuspendProcess cycle against DWM.
+    if DWM_APPLY_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err("A DWM patch is already in progress — wait for it to finish before applying again.".into());
+    }
+    // The restart+patch flow changes the DWM PID, so record the fresh
+    // instance as "already applied" — otherwise the auto-reapply watcher
+    // would see a PID change right after this manual apply and immediately
+    // run another restart+patch cycle.
+    let result = tauri::async_runtime::spawn_blocking(move || dwm_eotf::apply_dwm_patch_v2(&profile))
+        .await
+        .map_err(|error| {
+            DWM_APPLY_IN_PROGRESS.store(false, Ordering::Relaxed);
+            format!("DWM patch worker failed: {error}")
+        })?;
+    if result.dwm_pid != 0 {
+        LAST_APPLIED_DWM_PID.store(result.dwm_pid, Ordering::Relaxed);
+    }
+    LAST_AUTO_APPLY_MS.store(now_ms(), Ordering::Relaxed);
+    DWM_APPLY_IN_PROGRESS.store(false, Ordering::Relaxed);
+    Ok(result)
+}
+
+#[tauri::command]
 fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
     vendor_info::query_vendor_display_info_fresh()
 }
@@ -549,6 +660,69 @@ fn tray_display_mode_change(app: AppHandle, result: Result<display_info::Applied
     rebuild_tray_menu(&app);
 }
 
+// Background watcher for the DWM EOTF override. Every few seconds it checks
+// whether dwm.exe has been replaced (new PID) while a gamma profile is
+// persisted and auto-reapply is enabled, and if so re-runs the restart+patch
+// flow so the override survives DWM restarts. Only one patch can run at a
+// time (DWM_APPLY_IN_PROGRESS guards against the manual Apply racing this
+// thread); the cooldown prevents a burst of restarts from stacking patches.
+fn dwm_eotf_watch_loop(app: AppHandle) {
+    // Give the UI a moment to settle before the first tick; DWM may still be
+    // mid-restart from a tray relaunch or a mode change at launch.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if DWM_WATCHER_STOP.load(Ordering::Relaxed) {
+            break;
+        }
+        if DWM_APPLY_IN_PROGRESS.load(Ordering::Relaxed) {
+            continue;
+        }
+        let cfg = config::load_config(app.clone());
+        let profile = cfg.dwm_eotf_profile.clone();
+        if profile.is_empty() || !cfg.dwm_eotf_auto_reapply {
+            continue;
+        }
+        let Some(pid) = dwm_eotf::current_dwm_pid() else {
+            continue;
+        };
+        let last = LAST_APPLIED_DWM_PID.load(Ordering::Relaxed);
+        // First tick with a persisted profile: treat the currently running DWM
+        // as already applied. DWM's memory holds the gamma across app
+        // relaunches, so restarting it just because the app started would
+        // flash the screen for nothing. The watcher only reacts to restarts
+        // that happen while this process is alive.
+        if last == 0 {
+            LAST_APPLIED_DWM_PID.store(pid, Ordering::Relaxed);
+            continue;
+        }
+        if last == pid {
+            continue;
+        }
+        // A fresh DWM instance — try once, then record the outcome so a
+        // persistent failure isn't retried every tick.
+        let now = now_ms();
+        if now.saturating_sub(LAST_AUTO_APPLY_MS.load(Ordering::Relaxed)) < 10_000 {
+            continue;
+        }
+        DWM_APPLY_IN_PROGRESS.store(true, Ordering::Relaxed);
+        log::info!(
+            "[dwm-eotf] DWM restarted (PID {pid}, last applied {last}); auto re-applying '{profile}'"
+        );
+        let result = dwm_eotf::apply_dwm_patch_v2(&profile);
+        LAST_AUTO_APPLY_MS.store(now_ms(), Ordering::Relaxed);
+        DWM_APPLY_IN_PROGRESS.store(false, Ordering::Relaxed);
+        let applied_pid = if result.dwm_pid != 0 { result.dwm_pid } else { pid };
+        LAST_APPLIED_DWM_PID.store(applied_pid, Ordering::Relaxed);
+        log::info!(
+            "[dwm-eotf] auto re-apply finished: {} — {} (new PID {})",
+            result.status,
+            result.message,
+            applied_pid
+        );
+    }
+}
+
 fn shutdown_gamma_worker(app: &AppHandle) {
     let state = app.state::<GammaState>();
     state.shutdown.requested.store(true, Ordering::Release);
@@ -561,14 +735,115 @@ fn shutdown_gamma_worker(app: &AppHandle) {
     unsafe {
         gamma_ramp::reset_display_ramp();
     }
+    // app.exit(0) bypasses Rust Drop, so explicitly close the process-lifetime
+    // NVAPI DRS session/context before Tauri terminates. Flush afterward so
+    // the teardown confirmation is written to the file log before exit.
+    vendor_info::shutdown();
+    log::logger().flush();
     config::shutdown();
 }
 
 fn request_shutdown_and_exit(app: &AppHandle) {
+    DWM_WATCHER_STOP.store(true, Ordering::Relaxed);
     taskbar_dimmer::shutdown();
     hotkeys::shutdown();
     shutdown_gamma_worker(app);
     app.exit(0);
+}
+
+// Set once at startup from --open-tab=<tab> (elevated RTX HDR restart) and
+// consumed by take_startup_tab so the frontend reopens on the user's tab.
+static STARTUP_TAB: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+// Returns the tab requested via --open-tab (if any) exactly once, then clears
+// it so a later frontend reload does not re-apply a stale tab.
+#[tauri::command]
+fn take_startup_tab() -> Option<String> {
+    let mut guard = match STARTUP_TAB.get() {
+        Some(lock) => lock.lock().ok()?,
+        None => return None,
+    };
+    guard.take()
+}
+
+#[tauri::command]
+fn set_hdr_enhancement_mode(mode: String) -> Result<(), String> {
+    match mode.as_str() {
+        "rtx" => {
+            if !vendor_info::is_nvidia_primary_gpu() {
+                return Err("NVIDIA RTX HDR is unavailable on this GPU".into());
+            }
+            // The admin-gated RTX write happens before touching Auto HDR. If
+            // UAC is required, the current mode is left intact. If the second
+            // operation fails, roll RTX back so both modes cannot remain on.
+            vendor_info::enable_rtx_hdr_for_mode()?;
+            if let Err(error) = hdr_toggle::set_auto_hdr_enabled(false) {
+                let _ = vendor_info::set_rtx_hdr_enabled(false);
+                return Err(error);
+            }
+        }
+        "auto" | "off" => {
+            let want_auto = mode == "auto";
+            let was_rtx_enabled = if vendor_info::is_nvidia_primary_gpu() {
+                vendor_info::get_rtx_hdr_settings()
+                    .map(|settings| settings.enabled)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if was_rtx_enabled {
+                vendor_info::set_rtx_hdr_enabled(false)?;
+            }
+            if let Err(error) = hdr_toggle::set_auto_hdr_enabled(want_auto) {
+                if was_rtx_enabled {
+                    let _ = vendor_info::set_rtx_hdr_enabled(true);
+                }
+                return Err(error);
+            }
+        }
+        _ => return Err(format!("unknown HDR enhancement mode '{mode}'")),
+    }
+    Ok(())
+}
+
+fn apply_pending_hdr_mode(mode: &str) -> Result<(), String> {
+    match mode {
+        "rtx" => {
+            if !vendor_info::is_nvidia_primary_gpu() {
+                return Err("NVIDIA RTX HDR is unavailable on this GPU".into());
+            }
+            // Configure RTX first. If the driver rejects the elevated write,
+            // Auto HDR remains untouched. Only disable Auto HDR after RTX is
+            // known to be enabled, and roll RTX back if that second operation
+            // fails so the transition never leaves both paths active.
+            vendor_info::enable_rtx_hdr_for_mode()?;
+            if let Err(error) = hdr_toggle::set_auto_hdr_enabled(false) {
+                let rollback = vendor_info::set_rtx_hdr_enabled(false);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(format!(
+                        "{error}; RTX HDR rollback also failed: {rollback_error}"
+                    )),
+                };
+            }
+        }
+        "auto" => {
+            // Disable RTX HDR only when this machine has NVIDIA RTX HDR.
+            // Non-NVIDIA systems expose only Off and Windows Auto HDR.
+            if vendor_info::is_nvidia_primary_gpu() {
+                vendor_info::set_rtx_hdr_enabled(false)?;
+            }
+            hdr_toggle::set_auto_hdr_enabled(true)?;
+        }
+        "off" => {
+            if vendor_info::is_nvidia_primary_gpu() {
+                vendor_info::set_rtx_hdr_enabled(false)?;
+            }
+            hdr_toggle::set_auto_hdr_enabled(false)?;
+        }
+        _ => return Err(format!("unknown HDR enhancement mode '{mode}'")),
+    }
+    Ok(())
 }
 
 fn request_restart(app: &AppHandle) {
@@ -597,6 +872,96 @@ fn request_restart(app: &AppHandle) {
     // (--restart-parent) before initializing WebView2, preventing overlapping
     // browser/profile lifetimes during a tray restart.
     app.exit(0);
+}
+
+// RTX HDR lives in the NVIDIA global driver profile, which the driver only
+// lets elevated processes write (SetSetting returns NVAPI_INVALID_USER_
+// PRIVILEGE otherwise). Reads work non-elevated, so the UI can show the
+// current mode — applying a change needs a one-time elevated restart.
+// Relaunch via ShellExecuteW with the "runas" verb (UAC prompt), reusing the
+// --restart-parent handoff so the new instance waits for this process to
+// release WebView2's user-data folder. An optional pending RTX HDR mode is
+// forwarded as --rtx-hdr-flags=<n> so the elevated instance applies it right
+// after startup, and the active tab as --open-tab=<tab> so the user lands
+// where they were.
+#[tauri::command]
+fn relaunch_elevated(
+    app: AppHandle,
+    rtx_hdr_flags: Option<u32>,
+    rtx_hdr_enabled: Option<bool>,
+    hdr_mode: Option<String>,
+    tab: Option<String>,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    args.push("--restart-parent".into());
+    args.push(std::process::id().to_string().into());
+    if let Some(flags) = rtx_hdr_flags {
+        args.push(format!("--rtx-hdr-flags={flags}").into());
+    }
+    if let Some(enabled) = rtx_hdr_enabled {
+        args.push(format!("--rtx-hdr-enabled={}", u8::from(enabled)).into());
+    }
+    if let Some(mode) = hdr_mode.as_deref().filter(|mode| matches!(*mode, "off" | "auto" | "rtx")) {
+        args.push(format!("--hdr-mode={mode}").into());
+    }
+    // Only forward tab ids the app actually has (see the tab switch chain in
+    // App.svelte); anything else is ignored rather than carried into the
+    // command line.
+    const KNOWN_TABS: [&str; 9] = [
+        "crush", "dimmer", "windows-hdr", "experimental", "hotkeys", "debug", "system", "settings", "about",
+    ];
+    if let Some(tab) = tab {
+        if KNOWN_TABS.contains(&tab.as_str()) {
+            args.push(format!("--open-tab={tab}").into());
+        }
+    }
+    // Quote each argument so a path with spaces survives the command line.
+    let params: Vec<u16> = args
+        .iter()
+        .map(|arg| {
+            let text = arg.to_string_lossy().replace('"', "\\\"");
+            format!("\"{text}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let exe_w: Vec<u16> = exe
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let result = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("runas"),
+            windows::core::PCWSTR(exe_w.as_ptr()),
+            windows::core::PCWSTR(params.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
+    // are failures. The one exception is ERROR_CANCELLED (1223): dismissing
+    // the UAC prompt also yields > 32, so it must be checked explicitly —
+    // otherwise cancelling the elevation would look like success and kill
+    // this instance. Keep the app fully functional whenever the launch did
+    // not actually happen.
+    let code = result.0 as isize;
+    if code <= 32 || code == 1223 {
+        return Err(if code == 1223 {
+            "Elevation was cancelled — no changes were made.".to_string()
+        } else {
+            format!("could not start elevated instance (ShellExecuteW returned {code})")
+        });
+    }
+
+    taskbar_dimmer::shutdown();
+    shutdown_gamma_worker(&app);
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -694,6 +1059,86 @@ pub fn run() {
         }
     }
 
+    // An elevated relaunch (RTX HDR write) can carry the mode the user tried
+    // to apply before the restart. Apply it once, shortly after startup, on a
+    // background thread — this instance is elevated, so the DRS write that
+    // failed before now succeeds.
+    let pending_rtx_hdr_flags: Option<u32> = std::env::args()
+        .find_map(|arg| {
+            arg.strip_prefix("--rtx-hdr-flags=")
+                .and_then(|value| value.parse().ok())
+        });
+    let pending_rtx_hdr_enabled: Option<bool> = std::env::args()
+        .find_map(|arg| {
+            arg.strip_prefix("--rtx-hdr-enabled=")
+                .and_then(|value| match value {
+                    "1" | "true" => Some(true),
+                    "0" | "false" => Some(false),
+                    _ => None,
+                })
+        });
+    let pending_hdr_mode: Option<String> = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--hdr-mode=")
+            .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
+            .map(str::to_string)
+    });
+    // An elevated relaunch can carry the tab the user was on
+    // (--open-tab=<tab>); take_startup_tab hands it to the frontend once so
+    // the UI opens on the same tab after the UAC restart.
+    let startup_tab: Option<String> = std::env::args()
+        .find_map(|arg| arg.strip_prefix("--open-tab=").map(str::to_string));
+    if let Some(tab) = startup_tab {
+        if let Ok(mut guard) = STARTUP_TAB.get_or_init(|| Mutex::new(None)).lock() {
+            *guard = Some(tab);
+        }
+    }
+    if pending_rtx_hdr_flags.is_some()
+        || pending_rtx_hdr_enabled.is_some()
+        || pending_hdr_mode.is_some()
+    {
+        if let Err(error) = std::thread::Builder::new()
+            .name("rtx-hdr-pending-apply".into())
+            .spawn(move || {
+                // Let nvapi and the driver settle before touching the profile.
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                // Apply the exclusive mode first. This disables the currently
+                // active path before enabling the requested one, so an elevated
+                // restart cannot leave Auto HDR and RTX HDR enabled together.
+                if let Some(mode) = pending_hdr_mode.as_deref() {
+                    match apply_pending_hdr_mode(mode) {
+                        Ok(()) => log::info!("applied pending HDR enhancement mode '{mode}' after elevated restart"),
+                        Err(error) => log::warn!("pending HDR enhancement mode apply failed: {error}"),
+                    }
+                }
+                // Legacy individual RTX arguments remain supported for older
+                // relaunches. Apply them after the mode only when present.
+                if pending_hdr_mode.as_deref() == Some("rtx") {
+                    if let Some(flags) = pending_rtx_hdr_flags {
+                        match vendor_info::set_rtx_hdr_flags(flags) {
+                        Ok(()) => log::info!(
+                            "applied pending RTX HDR mode 0x{flags:02X} after elevated restart"
+                        ),
+                            Err(error) => log::warn!("pending RTX HDR mode apply failed: {error}"),
+                        }
+                    }
+                }
+                if pending_hdr_mode.is_none() {
+                    if let Some(enabled) = pending_rtx_hdr_enabled {
+                    match vendor_info::set_rtx_hdr_enabled(enabled) {
+                        Ok(()) => log::info!(
+                            "applied pending RTX HDR global enable={} after elevated restart",
+                            enabled
+                        ),
+                            Err(error) => log::warn!("pending RTX HDR global enable apply failed: {error}"),
+                        }
+                    }
+                }
+            })
+        {
+            log::error!("could not start RTX HDR pending-apply thread: {error}");
+        }
+    }
+
     let mut builder = tauri::Builder::default();
     // Must be the first plugin registered (Tauri docs recommendation). Skip
     // it for our own restart-child processes: the old instance is still
@@ -725,7 +1170,18 @@ pub fn run() {
             apply_gamma_ramp,
             log_frontend,
             get_display_info,
+            scan_dwm_eotf,
+            scan_dwm_eotf_debug_priv,
+            scan_dwm_shaders,
+            scan_dwm_dry_run,
+            dump_dwm_shader_digests,
+            apply_dwm_patch,
             refresh_vendor_display_info,
+            vendor_info::get_rtx_hdr_settings_state,
+            set_hdr_enhancement_mode,
+            vendor_info::set_rtx_hdr_state,
+            relaunch_elevated,
+            take_startup_tab,
             set_refresh_rate,
             set_resolution,
             confirm_display_mode_change,
@@ -736,6 +1192,7 @@ pub fn run() {
             config::save_config,
             config::reset_config,
             config::open_config_folder,
+            set_detailed_logging,
             log_history::take_log_history,
             hotkeys::set_hotkey,
             hotkeys::reset_hotkeys,
@@ -751,6 +1208,8 @@ pub fn run() {
             hdr_toggle::get_hdr_luminance,
             hdr_toggle::get_sdr_white_level,
             hdr_toggle::set_sdr_brightness_nits,
+            hdr_toggle::get_auto_hdr_enabled,
+            hdr_toggle::set_auto_hdr_enabled,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,
@@ -777,6 +1236,17 @@ pub fn run() {
                     .lock()
                     .map_err(|_| "gamma state was poisoned".to_string())?
                     .replace(handle);
+            }
+
+            // DWM EOTF auto-reapply: watches for dwm.exe restarts and re-applies
+            // the persisted gamma profile so the override survives resolution
+            // changes, driver updates, and DWM crashes.
+            {
+                let watch_app = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("dwm-eotf-watch".into())
+                    .spawn(move || dwm_eotf_watch_loop(watch_app))
+                    .map_err(|error| format!("could not start DWM EOTF watch thread: {error}"))?;
             }
 
             // Always-on rotating file log (not just debug builds) — GPU-init
@@ -1005,6 +1475,12 @@ pub fn run() {
                     if tray_enabled {
                         api.prevent_close();
                         if window.hide().is_ok() {
+                            // The process remains alive in the tray, but
+                            // release the optional vendor-driver resources
+                            // while idle. This is separate from final
+                            // shutdown so NVAPI can initialize lazily again
+                            // when the window is shown.
+                            vendor_info::release_for_tray();
                             let _ = window.app_handle().emit("window-visibility", false);
                         }
                     }
@@ -1014,6 +1490,7 @@ pub fn run() {
                     // the window is actually destroyed, request a synchronous
                     // worker shutdown so the display ramp is reset before the
                     // process exits.
+                    DWM_WATCHER_STOP.store(true, Ordering::Relaxed);
                     taskbar_dimmer::shutdown();
                     hotkeys::shutdown();
                     shutdown_gamma_worker(window.app_handle());

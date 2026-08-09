@@ -35,7 +35,14 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID, WIN32_ERROR,
+};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
@@ -197,6 +204,10 @@ pub fn set_windows_hdr(enable: bool) -> Result<(), String> {
     }
 
     if applied_any {
+        // The HDR state flip changes which target qualifies as the primary
+        // HDR target; drop the cached target so the next SDR white level
+        // read re-resolves.
+        invalidate_hdr_target_cache();
         Ok(())
     } else {
         Err(last_err.unwrap_or_else(|| "no HDR-capable display found".to_string()))
@@ -282,8 +293,59 @@ fn primary_hdr_path() -> Result<Option<DISPLAYCONFIG_PATH_INFO>, String> {
     }))
 }
 
+// The primary-HDR target (adapterId + target id) is what the SDR white level
+// GET/SET calls address, and it only changes when the display topology or HDR
+// state changes. Resolving it via primary_hdr_path() re-walks the whole
+// display configuration (GetDisplayConfigBufferSizes + QueryDisplayConfig +
+// device enumeration + per-path DisplayConfigGetDeviceInfo) — real driver
+// work that the Windows HDR tab's 500ms poll was paying on EVERY tick even
+// though the target never moved. Cache the resolved target and only re-walk
+// when it goes stale or the display topology changes.
+struct CachedHdrTarget {
+    captured_at: Instant,
+    // None = HDR is off / no HDR-capable primary target. The timestamp is
+    // cached even for the negative result so an HDR-off session doesn't
+    // re-walk the topology on every 500ms poll — the frontend's refresh()
+    // calls get_sdr_white_level unconditionally while the tab is open.
+    target: Option<(LUID, u32)>,
+}
+
+static HDR_TARGET_CACHE: OnceLock<Mutex<Option<CachedHdrTarget>>> = OnceLock::new();
+// The target is stable in practice; the TTL is a safety net for a missed
+// display-change event, and lib.rs's notify_display_changed invalidates it
+// eagerly on any topology change.
+const HDR_TARGET_CACHE_TTL: Duration = Duration::from_secs(5);
+
+// Returns the cached primary-HDR (adapterId, targetId), resolving it on cache
+// miss. Ok(None) means HDR is off / no HDR-capable primary target.
+fn cached_primary_hdr_target() -> Result<Option<(LUID, u32)>, String> {
+    let cache = HDR_TARGET_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cached) = guard
+        .as_ref()
+        .filter(|cached| cached.captured_at.elapsed() < HDR_TARGET_CACHE_TTL)
+    {
+        return Ok(cached.target);
+    }
+    let resolved = primary_hdr_path()?
+        .map(|path| (path.targetInfo.adapterId, path.targetInfo.id));
+    *guard = Some(CachedHdrTarget {
+        captured_at: Instant::now(),
+        target: resolved,
+    });
+    Ok(resolved)
+}
+
+pub fn invalidate_hdr_target_cache() {
+    if let Some(cache) = HDR_TARGET_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
 fn query_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
-    let Some(path) = primary_hdr_path()? else {
+    let Some((adapter_id, target_id)) = cached_primary_hdr_target()? else {
         return Ok(None);
     };
     unsafe {
@@ -291,13 +353,16 @@ fn query_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
             header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
                 r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
                 size: std::mem::size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32,
-                adapterId: path.targetInfo.adapterId,
-                id: path.targetInfo.id,
+                adapterId: adapter_id,
+                id: target_id,
             },
             ..Default::default()
         };
         let result = DisplayConfigGetDeviceInfo(&mut level.header);
         if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
+            // A stale cached target (HDR toggled off / display removed) makes
+            // the read fail; drop the cache so the next poll re-resolves.
+            invalidate_hdr_target_cache();
             return Err(format!(
                 "DisplayConfigGetDeviceInfo(SDR white level) failed: {result:?}"
             ));
@@ -337,7 +402,7 @@ fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
     if !nits.is_finite() || nits < 80.0 {
         return Err("SDR white level must be at least 80 nits".into());
     }
-    let Some(path) = primary_hdr_path()? else {
+    let Some((adapter_id, target_id)) = cached_primary_hdr_target()? else {
         return Err("Windows HDR is not enabled on the primary display".into());
     };
     let raw = (nits * 1000.0 / 80.0).round() as u32;
@@ -348,14 +413,15 @@ fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
                     DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL_I,
                 ),
                 size: std::mem::size_of::<DISPLAYCONFIG_SET_SDR_WHITE_LEVEL_INTERNAL>() as u32,
-                adapterId: path.targetInfo.adapterId,
-                id: path.targetInfo.id,
+                adapterId: adapter_id,
+                id: target_id,
             },
             SDRWhiteLevel: raw,
             finalValue: 1,
         };
         let result = DisplayConfigSetDeviceInfo(&params.header);
         if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
+            invalidate_hdr_target_cache();
             return Err(format!(
                 "DisplayConfigSetDeviceInfo(SDR white level) failed: {result:?}"
             ));
@@ -378,7 +444,7 @@ pub fn set_sdr_white_level(nits: f32) -> Result<SdrWhiteLevel, String> {
     if !nits.is_finite() || !(80.0..=480.0).contains(&nits) {
         return Err("SDR white level must be between 80 and 480 nits".into());
     }
-    if primary_hdr_path()?.is_none() {
+    if cached_primary_hdr_target()?.is_none() {
         return Err("Windows HDR is not enabled on the primary display".into());
     }
     set_sdr_white_level_ccd(nits)
@@ -609,4 +675,187 @@ pub fn query_hdr_luminance() -> Option<HdrLuminance> {
 #[tauri::command]
 pub fn get_hdr_luminance() -> Option<HdrLuminance> {
     query_hdr_luminance()
+}
+
+// ── Auto HDR (system-wide) ─────────────────────────────────────────────────
+// Windows 11's system-wide Auto HDR switch is not exposed by any public Win32
+// API. The Settings app stores it as a flag in the DirectX user GPU
+// preferences value:
+//
+//   HKCU\Software\Microsoft\DirectX\UserGpuPreferences
+//     DirectXUserGlobalSettings (REG_SZ) =
+//       "AutoHDREnable=0;SwapEffectUpgradeEnable=1;VRROptimizeEnable=0;"
+//
+// The value is a semicolon-separated list of "Name=Value;" toggles (the same
+// list that holds the "Optimizations for windowed games" flags). We rewrite
+// only the AutoHDREnable token and preserve every other flag. Per-app
+// overrides live in the same key as per-exe values and are left untouched.
+//
+// Caveat: the flag is read when an app starts, so the change only affects
+// games launched afterwards — running games need a restart. It also only has
+// an effect while Windows HDR is enabled on the display.
+const AUTO_HDR_PREFS_SUBKEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
+const AUTO_HDR_SETTINGS_VALUE: &str = "DirectXUserGlobalSettings";
+const AUTO_HDR_FLAG_PREFIX: &str = "AutoHDREnable=";
+
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// Reads the DirectXUserGlobalSettings string. Ok(None) when the key or value
+// does not exist yet (fresh user profile) — callers treat that as "all flags
+// off". A genuine registry failure is an Err so a write is never based on a
+// silently-failed read (which would clobber the user's other flags).
+fn read_directx_global_settings() -> Result<Option<String>, String> {
+    unsafe {
+        let mut key = HKEY::default();
+        let open = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(wide(AUTO_HDR_PREFS_SUBKEY).as_ptr()),
+            Some(0),
+            KEY_QUERY_VALUE,
+            &mut key,
+        );
+        if open == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if open != ERROR_SUCCESS || key.is_invalid() {
+            return Err(format!(
+                "RegOpenKeyExW({AUTO_HDR_PREFS_SUBKEY}) failed: {open:?}"
+            ));
+        }
+
+        let value_name = wide(AUTO_HDR_SETTINGS_VALUE);
+        let mut required = 0u32;
+        let mut value_type = REG_VALUE_TYPE::default();
+        let size_query = RegQueryValueExW(
+            key,
+            windows::core::PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            None,
+            Some(&mut required),
+        );
+        if size_query == ERROR_FILE_NOT_FOUND {
+            let _ = RegCloseKey(key);
+            return Ok(None);
+        }
+        if size_query != ERROR_SUCCESS || required == 0 || required > 4096 {
+            let _ = RegCloseKey(key);
+            return Err(format!(
+                "RegQueryValueExW size query failed: {size_query:?}"
+            ));
+        }
+
+        // required is the byte count (UTF-16, null-terminated); the buffer is
+        // sized in u16 units so a trailing partial unit stays in bounds.
+        let mut buf = vec![0u16; (required as usize + 1) / 2];
+        let mut read = required;
+        let query = RegQueryValueExW(
+            key,
+            windows::core::PCWSTR(value_name.as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some(buf.as_mut_ptr() as *mut u8),
+            Some(&mut read),
+        );
+        let _ = RegCloseKey(key);
+        if query != ERROR_SUCCESS {
+            return Err(format!("RegQueryValueExW read failed: {query:?}"));
+        }
+        Ok(Some(
+            String::from_utf16_lossy(&buf)
+                .trim_end_matches('\0')
+                .to_string(),
+        ))
+    }
+}
+
+fn write_directx_global_settings(settings: &str) -> Result<(), String> {
+    unsafe {
+        let mut key = HKEY::default();
+        // Create the key if this is a fresh profile; opening an existing key
+        // behaves identically.
+        let create = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR(wide(AUTO_HDR_PREFS_SUBKEY).as_ptr()),
+            None,
+            windows::core::PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        );
+        if create != ERROR_SUCCESS || key.is_invalid() {
+            return Err(format!(
+                "RegCreateKeyExW({AUTO_HDR_PREFS_SUBKEY}) failed: {create:?}"
+            ));
+        }
+
+        // REG_SZ payload: UTF-16LE bytes including the null terminator.
+        let mut data: Vec<u8> = Vec::with_capacity((settings.len() + 1) * 2);
+        for unit in settings.encode_utf16() {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        data.extend_from_slice(&0u16.to_le_bytes());
+
+        let value_name = wide(AUTO_HDR_SETTINGS_VALUE);
+        let set = RegSetValueExW(
+            key,
+            windows::core::PCWSTR(value_name.as_ptr()),
+            None,
+            REG_SZ,
+            Some(&data),
+        );
+        let _ = RegCloseKey(key);
+        if set != ERROR_SUCCESS {
+            return Err(format!(
+                "RegSetValueExW({AUTO_HDR_SETTINGS_VALUE}) failed: {set:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_auto_hdr_enabled(settings: &str) -> bool {
+    settings
+        .split(';')
+        .map(str::trim)
+        .any(|token| token == "AutoHDREnable=1")
+}
+
+// Replaces the AutoHDREnable flag in place (or prepends it when the flag is
+// absent), preserving every other flag in the value.
+fn set_auto_hdr_flag(settings: &str, enabled: bool) -> String {
+    let flag = format!("{AUTO_HDR_FLAG_PREFIX}{}", if enabled { 1 } else { 0 });
+    let tokens: Vec<&str> = settings.split(';').filter(|t| !t.is_empty()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len() + 1);
+    let mut replaced = false;
+    for token in tokens {
+        let token = token.trim();
+        if token.starts_with(AUTO_HDR_FLAG_PREFIX) {
+            out.push(flag.clone());
+            replaced = true;
+        } else {
+            out.push(token.to_string());
+        }
+    }
+    if !replaced {
+        out.insert(0, flag);
+    }
+    format!("{};", out.join(";"))
+}
+
+#[tauri::command]
+pub fn get_auto_hdr_enabled() -> Result<bool, String> {
+    Ok(read_directx_global_settings()?
+        .map(|s| parse_auto_hdr_enabled(&s))
+        .unwrap_or(false))
+}
+
+#[tauri::command]
+pub fn set_auto_hdr_enabled(enabled: bool) -> Result<(), String> {
+    let existing = read_directx_global_settings()?.unwrap_or_default();
+    write_directx_global_settings(&set_auto_hdr_flag(&existing, enabled))
 }

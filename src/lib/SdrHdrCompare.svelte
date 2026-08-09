@@ -1,5 +1,5 @@
 <script>
-  // SDR-vs-HDR nits-matched comparison ramp (Experimental tab).
+  // SDR-vs-HDR nits-matched comparison ramp (Windows HDR tab).
   //
   // Two rows of gray patches on a small WebGPU canvas:
   //   • TOP row (SDR)     — the same nits levels shown the way SDR content
@@ -136,7 +136,7 @@
   }
 
   // Keep the last successful comparison diagnostics in the session store.
-  // The canvas is intentionally destroyed when leaving Experimental, but
+  // The canvas is intentionally destroyed when leaving Windows HDR, but
   // clearing the record would make System Info forget a renderer that really
   // did initialize successfully.
   onDestroy(releaseGpuResources);

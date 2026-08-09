@@ -7,7 +7,7 @@ export const app = $state({
   hdrStatus: 'unknown',
   hdrLuminance: null,
   // Windows SDR white level in nits (80–480), read live for System Info and
-  // the Experimental tab.
+  // the Windows HDR tab.
   sdrWhiteNits: 80,
   // The SDR white level the browser's HDR compositor captured at WebView
   // startup and froze for the session. The Brightness strip must encode
@@ -16,7 +16,7 @@ export const app = $state({
   // the live slider makes the strip drift whenever the SDR brightness moves.
   // Captured on the first successful read (null → fallback 80).
   sdrWhiteBaseNits: null,
-  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', gpuModel: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, dynamicRange: '', vrr: '', referenceMode: false, refreshRateHz: null, refreshRates: [], resolutions: [] },
+  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', gpuModel: '', vendor: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, dynamicRange: '', vrr: '', referenceMode: false, refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
   // Actual canvas rendering path reported by the WebGPU calibration surfaces.
@@ -28,7 +28,7 @@ export const app = $state({
 });
 
 // Keep diagnostics per canvas. The main calibration canvas and the
-// Experimental comparison canvas can initialize at different times; a single
+// Windows HDR comparison canvas can initialize at different times; a single
 // shared record would make System Info report whichever one initialized last.
 export function setGpuRenderingInfo(source, info = {}) {
   if (source !== 'main' && source !== 'comparison') return;
@@ -157,8 +157,17 @@ export const taskbarDimmer = $state({
 });
 
 export const traySettings = $state({ enabled: true });
-export const runtimeLogSettings = $state({ verbosePeriodic: false });
+// Debug-tab logging switches, independent of each other:
+//   verbosePeriodic — vendor/EDID detailed diagnostics (set_detailed_logging)
+//   dimmerVerbose   — taskbar dimmer tick/winevent/fade verbose logs
+//                     (set_taskbar_dimmer_verbose_logging)
+export const runtimeLogSettings = $state({ verbosePeriodic: false, dimmerVerbose: false });
 export const debugSettings = $state({ contextMenuEnabled: false });
+// DWM EOTF gamma override (Experimental tab): the last successfully applied
+// profile ("srgb"/"2.2"/"2.4"/"2.6", empty = no override) and whether the
+// backend watcher should re-apply it after DWM restarts. Persisted in the
+// config so the override survives app relaunches too.
+export const dwmEotf = $state({ profile: '', autoReapply: true });
 
 // Global hotkey bindings: action name → combo string ("Ctrl+Alt+F9", or
 // "None" for unbound). Loaded from config on startup; changes go through
@@ -369,6 +378,8 @@ export async function loadConfig(prefetchedCfg = null) {
         if (typeof combo === 'string') hotkeys[action] = combo;
       }
     }
+    if (cfg && typeof cfg.dwm_eotf_profile === 'string') dwmEotf.profile = cfg.dwm_eotf_profile;
+    if (cfg && typeof cfg.dwm_eotf_auto_reapply === 'boolean') dwmEotf.autoReapply = cfg.dwm_eotf_auto_reapply;
     try {
       const status = await invoke('get_taskbar_dimmer_status');
       if (status) taskbarDimmer.available = status.available !== false;
@@ -423,7 +434,17 @@ export function saveConfig() {
     display_menu_show_tags: displayMenuPrefs.showTags,
     display_menu_refresh_rate_sort: displayMenuPrefs.refreshRateSort,
     hotkeys: { ...hotkeys },
+    dwm_eotf_profile: dwmEotf.profile,
+    dwm_eotf_auto_reapply: dwmEotf.autoReapply,
   } }).catch((e) => console.warn('[config] save failed', e));
+}
+export function setDwmEotfProfile(profile) {
+  dwmEotf.profile = profile;
+  saveConfig();
+}
+export function setDwmEotfAutoReapply(enabled) {
+  dwmEotf.autoReapply = !!enabled;
+  saveConfig();
 }
 export async function setTrayEnabled(enabled) {
   const previous = traySettings.enabled;
@@ -580,7 +601,11 @@ export function setPollIntervalMs(ms) {
 }
 export function setVerbosePeriodicLogging(enabled) {
   runtimeLogSettings.verbosePeriodic = enabled;
-  invoke('set_taskbar_dimmer_verbose_logging', { enabled }).catch((e) => console.warn('[runtime-log] verbose logging update failed', e));
+  invoke('set_detailed_logging', { enabled }).catch((e) => console.warn('[runtime-log] detailed logging update failed', e));
+}
+export function setDimmerVerboseLogging(enabled) {
+  runtimeLogSettings.dimmerVerbose = enabled;
+  invoke('set_taskbar_dimmer_verbose_logging', { enabled }).catch((e) => console.warn('[runtime-log] dimmer verbose logging update failed', e));
 }
 export function setContextMenuEnabled(enabled) {
   debugSettings.contextMenuEnabled = enabled;
@@ -625,9 +650,16 @@ export function setSdrWhiteNits(nits) {
 // Windows display-topology notification. Refresh only the small vendor-info
 // payload; do not re-enumerate modes, EDID, and connector data each time.
 let vendorDisplayRefreshInFlight = false;
+let vendorDisplayRefreshQueued = false;
 let vendorDisplayRefreshSequence = 0;
 export function refreshVendorDisplayInfo() {
-  if (vendorDisplayRefreshInFlight) return Promise.resolve();
+  if (vendorDisplayRefreshInFlight) {
+    // A display-change refresh can arrive while the normal visibility/system
+    // refresh is still in flight. Do not drop that request: run one more
+    // lightweight query after the current call finishes.
+    vendorDisplayRefreshQueued = true;
+    return Promise.resolve();
+  }
   vendorDisplayRefreshInFlight = true;
   const sequence = ++vendorDisplayRefreshSequence;
   return invoke('refresh_vendor_display_info').then((info) => {
@@ -638,8 +670,17 @@ export function refreshVendorDisplayInfo() {
     // Keep the last-known model — a transient vendor refresh returning an
     // empty name should never wipe a good one.
     if (typeof info.gpu_model === 'string' && info.gpu_model) app.displayInfo.gpuModel = info.gpu_model;
+    // A display-mode transition can briefly return an incomplete vendor
+    // payload while the driver is settling. Never erase a known vendor on an
+    // empty response; a later non-empty refresh can still update it when the
+    // actual adapter changes.
+    if (typeof info.vendor === 'string' && info.vendor) app.displayInfo.vendor = info.vendor;
   }).catch(() => {}).finally(() => {
     vendorDisplayRefreshInFlight = false;
+    if (vendorDisplayRefreshQueued) {
+      vendorDisplayRefreshQueued = false;
+      setTimeout(() => refreshVendorDisplayInfo(), 0);
+    }
   });
 }
 
@@ -683,7 +724,8 @@ export function pollDisplayInfo() {
   const prevVrr = app.displayInfo.vrr;
   const prevReferenceMode = app.displayInfo.referenceMode;
   const prevGpuModel = app.displayInfo.gpuModel;
-  app.displayInfo = { width: Math.round(s.width * dpr), height: Math.round(s.height * dpr), deviceName: prevDeviceName, monitorName: prevMonitorName, monitorId: prevMonitorId, nativeWidth: prevNativeWidth, nativeHeight: prevNativeHeight, nativeSource: prevNativeSource, gpuModel: prevGpuModel, connector: prevConnector, colorFormat: prevColorFormat, bitsPerChannel: prevBitsPerChannel, desktopBits: prevDesktopBits, dynamicRange: prevDynamicRange, vrr: prevVrr, referenceMode: prevReferenceMode, refreshRateHz: prevRefreshRateHz, refreshRates: prevRefreshRates, resolutions: prevResolutions };
+  const prevVendor = app.displayInfo.vendor;
+  app.displayInfo = { width: Math.round(s.width * dpr), height: Math.round(s.height * dpr), deviceName: prevDeviceName, monitorName: prevMonitorName, monitorId: prevMonitorId, nativeWidth: prevNativeWidth, nativeHeight: prevNativeHeight, nativeSource: prevNativeSource, gpuModel: prevGpuModel, vendor: prevVendor, connector: prevConnector, colorFormat: prevColorFormat, bitsPerChannel: prevBitsPerChannel, desktopBits: prevDesktopBits, dynamicRange: prevDynamicRange, vrr: prevVrr, referenceMode: prevReferenceMode, refreshRateHz: prevRefreshRateHz, refreshRates: prevRefreshRates, resolutions: prevResolutions };
   invoke('get_display_info').then((info) => {
     if (requestSequence !== displayPollSequence) return;
     if (!info) { scheduleDisplayInfoRetry(); return; }
@@ -705,7 +747,7 @@ export function pollDisplayInfo() {
       // the scoped profile for the newly detected display/mode.
       persistCurrentBlackLevelProfile();
     }
-    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', gpuModel: typeof info.gpu_model === 'string' && info.gpu_model ? info.gpu_model : prevGpuModel, connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, dynamicRange: typeof info.dynamic_range === 'string' ? info.dynamic_range : '', vrr: typeof info.vrr === 'string' ? info.vrr : '', referenceMode: info.reference_mode === true, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
+    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', gpuModel: typeof info.gpu_model === 'string' && info.gpu_model ? info.gpu_model : prevGpuModel, vendor: prevVendor, connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, dynamicRange: typeof info.dynamic_range === 'string' ? info.dynamic_range : '', vrr: typeof info.vrr === 'string' ? info.vrr : '', referenceMode: info.reference_mode === true, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
     if (nextRefreshRate && (nextRefreshRate !== previousRefreshRate || displayOrModeChanged)) applyBlackLevelProfileForRefreshRate(nextRefreshRate);
   }).catch(() => scheduleDisplayInfoRetry());
 }

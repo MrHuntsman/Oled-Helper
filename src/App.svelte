@@ -1,11 +1,12 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
+  import TabWindowsHdr from './lib/TabWindowsHdr.svelte';
   import TabExperimental from './lib/TabExperimental.svelte';
   import TabDebug from './lib/TabDebug.svelte';
   import TabSystem from './lib/TabSystem.svelte';
@@ -21,6 +22,8 @@
   import tabAboutIcon from './lib/icons/tab_about.png?inline';
   import tabCrushIcon from './lib/icons/tab_crush.png?inline';
   import tabDimmerIcon from './lib/icons/tab_dimmer.png?inline';
+  import tabHdrIcon from './lib/icons/tab_hdr.png?inline';
+  import tabDebugIcon from './lib/icons/tab_debug.png?inline';
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
 
   let windowVisible = $state(true);
@@ -28,6 +31,7 @@
   // WM_DISPLAYCHANGE/WM_DEVICECHANGE messages) into a single SDR-white base
   // re-capture, and gives the OS a beat to settle before the new value is read.
   let sdrWhiteBaseRecaptureTimer = null;
+  let vendorDisplayRefreshTimer = null;
 
   // Keep the native tray flyout's accent in sync with the main UI: push the
   // current HDR/SDR status to Rust so the flyout's Keep button matches
@@ -782,6 +786,53 @@
     invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch(() => {});
   }
 
+  // SDR Content Brightness is a Windows setting, not an OLED Helper setting.
+  // Read it immediately before each hotkey step so the action remains correct
+  // when Windows Settings or another tool changed it while the app was hidden.
+  // Queue repeated WM_HOTKEY events rather than allowing overlapping reads and
+  // writes to race while the user holds the shortcut.
+  const SDR_BRIGHTNESS_STEP_NITS = 50;
+  const SDR_BRIGHTNESS_MIN_NITS = 80;
+  const SDR_BRIGHTNESS_MAX_NITS = 480;
+  let pendingSdrBrightnessDelta = 0;
+  let sdrBrightnessHotkeyBusy = false;
+
+  async function drainSdrBrightnessHotkeys() {
+    if (sdrBrightnessHotkeyBusy) return;
+    sdrBrightnessHotkeyBusy = true;
+    try {
+      while (pendingSdrBrightnessDelta !== 0) {
+        const delta = pendingSdrBrightnessDelta;
+        pendingSdrBrightnessDelta = 0;
+        try {
+          const info = await invoke('get_sdr_white_level');
+          const current = Number(info?.nits);
+          if (!Number.isFinite(current)) continue;
+          const target = Math.max(
+            SDR_BRIGHTNESS_MIN_NITS,
+            Math.min(SDR_BRIGHTNESS_MAX_NITS, current + delta),
+          );
+          if (target === current) continue;
+          const result = await invoke('set_sdr_brightness_nits', { nits: target });
+          const applied = Number(result?.nits);
+          if (Number.isFinite(applied)) setSdrWhiteNits(applied);
+        } catch (error) {
+          console.warn('[sdr-brightness-hotkey] update failed', error);
+        }
+      }
+    } finally {
+      sdrBrightnessHotkeyBusy = false;
+      // Handle an event that arrived between the final loop check and the
+      // busy flag being cleared without recursively awaiting from the event.
+      if (pendingSdrBrightnessDelta !== 0) void drainSdrBrightnessHotkeys();
+    }
+  }
+
+  function adjustSdrBrightnessForHotkey(direction) {
+    pendingSdrBrightnessDelta += direction * SDR_BRIGHTNESS_STEP_NITS;
+    void drainSdrBrightnessHotkeys();
+  }
+
   function scheduleHotkeyConfigSave() {
     clearTimeout(hotkeySaveTimer);
     hotkeySaveTimer = setTimeout(() => saveConfig(), 400);
@@ -793,7 +844,7 @@
   // Chromium presents the whole window via the HDR path (the SDR chrome is
   // scaled by the frozen SDR-white reference); without one, the window is a
   // plain SDR swapchain and Windows scales the chrome by the LIVE SDR
-  // slider. The calibration tabs own HDR canvases (Crush, Experimental), and
+  // slider. The calibration tabs own HDR canvases (Crush, Windows HDR), and
   // leaving those tabs destroys them via onDestroy — so the window flips to
   // SDR presentation and the whole interface visibly brightens. This
   // always-mounted 1×1 HDR canvas keeps the window in the HDR path for the
@@ -925,10 +976,23 @@
       case 'toggle_hdr':
         toggleWindowsHdr();
         break;
+      case 'decrease_sdr_brightness':
+        adjustSdrBrightnessForHotkey(-1);
+        break;
+      case 'increase_sdr_brightness':
+        adjustSdrBrightnessForHotkey(1);
+        break;
     }
   }
 
   onMount(() => {
+    // An elevated RTX HDR restart carries --open-tab=<tab> so the user lands
+    // back where they were; consume it once (cleared after first read).
+    invoke('take_startup_tab')
+      .then((tab) => {
+        if (typeof tab === 'string' && tab) app.activeTab = tab;
+      })
+      .catch(() => {});
     // One-time: seed display info and HDR status. Mode changes re-poll
     // explicitly afterward — there is no periodic poll on the main thread.
     pollDisplayInfo();
@@ -947,6 +1011,15 @@
     // refresh below handles that case without touching mode lists or EDID.
     listen('display-changed', () => {
       scheduleDisplayInfoRefresh();
+      // A mode change can briefly make the full display query incomplete, and
+      // that query rebuilds displayInfo. Re-check the lightweight GPU payload
+      // after the driver has settled so NVIDIA-only controls do not depend on
+      // visiting another tab to repopulate the vendor field.
+      clearTimeout(vendorDisplayRefreshTimer);
+      vendorDisplayRefreshTimer = setTimeout(() => {
+        vendorDisplayRefreshTimer = null;
+        refreshVendorDisplayInfo();
+      }, 350);
       // Display topology changes (incl. HDR toggles, resolution/hotplug)
       // make the WebView re-read its display info — including the SDR white
       // level it froze at startup — so re-capture the strip's base to match.
@@ -991,6 +1064,7 @@
     return () => {
       unlisten?.();
       unlistenDisplayChanged?.();
+      clearTimeout(vendorDisplayRefreshTimer);
       unlistenHotkeyPressed?.();
       unlistenTrayMode?.();
     };
@@ -1016,20 +1090,42 @@
     };
   });
 
-  // Driver-level range/VRR settings may change without a Windows display
-  // notification. Refresh only those two fields while the app window is
-  // visible, at a gentle 5-second cadence. The full display query remains
-  // event-driven, so this does not repeatedly enumerate modes or read EDID.
+  // Driver-level range/VRR/reference-mode settings may change without a
+  // Windows display notification. The full vendor NVAPI query chain is only
+  // consumed by the System Info tab, so the periodic refresh runs only while
+  // that tab is open (the Windows HDR tab reads the single RTX HDR DRS value
+  // through its own 500 ms poll, which stays independent of this).
+  //
+  // A one-shot fetch always runs on window-visible: it populates the GPU
+  // vendor/model that gates NVIDIA-only UI (the RTX HDR section, vendor
+  // tags) — that must not depend on which tab is open. Entering the Crush
+  // tab also re-fetches once so its reference-mode warning reflects the
+  // current driver state even if System Info was never opened (the effect
+  // re-runs on tab switches, covering that case).
+  // Keep one vendor fetch tied only to visibility, not to activeTab. This
+  // discovers the GPU vendor/model on startup and after returning from the
+  // tray, including an elevated restart that opens directly on Windows HDR.
+  $effect(() => {
+    if (windowVisible) refreshVendorDisplayInfo();
+  });
+
+  // The full vendor query is needed on the tabs that consume those settings.
+  // Do not run it merely because an unrelated tab became active — that caused
+  // a full NVAPI color/VRR/reference-mode probe on every tab switch.
   $effect(() => {
     if (!windowVisible) return;
-    refreshVendorDisplayInfo();
-    const timer = setInterval(() => refreshVendorDisplayInfo(), 5000);
-    return () => clearInterval(timer);
+    const tab = app.activeTab;
+    if (tab === 'crush') refreshVendorDisplayInfo();
+    if (tab === 'system') {
+      refreshVendorDisplayInfo();
+      const timer = setInterval(() => refreshVendorDisplayInfo(), 5000);
+      return () => clearInterval(timer);
+    }
   });
 
   // The Windows SDR white level can be changed from Settings or other tools
   // with no display-topology event. Re-read it periodically (2s, only while
-  // the window is visible) to keep System Info and the Experimental tab fresh.
+  // the window is visible) to keep System Info and the Windows HDR tab fresh.
   // The Brightness strip does NOT follow this live value: Chromium/WebView2
   // froze the SDR white level at WebView startup, so the strip encodes against
   // the first-read base (app.sdrWhiteBaseNits) captured here instead.
@@ -1086,8 +1182,11 @@
     <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
       <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
     </button>
+    <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
+      <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
+    </button>
     <button class="nav-btn" class:active={app.activeTab === 'experimental'} onclick={() => app.activeTab = 'experimental'}>
-      <span class="nav-icon experimental-nav-icon" aria-hidden="true">⚗</span> Experimental
+      <img class="nav-icon" src={tabDebugIcon} alt="" /> Experimental
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
@@ -1107,6 +1206,8 @@
         <TabHotkeys />
       {:else if app.activeTab === 'experimental'}
         <TabExperimental />
+      {:else if app.activeTab === 'windows-hdr'}
+        <TabWindowsHdr />
       {:else if app.activeTab === 'debug'}
         <TabDebug />
       {:else if app.activeTab === 'system'}

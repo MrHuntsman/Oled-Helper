@@ -42,7 +42,7 @@
   // Keep the original Crush canvas configuration. The extended tone-mapping
   // experiment changed the browser's HDR presentation path and caused the
   // Brightness strip's previously calibrated values to clip at the wrong
-  // luminance. The Experimental comparison owns its separate HDR experiment.
+  // luminance. The Windows HDR comparison owns its separate HDR experiment.
   function configureContext(format, colorSpace) {
     ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
     return 'browser default';
@@ -1057,7 +1057,7 @@
         <div class="tab-heading-title-row">
           <h2>Black Crush Tweak</h2>
         </div>
-        <span class="subtitle">Adjust black levels using a Reinhard gamma curve. Preserves pure black.</span>
+        <span class="subtitle">Adjust visibility in dark ares. Preserves pure black.</span>
       </div>
       <div class="tab-heading-spacer"></div>
       <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>

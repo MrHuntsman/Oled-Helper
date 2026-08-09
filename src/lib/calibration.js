@@ -264,12 +264,12 @@ export function linearToSrgb(c) {
 // standard diffuse-white level, which Chromium also hardcodes as its default
 // SDR white level (ui/gfx/color_space.cc kDefaultSDRWhiteLevel). At this SDR
 // white level, Chromium tone-maps HDR screenshots with their intended
-// brightness, and the SDR/HDR comparison rows in the Experimental tab align
-// exactly. Shared by TabExperimental (reset default) and SdrHdrCompare (HDR
+// brightness, and the SDR/HDR comparison rows in the Windows HDR tab align
+// exactly. Shared by TabWindowsHdr (reset default) and SdrHdrCompare (HDR
 // row).
 export const HDR_REFERENCE_NITS = 203;
 
-// The SDR/HDR comparison strip's square values (Experimental tab). An
+// The SDR/HDR comparison strip's square values (Windows HDR tab). An
 // arithmetic progression centered on the BT.2408 reference, so every square
 // is equal-width AND its center lands exactly on the slider position for its
 // value (a non-uniform value set can only have one of the two). 203 is the
@@ -278,7 +278,7 @@ export const HDR_REFERENCE_NITS = 203;
 export const COMPARISON_NITS = [103, 153, 203, 253, 303, 353, 403, 453];
 
 // The cell-grid shader used by the calibration strip (TabCrush.svelte). Also
-// reused verbatim by the Experimental tab's SDR-vs-HDR comparison canvas so
+// reused verbatim by the Windows HDR tab's SDR-vs-HDR comparison canvas so
 // the two renderers can never drift apart.
 export const CELL_GRID_SHADER = `struct Cb{values:array<vec4<f32>,12>,counts:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
 struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
@@ -299,7 +299,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
   let g=idx/4;return vec4f(cb.values[g][idx%4]);
 }`;
 
-// Variable-width rectangle ramp for the Experimental tab's SDR-vs-HDR
+// Variable-width rectangle ramp for the Windows HDR tab's SDR-vs-HDR
 // comparison. Unlike CELL_GRID_SHADER (a uniform grid), each cell is an
 // explicit UV rectangle, so columns can sit at arbitrary nits positions on the
 // slider's linear scale. Buffer layout: 24 colors (vec4) + 24 rects (vec4,

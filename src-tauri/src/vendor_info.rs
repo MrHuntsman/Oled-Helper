@@ -6,7 +6,10 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use windows::core::PCSTR;
@@ -23,6 +26,14 @@ fn log_vendor(message: &str) {
     if crate::detailed_logging_enabled() {
         log::info!("[vendor-info] {message}");
     }
+}
+
+fn log_vendor_lifecycle(message: &str) {
+    // Teardown happens only during an explicit process shutdown or a cache
+    // replacement, so these lifecycle records are intentionally unconditional
+    // rather than hidden behind Detailed logging. They confirm whether the
+    // process actually released the NVAPI resources before app.exit(0).
+    log::info!("[vendor-info] {message}");
 }
 
 fn log_vendor_warn(message: &str) {
@@ -67,6 +78,10 @@ pub struct VendorDisplayInfo {
     // feeds the System Info GPU Adapter row leaves its device field blank on
     // Windows WebView2, so this is the authoritative model name.
     pub gpu_model: String,
+    // Canonical vendor id string: "nvidia" / "amd" / "intel" / "" — lets
+    // the frontend gate NVIDIA-only features (e.g. the RTX HDR dropdown)
+    // without string-matching the model name.
+    pub vendor: String,
     pub dynamic_range: String,
     pub vrr: String,
     // NVIDIA's Control Panel "Override to reference mode" (also called
@@ -95,13 +110,16 @@ struct CachedReferenceMode {
 }
 
 static REFERENCE_MODE_CACHE: OnceLock<Mutex<Option<CachedReferenceMode>>> = OnceLock::new();
-const REFERENCE_MODE_CACHE_TTL: Duration = Duration::from_secs(1);
+const REFERENCE_MODE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 pub fn nvidia_reference_mode_enabled() -> bool {
     // Gamma can be requested repeatedly while a slider is dragged. Reuse the
     // result briefly so those writes do not repeatedly enumerate DXGI and the
-    // NVIDIA registry tree. One second is short enough to notice a driver
-    // setting change promptly, while keeping this guard off the hot path.
+    // NVIDIA registry tree. Five seconds keeps this guard off the gamma hot
+    // path and the 5 s vendor refresh while still noticing a driver setting
+    // change within a couple of refreshes. The vendor/GPU lookup behind the
+    // scan is itself cached (ADAPTER_INFO_CACHE), so the remaining cost is a
+    // handful of registry reads per TTL expiry.
     let cache = REFERENCE_MODE_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(guard) = cache.lock() {
         if let Some(cached) = guard.as_ref() {
@@ -221,7 +239,150 @@ fn adapter_description(desc: &DXGI_ADAPTER_DESC) -> String {
 // The model name is vendor-agnostic (NVIDIA/AMD/Intel alike), which is why
 // the System Info GPU Adapter row prefers it over the WebGPU device field
 // (left blank by WebView2 on Windows).
+//
+// The result is cached: the app-wide vendor refresh calls this every 5 s, and
+// the reference-mode check calls it again — two full DXGI enumerations per
+// tick was real work. The GPU itself essentially never changes while the app
+// runs (hotplug/dock events go through the display-changed path, which
+// invalidates this cache).
+struct CachedAdapterInfo {
+    vendor_id: u32,
+    model: String,
+    captured_at: Instant,
+}
+
+static ADAPTER_INFO_CACHE: OnceLock<Mutex<Option<CachedAdapterInfo>>> = OnceLock::new();
+const ADAPTER_INFO_CACHE_TTL: Duration = Duration::from_secs(30);
+
 fn primary_adapter_info() -> Option<(u32, String)> {
+    let cache = ADAPTER_INFO_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.as_ref() {
+            if cached.captured_at.elapsed() < ADAPTER_INFO_CACHE_TTL {
+                return Some((cached.vendor_id, cached.model.clone()));
+            }
+        }
+    }
+    let queried = query_primary_adapter_info();
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((vendor_id, model)) = &queried {
+            *guard = Some(CachedAdapterInfo {
+                vendor_id: *vendor_id,
+                model: model.clone(),
+                captured_at: Instant::now(),
+            });
+        }
+    }
+    queried
+}
+
+// Called by primary_adapter_info (above) — the actual DXGI enumeration.
+pub(crate) fn invalidate_adapter_info_cache() {
+    if let Some(cache) = ADAPTER_INFO_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+// A display-topology change invalidates everything derived from the old
+// topology: the cached primary-adapter identity, the NVAPI display ID, and
+// (because its destroy fn-ptr comes from the context) the DRS session. The
+// DRS cache is cleared first so the session is destroyed through the still-
+// loaded old context before the context itself is dropped.
+pub(crate) fn invalidate_display_caches() {
+    // Serialize against IPC command threads that may be mid-query holding a
+    // &'static reference into the cached context. Called from the window-
+    // message path, so it must not deadlock: command threads hold this lock
+    // only for the duration of a vendor query (milliseconds) and never block
+    // on the message thread in return, so the brief wait here is safe.
+    let _query_guard = VENDOR_QUERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    invalidate_adapter_info_cache();
+    if let Some(cache) = RTX_HDR_DRS_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+    if let Some(cache) = RTX_HDR_NVAPI_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+}
+
+// Release the optional vendor-driver resources while the app is hidden in the
+// tray. This deliberately does not set NVAPI_SHUTDOWN_STARTED: the next
+// vendor query after the window is shown can initialize NVAPI and DRS lazily
+// again. Keep this narrower than display invalidation: hiding the window does
+// not change the active adapter, so the cached adapter identity can remain.
+// The query lock and DRS-before-context clearing order keep this safe if a poll
+// is finishing at hide time.
+pub(crate) fn release_for_tray() {
+    let _query_guard = VENDOR_QUERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    log_vendor_lifecycle("vendor driver session release for tray starting");
+
+    if let Some(cache) = RTX_HDR_DRS_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+    if let Some(cache) = RTX_HDR_NVAPI_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+
+    log_vendor_lifecycle("vendor driver session release for tray complete");
+}
+
+// Explicitly tears down process-lifetime NVAPI resources before Tauri exits.
+// AppHandle::exit ultimately terminates the process without running Rust Drop,
+// so relying on NvapiDrsSession/NvapiContext Drop alone would skip both the
+// DRS destroy and NvAPI_Unload logs. The DRS cache is taken and dropped first,
+// while the NVAPI context/DLL is still alive; then the context is taken and
+// dropped. The atomic makes this safe when both an exit command and a final
+// window-destroy event observe the same shutdown.
+pub(crate) fn shutdown() {
+    if NVAPI_SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _query_guard = VENDOR_QUERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    log_vendor_lifecycle("NVAPI shutdown starting");
+
+    let drs = RTX_HDR_DRS_CACHE.get().and_then(|cache| {
+        cache
+            .lock()
+            .map(|mut guard| guard.take())
+            .unwrap_or_else(|error| {
+                let mut guard = error.into_inner();
+                guard.take()
+            })
+    });
+    drop(drs);
+
+    let context = RTX_HDR_NVAPI_CACHE.get().and_then(|cache| {
+        cache
+            .lock()
+            .map(|mut guard| guard.take())
+            .unwrap_or_else(|error| {
+                let mut guard = error.into_inner();
+                guard.take()
+            })
+    });
+    drop(context);
+    log_vendor_lifecycle("NVAPI shutdown complete");
+}
+
+fn query_primary_adapter_info() -> Option<(u32, String)> {
     unsafe {
         let Ok(factory): windows::core::Result<IDXGIFactory1> = CreateDXGIFactory1() else {
             log_vendor_warn("CreateDXGIFactory1 failed");
@@ -265,6 +426,10 @@ fn primary_adapter_info() -> Option<(u32, String)> {
 
 fn primary_gpu_vendor() -> Option<u32> {
     primary_adapter_info().map(|(vendor, _)| vendor)
+}
+
+pub(crate) fn is_nvidia_primary_gpu() -> bool {
+    primary_gpu_vendor() == Some(VENDOR_NVIDIA)
 }
 
 struct CachedVendorInfo {
@@ -320,6 +485,13 @@ fn query_vendor_display_info_locked() -> VendorDisplayInfo {
         }
     };
     info.gpu_model = gpu_model.clone();
+    info.vendor = match vendor_id {
+        VENDOR_NVIDIA => "nvidia",
+        VENDOR_AMD => "amd",
+        VENDOR_INTEL => "intel",
+        _ => "",
+    }
+    .to_string();
     if vendor_id == VENDOR_NVIDIA {
         info.reference_mode = nvidia_reference_mode_enabled();
         log_vendor(&format!(
@@ -1046,8 +1218,17 @@ impl Drop for NvapiLibrary {
         // the module resident rather than invalidating driver state.
         if !self.initialized || self.unload_succeeded {
             unsafe {
-                let _ = FreeLibrary(self.handle);
+                let released = FreeLibrary(self.handle).is_ok();
+                if released {
+                    log_vendor_lifecycle("nvapi64.dll reference released successfully");
+                } else {
+                    log_vendor_warn("nvapi64.dll FreeLibrary failed");
+                }
             }
+        } else {
+            log_vendor_warn(
+                "nvapi64.dll retained because NvAPI_Unload did not complete successfully",
+            );
         }
     }
 }
@@ -1059,6 +1240,13 @@ struct NvapiContext {
     dll: NvapiLibrary,
 }
 
+// All uses of the context (including the cached RTX HDR session) happen while
+// VENDOR_QUERY_LOCK is held, so the raw query-interface pointer and GPU handle
+// are never touched concurrently even when the context is shared across
+// threads via the cache below. Safe to move between threads under that lock.
+unsafe impl Send for NvapiContext {}
+unsafe impl Sync for NvapiContext {}
+
 impl Drop for NvapiContext {
     fn drop(&mut self) {
         unsafe {
@@ -1067,7 +1255,7 @@ impl Drop for NvapiContext {
                 let unload: NvapiUnload = std::mem::transmute(unload_ptr);
                 let status = unload();
                 self.dll.unload_succeeded = status == NVAPI_OK;
-                log_vendor(&format!("NvAPI_Unload status={status}"));
+                log_vendor_lifecycle(&format!("NvAPI_Unload status={status}"));
             } else {
                 self.dll.unload_succeeded = false;
                 log_vendor_warn("NvAPI_Unload QueryInterface returned null");
@@ -1085,7 +1273,7 @@ unsafe fn unload_nvapi(query_interface: NvapiQueryInterface) -> bool {
     }
     let unload: NvapiUnload = std::mem::transmute(unload_ptr);
     let status = unload();
-    log_vendor(&format!("NvAPI_Unload init-cleanup status={status}"));
+    log_vendor_lifecycle(&format!("NvAPI_Unload init-cleanup status={status}"));
     status == NVAPI_OK
 }
 
@@ -1238,14 +1426,33 @@ fn enumerate_active_display_id(context: &NvapiContext) -> Option<u32> {
 
 fn query_nvapi() -> VendorDisplayInfo {
     log_vendor("query_nvapi starting");
-    let context = match nvapi_init() {
-        Some(context) => context,
-        None => {
-            log_vendor_warn("NVAPI initialization failed");
-            return VendorDisplayInfo::default();
+    // The app-wide vendor refresh runs this every 5 s. Reuse the cached
+    // NVAPI context (kept alive for the RTX HDR DRS session) instead of
+    // loading the DLL, initialising, querying, then unloading it on every
+    // tick — that init/unload churn was a real stutter every few seconds.
+    // Only fall back to a fresh context when the cache has no display ID
+    // (e.g. right after a display reconfiguration). Boxed so the fresh
+    // context lives for the whole query — the cached path borrows from the
+    // static cache instead.
+    let _owned_context;
+    let (context, display_id) = match rtx_hdr_nvapi_with_display_id() {
+        Some((context, Some(display_id))) => {
+            log_vendor(&format!("reusing cached NVAPI context, display_id={display_id}"));
+            (context, Some(display_id))
         }
+        _ => match nvapi_init() {
+            Some(context) => {
+                let display_id = enumerate_active_display_id(&context);
+                _owned_context = Some(Box::new(context));
+                (unsafe { _owned_context.as_deref().unwrap_unchecked() }, display_id)
+            }
+            None => {
+                log_vendor_warn("NVAPI initialization failed");
+                return VendorDisplayInfo::default();
+            }
+        },
     };
-    let Some(display_id) = enumerate_active_display_id(&context) else {
+    let Some(display_id) = display_id else {
         log_vendor_warn("no active NVIDIA display ID found");
         return VendorDisplayInfo::default();
     };
@@ -1256,7 +1463,7 @@ fn query_nvapi() -> VendorDisplayInfo {
     // Dynamic range: public NvAPI_Disp_ColorControl with GET.
     unsafe {
         if let Some(color_control) = nvapi_function::<NvapiDispColorControl>(
-            &context,
+            context,
             NVAPI_DISP_COLOR_CONTROL_ID,
             "NvAPI_Disp_ColorControl",
         ) {
@@ -1289,11 +1496,10 @@ fn query_nvapi() -> VendorDisplayInfo {
 
     // VRR/G-SYNC capability and current state.
     unsafe {
-        if let Some(get_caps) = nvapi_function::<NvapiDispGetMonitorCaps>(
-            &context,
-            NVAPI_DISP_GET_MONITOR_CAPABILITIES_ID,
-            "NvAPI_DISP_GetMonitorCapabilities",
-        ) {
+        if let Some(get_caps) = nvapi_function::<NvapiDispGetMonitorCaps>(                        context,
+                        NVAPI_DISP_GET_MONITOR_CAPABILITIES_ID,
+                        "NvAPI_DISP_GetMonitorCapabilities",
+                    ) {
             let mut caps = [0u8; MONITOR_CAPS_STRUCT_SIZE];
             std::ptr::write(caps.as_mut_ptr() as *mut u32, MONITOR_CAPABILITIES_VERSION);
             std::ptr::write(
@@ -1321,11 +1527,10 @@ fn query_nvapi() -> VendorDisplayInfo {
                 } else {
                     let mut vrr_info = [0u8; VRR_INFO_SIZE];
                     std::ptr::write(vrr_info.as_mut_ptr() as *mut u32, VRR_INFO_VERSION);
-                    if let Some(get_vrr) = nvapi_function::<NvapiDispGetVrrInfo>(
-                        &context,
-                        NVAPI_DISP_GET_VRR_INFO_ID,
-                        "NvAPI_Disp_GetVRRInfo",
-                    ) {
+                    if let Some(get_vrr) = nvapi_function::<NvapiDispGetVrrInfo>(                            context,
+                            NVAPI_DISP_GET_VRR_INFO_ID,
+                            "NvAPI_Disp_GetVRRInfo",
+                        ) {
                         let vrr_status = get_vrr(display_id, vrr_info.as_mut_ptr());
                         let vrr_flags = std::ptr::read(vrr_info.as_ptr().add(4) as *const u32);
                         log_vendor(&format!(
@@ -1371,7 +1576,7 @@ fn query_nvapi() -> VendorDisplayInfo {
                         // VRR state, but provides a useful fallback for whether
                         // the driver disabled adaptive sync on this display.
                         if let Some(get_adaptive) = nvapi_function::<NvapiDispGetAdaptiveSyncData>(
-                            &context,
+                            context,
                             NVAPI_DISP_GET_ADAPTIVE_SYNC_DATA_ID,
                             "NvAPI_DISP_GetAdaptiveSyncData",
                         ) {
@@ -1417,6 +1622,624 @@ fn query_nvapi() -> VendorDisplayInfo {
     info
 }
 
+// ── RTX HDR (driver profile) ──────────────────────────────────────────────
+// RTX HDR is a driver-profile setting (the "Global driver profile" rows that
+// NVIDIA Profile Inspector shows under 06 - Rendering Features). There is no
+// dedicated NVAPI call for it — it is written through the DRS (driver
+// settings) API, exactly like the Control Panel does. We reuse the same
+// interface IDs NVIDIA Profile Inspector uses (verified against its
+// NvapiDrsWrapper.cs, which works on current drivers), and the setting IDs
+// from its CustomSettingNames.xml:
+//
+//   RTX HDR - Enable       0x00DD48FB   (0 = off, 1 = on)
+//   RTX HDR - Driver Flags 0x00432F84   (mode: 0 off, 2 VeryHigh debanding,
+//                                       3 +indicator, 6 No debanding,
+//                                       10 Medium debanding, 35 +indicator+debug)
+//
+// The Driver Flags value is the authoritative mode; the Enable master switch
+// is kept in sync so the Control Panel agrees with what the app sets.
+const NVAPI_DRS_CREATE_SESSION_ID: u32 = 0x0694D52E;
+const NVAPI_DRS_DESTROY_SESSION_ID: u32 = 0xDAD9CFF8;
+const NVAPI_DRS_LOAD_SETTINGS_ID: u32 = 0x375DBD6B;
+const NVAPI_DRS_SAVE_SETTINGS_ID: u32 = 0xFCBC7E14;
+const NVAPI_DRS_GET_CURRENT_GLOBAL_PROFILE_ID: u32 = 0x617BFF9F;
+const NVAPI_DRS_GET_SETTING_ID: u32 = 0xEA99498D;
+const NVAPI_DRS_SET_SETTING_ID: u32 = 0x8A2CF5F5;
+
+// GetSetting returns this when the setting is not present in the profile
+// (i.e. the user has never touched RTX HDR) — treated as "off".
+const NVAPI_SETTING_NOT_FOUND: i32 = -160;
+
+// Writing DRS settings (profiles/global profile) requires an elevated
+// process; reads do not. The app normally runs non-elevated, so SetSetting
+// returns this until the user restarts as Administrator. The frontend matches
+// the marker below to offer that restart.
+const NVAPI_INVALID_USER_PRIVILEGE: i32 = -137;
+const ADMIN_REQUIRED_MARKER: &str = "ADMIN_REQUIRED:";
+
+fn drs_write_error(operation: &str, status: i32) -> String {
+    if status == NVAPI_INVALID_USER_PRIVILEGE {
+        format!(
+            "{ADMIN_REQUIRED_MARKER} {operation} needs administrator rights — restart OLED Helper as Administrator to change RTX HDR"
+        )
+    } else {
+        format!("{operation} failed: {status}")
+    }
+}
+
+const RTX_HDR_ENABLE_ID: u32 = 0x00DD48FB;
+const RTX_HDR_DRIVER_FLAGS_ID: u32 = 0x00432F84;
+
+// NVDRS_SETTING layout from NVIDIA's nvapi.h (_NVDRS_SETTING_V1, compiled
+// with #pragma pack(4)):
+//   version u32 | settingName NvAPI_UnicodeString (2048 WCHARs = 4096 bytes)
+//   | settingId | settingType | settingLocation | isCurrentPredefined
+//   | isPredefinedValid | union (predefined) | union (current)
+// Each union is 4100 bytes (NVDRS_BINARY_SETTING = valueLength u32 +
+// valueData[4096]) which is larger than the NvAPI_UnicodeString member, so
+// the whole struct is 4 + 4096 + 20 + 4100 + 4100 = 12320 bytes. The DRS
+// version constant embeds this size, and the driver validates it — passing
+// the wrong size returns NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9). Verified
+// against Profile Inspector's C# NVDRS_SETTING (Marshal.SizeOf = 12320),
+// which works on current drivers.
+const NVDRS_SETTING_SIZE: u32 = 12320;
+const NVDRS_SETTING_VER: u32 = (NVDRS_SETTING_SIZE & 0xFFFF) | (1 << 16);
+const NVDRS_DWORD_TYPE: u32 = 0;
+const NVDRS_CURRENT_PROFILE_LOCATION: u32 = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(non_snake_case)]
+struct NvDrsSetting {
+    version: u32,
+    settingName: [u16; 2048],
+    settingId: u32,
+    settingType: u32,
+    settingLocation: u32,
+    isCurrentPredefined: u32,
+    isPredefinedValid: u32,
+    // predefined-value union: u32 slot + binary/string tail.
+    u32PredefinedValue: u32,
+    _predefined_tail: [u8; 4096],
+    // current-value union: u32 slot (the only member we read/write) + tail.
+    u32CurrentValue: u32,
+    _current_tail: [u8; 4096],
+}
+
+// The big fixed-size arrays cannot derive Default, so build the zeroed
+// struct manually with const-repeat expressions.
+impl Default for NvDrsSetting {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            settingName: [0u16; 2048],
+            settingId: 0,
+            settingType: 0,
+            settingLocation: 0,
+            isCurrentPredefined: 0,
+            isPredefinedValid: 0,
+            u32PredefinedValue: 0,
+            _predefined_tail: [0u8; 4096],
+            u32CurrentValue: 0,
+            _current_tail: [0u8; 4096],
+        }
+    }
+}
+
+impl NvDrsSetting {
+    fn dword(setting_id: u32, value: u32) -> Self {
+        Self {
+            version: NVDRS_SETTING_VER,
+            settingId: setting_id,
+            settingType: NVDRS_DWORD_TYPE,
+            settingLocation: NVDRS_CURRENT_PROFILE_LOCATION,
+            u32CurrentValue: value,
+            ..Default::default()
+        }
+    }
+}
+
+// The DRS functions take opaque handle types (void*). Get/SetSetting use the
+// "Ex" variants (extra trailing args) that modern drivers expose — the same
+// signatures NVIDIA Profile Inspector's wrapper uses.
+type NvapiDrsCreateSession = unsafe extern "system" fn(session: *mut *mut c_void) -> i32;
+type NvapiDrsDestroySession = unsafe extern "system" fn(session: *mut c_void) -> i32;
+type NvapiDrsLoadSettings = unsafe extern "system" fn(session: *mut c_void) -> i32;
+type NvapiDrsSaveSettings = unsafe extern "system" fn(session: *mut c_void) -> i32;
+type NvapiDrsGetCurrentGlobalProfile =
+    unsafe extern "system" fn(session: *mut c_void, profile: *mut *mut c_void) -> i32;
+type NvapiDrsGetSetting = unsafe extern "system" fn(
+    session: *mut c_void,
+    profile: *mut c_void,
+    setting_id: u32,
+    setting: *mut NvDrsSetting,
+    unknown: *mut u32,
+) -> i32;
+type NvapiDrsSetSetting = unsafe extern "system" fn(
+    session: *mut c_void,
+    profile: *mut c_void,
+    setting: *mut NvDrsSetting,
+    unknown0: usize,
+    unknown1: usize,
+) -> i32;
+
+// Loads the driver settings and returns the current global profile handle.
+unsafe fn drs_global_profile(context: &NvapiContext, session: *mut c_void) -> Result<*mut c_void, String> {
+    let load = nvapi_function::<NvapiDrsLoadSettings>(
+        context,
+        NVAPI_DRS_LOAD_SETTINGS_ID,
+        "NvAPI_DRS_LoadSettings",
+    )
+    .ok_or_else(|| "NvAPI_DRS_LoadSettings is not available in this driver".to_string())?;
+    if load(session) != NVAPI_OK {
+        return Err("NvAPI_DRS_LoadSettings failed".into());
+    }
+    let get_global = nvapi_function::<NvapiDrsGetCurrentGlobalProfile>(
+        context,
+        NVAPI_DRS_GET_CURRENT_GLOBAL_PROFILE_ID,
+        "NvAPI_DRS_GetCurrentGlobalProfile",
+    )
+    .ok_or_else(|| "NvAPI_DRS_GetCurrentGlobalProfile is not available in this driver".to_string())?;
+    let mut profile = std::ptr::null_mut();
+    if get_global(session, &mut profile) != NVAPI_OK || profile.is_null() {
+        return Err("NvAPI_DRS_GetCurrentGlobalProfile failed".into());
+    }
+    Ok(profile)
+}
+
+// RTX HDR is polled every 500 ms while the Windows HDR tab is open. A fresh
+// nvapi_init() plus a fresh DRS session per poll would load nvapi64.dll, run
+// NvAPI_Initialize/EnumPhysicalGPUs, create a DRS session and re-read the
+// entire driver settings tree, then destroy it all again (NvAPI_Unload + unload
+// the DLL) twice a second — enough driver churn to stutter the UI. Cache the
+// initialized NVAPI context AND the DRS session plus its global-profile handle
+// so every poll is a single in-process NvAPI_DRS_GetSetting call. The context
+// and session are rebuilt only after explicit invalidation, a context lifetime
+// expiry, or a detected change to NVIDIA's DRS database file metadata. The
+// cache is only ever touched while VENDOR_QUERY_LOCK is held, so sharing the
+// context and session is safe.
+struct CachedNvapiContext {
+    // Boxed so the context's heap allocation (and thus a raw pointer to it)
+    // is stable even while the MutexGuard is dropped. The box is only ever
+    // replaced or removed while the cache lock is held, so a pointer taken
+    // out of the guard remains valid for the process lifetime.
+    context: Box<NvapiContext>,
+    // Resolved once at init: the app-wide vendor refresh and the RTX HDR poll
+    // reuse the display ID instead of re-enumerating it on every query. The
+    // display ID stays valid as long as the GPU handle does, and both live as
+    // long as the cached context does.
+    display_id: Option<u32>,
+    captured_at: Instant,
+}
+
+static RTX_HDR_NVAPI_CACHE: OnceLock<Mutex<Option<CachedNvapiContext>>> = OnceLock::new();
+static NVAPI_SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+// This is a safety lifetime for the NVAPI context, not the RTX HDR setting
+// refresh cadence. DRS metadata changes invalidate the setting session much
+// sooner; display notifications invalidate both caches immediately.
+const RTX_HDR_NVAPI_CACHE_TTL: Duration = Duration::from_secs(60);
+
+// Returns a process-lifetime reference to the cached NVAPI context, so the
+// 500 ms RTX HDR poll reuses the loaded DLL instead of re-initializing NVAPI
+// (and unloading it again) on every read.
+//
+// SAFETY CONTRACT: the returned reference is only valid while the caller
+// holds VENDOR_QUERY_LOCK — the cache box is replaced/dropped while that lock
+// is held, so the heap allocation behind the reference can disappear the
+// moment the lock is released. Both call sites (get/set_rtx_hdr_flags) hold
+// the lock for the entire use; never store the reference or use it outside a
+// VENDOR_QUERY_LOCK hold.
+fn rtx_hdr_nvapi_context() -> Option<&'static NvapiContext> {
+    let cache = RTX_HDR_NVAPI_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let fresh = guard
+        .as_ref()
+        .map(|cached| cached.captured_at.elapsed() < RTX_HDR_NVAPI_CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        // Re-init when the cached context is missing or stale. Drop the DRS
+        // session first: its destroy fn-ptr belongs to the old context, so it
+        // must be destroyed while that context is still loaded. The old
+        // context then drops here (unloading NVAPI) while the lock is held,
+        // so no other thread can be using it.
+        if let Some(cache) = RTX_HDR_DRS_CACHE.get() {
+            if let Ok(mut drs_guard) = cache.lock() {
+                *drs_guard = None;
+            }
+        }
+        if let Some(context) = nvapi_init() {
+            let display_id = enumerate_active_display_id(&context);
+            *guard = Some(CachedNvapiContext {
+                context: Box::new(context),
+                display_id,
+                captured_at: Instant::now(),
+            });
+        } else if guard.is_none() {
+            // nvapi_init failed and nothing is cached — report the failure
+            // to the caller instead of hanging on to a stale context.
+            return None;
+        }
+    }
+    // The context lives in a stable heap allocation owned by the static
+    // cache, so this reference outlives the guard. Safe because the box is
+    // only dropped while the cache lock is held, and every caller holds that
+    // lock for the whole use of the returned reference.
+    guard
+        .as_ref()
+        .map(|cached| unsafe { &*(&*cached.context as *const NvapiContext) })
+}
+
+// Returns the cached NVAPI context plus its pre-resolved display ID (None if
+// the ID could not be resolved). Unlike rtx_hdr_nvapi_context this does not
+// initialise NVAPI on demand — the 5 s vendor refresh must not trigger a
+// fresh init/unload cycle every tick; it reuses the cache and only re-inits
+// when the cache is empty or stale.
+fn rtx_hdr_nvapi_with_display_id() -> Option<(&'static NvapiContext, Option<u32>)> {
+    let cache = RTX_HDR_NVAPI_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let fresh = guard
+        .as_ref()
+        .map(|cached| cached.captured_at.elapsed() < RTX_HDR_NVAPI_CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        // Same DRS-before-context ordering as rtx_hdr_nvapi_context: the DRS
+        // session's destroy fn-ptr belongs to the old context.
+        if let Some(cache) = RTX_HDR_DRS_CACHE.get() {
+            if let Ok(mut drs_guard) = cache.lock() {
+                *drs_guard = None;
+            }
+        }
+        if let Some(context) = nvapi_init() {
+            let display_id = enumerate_active_display_id(&context);
+            *guard = Some(CachedNvapiContext {
+                context: Box::new(context),
+                display_id,
+                captured_at: Instant::now(),
+            });
+        } else if guard.is_none() {
+            return None;
+        }
+    }
+    guard.as_ref().map(|cached| {
+        let context = unsafe { &*(&*cached.context as *const NvapiContext) };
+        (context, cached.display_id)
+    })
+}
+
+// The DRS session and its global-profile handle are cached alongside the NVAPI
+// context: creating a DRS session and calling NvAPI_DRS_LoadSettings rebuilds
+// the driver's in-memory settings tree from disk — the expensive part of the
+// old per-poll session lifecycle.
+struct NvapiDrsSession {
+    handle: *mut c_void,
+    destroy: unsafe extern "system" fn(*mut c_void) -> i32,
+}
+// The session handle is only ever used while VENDOR_QUERY_LOCK is held (the
+// same lock that guards the shared NVAPI context), so sharing it across
+// threads through the static cache is safe.
+unsafe impl Send for NvapiDrsSession {}
+unsafe impl Sync for NvapiDrsSession {}
+impl Drop for NvapiDrsSession {
+    fn drop(&mut self) {
+        unsafe {
+            let status = (self.destroy)(self.handle);
+            if status == NVAPI_OK {
+                log_vendor_lifecycle("NvAPI_DRS_DestroySession completed successfully");
+            } else {
+                log_vendor_warn(&format!(
+                    "NvAPI_DRS_DestroySession failed: {status}"
+                ));
+            }
+        }
+    }
+}
+
+struct CachedDrsSession {
+    // Boxed so the entry's heap allocation is stable even while the
+    // MutexGuard is dropped — the session + profile handles stay valid for
+    // the process lifetime, only ever replaced while the cache lock is held.
+    entry: Box<CachedDrsEntry>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DrsFileStamp {
+    length: u64,
+    modified_ns: u128,
+}
+
+// NVIDIA writes the global driver profile to these files when Control Panel,
+// Profile Inspector, or another DRS client changes a setting. Reading their
+// metadata is cheap; parsing them with NvAPI_DRS_LoadSettings is not. The
+// stamp lets the 500 ms status poll notice an external change without
+// rebuilding the DRS session on a timer.
+fn drs_database_stamp() -> [DrsFileStamp; 2] {
+    let Some(program_data) = std::env::var_os("ProgramData") else {
+        return [DrsFileStamp { length: 0, modified_ns: 0 }; 2];
+    };
+    let root = std::path::PathBuf::from(program_data)
+        .join("NVIDIA Corporation")
+        .join("Drs");
+    ["nvdrsdb0.bin", "nvdrsdb1.bin"].map(|name| {
+        let path = root.join(name);
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return DrsFileStamp { length: 0, modified_ns: 0 };
+        };
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        DrsFileStamp {
+            length: metadata.len(),
+            modified_ns,
+        }
+    })
+}
+
+struct CachedDrsEntry {
+    session: NvapiDrsSession,
+    profile: *mut c_void,
+    // The resolved DRS function pointers are cached alongside the session so
+    // the 500ms RTX HDR poll is a single direct driver call. Re-resolving via
+    // nvapi_function() on every poll did an NvAPI_QueryInterface lookup AND
+    // logged a line for each — per-tick churn that showed up in the runtime
+    // log and IPC traffic.
+    get_setting: NvapiDrsGetSetting,
+    set_setting: NvapiDrsSetSetting,
+    save_settings: NvapiDrsSaveSettings,
+    database_stamp: [DrsFileStamp; 2],
+}
+// Like NvapiDrsSession, the cached profile handle + fn pointers are only ever
+// used while VENDOR_QUERY_LOCK is held.
+unsafe impl Send for CachedDrsEntry {}
+unsafe impl Sync for CachedDrsEntry {}
+
+static RTX_HDR_DRS_CACHE: OnceLock<Mutex<Option<CachedDrsSession>>> = OnceLock::new();
+
+// Returns the cached DRS session + global profile, (re)creating them only when
+// the session is absent or NVIDIA's DRS database metadata changed externally.
+// Must be called while VENDOR_QUERY_LOCK is held. This avoids the old 5-second
+// TTL rebuild, whose NvAPI_DRS_LoadSettings call caused the periodic hitch.
+unsafe fn cached_drs_session(context: &NvapiContext) -> Option<&'static CachedDrsEntry> {
+    let cache = RTX_HDR_DRS_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let current_stamp = drs_database_stamp();
+    let fresh = guard
+        .as_ref()
+        .map(|cached| cached.entry.database_stamp == current_stamp)
+        .unwrap_or(false);
+    if !fresh {
+        let create = nvapi_function::<NvapiDrsCreateSession>(
+            context,
+            NVAPI_DRS_CREATE_SESSION_ID,
+            "NvAPI_DRS_CreateSession",
+        )?;
+        let mut session = std::ptr::null_mut();
+        if create(&mut session) != NVAPI_OK || session.is_null() {
+            return None;
+        }
+        let destroy = nvapi_function::<NvapiDrsDestroySession>(
+            context,
+            NVAPI_DRS_DESTROY_SESSION_ID,
+            "NvAPI_DRS_DestroySession",
+        )?;
+        // LoadSettings re-reads the driver settings tree, then
+        // GetCurrentGlobalProfile gives us the global profile handle the
+        // app reads/writes. The profile handle is owned by the session and
+        // stays valid as long as the session lives. Resolve the read/write
+        // entry points once here; the poll reuses them directly.
+        let profile = match drs_global_profile(context, session) {
+            Ok(profile) => profile,
+            Err(_) => {
+                let status = destroy(session);
+                if status == NVAPI_OK {
+                    log_vendor_lifecycle("NvAPI_DRS_DestroySession init-cleanup completed successfully");
+                } else {
+                    log_vendor_warn(&format!(
+                        "NvAPI_DRS_DestroySession init-cleanup failed: {status}"
+                    ));
+                }
+                return None;
+            }
+        };
+        let Some(get_setting) = nvapi_function::<NvapiDrsGetSetting>(
+            context,
+            NVAPI_DRS_GET_SETTING_ID,
+            "NvAPI_DRS_GetSetting",
+        ) else {
+            let status = destroy(session);
+            if status == NVAPI_OK {
+                log_vendor("NvAPI_DRS_DestroySession init-cleanup completed successfully");
+            } else {
+                log_vendor_warn(&format!(
+                    "NvAPI_DRS_DestroySession init-cleanup failed: {status}"
+                ));
+            }
+            return None;
+        };
+        let Some(set_setting) = nvapi_function::<NvapiDrsSetSetting>(
+            context,
+            NVAPI_DRS_SET_SETTING_ID,
+            "NvAPI_DRS_SetSetting",
+        ) else {
+            let status = destroy(session);
+            if status == NVAPI_OK {
+                log_vendor("NvAPI_DRS_DestroySession init-cleanup completed successfully");
+            } else {
+                log_vendor_warn(&format!(
+                    "NvAPI_DRS_DestroySession init-cleanup failed: {status}"
+                ));
+            }
+            return None;
+        };
+        let Some(save_settings) = nvapi_function::<NvapiDrsSaveSettings>(
+            context,
+            NVAPI_DRS_SAVE_SETTINGS_ID,
+            "NvAPI_DRS_SaveSettings",
+        ) else {
+            let status = destroy(session);
+            if status == NVAPI_OK {
+                log_vendor("NvAPI_DRS_DestroySession init-cleanup completed successfully");
+            } else {
+                log_vendor_warn(&format!(
+                    "NvAPI_DRS_DestroySession init-cleanup failed: {status}"
+                ));
+            }
+            return None;
+        };
+        *guard = Some(CachedDrsSession {
+            entry: Box::new(CachedDrsEntry {
+                session: NvapiDrsSession { handle: session, destroy },
+                profile,
+                get_setting,
+                set_setting,
+                save_settings,
+                database_stamp: current_stamp,
+            }),
+        });
+    }
+    guard.as_ref().map(|cached| {
+        // The entry lives in a stable heap allocation owned by the static
+        // cache, so this reference outlives the guard — same reasoning as
+        // the context cache above.
+        unsafe { &*(&*cached.entry as *const CachedDrsEntry) }
+    })
+}
+
+unsafe fn with_cached_drs<T>(
+    work: impl FnOnce(&CachedDrsEntry) -> Result<T, String>,
+) -> Result<T, String> {
+    let context = rtx_hdr_nvapi_context().ok_or_else(|| "NVAPI unavailable".to_string())?;
+    let cached =
+        unsafe { cached_drs_session(context) }.ok_or_else(|| "NvAPI_DRS session unavailable".to_string())?;
+    work(cached)
+}
+
+/// Sets the global RTX HDR master switch in the driver profile.
+pub fn enable_rtx_hdr_for_mode() -> Result<(), String> {
+    // RTX HDR needs a non-zero Driver Flags value as well as the global
+    // enable bit. Profile Inspector can leave the flags at zero after a
+    // reset, which would make the UI say RTX HDR is active while the driver
+    // applies no RTX HDR processing. Use NVIDIA's known performance default
+    // only in that case; preserve an existing user-selected mode otherwise.
+    let settings = get_rtx_hdr_settings()?;
+    if settings.flags == 0 {
+        set_rtx_hdr_flags(0x06)?;
+    } else if !settings.enabled {
+        set_rtx_hdr_enabled(true)?;
+    }
+    Ok(())
+}
+
+pub fn set_rtx_hdr_enabled(enabled: bool) -> Result<(), String> {
+    let _query_guard = VENDOR_QUERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    unsafe {
+        with_cached_drs(|cached| {
+            let mut setting = NvDrsSetting::dword(RTX_HDR_ENABLE_ID, u32::from(enabled));
+            let status = (cached.set_setting)(cached.session.handle, cached.profile, &mut setting, 0, 0);
+            if status != NVAPI_OK {
+                return Err(drs_write_error("NvAPI_DRS_SetSetting(Enable)", status));
+            }
+            if (cached.save_settings)(cached.session.handle) != NVAPI_OK {
+                return Err("NvAPI_DRS_SaveSettings failed".into());
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Sets the RTX HDR mode in the global driver profile. `flags` is the
+/// "RTX HDR - Driver Flags" value (0 = off). Non-zero modes also enable the
+/// master switch so selecting a mode remains a one-step operation.
+pub fn set_rtx_hdr_flags(flags: u32) -> Result<(), String> {
+    // Only the documented Driver Flags values exist.
+    if !matches!(flags, 0x00 | 0x02 | 0x03 | 0x06 | 0x0A | 0x23) {
+        return Err(format!("unknown RTX HDR mode 0x{flags:02X}"));
+    }
+    let _query_guard = VENDOR_QUERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    unsafe {
+        with_cached_drs(|cached| {
+            let mut flags_setting = NvDrsSetting::dword(RTX_HDR_DRIVER_FLAGS_ID, flags);
+            let flags_status = (cached.set_setting)(cached.session.handle, cached.profile, &mut flags_setting, 0, 0);
+            if flags_status != NVAPI_OK {
+                return Err(drs_write_error("NvAPI_DRS_SetSetting(Driver Flags)", flags_status));
+            }
+            let mut enable_setting = NvDrsSetting::dword(
+                RTX_HDR_ENABLE_ID,
+                if flags == 0x00 { 0 } else { 1 },
+            );
+            let enable_status = (cached.set_setting)(cached.session.handle, cached.profile, &mut enable_setting, 0, 0);
+            if enable_status != NVAPI_OK {
+                return Err(drs_write_error("NvAPI_DRS_SetSetting(Enable)", enable_status));
+            }
+            if (cached.save_settings)(cached.session.handle) != NVAPI_OK {
+                return Err("NvAPI_DRS_SaveSettings failed".into());
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct RtxHdrSettings {
+    pub enabled: bool,
+    pub flags: u32,
+}
+
+// Reads both RTX HDR values under one vendor-query lock and one cached DRS
+// session. The Windows HDR tab polls this every 500 ms; keeping the pair in a
+// single command avoids two IPC calls and duplicate lock/context overhead.
+pub fn get_rtx_hdr_settings() -> Result<RtxHdrSettings, String> {
+    let _query_guard = VENDOR_QUERY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    unsafe {
+        with_cached_drs(|cached| {
+            let read_dword = |setting_id| {
+                let mut setting = NvDrsSetting::default();
+                setting.version = NVDRS_SETTING_VER;
+                let mut unknown = 0u32;
+                let status = (cached.get_setting)(
+                    cached.session.handle,
+                    cached.profile,
+                    setting_id,
+                    &mut setting,
+                    &mut unknown,
+                );
+                if status == NVAPI_OK {
+                    Ok(setting.u32CurrentValue)
+                } else if status == NVAPI_SETTING_NOT_FOUND {
+                    Ok(0)
+                } else {
+                    Err(format!("NvAPI_DRS_GetSetting failed: {status}"))
+                }
+            };
+            Ok(RtxHdrSettings {
+                enabled: read_dword(RTX_HDR_ENABLE_ID)? != 0,
+                flags: read_dword(RTX_HDR_DRIVER_FLAGS_ID)?,
+            })
+        })
+    }
+}
+
+#[tauri::command]
+pub fn get_rtx_hdr_settings_state() -> Result<RtxHdrSettings, String> {
+    get_rtx_hdr_settings()
+}
+
+#[tauri::command]
+pub fn set_rtx_hdr_state(flags: u32) -> Result<(), String> {
+    set_rtx_hdr_flags(flags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1429,6 +2252,19 @@ mod tests {
         assert_eq!(DISPLAY_IDS_SIZE, 16);
         assert_eq!(VRR_INFO_SIZE, 24);
         assert_eq!(ADAPTIVE_SYNC_DATA_SIZE, 40);
+
+        // The DRS setting struct must stay at the driver-expected size so
+        // the version constant (which embeds it) is accepted. 12320 matches
+        // Profile Inspector's Marshal.SizeOf<NVDRS_SETTING>() — a wrong size
+        // makes the driver return NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9).
+        assert_eq!(std::mem::size_of::<NvDrsSetting>(), 12320);
+        assert_eq!(NVDRS_SETTING_VER, 0x00013020);
+
+        // The value slots must sit exactly where the C unions do, or
+        // Get/SetSetting would read/write the wrong member while the total
+        // size (and thus the version constant) stays valid.
+        assert_eq!(std::mem::offset_of!(NvDrsSetting, u32PredefinedValue), 4120);
+        assert_eq!(std::mem::offset_of!(NvDrsSetting, u32CurrentValue), 8220);
 
         // These layouts are part of the public Intel C ABI. Keep the checks
         // here so a future edit to the hand-written bindings cannot silently

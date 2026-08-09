@@ -68,7 +68,7 @@
     // path and explain that the detailed context probe is lazy instead of
     // showing a misleading wall of "Not initialized" values.
     const mainActive = app.activeTab === 'crush';
-    const comparisonActive = app.activeTab === 'experimental';
+    const comparisonActive = app.activeTab === 'windows-hdr';
     const canvas = gpu.format
       ? `${gpu.format}${gpu.colorSpace ? ` · ${gpu.colorSpace}` : ''} (last initialized${mainActive ? ', active' : ''})`
       : navigator.gpu
@@ -89,7 +89,7 @@
       : 'Unavailable');
     const comparisonPath = comparisonGpu.format
       ? `${comparisonGpu.format} · ${comparisonGpu.toneMapping || 'standard'} (last initialized${comparisonActive ? ', active' : ''})`
-      : 'Initializes when Experimental opens';
+      : 'Initializes when Windows HDR opens';
     return [
       {
         title: 'Browser',

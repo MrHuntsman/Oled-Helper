@@ -1,5 +1,5 @@
 <script>
-  import { gpuLogVersion, gpuLogSnapshot, clearGpuLog, runtimeLogSettings, setVerbosePeriodicLogging, dimmerDetections, setDimmerDetection, debugSettings, setContextMenuEnabled } from './stores.svelte.js';
+  import { gpuLogVersion, gpuLogSnapshot, clearGpuLog, runtimeLogSettings, setVerbosePeriodicLogging, setDimmerVerboseLogging, dimmerDetections, setDimmerDetection, debugSettings, setContextMenuEnabled } from './stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
 
   let logCopied = $state(false);
@@ -90,6 +90,10 @@
         <label class="diag-verbose-toggle">
           <input type="checkbox" checked={runtimeLogSettings.verbosePeriodic} onchange={(e) => setVerbosePeriodicLogging(e.currentTarget.checked)} />
           <span>Detailed logging</span>
+        </label>
+        <label class="diag-verbose-toggle">
+          <input type="checkbox" checked={runtimeLogSettings.dimmerVerbose} onchange={(e) => setDimmerVerboseLogging(e.currentTarget.checked)} />
+          <span>Taskbar dimmer verbose</span>
         </label>
         <label class="diag-verbose-toggle">
           <input type="checkbox" checked={debugSettings.contextMenuEnabled} onchange={(e) => setContextMenuEnabled(e.currentTarget.checked)} />

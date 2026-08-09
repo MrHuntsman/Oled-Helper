@@ -275,9 +275,13 @@ mod platform {
         drop(guard);
     }
 
+    // Controls ONLY this module's own verbose diagnostics (tick, winevent,
+    // fullscreen/taskbar-cache refreshes, fade summaries). The general
+    // vendor/EDID detailed logging is a separate switch (set_detailed_logging
+    // in lib.rs) so enabling vendor diagnostics doesn't flood the log with
+    // dimmer ticks and vice versa.
     pub fn set_verbose_logging(enabled: bool) {
         VERBOSE_LOGGING.store(enabled, Ordering::Relaxed);
-        crate::set_detailed_logging_enabled(enabled);
     }
 
     pub fn set_detection(name: &str, enabled: bool) {
@@ -2179,9 +2183,8 @@ mod platform {
     pub fn available() -> bool {
         false
     }
-    pub fn set_verbose_logging(enabled: bool) {
-        crate::set_detailed_logging_enabled(enabled);
-    }
+    pub fn set_verbose_logging(_enabled: bool) {}
+
     pub fn set_detection(_name: &str, _enabled: bool) {}
     pub fn set_hover_mode(_mode: &str) {}
     pub fn set_poll_interval_ms(_ms: u32) {}

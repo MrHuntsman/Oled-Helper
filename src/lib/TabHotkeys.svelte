@@ -12,12 +12,15 @@
     { key: 'hold_compare', label: 'Hold to Compare', desc: 'Temporarily disable black level while held. Restores on release.' },
     { key: 'toggle_taskbar_dimmer', label: 'Toggle Taskbar Dimmer', desc: 'Show or hide the taskbar overlay.' },
     { key: 'toggle_hdr', label: 'Toggle HDR/SDR', desc: 'Switch Windows HDR on or off.' },
+    { key: 'decrease_sdr_brightness', label: 'Decrease SDR Content Brightness (−50 nits)', desc: 'Lower Windows SDR content brightness by 50 nits.' },
+    { key: 'increase_sdr_brightness', label: 'Increase SDR Content Brightness (+50 nits)', desc: 'Raise Windows SDR content brightness by 50 nits.' },
   ];
 
   const SECTIONS = [
     { title: 'Black Crush Tweak', keys: ['toggle_black_crush', 'decrease_black_crush', 'increase_black_crush', 'hold_compare'] },
     { title: 'Taskbar Dimmer', keys: ['toggle_taskbar_dimmer'] },
     { title: 'System', keys: ['toggle_hdr'] },
+    { title: 'Windows HDR', keys: ['decrease_sdr_brightness', 'increase_sdr_brightness'] },
   ];
 
   // Capturing state: the key of the row currently listening for a combo.

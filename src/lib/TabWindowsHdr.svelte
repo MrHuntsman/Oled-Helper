@@ -3,13 +3,26 @@
   import { invoke } from '@tauri-apps/api/core';
   import { app, pollHDRLuminance, setSdrWhiteNits } from './stores.svelte.js';
   import { COMPARISON_NITS } from './calibration.js';
+  import tabHdrIcon from './icons/tab_hdr.png?inline';
   import SdrHdrCompare from './SdrHdrCompare.svelte';
+  import ShieldBadge from './ShieldBadge.svelte';
+  import VendorTag from './VendorTag.svelte';
+  import { createDropdownPositionController } from './dropdown-position.js';
 
   let currentNits = $state(null);
   let detectedNits = $state(null);
   let applying = $state(false);
   let applyQueued = $state(false);
   let applyTimer = null;
+  // While dragging, apply the brightness continuously (~20 updates/sec,
+  // matching Windows' own slider) instead of only after release. A pure
+  // trailing debounce never fires while inputs arrive faster than the delay
+  // (a drag emits ~16-33ms apart), so the old 60ms debounce effectively
+  // applied nothing until the drag ended. The throttle below applies on the
+  // leading edge (as soon as the window since the last apply has elapsed)
+  // and still guarantees a trailing apply so the final value always lands.
+  const APPLY_THROTTLE_MS = 50;
+  let lastApplyTime = 0;
   let error = $state('');
   let sliderDragging = $state(false);
   let sliderHovering = $state(false);
@@ -70,6 +83,7 @@
     if (applying) { applyQueued = true; return; }
     applying = true; applyQueued = false; error = '';
     const requestedNits = Number(currentNits);
+    lastApplyTime = Date.now();
     try {
       const result = await invoke('set_sdr_brightness_nits', { nits: requestedNits });
       if (Number(currentNits) !== requestedNits) applyQueued = true;
@@ -83,7 +97,17 @@
   }
   function scheduleApply() {
     clearTimeout(applyTimer);
-    applyTimer = setTimeout(() => { applyTimer = null; void apply(); }, 60);
+    if (sliderDragging) {
+      // Throttle while dragging: apply as soon as the throttle window since
+      // the last actual apply has elapsed (leading edge), so a continuous
+      // drag updates the screen live instead of waiting for release.
+      const since = Date.now() - lastApplyTime;
+      const delay = since >= APPLY_THROTTLE_MS ? 0 : APPLY_THROTTLE_MS - since;
+      applyTimer = setTimeout(() => { applyTimer = null; void apply(); }, delay);
+    } else {
+      // Keyboard arrows / programmatic changes: keep the trailing debounce.
+      applyTimer = setTimeout(() => { applyTimer = null; void apply(); }, 60);
+    }
   }
   // Snap to the reference white only while actually dragging with the
   // pointer, mirroring the other ticked sliders (Black Level in TabCrush,
@@ -99,11 +123,217 @@
     currentNits = normalized;
     scheduleApply();
   }
-  async function reset() {
-    clearTimeout(applyTimer);
-    currentNits = DEFAULT_NITS;
-    await apply();
+  // Auto HDR is a system-wide Windows setting stored by hdr_toggle.rs.
+  // The selector below deliberately treats it and NVIDIA RTX HDR as one
+  // mutually-exclusive mode. null means the state has not loaded yet.
+  let autoHdrEnabled = $state(null);
+  let autoHdrError = $state('');
+  let hdrModeBusy = $state(false);
+  let hdrModeError = $state('');
+  let hdrModePending = $state(null);
+  let autoHdrRefreshing = false;
+  let pollTicks = 0;
+
+  const RTX_HDR_OPTIONS = [
+    { value: 0x00, label: 'Off' },
+    { value: 0x06, label: 'No Debanding (Performance)' },
+    { value: 0x0A, label: 'Medium Debanding' },
+    { value: 0x02, label: 'Very High Debanding' },
+  ];
+  let rtxHdrEnabled = $state(null);
+  let rtxHdrFlags = $state(null);
+  let rtxHdrError = $state('');
+  let rtxHdrPendingFlags = $state(null);
+  let rtxHdrRefreshing = false;
+  let rtxHdrFlagsBusy = $state(false);
+  let rtxHdrMenuOpen = $state(false);
+  let rtxHdrMenuPlacement = $state('down-right');
+  let rtxHdrWrapEl = $state(null);
+  let rtxHdrMenuEl = $state(null);
+  let rtxHdrPositionController = null;
+  let rtxHdrRelaunching = $state(false);
+  const isNvidiaGpu = $derived(app.displayInfo.vendor === 'nvidia');
+  const rtxHdrLabel = $derived(
+    RTX_HDR_OPTIONS.find((option) => option.value === rtxHdrFlags)?.label ?? 'Unknown'
+  );
+
+  async function refreshAutoHdr() {
+    if (autoHdrRefreshing) return;
+    autoHdrRefreshing = true;
+    try {
+      autoHdrEnabled = !!await invoke('get_auto_hdr_enabled');
+      autoHdrError = '';
+    } catch (e) {
+      autoHdrError = String(e);
+    } finally {
+      autoHdrRefreshing = false;
+    }
   }
+
+  async function refreshRtxHdr() {
+    if (!isNvidiaGpu || rtxHdrRefreshing) return;
+    rtxHdrRefreshing = true;
+    try {
+      const settings = await invoke('get_rtx_hdr_settings_state');
+      rtxHdrEnabled = !!settings?.enabled;
+      rtxHdrFlags = Number(settings?.flags ?? 0);
+      // A read can succeed even when the preceding write was rejected for
+      // lack of administrator rights. Keep that actionable error visible so
+      // the restart button is not cleared by the follow-up refresh/poll.
+      if (!rtxHdrError.startsWith('ADMIN_REQUIRED:')) rtxHdrError = '';
+    } catch (e) {
+      rtxHdrError = String(e);
+    } finally {
+      rtxHdrRefreshing = false;
+    }
+  }
+
+  const hdrModeReady = $derived(
+    autoHdrEnabled !== null && (!isNvidiaGpu || rtxHdrEnabled !== null)
+  );
+  const hdrMode = $derived(
+    !hdrModeReady ? null
+      : autoHdrEnabled && isNvidiaGpu && rtxHdrEnabled ? 'conflict'
+      : autoHdrEnabled ? 'auto'
+      : isNvidiaGpu && rtxHdrEnabled ? 'rtx'
+      : 'off'
+  );
+  const hdrModeNeedsAdmin = $derived(
+    hdrModeError.startsWith('ADMIN_REQUIRED:')
+      || rtxHdrError.startsWith('ADMIN_REQUIRED:')
+  );
+  const hdrModeOptions = $derived(isNvidiaGpu
+    ? [
+        { value: 'off', label: 'Off', description: 'Disable all auto HDR modes.' },
+        { value: 'auto', label: 'Windows Auto HDR', description: 'Use Windows auto HDR.' },
+        { value: 'rtx', label: 'NVIDIA RTX HDR', description: 'Use NVIDIA RTX HDR.' },
+      ]
+    : [
+        { value: 'off', label: 'Off', description: 'Disable Windows Auto HDR.' },
+        { value: 'auto', label: 'Windows Auto HDR', description: 'Use Windows tone mapping for supported SDR games.' },
+      ]);
+
+  function toggleRtxHdrMenu() {
+    rtxHdrMenuOpen = !rtxHdrMenuOpen;
+    if (rtxHdrMenuOpen) {
+      rtxHdrPositionController?.stop();
+      rtxHdrPositionController = createDropdownPositionController({
+        getTrigger: () => rtxHdrWrapEl?.querySelector('.rtx-hdr-trigger'),
+        getMenu: () => rtxHdrMenuEl,
+        onPlacement: (placement) => { rtxHdrMenuPlacement = placement; },
+        options: { gap: 6, maxHeight: 240 },
+      });
+      rtxHdrPositionController.start();
+    } else {
+      rtxHdrPositionController?.stop();
+      rtxHdrPositionController = null;
+    }
+  }
+
+  async function selectRtxHdrFlags(value) {
+    rtxHdrMenuOpen = false;
+    rtxHdrPositionController?.stop();
+    rtxHdrPositionController = null;
+    if (rtxHdrFlagsBusy || !isNvidiaGpu || hdrMode !== 'rtx' || rtxHdrFlags === value) return;
+    rtxHdrFlagsBusy = true;
+    rtxHdrError = '';
+    const previous = rtxHdrFlags;
+    rtxHdrFlags = value;
+    try {
+      await invoke('set_rtx_hdr_state', { flags: value });
+      rtxHdrPendingFlags = null;
+      await refreshRtxHdr();
+    } catch (e) {
+      rtxHdrError = String(e);
+      rtxHdrFlags = previous;
+      if (rtxHdrError.startsWith('ADMIN_REQUIRED:')) {
+        rtxHdrPendingFlags = value;
+        hdrModePending = 'rtx';
+      }
+      await refreshRtxHdr();
+    } finally {
+      rtxHdrFlagsBusy = false;
+    }
+  }
+
+  async function selectHdrMode(mode) {
+    if (!hdrModeReady || hdrModeBusy || !hdrAvailable) return;
+    if (mode === 'rtx' && !isNvidiaGpu) return;
+    if (mode === hdrMode) return;
+
+    hdrModeBusy = true;
+    hdrModeError = '';
+    rtxHdrError = '';
+    hdrModePending = null;
+    try {
+      // Keep the transition in one backend command. It disables the old path
+      // before enabling the new one, and rolls back RTX if the Auto HDR write
+      // fails, so both systems cannot remain enabled after a failed transition.
+      await invoke('set_hdr_enhancement_mode', { mode });
+      await refreshAutoHdr();
+      await refreshRtxHdr();
+    } catch (e) {
+      hdrModeError = String(e);
+      if (hdrModeError.startsWith('ADMIN_REQUIRED:')) hdrModePending = mode;
+      await refreshAutoHdr();
+      await refreshRtxHdr();
+    } finally {
+      hdrModeBusy = false;
+    }
+  }
+
+  // RTX HDR writes need an elevated process. The pending exclusive mode is
+  // forwarded so the elevated child performs the complete transition before
+  // the replacement UI is shown.
+  async function relaunchRtxHdrElevated() {
+    if (rtxHdrRelaunching) return;
+    rtxHdrRelaunching = true;
+    hdrModeError = '';
+    // The admin error is no longer needed once the elevated relaunch starts;
+    // the new process will apply the pending mode/flags.
+    rtxHdrError = '';
+    try {
+      await invoke('relaunch_elevated', {
+        rtxHdrFlags: rtxHdrPendingFlags,
+        hdrMode: hdrModePending,
+        tab: app.activeTab,
+      });
+    } catch (e) {
+      hdrModeError = String(e);
+      rtxHdrRelaunching = false;
+    }
+  }
+
+  // Close the RTX HDR options menu on outside click or Escape.
+  $effect(() => {
+    if (!rtxHdrMenuOpen) return;
+    function onDown(event) {
+      if (rtxHdrWrapEl && !rtxHdrWrapEl.contains(event.target)) {
+        rtxHdrMenuOpen = false;
+        rtxHdrPositionController?.stop();
+      }
+    }
+    function onKey(event) {
+      if (event.key === 'Escape') {
+        rtxHdrMenuOpen = false;
+        rtxHdrPositionController?.stop();
+      }
+    }
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onDown);
+      window.removeEventListener('keydown', onKey);
+      rtxHdrPositionController?.stop();
+      rtxHdrPositionController = null;
+    };
+  });
+
+  // Load RTX HDR as soon as the GPU vendor is known (it arrives async from
+  // refresh_vendor_display_info, possibly after mount).
+  $effect(() => {
+    if (isNvidiaGpu) refreshRtxHdr();
+  });
 
   $effect(() => {
     if (!sliderDragging) return;
@@ -122,17 +352,40 @@
     // Windows does NOT broadcast a display-change message when the SDR white
     // level slider moves (it is an in-place compositor update, not a display
     // topology change), so there is no event to listen for. Poll only while
-    // this tab is active — one cheap CCD read every 2 s, cleared on unmount.
+    // this tab is active — the CCD read runs on every 500 ms tick, but it is
+    // cheap: the primary-HDR target lookup is cached in Rust (5 s TTL) and
+    // only the single DisplayConfigGetDeviceInfo value read runs per tick.
+    // Cleared on unmount.
     const poll = setInterval(() => {
       // applyTimer != null means a slider edit is still in its 60ms debounce
       // window — don't overwrite it with the previous CCD value before the
       // user's new value has been applied.
       if (sliderDragging || applying || applyTimer !== null) return;
       refresh();
+      // Auto HDR state changes rarely (only via Windows Settings or here), so
+      // a 2 s cadence while the tab is open keeps the pill in sync without a
+      // registry read on every tick.
+      if (hdrAvailable && (++pollTicks % 4) === 0) refreshAutoHdr();
+      // RTX HDR can be changed externally (Profile Inspector, Control Panel).
+      // Poll it every tick (500 ms) while the tab is open — each read is a
+      // handful of cheap in-process driver calls with no GPU sync, and the
+      // refresh guard below prevents overlapping reads.
+      if (hdrAvailable && isNvidiaGpu) refreshRtxHdr();
     }, 500);
+    refreshAutoHdr();
+    refreshRtxHdr();
+    // External tools (Profile Inspector) may change RTX HDR while this tab is
+    // focused; refresh immediately when the window regains focus.
+    function onFocus() {
+      refresh();
+      if (hdrAvailable) refreshAutoHdr();
+      if (isNvidiaGpu) refreshRtxHdr();
+    }
+    window.addEventListener('focus', onFocus);
     return () => {
       clearTimeout(applyTimer);
       clearInterval(poll);
+      window.removeEventListener('focus', onFocus);
     };
   });
 
@@ -149,6 +402,8 @@
       if (hdr !== 'hdr') { currentNits = null; return; }
       currentNits = null;
       refresh();
+      refreshAutoHdr();
+      refreshRtxHdr();
     });
   });
 </script>
@@ -156,31 +411,36 @@
 <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
     <div class="tab-heading-toggle">
-      <span class="experimental-tab-icon" aria-hidden="true">⚗</span>
+      <img class="tab-icon" src={tabHdrIcon} alt="" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
-          <h2>SDR Content Brightness</h2>
+          <h2>Windows HDR</h2>
         </div>
-        <span class="subtitle">Adjusts Windows SDR brightness while HDR is enabled.</span>
+        <span class="subtitle">Change Windows HDR settings</span>
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" type="button" onclick={reset} disabled={!hdrAvailable || applying}>↻ Reset to 203 nits</button>
   </div>
   <div class="separator"></div>
-
-  {#if hdrAvailable}
-    <div class="experimental-section-note">
-      Compares SDR content (top row) with true HDR luminance (bottom row) at the same
-      nits levels. Both rows match at 203 nits — the industry reference for SDR white
-      in HDR. Below 203, SDR renders dimmer; above it, SDR clips to white.
-    </div>
-  {/if}
 
   <div class="dimmer-control-group" class:disabled={!hdrAvailable || currentNits === null}>
     <div class="dimmer-control">
       <div class="dimmer-control-heading">
-        <span class="settings-row-label">SDR white level</span>
+        <span class="hdr-control-title">
+          <span class="settings-row-label">SDR Content Brightness</span>
+          <span class="info-tip-wrap">
+            <button class="info-tip-btn" aria-label="About SDR Content Brightness" tabindex="0">Info</button>
+            <span class="info-tip">
+              <span>Adjusts SDR content brightness while HDR is enabled.</span>
+              {#if hdrAvailable}
+                <span class="info-tip-note">
+                  <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
+                  <span>In Chromium browsers, HDR images are affected by SDR brightness and 203 renders them accurately.</span>
+                </span>
+              {/if}
+            </span>
+          </span>
+        </span>
         <span class="slider-val">{formatNits(currentNits)}</span>
       </div>
       <!-- The track + scale block shrinks from the RIGHT by the comparison's
@@ -218,8 +478,109 @@
     </div>
   </div>
 
+  <div class="dimmer-control-group" class:disabled={!hdrAvailable || !hdrModeReady}>
+    <div class="dimmer-control">
+      <div class="dimmer-control-heading">
+        <span class="hdr-control-title">
+          <span class="settings-row-label">SDR to HDR inverse tone mapping</span>
+          <span class="info-tip-wrap">
+            <button class="info-tip-btn" aria-label="About HDR enhancement mode" tabindex="0">Info</button>
+            <span class="info-tip">
+              <span>SDR to HDR conversion methods.</span>
+              <span class="info-tip-note">
+                <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
+                <span>Games may need a restart after changing the mode.</span>
+              </span>
+            </span>
+          </span>
+        </span>
+      </div>
+      <div class="hdr-mode-switch" role="radiogroup" aria-label="HDR enhancement mode">
+        {#each hdrModeOptions as option (option.value)}
+          <div
+            class="hdr-mode-option-wrap"
+            class:rtx-mode-active={option.value === 'rtx' && hdrMode === 'rtx' && rtxHdrFlags !== null}>
+            <button
+              type="button"
+              class="hdr-mode-option"
+              class:active={hdrMode === option.value}
+              class:conflict={hdrMode === 'conflict'}
+              disabled={!hdrAvailable || !hdrModeReady || hdrModeBusy}
+              role="radio"
+              aria-checked={hdrMode === option.value}
+              onclick={() => selectHdrMode(option.value)}>
+              <span class="hdr-mode-radio-dot" aria-hidden="true"></span>
+              <span class="hdr-mode-option-copy">
+                <span class="hdr-mode-option-title">
+                  {option.label}
+                  {#if option.value === 'rtx'}<VendorTag vendor="nvidia" />{/if}
+                </span>
+                <span class="hdr-mode-option-desc">{option.description}</span>
+              </span>
+            </button>
+            {#if option.value === 'rtx' && hdrMode === 'rtx' && rtxHdrFlags !== null}
+              <span class="rtx-hdr-inline-select" bind:this={rtxHdrWrapEl}>
+                <ShieldBadge text="Admin required." />
+                <button
+                  type="button"
+                  class="rtx-hdr-trigger"
+                  aria-haspopup="listbox"
+                  aria-expanded={rtxHdrMenuOpen}
+                  disabled={rtxHdrFlagsBusy || hdrModeBusy}
+                  onclick={toggleRtxHdrMenu}>
+                  <span>{rtxHdrLabel}</span>
+                  <span class="rtx-hdr-caret" aria-hidden="true"></span>
+                </button>
+                {#if rtxHdrMenuOpen}
+                  <div
+                    class="hz-menu rtx-hdr-menu dropdown-menu-position-{rtxHdrMenuPlacement}"
+                    bind:this={rtxHdrMenuEl}
+                    role="listbox"
+                    aria-label="RTX HDR mode options">
+                    {#each RTX_HDR_OPTIONS as rtxOption (rtxOption.value)}
+                      <button
+                        type="button"
+                        class="hz-menu-item"
+                        class:active={rtxHdrFlags === rtxOption.value}
+                        role="option"
+                        aria-selected={rtxHdrFlags === rtxOption.value}
+                        onclick={() => selectRtxHdrFlags(rtxOption.value)}>
+                        {rtxOption.label}
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </span>
+            {/if}
+          </div>
+        {/each}
+      </div>
+      {#if hdrMode === 'conflict' && !hdrModeBusy}
+        <p class="gpu-error">Both HDR enhancement modes are enabled outside OLED Helper. Choose one option to resolve the conflict.</p>
+      {/if}
+      {#if hdrModeNeedsAdmin}
+        <div class="gpu-error-block">
+          <p class="gpu-error">RTX HDR changes need administrator rights. Restart OLED Helper as Administrator to apply the selected mode.</p>
+          <button
+            type="button"
+            class="restore-defaults-btn"
+            onclick={relaunchRtxHdrElevated}
+            disabled={rtxHdrRelaunching}>
+            {rtxHdrRelaunching ? 'Restarting…' : 'Restart as Administrator'}
+          </button>
+        </div>
+      {:else if hdrModeError}
+        <p class="gpu-error">{hdrModeError}</p>
+      {:else if autoHdrError}
+        <p class="gpu-error">{autoHdrError}</p>
+      {:else if rtxHdrError}
+        <p class="gpu-error">{rtxHdrError}</p>
+      {/if}
+    </div>
+  </div>
+
   {#if !hdrAvailable}
-    <p class="gpu-error">Enable Windows HDR to use this control.</p>
+    <p class="gpu-error">Enable Windows HDR to use these controls.</p>
   {/if}
   {#if error}
     <p class="gpu-error">{error}</p>

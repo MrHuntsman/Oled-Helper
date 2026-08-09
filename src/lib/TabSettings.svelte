@@ -164,7 +164,7 @@
   <button class="settings-row reset-all-row" bind:this={resetAllBtnEl} onclick={openResetAllConfirm}>
     <div class="settings-row-text">
       <span class="settings-row-label">Reset All Settings</span>
-      <span class="settings-row-desc">Restore every setting to its default value.</span>
+      <span class="settings-row-desc">Restore OLED Helper settings; Windows HDR and display brightness are not changed.</span>
     </div>
     <span class="reset-all-chevron">↻ Reset all</span>
   </button>
@@ -186,7 +186,7 @@
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reset-all-title" aria-describedby="reset-all-desc" tabindex="-1" onkeydown={onResetAllKeydown} bind:this={resetAllConfirmEl}>
         <div class="modal-title" id="reset-all-title">Reset all settings?</div>
         <p class="modal-desc" id="reset-all-desc">
-          This restores every setting to its default and cannot be undone.
+          This restores OLED Helper settings to their defaults. Windows HDR, SDR brightness, Auto HDR, and RTX HDR settings are not changed.
         </p>
         <div class="modal-actions">
           <button class="modal-btn modal-btn-cancel" onclick={closeResetAllConfirm}>Cancel</button>
