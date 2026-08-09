@@ -1166,7 +1166,24 @@ mod platform {
             if forced {
                 FORCE_REPAIR_COUNT.fetch_sub(1, Ordering::Release);
             }
-            let in_place = IsWindowVisible(hwnd).as_bool()
+            // The z-order can be perfect while the overlay still sits at the
+            // OLD taskbar geometry — after a resolution/refresh-rate change
+            // (or a taskbar edge move) the cached rect updates to the new
+            // monitor bounds but the overlay only follows when a repair
+            // actually repositions it. The in_place skip below must therefore
+            // ALSO verify the overlay's current rect matches the cached
+            // taskbar rect; otherwise the SetWindowPos that would move it to
+            // the new resolution is skipped on every repair and the overlay
+            // stays glued to the old position. GetWindowRect is a cheap read,
+            // so steady-state repairs (rect unchanged) remain a no-op.
+            let mut overlay_rect = RECT::default();
+            let geometry_matches = GetWindowRect(hwnd, &mut overlay_rect).is_ok()
+                && overlay_rect.left == rect.left
+                && overlay_rect.top == rect.top
+                && overlay_rect.right == rect.right
+                && overlay_rect.bottom == rect.bottom;
+            let in_place = geometry_matches
+                && IsWindowVisible(hwnd).as_bool()
                 && !forced
                 && match insert_after {
                     Some(target) if target == HWND_TOPMOST => {
