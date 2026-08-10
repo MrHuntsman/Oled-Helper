@@ -1,7 +1,7 @@
 <script>
   import { onDestroy } from 'svelte';
 
-  // Windows-style admin shield badge — flat single-color icon (filled bold
+  // Windows-style admin shield badge ,  flat single-color icon (filled bold
   // silhouette + checkmark, one fill, no strokes) signalling a control needs
   // administrator rights. Hovering (or keyboard-focusing) reveals a tooltip.
   //

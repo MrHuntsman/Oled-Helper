@@ -199,7 +199,7 @@
 <div class="tab-body experimental-tab">
   <div class="tab-heading">
     <h2>Experimental</h2>
-    <span class="subtitle">— DWM EOTF research</span>
+    <span class="subtitle">DWM EOTF research</span>
     <div class="tab-heading-spacer"></div>
   </div>
   <div class="separator"></div>
@@ -219,7 +219,7 @@
     <div class="experimental-card-header">
       <div>
         <h3 id="dwm-scan-title">DWM EOTF detector</h3>
-        <p>Run this manually after enabling Windows HDR. The scan is bounded and usually completes quickly. If the normal scan is blocked, try the debug-privilege scan — it enables SeDebugPrivilege to access protected DWM modules but still never modifies DWM.</p>
+        <p>Run this manually after enabling Windows HDR. The scan is bounded and usually completes quickly. If the normal scan is blocked, try the debug-privilege scan ,  it enables SeDebugPrivilege to access protected DWM modules but still never modifies DWM.</p>
       </div>
       <div class="experimental-scan-buttons">
         <button class="experimental-scan-btn" class:busy={scanning} onclick={runScan} disabled={scanning}>
@@ -260,7 +260,7 @@
       </div>
       <label class="experimental-auto-reapply">
         <input type="checkbox" checked={dwmEotf.autoReapply} onchange={(event) => setDwmEotfAutoReapply(event.currentTarget.checked)} disabled={patching || scanning} />
-        <span>Auto re-apply after DWM restarts{dwmEotf.profile && dwmEotf.autoReapply ? ` — currently ${GAMMA_PROFILES.find(p => p.id === dwmEotf.profile)?.label || dwmEotf.profile}` : dwmEotf.profile && !dwmEotf.autoReapply ? ' (paused)' : ''}</span>
+        <span>Auto re-apply after DWM restarts{dwmEotf.profile && dwmEotf.autoReapply ? ` ,  currently ${GAMMA_PROFILES.find(p => p.id === dwmEotf.profile)?.label || dwmEotf.profile}` : dwmEotf.profile && !dwmEotf.autoReapply ? ' (paused)' : ''}</span>
       </label>
     </div>
 
@@ -309,7 +309,7 @@
     {:else if scan}
       <div class="experimental-result {scan.status}">
         <div class="experimental-result-title-row">
-          <div class="experimental-result-title">{scan.status === 'patched' ? `Applied — ${GAMMA_PROFILES.find(p => p.id === gammaProfile)?.label || gammaProfile}` : scan.status === 'patch-skipped' ? 'Patch skipped — no changes' : scan.status === 'dry-run-ready' ? 'Dry run — ready to patch' : scan.status === 'dry-run-skipped' ? 'Dry run — nothing to patch' : scan.status === 'whitelist-match' ? 'Known shaders confirmed' : scan.status === 'constants-found' ? 'Known constants found' : scan.status.replaceAll('-', ' ')}</div>
+          <div class="experimental-result-title">{scan.status === 'patched' ? `Applied ,  ${GAMMA_PROFILES.find(p => p.id === gammaProfile)?.label || gammaProfile}` : scan.status === 'patch-skipped' ? 'Patch skipped ,  no changes' : scan.status === 'dry-run-ready' ? 'Dry run ,  ready to patch' : scan.status === 'dry-run-skipped' ? 'Dry run ,  nothing to patch' : scan.status === 'whitelist-match' ? 'Known shaders confirmed' : scan.status === 'constants-found' ? 'Known constants found' : scan.status.replaceAll('-', ' ')}</div>
           <button class="experimental-copy-btn" class:success={copied} onclick={copyResults} title={copied ? 'Copied!' : 'Copy scan results as text'} aria-label="Copy scan results">
             {#if copied}
               <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -320,13 +320,13 @@
         </div>
         <p>{scan.message}</p>
         <div class="experimental-metrics">
-          <div><span>DWM process</span><strong>{scan.dwm_pid || '—'}</strong></div>
-          <div><span>dwmcore.dll</span><strong>{scan.dwmcore_size ? `${Math.round(scan.dwmcore_size / 1024 / 1024)} MB` : '—'}</strong></div>
+          <div><span>DWM process</span><strong>{scan.dwm_pid || ', '}</strong></div>
+          <div><span>dwmcore.dll</span><strong>{scan.dwmcore_size ? `${Math.round(scan.dwmcore_size / 1024 / 1024)} MB` : ', '}</strong></div>
           <div><span>Readable regions</span><strong>{scan.readable_regions}</strong></div>
           <div><span>Scanned</span><strong>{Math.round((scan.scanned_bytes || 0) / 1024 / 1024)} MB</strong></div>
           <div><span>Constants · vec3</span><strong>{scan.status === 'constants-found' ? '4 + 4' : `${scan.constant_hits > 4 ? '4' : Math.min(scan.constant_hits, 4)} · ${Math.max(0, scan.constant_hits - 4)}`}</strong></div>
-          <div><span>DXBC containers</span><strong>{scan.dxbc_containers || '—'}</strong></div>
-          <div><span>Whitelist hits</span><strong>{scan.whitelist_hits ?? '—'} / 4</strong></div>
+          <div><span>DXBC containers</span><strong>{scan.dxbc_containers || ', '}</strong></div>
+          <div><span>Whitelist hits</span><strong>{scan.whitelist_hits ?? ', '} / 4</strong></div>
         </div>
         {#if scan.whitelist_matched?.length > 0}
           <div class="experimental-whitelist">

@@ -30,7 +30,7 @@ pub struct AppConfig {
     pub black_lift_profiles: HashMap<String, f64>,
     #[serde(default = "default_true")]
     pub black_enabled: bool,
-    // Hide the calibration strip interface (labels, controls) — right-click
+    // Hide the calibration strip interface (labels, controls) ,  right-click
     // menu on the strip. The info tooltip and fullscreen slider only hide in
     // fullscreen modes; the rest of the interface hides everywhere.
     #[serde(default)]
@@ -62,7 +62,7 @@ pub struct AppConfig {
     // config should seed both new fields from it. Serde's alias only binds
     // the first field that claims it per input key when deserializing a
     // struct from a map, so the JSON key would only reach whichever field is
-    // listed first — to migrate old configs correctly, the fade-out field
+    // listed first ,  to migrate old configs correctly, the fade-out field
     // reads the legacy key by hand in `migrate_legacy_ease_duration` below
     // instead of relying on a second #[serde(alias)] here.
     #[serde(
@@ -92,7 +92,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub hotkeys: HashMap<String, String>,
     // DWM EOTF gamma override: last successfully applied profile ("srgb",
-    // "2.2", "2.4", "2.6" — empty = no override active). A background
+    // "2.2", "2.4", "2.6" ,  empty = no override active). A background
     // watcher re-applies this profile whenever DWM restarts (resolution
     // changes, driver updates, crashes), since a fresh compositor always
     // reloads its original sRGB shaders.

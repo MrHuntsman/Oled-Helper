@@ -162,7 +162,7 @@ button {
 }
 /* Animate an inner span, not the button itself, so the button's own box
    (what actually gets hit-tested for hover/click) never moves. Previously
-   `transform: translateY(-2px)` was on .top-btn directly — the visible
+   `transform: translateY(-2px)` was on .top-btn directly, the visible
    content shifted up 2px but the button's layout box (and therefore its
    clickable area) stayed put, leaving a ~2px dead zone at the bottom where
    hover still registered but the button looked like it wasn't there,
@@ -318,7 +318,7 @@ button {
 .experimental-gamma-select:hover { border-color: color-mix(in srgb, var(--accent) 50%, var(--divider)); }
 .experimental-gamma-select:focus-visible { border-color: var(--accent); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent); }
 
-/* Auto re-apply toggle under the gamma controls — same checkbox language as
+/* Auto re-apply toggle under the gamma controls, same checkbox language as
    the app's other option rows (accent-tinted native checkbox). */
 .experimental-auto-reapply {
   display: flex;
@@ -338,7 +338,7 @@ button {
 }
 .experimental-auto-reapply:has(input:disabled) { opacity: 0.6; cursor: default; }
 
-/* Whitelist-growth section — same card rhythm as the patch section. */
+/* Whitelist-growth section, same card rhythm as the patch section. */
 .experimental-digest-section {
   margin-top: 16px;
   padding-top: 14px;
@@ -398,7 +398,7 @@ button {
 .experimental-warning strong { color: #fff; font-size: 12px; font-weight: 600; }
 .experimental-warning p { margin-top: 4px; }
 
-/* ── Windows HDR switch (sidebar) — flips real OS HDR. Styled to match the
+/* ── Windows HDR switch (sidebar), flips real OS HDR. Styled to match the
    .sdr-pill-toggle reference component (HDR_Gallery lightbox toggle). */
 .hdr-switch-wrap {
   position: relative;
@@ -635,7 +635,7 @@ button {
 /* ── Info tooltip (? icon) ─────────────────────────────────── */
 /* ── Info tooltip (? icon) ─────────────────────────────────── */
 .info-tip-wrap { position: relative; display: inline-flex; align-items: center; vertical-align: middle; margin-left: 4px; }
-/* Inside .strip-heading-title the wrap needs no extra left margin — the
+/* Inside .strip-heading-title the wrap needs no extra left margin, the
    fixed-width container is the spacing authority, and the heading's flex gap
    separates it from the switch. (The generic rule above keeps margin-left
    for any other use, e.g. the old standalone placement.) */
@@ -756,7 +756,7 @@ button {
 }
 .slider-track-wrap input[type=range]:disabled::-webkit-slider-thumb { cursor: default; }
 
-/* Compact zoom slider — shorter width, thinner track, smaller thumb */
+/* Compact zoom slider, shorter width, thinner track, smaller thumb */
 .slider-track-wrap-sm {
   flex: 0 0 120px;
   height: 18px;
@@ -794,7 +794,7 @@ button {
   text-align: left;
 }
 
-/* High Nits range controls — replaces the zoom slider for the fixed 3×7
+/* High Nits range controls, replaces the zoom slider for the fixed 3×7
    grid: three labelled sliders (Min / Step / Max) in the same compact
    style as the zoom row below the strip. */
 .nits-range-control {
@@ -825,13 +825,13 @@ button {
   text-align: left;
 }
 /* In SDR the High Nits strip shows a fixed RGB ramp, so the nits range is
-   not applicable — grey the row out (still configurable once in HDR). */
+   not applicable, grey the row out (still configurable once in HDR). */
 .nits-range-control.sdr-disabled {
   opacity: 0.45;
   pointer-events: none;
 }
 
-/* Hover tooltip on the High Nits grid — follows the cursor and shows the
+/* Hover tooltip on the High Nits grid, follows the cursor and shows the
    value of the square underneath. pointer-events: none so it never steals
    clicks/wheel from the strip, and fixed positioning keeps it glued to the
    cursor even in fullscreen. */
@@ -1064,7 +1064,7 @@ button {
    (used by the Black Level slider), extended with thumb-radius compensation.
    The thumb's travel range is [9px, 100% - 9px], not [0%, 100%], so a plain
    10%/20%/...90% position doesn't align with where the thumb actually sits at
-   those values. calc((100% - 18px) * 0.1 + 9px) IS valid CSS — multiplying
+   those values. calc((100% - 18px) * 0.1 + 9px) IS valid CSS, multiplying
    a single length-percentage value by a unitless number is allowed; an
    earlier attempt (calc(25% * (100% - 18px))) was invalid because it tried
    to multiply two percentage/length values together, which silently drops
@@ -1087,7 +1087,7 @@ button {
     ),
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
-/* SDR white slider (Windows HDR tab) — same thumb-travel tick math, but the
+/* SDR white slider (Windows HDR tab), same thumb-travel tick math, but the
    ticks layer is supplied at runtime via --tick-bg (always set inline on that
    slider). A dedicated class is used instead of a var() fallback on the shared
    .has-ticks-dimmer rule: Chromium drops the whole background declaration when
@@ -1101,7 +1101,7 @@ button {
 }
 
 /* Fade sliders use half the tick density of the opacity slider (4 ticks at
-   20/40/60/80% instead of 9 at 10–90%) — same valid calc() pattern as
+   20/40/60/80% instead of 9 at 10–90%), same valid calc() pattern as
    .has-ticks-dimmer above. */
 .dimmer-slider-track input[type=range].has-ticks-dimmer-fade {
   background:
@@ -1115,14 +1115,14 @@ button {
 }
 /* SDR white slider block (Windows HDR tab): shrinks from the right by the
    comparison's label column so the track and the comparison canvas share one
-   width — the canvas has the same 9px thumb-travel inset, so slider ticks and
+   width, the canvas has the same 9px thumb-travel inset, so slider ticks and
    comparison squares land at the same x for the same nits. */
 .exp-track-block {
   margin-right: var(--sdr-label-block, 68px);
 }
 
 /* SDR-vs-HDR comparison ramp (Windows HDR tab, SdrHdrCompare). Sits INSIDE
-   the same .dimmer-control box as the slider — no own border/background, just
+   the same .dimmer-control box as the slider, no own border/background, just
    breathing room. Bottom padding keeps the absolutely-positioned column
    labels (which hang ~6px below the canvas) inside the box. */
 .sdr-hdr-compare {
@@ -1207,7 +1207,7 @@ button {
 
 /* Chain-link toggle button sitting centered in the gap between the two
    fade-duration boxes. Standard link glyph: gray/outline when unlinked,
-   accent-colored when linked — same visual language as the pill toggles
+   accent-colored when linked, same visual language as the pill toggles
    elsewhere in the app. */
 .dimmer-chain-btn-wrap {
   display: flex;
@@ -1240,15 +1240,15 @@ button {
 }
 /* Rest state: unlinked hooks sit pulled apart (broken look); linked hooks
    sit pulled together, closing the gap the bar bridges. This is the actual
-   linked/unlinked distinction — hover (below) nudges further in the
+   linked/unlinked distinction, hover (below) nudges further in the
    direction the click would move them, as a preview on top of this. */
 .dimmer-chain-btn:not(.linked) .chain-hook-a { transform: translate(1.5px, -1.5px); }
 .dimmer-chain-btn:not(.linked) .chain-hook-b { transform: translate(-1.5px, 1.5px); }
 .dimmer-chain-btn.linked .chain-hook-a { transform: translate(-1px, 1px); }
 .dimmer-chain-btn.linked .chain-hook-b { transform: translate(1px, -1px); }
 /* Hover: nudge further in the same direction as the rest state already
-   points — unlinked hovers pull apart more, linked hovers pull together
-   more — previewing that the state is about to flip. Kept subtle: a small
+   points, unlinked hovers pull apart more, linked hovers pull together
+   more, previewing that the state is about to flip. Kept subtle: a small
    increment on top of the rest-state offset, not a large sweep. */
 .dimmer-chain-btn.linked:hover .chain-hook-a { transform: translate(-1.5px, 1.5px); }
 .dimmer-chain-btn.linked:hover .chain-hook-b { transform: translate(1.5px, -1.5px); }
@@ -1257,7 +1257,7 @@ button {
 /* Right after a click the cursor is still over the button, so :hover would
    otherwise immediately apply the OTHER state's hover rule (see
    toggleFadeLinked in TabDimmer.svelte). Pin the hooks back to their plain
-   rest-state transform until pointerleave actually fires — driven by the
+   rest-state transform until pointerleave actually fires, driven by the
    real event, not a guessed timeout, so it can't desync from the cursor. */
 .dimmer-chain-btn.suppress-hover:hover.linked .chain-hook-a,
 .dimmer-chain-btn.suppress-hover.linked .chain-hook-a { transform: translate(-1px, 1px); }
@@ -1315,7 +1315,7 @@ button {
 .settings-row-desc { font-size: 12px; color: var(--text-weak); }
 .settings-row-toggle-only { justify-content: flex-end; }
 
-/* Destructive "Reset all settings" row — right side carries the action label
+/* Destructive "Reset all settings" row, right side carries the action label
    instead of a pill toggle. */
 .reset-all-row { cursor: pointer; }
 .reset-all-chevron {
@@ -1338,7 +1338,7 @@ button {
   color: #ff6b6b;
 }
 
-/* Confirmation modal — centered dialog over a dimmed backdrop. */
+/* Confirmation modal, centered dialog over a dimmed backdrop. */
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -1423,7 +1423,7 @@ button {
   width: 100%;
   background: var(--accent);
   transform-origin: left center;
-  /* scaleX instead of width so the drain animates on the compositor only —
+  /* scaleX instead of width so the drain animates on the compositor only.
      no layout work every frame. Starts full, shrinks to 0. */
   animation: mode-confirm-timerbar-shrink 15s linear forwards;
   pointer-events: none;
@@ -1450,7 +1450,7 @@ button {
   --mode-confirm-exit-drop: 14px;
   /* Delay between the flyout's native window becoming visible and its
      entrance animation starting (see FLYOUT_ENTRANCE_DWELL_MS in
-     Flyout.svelte). The in-app modal doesn't use it — it mounts into an
+     Flyout.svelte). The in-app modal doesn't use it, it mounts into an
      already-visible window, so its entrance plays immediately. */
   --mode-confirm-entrance-dwell: 300ms;
 }
@@ -1469,7 +1469,7 @@ button {
 }
 /* The in-app modal stays mounted through the mode-change invoke (its exit
    animation ends at opacity 0 via forwards fill), so fade the dimmed
-   backdrop out in sync with the modal — otherwise the whole app would sit
+   backdrop out in sync with the modal, otherwise the whole app would sit
    dimmed with no visible dialog for the invoke's duration. On failure the
    exiting class is removed and the base modal-backdrop-in re-applies. The
    flyout never has this class (it uses .flyout-exiting), so it is
@@ -1527,7 +1527,7 @@ button {
 .settings-row-2line:hover,
 .settings-row-2line:hover:not(:disabled) { background: rgba(0, 0, 0, 0.12); }
 
-/* Detection Method section on the Dimmer tab — mirrors the spacing/heading
+/* Detection Method section on the Dimmer tab, mirrors the spacing/heading
    pattern of the fade-duration row above it (margin-top: 16px) rather than
    the bordered .settings-row-2line wrapper used when this lived in Settings. */
 .dimmer-hover-section { margin-top: 16px; }
@@ -1539,7 +1539,7 @@ button {
 .dimmer-section-heading { display: block; margin-bottom: 8px; }
 .dimmer-section-desc { display: block; margin-bottom: 8px; }
 
-/* Segmented hover-detection switch — both options and their descriptions
+/* Segmented hover-detection switch, both options and their descriptions
    are visible at once so the user can compare before switching, instead of
    the old pill toggle which only showed the currently active description. */
 .hover-detect-switch {
@@ -1588,7 +1588,7 @@ button {
 }
 .hover-detect-opt.active .hover-detect-opt-desc { color: var(--text); }
 
-/* Option 2: stacked full-width radio rows, dot on the left — more room per
+/* Option 2: stacked full-width radio rows, dot on the left, more room per
    option than the segmented cards, better for longer descriptions. */
 .hover-detect-radios {
   display: flex;
@@ -1835,7 +1835,7 @@ button {
    is what actually fixes the misalignment: a fixed-width row (the previous
    approach) doesn't grow to fit content, so wider chips (the mouse-icon
    badges: Double-click/Right-click/Scroll) simply overflowed the box by
-   different amounts per row — invisible at the small non-fullscreen chip
+   different amounts per row, invisible at the small non-fullscreen chip
    size, but obvious once fullscreen mode scales the chips up. Grid columns
    size to their widest member automatically, so every row's key/chip lands
    on the same right edge regardless of individual content width, and no
@@ -1928,7 +1928,7 @@ button {
 }
 /* In-app fullscreen sits in a windowed browser context (not a full physical
    display like monitor fullscreen), so it gets a smaller scale bump than
-   monitor fullscreen — closer to the base tooltip size instead of matching
+   monitor fullscreen, closer to the base tooltip size instead of matching
    monitor fullscreen's larger jump. */
 .strip-wrap.inapp-fullscreen .fs-keycap {
   font-size: 12px;
@@ -1996,7 +1996,7 @@ button {
   min-width: 40px;
 }
 
-/* Scale up in real monitor fullscreen — fixed px sizing reads noticeably
+/* Scale up in real monitor fullscreen, fixed px sizing reads noticeably
    smaller at full monitor resolution than it does in-app or in windowed
    in-app fullscreen. */
 .strip-wrap.monitor-fullscreen .fs-black-slider {
@@ -2143,7 +2143,7 @@ button {
   line-height: 1.5;
   max-width: 560px;
 }
-/* Hint sits at the top of the tab now (below the separator) — space it off
+/* Hint sits at the top of the tab now (below the separator), space it off
    the first section instead of the old bottom placement. */
 .hotkey-hint-top {
   margin: 0 0 10px;
@@ -2158,7 +2158,7 @@ button {
 /* Title + Info button group: sizes to its content so the Info button always
    sits right next to the title text, whatever the title length. The strip
    switch is anchored to the heading's right edge (margin-left:auto) so it
-   never moves when switching strips. No overflow:hidden here — the Info
+   never moves when switching strips. No overflow:hidden here, the Info
    tooltip drops below and must stay visible; only the title text
    ellipsizes. */
 .strip-heading-title {
@@ -2175,7 +2175,7 @@ button {
   text-overflow: ellipsis;
 }
 
-/* Strip switcher — segmented button row anchored to the heading's right
+/* Strip switcher, segmented button row anchored to the heading's right
    edge (margin-left:auto) so it stays in place when switching strips. */
 .strip-switch {
   display: inline-flex;
@@ -2217,7 +2217,7 @@ button {
    squares, so labels drift out of alignment with their square as squareCount
    (and therefore total gap count) grows.
    Font size is in container-query width units (cqw), scoped to .strip-wrap
-   (see container-type: inline-size above) — so it scales correctly with the
+   (see container-type: inline-size above), so it scales correctly with the
    strip's actual rendered width in every mode (in-app, in-app fullscreen,
    monitor fullscreen) with one rule, no per-mode overrides needed. */
 .square-labels {
@@ -2232,7 +2232,7 @@ button {
 }
 .strip-wrap.monitor-fullscreen .square-labels { font-size: clamp(9px, calc((100cqw / var(--sq-count, 12)) * 0.22 * 1.2), 30px); }
 .strip-wrap.inapp-fullscreen .square-labels { font-size: clamp(9px, calc((100cqw / var(--sq-count, 12)) * 0.22 * 1.2), 20px); }
-/* High Nits grid labels — each cell is a spreadsheet-style box with the
+/* High Nits grid labels, each cell is a spreadsheet-style box with the
    number centered. Grid geometry (--grid-cols/--grid-rows) must match the
    shader's row-major cell layout exactly, and the 0.8% gap matches
    GAP_FRACTION. Font scales with column width since nits values (up to
@@ -2244,10 +2244,10 @@ button {
   grid-template-columns: repeat(var(--grid-cols, 1), 1fr);
   grid-template-rows: repeat(var(--grid-rows, 1), 1fr);
   /* High Nits cells render edge-to-edge (HIGH_NITS_GAP_FRACTION = 0), so the
-     label tracks must match — a CSS gap here would offset the labels from
+     label tracks must match, a CSS gap here would offset the labels from
      the rendered cells. */
   gap: 0;
-  /* Font scales with cell width only — same visual language as the black
+  /* Font scales with cell width only, same visual language as the black
      strip's labels, with tabular digits so 100 and 10000 stay evenly spaced
      and crisp. The grid is a fixed 3 rows × 7 columns in normal mode; in
      fullscreen it grows to the aspect-fit count (up to 8×5 = 40 cells) so
@@ -2261,7 +2261,7 @@ button {
 }
 /* Smaller fullscreen label font: the grid grows to the aspect-fit cell
    count in fullscreen, so the labels must stay subtle and not compete with
-   the bright cells — smaller multiplier and a lower clamp ceiling than the
+   the bright cells, smaller multiplier and a lower clamp ceiling than the
    in-app strip. */
 .strip-wrap.monitor-fullscreen .grid-labels { font-size: clamp(10px, calc((100cqw / var(--grid-cols, 1)) * 0.22), 26px); }
 .strip-wrap.inapp-fullscreen .grid-labels { font-size: clamp(9px, calc((100cqw / var(--grid-cols, 1)) * 0.2), 20px); }
@@ -2278,16 +2278,16 @@ button {
   padding: 1px;
 }
 /* High Nits cells are bright (up to 10,000 nits / RGB 255), so the light
-   --text color would vanish — use a single solid dark ink for the number
+   --text color would vanish, use a single solid dark ink for the number
    and its unit. A blurred text-shadow was avoided here before because it
    softens the glyph edges, but that's also exactly why dark text on the
    brightest cells (near-white/10000 nits) reads as thinner and lower
-   contrast than the same text on a dark cell — the near-white background
+   contrast than the same text on a dark cell, the near-white background
    compresses the perceived contrast of anti-aliased dark edges, and OLED/HDR
    panels can bloom slightly into dark text sitting on very bright regions.
    A zero-blur multi-directional outline (four 0.5px offset copies, no blur
    radius) counteracts that by thickening the glyph silhouette by about half
-   a pixel on every side — it stays crisp because there's no blur, just a
+   a pixel on every side, it stays crisp because there's no blur, just a
    sharper repeated copy of the same edge. */
 .grid-label {
   color: rgba(13, 13, 15, 0.92);
@@ -2434,7 +2434,7 @@ button {
   padding: 4px 8px 2px;
   text-align: left;
 }
-/* Radio dot for mutually-exclusive choices (sort direction) — distinct
+/* Radio dot for mutually-exclusive choices (sort direction), distinct
    shape from the checkbox below so exclusive picks and independent toggles
    are visually different classes of control, not identical-looking rows. */
 .ctx-radio-dot {
@@ -2568,7 +2568,7 @@ button {
 }
 .display-info { color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-/* Custom Hz dropdown — replaces the native <select> for refresh rate.
+/* Custom Hz dropdown, replaces the native <select> for refresh rate.
    Native <select> popups auto-close on ANY page-wide wheel scroll (a
    Chromium/WebView2 built-in, not app logic), which made the dropdown
    dismiss itself unexpectedly. This is a plain click-toggled floating list:
@@ -2701,7 +2701,7 @@ button {
   outline: none;
   transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, color 0.15s ease;
 }
-/* Sized to content instead of a fixed width — a fixed 200px left a lot of
+/* Sized to content instead of a fixed width, a fixed 200px left a lot of
    dead space after short labels like "1920×1080" since text is left-aligned.
    min/max bound it so it neither collapses too small nor grows unbounded for
    the longest realistic label ("3840×2160 · 4K UHD"). The dropdown menu
@@ -2714,7 +2714,7 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* Fixed width (not content-sized like .resolution-select) — this button's
+/* Fixed width (not content-sized like .resolution-select), this button's
    label includes the black-level value in parens (e.g. "144 Hz (+0.9)"),
    which changes digit count as the user adjusts black level. A content-fit
    width would resize the button on every such change and shift the HDR
@@ -2990,7 +2990,7 @@ button {
 .diag-val { color: var(--text); word-break: break-all; }
 
 /* ── Windows HDR tab ───────────────────────────────────────────────── */
-/* Windows HDR tab: the control box's title group — label + Info button on
+/* Windows HDR tab: the control box's title group, label + Info button on
    the left of the heading row, value pushed right by space-between. */
 .hdr-control-title { display: inline-flex; align-items: center; min-width: 0; }
 
@@ -3186,7 +3186,7 @@ button {
 }
 
 /* Auto HDR toggle (Windows HDR tab): compact pill button next to the control
-   heading — the .pill knob already carries the on/off state. */
+   heading, the .pill knob already carries the on/off state. */
 .auto-hdr-toggle {
   display: inline-flex;
   align-items: center;
@@ -3203,7 +3203,7 @@ button {
 .auto-hdr-toggle .pill { pointer-events: none; }
 .auto-hdr-desc { font-size: 12px; color: var(--text-weak); margin: 2px 0 0; }
 
-/* RTX HDR mode dropdown (Windows HDR tab, NVIDIA only) — reuses the app's
+/* RTX HDR mode dropdown (Windows HDR tab, NVIDIA only), reuses the app's
    .hz-menu popup pattern; the menu opens downward, right-aligned. */
 .auto-hdr-detail-row {
   display: flex;
@@ -3401,7 +3401,7 @@ button {
    Chromium's HDR presentation path for the whole session, so the SDR chrome
    brightness stays uniform across all tabs (without it, the window flips to
    plain-SDR presentation when the active tab has no calibration canvas and
-   Windows scales the chrome by the live SDR slider — visibly brighter).
+   Windows scales the chrome by the live SDR slider, visibly brighter).
    Invisible: 1px, near-zero opacity, never hit-testable. */
 .hdr-layer {
   position: fixed;

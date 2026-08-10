@@ -1,5 +1,5 @@
 <script>
-  // Inlined data URIs — see App.svelte for why icons never hit the network.
+  // Inlined data URIs, see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
   import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax } from './stores.svelte.js';
@@ -26,7 +26,7 @@
   let shaderModule = null;
   let currentFormat = null;
   // If the GPU rejects the HDR (rgba16float) format, we render in SDR locally
-  // without touching app.hdrStatus — that's the shared source of truth also
+  // without touching app.hdrStatus, that's the shared source of truth also
   // written by App.svelte's poll timer, and writing to it here caused an
   // infinite render ↔ fallback ↔ poll loop (Svelte's max update depth error).
   let forceSdrRender = $state(false);
@@ -108,15 +108,15 @@
 
   // Grid geometry for the current strip, matching the shader exactly
   // (cells, cols, rows). Black = one row of sq cells; high-nits = the fixed
-  // 3×7 spreadsheet grid (7 columns across, 3 rows down — 21 cells) in
+  // 3×7 spreadsheet grid (7 columns across, 3 rows down, 21 cells) in
   // normal mode. In fullscreen the canvas fills the whole screen, so the
   // fixed 3×7 would stretch the cells into rectangles on a 16:9 (or wider)
-  // panel — instead the grid is recomputed from the canvas aspect ratio to
+  // panel, instead the grid is recomputed from the canvas aspect ratio to
   // keep every cell as close to a square as possible. The grid is also
   // allowed to grow past 21 cells so every slot shows a real nits value
   // (no empty black cells): the value generators accept the cell count.
   // Initialized from computeStripGeom() (hoisted below) so the very first
-  // frame already matches the active strip — stripLabels() derives its
+  // frame already matches the active strip, stripLabels() derives its
   // label count from this, and a stale 12-cell default would briefly
   // misalign the high-nits labels before the render effect corrects it.
   let stripGeom = $state(computeStripGeom());
@@ -129,7 +129,7 @@
   // Best-fit square-ish grid on a canvas of the given aspect ratio: search
   // every rows×cols layout whose cell count is between the fixed 21 and the
   // 40-cell cap, keep the layout whose cells come closest to 1:1 (width vs
-  // height). Every slot gets a real value — the value generators accept the
+  // height). Every slot gets a real value, the value generators accept the
   // returned cell count, so nothing renders black.
   function bestFitGrid(canvasW, canvasH) {
     if (canvasW < 1 || canvasH < 1) return { cells: HIGH_NITS_CELLS, cols: HIGH_NITS_COLS, rows: HIGH_NITS_ROWS };
@@ -185,7 +185,7 @@
     function onUp() {
       sliderDragging = false;
       fsSliderDragging = false;
-      // Persist exactly once, when the drag ends (mouse button released) —
+      // Persist exactly once, when the drag ends (mouse button released).
       // never mid-drag, so a paused drag can't trigger a config write while
       // the user is still adjusting.
       scheduleConfigSave();
@@ -229,7 +229,7 @@
   onDestroy(releaseGpuResources);
 
   async function initGPU() {
-    if (initStarted) { dwarn('initGPU called again while already running/ran — skipping'); return; }
+    if (initStarted) { dwarn('initGPU called again while already running/ran, skipping'); return; }
     initStarted = true;
     const generation = gpuGeneration;
     try {
@@ -305,7 +305,7 @@
         try {
           configureContext(format, colorSpace);
           dlog('fallback configure SUCCESS');
-          if (wantHdr) { dwarn('matchMedia said HDR but GPU rejected rgba16float — using SDR locally'); forceSdrRender = true; }
+          if (wantHdr) { dwarn('matchMedia said HDR but GPU rejected rgba16float, using SDR locally'); forceSdrRender = true; }
         } catch (e2) {
           derr(`fallback configure FAILED: ${e2.message}`);
           throw e2;
@@ -340,7 +340,7 @@
       }
       ready = true;
       gpuError = '';
-      dlog('GPU init complete — calling first render');
+      dlog('GPU init complete, calling first render');
       render();
       device.lost.then((info) => {
         if (generation !== gpuGeneration) return;
@@ -360,7 +360,7 @@
 
   // Reconfigures the canvas context and rebuilds the render pipeline for the
   // given format/colorSpace. Needed because the format picked at initGPU()
-  // time was previously baked in forever — switching HDR↔SDR after launch
+  // time was previously baked in forever, switching HDR↔SDR after launch
   // (e.g. toggling Windows HDR while the app is open) kept rendering into a
   // stale 8-bit SDR pipeline, silently clipping/crushing HDR values above 1.0
   // (the higher PQ code columns) instead of actually reconfiguring for HDR.
@@ -374,7 +374,7 @@
       const toneMapping = configureContext(format, colorSpace);
       dlog(`reconfigure SUCCESS: ${format}/${colorSpace}/${toneMapping}`);
     } catch (e) {
-      dwarn(`reconfigure FAILED: ${e.message} — falling back to SDR`);
+      dwarn(`reconfigure FAILED: ${e.message}, falling back to SDR`);
       format = 'rgba8unorm';
       colorSpace = 'srgb';
       try {
@@ -396,7 +396,7 @@
       recordMainGpuRenderingInfo(format, colorSpace);
       dlog(`pipeline rebuilt with target format: ${format}`);
       // Entering HDR means the browser just created a fresh HDR surface and
-      // re-read its frozen SDR white level — re-capture the strip's base so
+      // re-read its frozen SDR white level, re-capture the strip's base so
       // it matches (covers HDR toggles that don't emit a display-changed
       // event, e.g. from Settings). The base change re-renders the strip via
       // the render effect.
@@ -411,7 +411,7 @@
   function render() {
     if (!ready || !device || !canvas) return;
     try {
-      // Keep the shader's grid geometry and the DOM label grid in sync — the
+      // Keep the shader's grid geometry and the DOM label grid in sync, the
       // aspect ratio (and therefore cols/rows) can change on every resize.
       //
       // untrack: refreshStripGeom() writes the stripGeom state and render()
@@ -436,7 +436,7 @@
       const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
       const highNits = crush.stripType === 'highNits';
       // High Nits: render the aspect-fit grid values (21 cells in normal
-      // mode, up to 40 in fullscreen — one value per slot, no empty cells),
+      // mode, up to 40 in fullscreen, one value per slot, no empty cells),
       // laid out row-major across a spreadsheet grid.
       let vals, grid;
       if (highNits) {
@@ -463,7 +463,7 @@
       try {
         tex = ctx.getCurrentTexture();
       } catch (e) {
-        // Surface lost or unavailable — silently skip this frame
+        // Surface lost or unavailable, silently skip this frame
         return;
       }
 
@@ -478,14 +478,14 @@
   }
 
   $effect(() => {
-    console.log(`[gpu] init effect fired — canvas=${!!canvas} initStarted=${initStarted}`);
+    console.log(`[gpu] init effect fired, canvas=${!!canvas} initStarted=${initStarted}`);
     if (canvas && !initStarted) initGPU();
   });
   $effect(() => {
     void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void app.sdrWhiteBaseNits; void canvas;
     // untrack the geometry write: stripGeom is a $state read by the template
-    // and by render() (high-nits grid). Writing it from inside this effect —
-    // whose render() call reads it — would re-schedule the effect on every
+    // and by render() (high-nits grid). Writing it from inside this effect.
+    // whose render() call reads it, would re-schedule the effect on every
     // run, tripping effect_update_depth_exceeded. The template still updates
     // because untracked writes still notify its reactive dependents.
     untrack(() => refreshStripGeom());
@@ -516,7 +516,7 @@
     return () => { resizeObs?.disconnect(); if (resizeRaf) cancelAnimationFrame(resizeRaf); };
   });
 
-  // Gamma updates are applied synchronously on every slider change — the
+  // Gamma updates are applied synchronously on every slider change, the
   // Tauri command builds the ramp and calls SetDeviceGammaRamp immediately.
   // A background safety thread re-applies every 2s to recover from external
   // gamma resets (fullscreen games, driver mode switches).
@@ -593,7 +593,7 @@
   // adjustment units (see .slider-track-wrap input[type=range].has-ticks):
   // a -150..150 range divided into 6 equal steps. Grabbing the thumb or
   // clicking the track snaps to a tick ONLY when within this many units of
-  // one — in RAW units. The displayed value is adjustment/10, so this 2 raw
+  // one, in RAW units. The displayed value is adjustment/10, so this 2 raw
   // is the same 0.2 the user asked for (and matches the ±2 dead zone at 0
   // in normalizeBlackLevel below). Anything farther stays where it is, so
   // the slider isn't forced onto every tick. Wheel and keyboard keep fine
@@ -608,7 +608,7 @@
 
   // Lets a drag start anywhere in the slider's expanded vertical buffer zone
   // (see .slider-track-wrap-half::before), not just on the thin native input.
-  // Can't hand this off to the native input via a synthetic pointerdown —
+  // Can't hand this off to the native input via a synthetic pointerdown.
   // browsers only start native thumb-drag tracking from a trusted event, so a
   // dispatched PointerEvent starts the drag visually but doesn't continue
   // tracking subsequent moves. Instead we drive the whole drag manually here:
@@ -668,7 +668,7 @@
   function handleBlackLevelInput(e) {
     const value = +e.target.value;
     // Snap to a tick when within tolerance (native thumb drags and keyboard
-    // both land here — track clicks already snapped in their pointerdown
+    // both land here, track clicks already snapped in their pointerdown
     // handler, and this re-applies harmlessly since the value is unchanged).
     const normalized = normalizeBlackLevel(snapToBlackLevelTick(value));
     crush.adjustment = normalized;
@@ -716,7 +716,7 @@
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
       setDragging(false);
-      // The drag (or click on the track) ended — persist the final value.
+      // The drag (or click on the track) ended, persist the final value.
       // Saved directly in this handler (not in an $effect) because the
       // effect's window listener may not be registered yet for fast clicks.
       scheduleConfigSave();
@@ -788,7 +788,7 @@
   }
 
   // Mouse wheel over the strip changes the zoom (square count). Wheeling up
-  // (negative deltaY) increases zoom, down decreases — matches typical
+  // (negative deltaY) increases zoom, down decreases, matches typical
   // scroll-to-zoom conventions (maps, image viewers). The High Nits grid is
   // fixed at 3×7, so wheel instead steps the Max slider through its stops
   // (same behavior as wheeling over the Max control itself).
@@ -812,7 +812,7 @@
   // the 23 stops occupies an equal slice of the track regardless of its nits
   // value. That makes the visual steps match the requested stops exactly
   // (100, 200, … 1000, 1500, … 5000, 6000, … 10000 all evenly spaced) and
-  // keeps every stop clickable — a linear 100→10000 scale would cram the
+  // keeps every stop clickable, a linear 100→10000 scale would cram the
   // 100–1000 stops into the left 9% of the track. The readout and the strip
   // still use the true nits value.
   function highNitsStopIndex() {
@@ -844,11 +844,11 @@
 
   // Arrow/Page/Home/End keys step through the slider stops instead of the
   // native 1-nits step (which would snap back to the same stop and feel
-  // dead — value+1 rounds back to the current stop).
+  // dead, value+1 rounds back to the current stop).
   function handleNitsSliderKeydown(e) {
     let idx = HIGH_NITS_MAX_STOPS.indexOf(highNitsMaxValue());
     if (idx < 0) {
-      // Defensive: not on a stop yet — snap to the nearest one first.
+      // Defensive: not on a stop yet, snap to the nearest one first.
       const value = highNitsMaxValue();
       let best = 0;
       let bestDist = Infinity;
@@ -906,7 +906,7 @@
     const idx = row * cols + col;
     if (idx !== lastHoverIdx) { lastHoverIdx = idx; hoverCell = idx; }
     // Sit on the right side of the cursor with its top edge aligned to the
-    // cursor's Y. Never flips sides — it just follows the cursor even at the
+    // cursor's Y. Never flips sides, it just follows the cursor even at the
     // screen edges (only the vertical position clamps to keep it on-screen).
     const off = 12;
     const x = e.clientX + off;
@@ -981,11 +981,11 @@
 
   // Another context menu (resolution / refresh rate in the status bar)
   // opened, which stopPropagation()'s the contextmenu event so this menu's
-  // document listener never hears it — close via the shared dismiss tick.
+  // document listener never hears it, close via the shared dismiss tick.
   $effect(() => {
     void ctxMenuDismissTick.n;
     // Read ctxMenu.open untracked so the effect only re-runs when the tick
-    // changes — otherwise opening the menu would immediately close it.
+    // changes, otherwise opening the menu would immediately close it.
     untrack(() => { if (ctxMenu.open) closeContextMenu(); });
   });
   $effect(() => {
@@ -1238,12 +1238,12 @@
     </div>
 
     {#if crush.stripType === 'highNits'}
-      <!-- Fixed 3×7 grid — the user picks only the top of the nits range   -->
+      <!-- Fixed 3×7 grid, the user picks only the top of the nits range   -->
       <!-- with a single Max slider; Min is fixed and the nits-per-cell step -->
       <!-- is derived silently as (max − min) / 20 (setHighNitsMax in        -->
       <!-- stores.svelte.js), not shown as its own control. The slider only -->
       <!-- rests on HIGH_NITS_MAX_STOPS. In SDR the strip shows a fixed RGB  -->
-      <!-- ramp, so the nits range doesn't apply — greyed out (still         -->
+      <!-- ramp, so the nits range doesn't apply, greyed out (still         -->
       <!-- configurable once in HDR).                                       -->
       <div class="nits-range-control" class:sdr-disabled={app.hdrStatus !== 'hdr' || forceSdrRender} title={app.hdrStatus === 'hdr' && !forceSdrRender ? 'Nits range shown on the strip' : 'Nits range only applies in HDR'}>
         <!-- SDR: the ramp is a fixed RGB range, so disable the control -->

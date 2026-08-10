@@ -1,4 +1,4 @@
-// vendor_info.rs — queries GPU-driver-specific display properties that have no
+// vendor_info.rs ,  queries GPU-driver-specific display properties that have no
 // generic Win32 API. NVIDIA uses NVAPI, AMD uses the dynamically loaded ADLX
 // runtime, and Intel uses the dynamically loaded IGCL/ControlLib runtime. The
 // vendor DLLs are optional: absence of a driver SDK is always a blank result,
@@ -73,12 +73,12 @@ fn log_vendor_warn(message: &str) {
 #[derive(Clone, Default, serde::Serialize)]
 pub struct VendorDisplayInfo {
     // The primary adapter's full model name from DXGI (e.g. "NVIDIA GeForce
-    // RTX 3080") — vendor-agnostic, so it works for NVIDIA, AMD, Intel and
+    // RTX 3080") ,  vendor-agnostic, so it works for NVIDIA, AMD, Intel and
     // any other vendor without a driver SDK. The WebGPU adapter info that
     // feeds the System Info GPU Adapter row leaves its device field blank on
     // Windows WebView2, so this is the authoritative model name.
     pub gpu_model: String,
-    // Canonical vendor id string: "nvidia" / "amd" / "intel" / "" — lets
+    // Canonical vendor id string: "nvidia" / "amd" / "intel" / "" ,  lets
     // the frontend gate NVIDIA-only features (e.g. the RTX HDR dropdown)
     // without string-matching the model name.
     pub vendor: String,
@@ -234,14 +234,14 @@ fn adapter_description(desc: &DXGI_ADAPTER_DESC) -> String {
 
 // Finds the DXGI adapter driving the primary display and returns its vendor
 // ID plus full model name. DXGI adapter order is not the same thing as the
-// adapter driving the primary monitor on hybrid laptops/docks — match the
+// adapter driving the primary monitor on hybrid laptops/docks ,  match the
 // primary HMONITOR first, then retain adapter 0 as a last-resort fallback.
 // The model name is vendor-agnostic (NVIDIA/AMD/Intel alike), which is why
 // the System Info GPU Adapter row prefers it over the WebGPU device field
 // (left blank by WebView2 on Windows).
 //
 // The result is cached: the app-wide vendor refresh calls this every 5 s, and
-// the reference-mode check calls it again — two full DXGI enumerations per
+// the reference-mode check calls it again ,  two full DXGI enumerations per
 // tick was real work. The GPU itself essentially never changes while the app
 // runs (hotplug/dock events go through the display-changed path, which
 // invalidates this cache).
@@ -276,7 +276,7 @@ fn primary_adapter_info() -> Option<(u32, String)> {
     queried
 }
 
-// Called by primary_adapter_info (above) — the actual DXGI enumeration.
+// Called by primary_adapter_info (above) ,  the actual DXGI enumeration.
 pub(crate) fn invalidate_adapter_info_cache() {
     if let Some(cache) = ADAPTER_INFO_CACHE.get() {
         if let Ok(mut guard) = cache.lock() {
@@ -1072,7 +1072,7 @@ fn query_igcl() -> VendorDisplayInfo {
         }
         let output = outputs[0];
         let mut info = VendorDisplayInfo::default();
-        let mut settings = CtlDisplaySettings::default();
+        let mut settings = CtlDisplaySettings { size: std::mem::size_of::<CtlDisplaySettings>() as u32, set: 0, ..Default::default() };
         settings.size = std::mem::size_of::<CtlDisplaySettings>() as u32;
         settings.set = 0;
         if get_settings(output, &mut settings) == CTL_OK
@@ -1429,10 +1429,10 @@ fn query_nvapi() -> VendorDisplayInfo {
     // The app-wide vendor refresh runs this every 5 s. Reuse the cached
     // NVAPI context (kept alive for the RTX HDR DRS session) instead of
     // loading the DLL, initialising, querying, then unloading it on every
-    // tick — that init/unload churn was a real stutter every few seconds.
+    // tick ,  that init/unload churn was a real stutter every few seconds.
     // Only fall back to a fresh context when the cache has no display ID
     // (e.g. right after a display reconfiguration). Boxed so the fresh
-    // context lives for the whole query — the cached path borrows from the
+    // context lives for the whole query ,  the cached path borrows from the
     // static cache instead.
     let _owned_context;
     let (context, display_id) = match rtx_hdr_nvapi_with_display_id() {
@@ -1625,7 +1625,7 @@ fn query_nvapi() -> VendorDisplayInfo {
 // ── RTX HDR (driver profile) ──────────────────────────────────────────────
 // RTX HDR is a driver-profile setting (the "Global driver profile" rows that
 // NVIDIA Profile Inspector shows under 06 - Rendering Features). There is no
-// dedicated NVAPI call for it — it is written through the DRS (driver
+// dedicated NVAPI call for it ,  it is written through the DRS (driver
 // settings) API, exactly like the Control Panel does. We reuse the same
 // interface IDs NVIDIA Profile Inspector uses (verified against its
 // NvapiDrsWrapper.cs, which works on current drivers), and the setting IDs
@@ -1647,7 +1647,7 @@ const NVAPI_DRS_GET_SETTING_ID: u32 = 0xEA99498D;
 const NVAPI_DRS_SET_SETTING_ID: u32 = 0x8A2CF5F5;
 
 // GetSetting returns this when the setting is not present in the profile
-// (i.e. the user has never touched RTX HDR) — treated as "off".
+// (i.e. the user has never touched RTX HDR) ,  treated as "off".
 const NVAPI_SETTING_NOT_FOUND: i32 = -160;
 
 // Writing DRS settings (profiles/global profile) requires an elevated
@@ -1660,7 +1660,7 @@ const ADMIN_REQUIRED_MARKER: &str = "ADMIN_REQUIRED:";
 fn drs_write_error(operation: &str, status: i32) -> String {
     if status == NVAPI_INVALID_USER_PRIVILEGE {
         format!(
-            "{ADMIN_REQUIRED_MARKER} {operation} needs administrator rights — restart OLED Helper as Administrator to change RTX HDR"
+            "{ADMIN_REQUIRED_MARKER} {operation} needs administrator rights ,  restart OLED Helper as Administrator to change RTX HDR"
         )
     } else {
         format!("{operation} failed: {status}")
@@ -1678,7 +1678,7 @@ const RTX_HDR_DRIVER_FLAGS_ID: u32 = 0x00432F84;
 // Each union is 4100 bytes (NVDRS_BINARY_SETTING = valueLength u32 +
 // valueData[4096]) which is larger than the NvAPI_UnicodeString member, so
 // the whole struct is 4 + 4096 + 20 + 4100 + 4100 = 12320 bytes. The DRS
-// version constant embeds this size, and the driver validates it — passing
+// version constant embeds this size, and the driver validates it ,  passing
 // the wrong size returns NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9). Verified
 // against Profile Inspector's C# NVDRS_SETTING (Marshal.SizeOf = 12320),
 // which works on current drivers.
@@ -1740,7 +1740,7 @@ impl NvDrsSetting {
 }
 
 // The DRS functions take opaque handle types (void*). Get/SetSetting use the
-// "Ex" variants (extra trailing args) that modern drivers expose — the same
+// "Ex" variants (extra trailing args) that modern drivers expose ,  the same
 // signatures NVIDIA Profile Inspector's wrapper uses.
 type NvapiDrsCreateSession = unsafe extern "system" fn(session: *mut *mut c_void) -> i32;
 type NvapiDrsDestroySession = unsafe extern "system" fn(session: *mut c_void) -> i32;
@@ -1791,7 +1791,7 @@ unsafe fn drs_global_profile(context: &NvapiContext, session: *mut c_void) -> Re
 // nvapi_init() plus a fresh DRS session per poll would load nvapi64.dll, run
 // NvAPI_Initialize/EnumPhysicalGPUs, create a DRS session and re-read the
 // entire driver settings tree, then destroy it all again (NvAPI_Unload + unload
-// the DLL) twice a second — enough driver churn to stutter the UI. Cache the
+// the DLL) twice a second ,  enough driver churn to stutter the UI. Cache the
 // initialized NVAPI context AND the DRS session plus its global-profile handle
 // so every poll is a single in-process NvAPI_DRS_GetSetting call. The context
 // and session are rebuilt only after explicit invalidation, a context lifetime
@@ -1824,7 +1824,7 @@ const RTX_HDR_NVAPI_CACHE_TTL: Duration = Duration::from_secs(60);
 // (and unloading it again) on every read.
 //
 // SAFETY CONTRACT: the returned reference is only valid while the caller
-// holds VENDOR_QUERY_LOCK — the cache box is replaced/dropped while that lock
+// holds VENDOR_QUERY_LOCK ,  the cache box is replaced/dropped while that lock
 // is held, so the heap allocation behind the reference can disappear the
 // moment the lock is released. Both call sites (get/set_rtx_hdr_flags) hold
 // the lock for the entire use; never store the reference or use it outside a
@@ -1855,7 +1855,7 @@ fn rtx_hdr_nvapi_context() -> Option<&'static NvapiContext> {
                 captured_at: Instant::now(),
             });
         } else if guard.is_none() {
-            // nvapi_init failed and nothing is cached — report the failure
+            // nvapi_init failed and nothing is cached ,  report the failure
             // to the caller instead of hanging on to a stale context.
             return None;
         }
@@ -1871,7 +1871,7 @@ fn rtx_hdr_nvapi_context() -> Option<&'static NvapiContext> {
 
 // Returns the cached NVAPI context plus its pre-resolved display ID (None if
 // the ID could not be resolved). Unlike rtx_hdr_nvapi_context this does not
-// initialise NVAPI on demand — the 5 s vendor refresh must not trigger a
+// initialise NVAPI on demand ,  the 5 s vendor refresh must not trigger a
 // fresh init/unload cycle every tick; it reuses the cache and only re-inits
 // when the cache is empty or stale.
 fn rtx_hdr_nvapi_with_display_id() -> Option<(&'static NvapiContext, Option<u32>)> {
@@ -1908,7 +1908,7 @@ fn rtx_hdr_nvapi_with_display_id() -> Option<(&'static NvapiContext, Option<u32>
 
 // The DRS session and its global-profile handle are cached alongside the NVAPI
 // context: creating a DRS session and calling NvAPI_DRS_LoadSettings rebuilds
-// the driver's in-memory settings tree from disk — the expensive part of the
+// the driver's in-memory settings tree from disk ,  the expensive part of the
 // old per-poll session lifecycle.
 struct NvapiDrsSession {
     handle: *mut c_void,
@@ -1936,7 +1936,7 @@ impl Drop for NvapiDrsSession {
 
 struct CachedDrsSession {
     // Boxed so the entry's heap allocation is stable even while the
-    // MutexGuard is dropped — the session + profile handles stay valid for
+    // MutexGuard is dropped ,  the session + profile handles stay valid for
     // the process lifetime, only ever replaced while the cache lock is held.
     entry: Box<CachedDrsEntry>,
 }
@@ -1983,7 +1983,7 @@ struct CachedDrsEntry {
     // The resolved DRS function pointers are cached alongside the session so
     // the 500ms RTX HDR poll is a single direct driver call. Re-resolving via
     // nvapi_function() on every poll did an NvAPI_QueryInterface lookup AND
-    // logged a line for each — per-tick churn that showed up in the runtime
+    // logged a line for each ,  per-tick churn that showed up in the runtime
     // log and IPC traffic.
     get_setting: NvapiDrsGetSetting,
     set_setting: NvapiDrsSetSetting,
@@ -2101,7 +2101,7 @@ unsafe fn cached_drs_session(context: &NvapiContext) -> Option<&'static CachedDr
     }
     guard.as_ref().map(|cached| {
         // The entry lives in a stable heap allocation owned by the static
-        // cache, so this reference outlives the guard — same reasoning as
+        // cache, so this reference outlives the guard ,  same reasoning as
         // the context cache above.
         unsafe { &*(&*cached.entry as *const CachedDrsEntry) }
     })
@@ -2118,7 +2118,7 @@ unsafe fn with_cached_drs<T>(
 
 /// Sets the global RTX HDR master switch in the driver profile.
 pub fn enable_rtx_hdr_for_mode() -> Result<(), String> {
-    // RTX HDR only needs the global enable bit set — the driver applies its
+    // RTX HDR only needs the global enable bit set ,  the driver applies its
     // own default debanding when Driver Flags is 0x00, so never overwrite a
     // user's existing flag selection.
     let settings = get_rtx_hdr_settings()?;
@@ -2168,7 +2168,7 @@ pub fn set_rtx_hdr_flags(flags: u32) -> Result<(), String> {
             if flags_status != NVAPI_OK {
                 return Err(drs_write_error("NvAPI_DRS_SetSetting(Driver Flags)", flags_status));
             }
-            // Every Driver Flags value — including 0x00 (driver default) —
+            // Every Driver Flags value ,  including 0x00 (driver default) , 
             // keeps RTX HDR enabled. Disabling is handled separately by
             // set_rtx_hdr_enabled(false).
             let mut enable_setting = NvDrsSetting::dword(RTX_HDR_ENABLE_ID, 1);
@@ -2201,8 +2201,7 @@ pub fn get_rtx_hdr_settings() -> Result<RtxHdrSettings, String> {
     unsafe {
         with_cached_drs(|cached| {
             let read_dword = |setting_id| {
-                let mut setting = NvDrsSetting::default();
-                setting.version = NVDRS_SETTING_VER;
+                let mut setting = NvDrsSetting { version: NVDRS_SETTING_VER, ..Default::default() };
                 let mut unknown = 0u32;
                 let status = (cached.get_setting)(
                     cached.session.handle,
@@ -2221,8 +2220,8 @@ pub fn get_rtx_hdr_settings() -> Result<RtxHdrSettings, String> {
             };
             let mut flags = read_dword(RTX_HDR_DRIVER_FLAGS_ID)?;
             // Driver Flags 0x00 is the driver's unset/default state. It
-            // applies the same top-tier debanding as 0x02 (Very High) —
-            // equivalent output and performance — so normalize it here so
+            // applies the same top-tier debanding as 0x02 (Very High) , 
+            // equivalent output and performance ,  so normalize it here so
             // the UI always shows a known mode instead of "Unknown".
             if flags == 0x00 {
                 flags = 0x02;
@@ -2260,7 +2259,7 @@ mod tests {
 
         // The DRS setting struct must stay at the driver-expected size so
         // the version constant (which embeds it) is accepted. 12320 matches
-        // Profile Inspector's Marshal.SizeOf<NVDRS_SETTING>() — a wrong size
+        // Profile Inspector's Marshal.SizeOf<NVDRS_SETTING>() ,  a wrong size
         // makes the driver return NVAPI_INCOMPATIBLE_STRUCT_VERSION (-9).
         assert_eq!(std::mem::size_of::<NvDrsSetting>(), 12320);
         assert_eq!(NVDRS_SETTING_VER, 0x00013020);

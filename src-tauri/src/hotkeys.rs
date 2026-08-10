@@ -1,4 +1,4 @@
-// hotkeys.rs — global hotkey bindings for the app's main features.
+// hotkeys.rs ,  global hotkey bindings for the app's main features.
 //
 // Bindings are stored as strings in the config ("Ctrl+Alt+F9", or "None" for
 // unbound) and registered with RegisterHotKey on the main window. WM_HOTKEY
@@ -23,7 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-// Hotkey IDs (WM_HOTKEY wparam). Stable per action — not persisted anywhere,
+// Hotkey IDs (WM_HOTKEY wparam). Stable per action ,  not persisted anywhere,
 // but kept distinct so multiple bindings never collide on one slot.
 pub const HK_TOGGLE_DIMMER: i32 = 1;
 pub const HK_TOGGLE_CRUSH: i32 = 2;
@@ -286,7 +286,7 @@ pub fn register_all() -> Result<(), String> {
             continue;
         };
         // "None" is stored as the unbound marker; parse_hotkey returns None for
-        // it, so the loop above already skipped it — but guard anyway.
+        // it, so the loop above already skipped it ,  but guard anyway.
         let mods = if repeat { mods } else { mods | MOD_NOREPEAT.0 };
         unsafe {
             match RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(mods), vk) {
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn key_table_is_sorted_for_binary_search() {
         // parse_hotkey uses binary_search_by_key, which requires the table to
-        // be sorted — a regression here silently drops a key from the lookup.
+        // be sorted ,  a regression here silently drops a key from the lookup.
         let entries: Vec<(&str, u32)> = key_table().to_vec();
         let mut sorted = entries.clone();
         sorted.sort_by_key(|(name, _)| *name);

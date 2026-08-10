@@ -24,7 +24,7 @@ export const HIGH_NITS_GAP_FRACTION = 0;
 // left→right, top→bottom, from lower to higher nits. In SDR it shows a
 // bright-RGB ramp instead.
 
-// The High Nits grid is a FIXED 3 rows × 7 columns (21 cells) — no zoom.
+// The High Nits grid is a FIXED 3 rows × 7 columns (21 cells) ,  no zoom.
 // The user picks the minimum nits and the step between neighboring cells
 // (granularity); the maximum derives as min + step × 20. Only two of the
 // three are independent, and stores.svelte.js keeps them in sync.
@@ -32,7 +32,7 @@ export const HIGH_NITS_COLS = 7;
 export const HIGH_NITS_ROWS = 3;
 export const HIGH_NITS_CELLS = HIGH_NITS_COLS * HIGH_NITS_ROWS; // 21
 export const HIGH_NITS_DEFAULT_MIN = 100;
-// Max slider stops — the ONLY positions the Max slider rests on: 100-step
+// Max slider stops ,  the ONLY positions the Max slider rests on: 100-step
 // from 400 to 1000, 500-step from 1000 to 5000, then 1000-step to the
 // 10000 ceiling. Every stop is a value in the region-stepped ladder, so the
 // grid can always end exactly on it. Stops start at 400 (not 100) because a
@@ -54,7 +54,7 @@ export const HIGH_NITS_DEFAULT_STEP = 500;
 export const HIGH_NITS_MAX_CEILING = 10000;
 
 // Round steps used to fill the grid below 1000 when the Max is too low for
-// 21 distinct region-ladder values. Coarsest first — the grid prefers the
+// 21 distinct region-ladder values. Coarsest first ,  the grid prefers the
 // biggest round step that still fits 21 distinct values ending at the Max
 // (Max 10000 → 100s, Max 2000 → 25s, Max 500 → 10s, …).
 const NICE_FILL_STEPS = [100, 50, 25, 20, 10, 5, 2, 1];
@@ -62,7 +62,7 @@ const NICE_FILL_STEPS = [100, 50, 25, 20, 10, 5, 2, 1];
 // The grid never shows nits below this. A full 21-cell grid can't start at
 // exactly 300 for every Max (the span 300→1000 only divides evenly into a
 // nice step for Max 4000 and 10000), so the fill uses the closest round
-// start ≥ this floor — the minimum is always ≥ 300 (e.g. Max 900 → 400,
+// start ≥ this floor ,  the minimum is always ≥ 300 (e.g. Max 900 → 400,
 // Max 1000 → 500, Max 10000 → 300), never 0. This is only the *natural*
 // floor per Max; monotonicFloorForStop below then raises it so the minimum
 // never decreases as the Max slider moves up.
@@ -74,7 +74,7 @@ function naturalFillStep(end, count, floor) {
   return NICE_FILL_STEPS.find((st) => end - st * (count - 1) >= floor) ?? NICE_FILL_STEPS[NICE_FILL_STEPS.length - 1];
 }
 
-// The natural (round, floor-300) grid minimum for a Max — the start value the
+// The natural (round, floor-300) grid minimum for a Max ,  the start value the
 // current design would use before monotonicity is enforced. `cells` lets a
 // fullscreen grid grow past the fixed 21 (e.g. 28 cells on 16:9) while still
 // honoring the 300-nits floor.
@@ -117,12 +117,12 @@ function gridMinForFloor(max, floor, cells = HIGH_NITS_CELLS) {
 // grid minimum must NEVER decrease (a higher Max showing a lower min than a
 // lower Max is exactly the inconsistency reported). Stops are walked in
 // ascending order; each stop's floor is the highest minimum achieved so far
-// (its own natural minimum, or the previous stop's carried *grid* minimum —
+// (its own natural minimum, or the previous stop's carried *grid* minimum , 
 // the grid can start above its floor when the fill step rounds, so carrying
 // the natural floor alone could still let a later grid dip). When the
 // natural round grid would dip below the carried floor (Max 4000/10000
 // consume so many region cells that the round fill bottoms out at 300), the
-// fill switches to a fine non-round step anchored at the carried floor — the
+// fill switches to a fine non-round step anchored at the carried floor ,  the
 // user accepted non-round low values as the price of a monotonic minimum.
 const HIGH_NITS_STOP_FLOORS = new Map();
 (() => {
@@ -138,7 +138,7 @@ const HIGH_NITS_STOP_FLOORS = new Map();
 // The monotonic floor for any Max. Slider stops look it up directly; an
 // off-stop value (e.g. an old persisted Max before snapping) uses the first
 // stop at or above it, falling back to its natural minimum. Off-stop grids
-// are a transient fallback only — the frontend always snaps the Max to a
+// are a transient fallback only ,  the frontend always snaps the Max to a
 // slider stop before rendering, so in practice the grid is only built from
 // an exact stop and always ends exactly at the Max.
 function monotonicFloorForMax(max) {
@@ -164,7 +164,7 @@ function monotonicFloorForMax(max) {
 //
 // `cells` defaults to the fixed 21 (3×7) normal-mode grid. Fullscreen passes
 // a larger count (the aspect-fit grid, e.g. 28 on 16:9) so every slot shows
-// a real value — the extra cells simply make the below-1000 fill finer.
+// a real value ,  the extra cells simply make the below-1000 fill finer.
 export function highNitsGridCodes(max, cells = HIGH_NITS_CELLS) {
   // The monotonic floor map is only valid for the fixed 21-cell grid (the
   // slider's source of truth). Larger fullscreen grids use the natural
@@ -216,18 +216,18 @@ export function highNitsSdrCodes(cells = HIGH_NITS_CELLS) {
 export const HIGH_SDR_RANGE = [];
 for (let c = 232; c <= 255; c++) HIGH_SDR_RANGE.push(c);
 
-// Strip registry — adding a third strip later is one new entry here.
+// Strip registry ,  adding a third strip later is one new entry here.
 // `label` is the heading button / context-menu text; `title` its tooltip.
 export const STRIPS = [
   {
     id: 'black',
     label: 'Black',
-    title: 'Black calibration strip — dark PQ/RGB ramp for black level tuning',
+    title: 'Black calibration strip ,  dark PQ/RGB ramp for black level tuning',
   },
   {
     id: 'highNits',
     label: 'Brightness',
-    title: 'Brightness grid strip — ascending nits cells to judge peak output',
+    title: 'Brightness grid strip ,  ascending nits cells to judge peak output',
   },
 ];
 
@@ -238,7 +238,7 @@ export const STRIPS = [
 //
 // `sdrWhiteBaseNits` is the SDR white level the browser's HDR compositor
 // captured at WebView startup and froze for the session. Chromium/WebView2
-// scales the HDR canvas relative to that frozen value — a live reference
+// scales the HDR canvas relative to that frozen value ,  a live reference
 // crushed/reverse-crushed the strip whenever the Windows SDR brightness moved
 // while the app was open. Encoding each cell against the same frozen value
 // keeps physical luminance stable no matter where the Windows SDR slider sits,
@@ -260,7 +260,7 @@ export function linearToSrgb(c) {
   return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
 }
 
-// ITU-R BT.2408 reference/diffuse white for HDR (nits) — the industry
+// ITU-R BT.2408 reference/diffuse white for HDR (nits) ,  the industry
 // standard diffuse-white level, which Chromium also hardcodes as its default
 // SDR white level (ui/gfx/color_space.cc kDefaultSDRWhiteLevel). At this SDR
 // white level, Chromium tone-maps HDR screenshots with their intended
@@ -304,7 +304,7 @@ struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}
 // explicit UV rectangle, so columns can sit at arbitrary nits positions on the
 // slider's linear scale. Buffer layout: 24 colors (vec4) + 24 rects (vec4,
 // x0,x1,y0,y1 in UV) + cfg (vec4, x = cell count) = 784 bytes. NOTE: the
-// struct field is named `cfg` — `meta` is a reserved keyword in WGSL and
+// struct field is named `cfg` ,  `meta` is a reserved keyword in WGSL and
 // fails compilation.
 export const COMPARE_RAMP_SHADER = `struct Cb{colors:array<vec4<f32>,24>,rects:array<vec4<f32>,24>,cfg:vec4<f32>}@group(0)@binding(0)var<uniform>cb:Cb;
 struct VO{@builtin(position)p:vec4f,@location(0)uv:vec2f}

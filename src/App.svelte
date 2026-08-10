@@ -14,7 +14,7 @@
   import TabAbout from './lib/TabAbout.svelte';
 
   // Icons are inlined as data URIs (?inline) instead of /icons/*.png URLs so
-  // they never depend on the dev server or asset protocol at runtime — a tray
+  // they never depend on the dev server or asset protocol at runtime, a tray
   // restart can leave the vite dev server dead, and any icon requested after
   // that would otherwise render as a broken-image logo.
   import appIcon from './lib/icons/app-icon.png?inline';
@@ -62,8 +62,8 @@
     // A press on the list while its context menu was open sets
     // resCtxDismissClick (document capture guard below). If a click still
     // fires despite preventDefault, swallow it here instead of applying the
-    // item under the cursor. Also covers keyboard activation — Enter on a
-    // focused item — where no pointer event precedes the click: dismiss the
+    // item under the cursor. Also covers keyboard activation, Enter on a
+    // focused item, where no pointer event precedes the click: dismiss the
     // menu instead of applying the item underneath it.
     if (resCtxDismissClick) {
       resCtxDismissClick = false;
@@ -89,7 +89,7 @@
     document.addEventListener('pointerdown', onDocPointerDown);
     document.addEventListener('keydown', onKeydown);
     // Jump the list so the currently-selected resolution is already in view
-    // (centered where possible) instead of opening scrolled to the top —
+    // (centered where possible) instead of opening scrolled to the top.
     // matches how native <select> popups position themselves around the
     // selected option. block:'center' with behavior:'instant' (not
     // 'smooth') mirrors the native no-animation snap.
@@ -102,13 +102,13 @@
 
   // Custom click-only dropdown for refresh rate (Hz), replacing the native
   // <select>. Native selects use the OS/Chromium popup, which auto-closes on
-  // ANY wheel scroll anywhere on the page (not just over the control) — by
+  // ANY wheel scroll anywhere on the page (not just over the control), by
   // design, to avoid the popup misaligning from its anchor while the page
   // scrolls underneath. That's what caused the "dropdown closes itself"
   // reports. A plain absolutely-positioned list has no such built-in
   // dismiss-on-scroll behavior, so it stays open through an incidental page
   // scroll and only closes on an explicit outside click, Escape, or picking
-  // an option — exactly the click-only interaction that was asked for.
+  // an option, exactly the click-only interaction that was asked for.
   let hzMenuOpen = $state(false);
   let hzMenuEl = $state(null);
   let hzButtonEl = $state(null);
@@ -181,7 +181,7 @@
     e.stopPropagation();
     if (app.displayInfo.resolutions.length === 0) return;
     // Keep the resolution list open whether the right-click landed on the
-    // button or on a row — the context menu overlays it instead of replacing
+    // button or on a row, the context menu overlays it instead of replacing
     // it. Only the other dropdown and its context menu close (their
     // document-level close listener can't fire because this handler stops
     // propagation of the contextmenu event). The calibration strip's menu
@@ -208,7 +208,7 @@
     e.preventDefault();
     e.stopPropagation();
     if (app.displayInfo.refreshRates.length === 0) return;
-    // See openResContextMenu — same stopPropagation caveat, so dismiss the
+    // See openResContextMenu, same stopPropagation caveat, so dismiss the
     // strip menu through the shared tick.
     dismissCtxMenus();
     closeResMenu();
@@ -225,7 +225,7 @@
   }
 
   // While a context menu overlays its dropdown, a press anywhere on the
-  // dropdown list should only dismiss the context menu — never pick the item
+  // dropdown list should only dismiss the context menu, never pick the item
   // under the cursor. This is a native capture-phase listener on document so
   // it runs before any element-level or document bubble handler (including
   // the context menu's own outside-click closers, which would otherwise close
@@ -377,7 +377,7 @@
 
   // Toggling real Windows HDR (Settings > Display > HDR) via the backend.
   // Detection already exists (app.hdrStatus, driven by pollHDRStatus's
-  // matchMedia check below) — this just adds the write side.
+  // matchMedia check below), this just adds the write side.
   let windowsHdrBusy = $state(false);
   let windowsHdrError = $state('');
   let refreshRateError = $state('');
@@ -387,7 +387,7 @@
   let modeConfirmationBusy = $state(false);
   let modeConfirmationError = $state('');
   // Plays the shared exit ease (mode-confirm-exit-in) before the modal is
-  // removed — mirrors Flyout.svelte's `exiting` state so the in-app modal
+  // removed, mirrors Flyout.svelte's `exiting` state so the in-app modal
   // and the tray flyout animate identically.
   let modeConfirmationExiting = $state(false);
   let modeConfirmKeepBtnEl = $state(null);
@@ -448,7 +448,7 @@
     // button that triggered the change) so closeModeConfirmation can restore
     // it. Must happen here, not in an $effect: the countdown reassigns
     // pendingModeConfirmation every 250ms, and an effect keyed on it would
-    // re-run each tick — stealing focus back to Revert after the user tabs
+    // re-run each tick, stealing focus back to Revert after the user tabs
     // to Keep this mode, and re-capturing the Revert button as the restore
     // target just before it unmounts.
     modeConfirmLastFocused = document.activeElement;
@@ -473,7 +473,7 @@
 
   // Shared close path for Keep and Revert, mirroring Flyout.svelte's
   // closeFlyout. The exit ease plays FIRST with nothing running concurrently
-  // — confirm_mode_change / rollback both re-apply the display mode via
+  //, confirm_mode_change / rollback both re-apply the display mode via
   // ChangeDisplaySettingsExW, and doing that while the animation plays stalls
   // the compositor and makes it stutter. So the order is: play the exit
   // animation (smooth), then run the mode-change invoke. On success the modal
@@ -483,7 +483,7 @@
     if (modeConfirmationBusy || !pendingModeConfirmation) return;
     modeConfirmationBusy = true;
     modeConfirmationError = '';
-    // Scope to the mode-confirm modal specifically — the generic
+    // Scope to the mode-confirm modal specifically, the generic
     // .modal-backdrop .modal selector could match TabSettings' reset-all
     // confirm if both were ever open at once.
     const modal = document.querySelector('.mode-confirm-backdrop .modal');
@@ -499,7 +499,7 @@
             modal.removeEventListener('animationcancel', onCancel);
             resolve();
           };
-          // Only the exit animation ends the dialog — a leftover entrance
+          // Only the exit animation ends the dialog, a leftover entrance
           // animationend (mode-confirm-rise-in) must not resolve this early.
           const onEnd = (event) => {
             if (event.animationName === 'mode-confirm-exit-in') finish();
@@ -518,7 +518,7 @@
         })
       : Promise.resolve();
     try {
-      // Exit animation plays first — smooth, nothing concurrent yet.
+      // Exit animation plays first, smooth, nothing concurrent yet.
       await exitFinished;
       // The mode change runs now; its display re-apply happens after the
       // modal has faded out, so the compositor hiccup is invisible.
@@ -576,11 +576,11 @@
   }
 
   // Desktop color depth as Windows' classic Display Properties reports it
-  // (GetDeviceCaps BITSPIXEL on the screen DC — 32 on modern setups). The
+  // (GetDeviceCaps BITSPIXEL on the screen DC, 32 on modern setups). The
   // browser's screen.colorDepth reports 30 on 10-bit panels, which is the
   // signal bit depth, not the desktop color mode.
   function desktopColorDepth() {
-    return app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '—';
+    return app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '-';
   }
 
   // Anything wider than a standard 16:9 panel (1.9 gives headroom above
@@ -610,7 +610,7 @@
     const ratio = width / height;
     // 0.5% tolerance absorbs the off-by-a-few-px rounding some resolutions
     // have from their nominal ratio (e.g. 3840x1600 is 2.4, exactly 12:5,
-    // but is marketed and commonly labeled as 21:9 — nominally 2.333 —
+    // but is marketed and commonly labeled as 21:9, nominally 2.333.
     // rather than its precise fraction).
     let best = null;
     let bestDiff = Infinity;
@@ -623,7 +623,7 @@
     return `${width / d}:${height / d}`;
   }
 
-  // Popularity rank for common display aspect ratios, most-used first —
+  // Popularity rank for common display aspect ratios, most-used first.
   // used to order the aspect-ratio groups themselves (see groupedResolutions
   // below), independent from COMMON_ASPECT_RATIOS's declaration order which
   // exists only for the nearest-match search in aspectRatioLabel.
@@ -753,7 +753,7 @@
     const previous = app.hdrStatus;
     windowsHdrBusy = true;
     // Reflect the switch instantly instead of waiting for the next 1s poll
-    // tick to pick it up via matchMedia — that wait is what made toggling
+    // tick to pick it up via matchMedia, that wait is what made toggling
     // from inside the app feel slower than the Windows keyboard shortcut,
     // even though the underlying OS-level change completes at the same speed
     // either way. Reverted in the catch block if the backend call fails.
@@ -778,12 +778,12 @@
   }
 
   // Global hotkey actions, dispatched by Rust's hotkeys module (WM_HOTKEY).
-  // The strip's own keyboard shortcuts are unaffected — these only fire for
+  // The strip's own keyboard shortcuts are unaffected, these only fire for
   // the registered global bindings.
   let hotkeySaveTimer = null;
 
   function applyGammaForHotkey() {
-    invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch(() => {});
+    invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch((e) => console.warn('[hotkey] gamma apply failed', e));
   }
 
   // SDR Content Brightness is a Windows setting, not an OLED Helper setting.
@@ -845,7 +845,7 @@
   // scaled by the frozen SDR-white reference); without one, the window is a
   // plain SDR swapchain and Windows scales the chrome by the LIVE SDR
   // slider. The calibration tabs own HDR canvases (Crush, Windows HDR), and
-  // leaving those tabs destroys them via onDestroy — so the window flips to
+  // leaving those tabs destroys them via onDestroy, so the window flips to
   // SDR presentation and the whole interface visibly brightens. This
   // always-mounted 1×1 HDR canvas keeps the window in the HDR path for the
   // entire session, making the chrome brightness uniform across all tabs.
@@ -883,7 +883,7 @@
       hdrLayerLayout = hdrLayerDevice.createPipelineLayout({ bindGroupLayouts: [bgl] });
       hdrLayerBg = hdrLayerDevice.createBindGroup({ layout: bgl, entries: [] });
       // Transient device losses (driver reset, GPU re-init) would silently
-      // drop the persistent layer — the exact failure this feature exists to
+      // drop the persistent layer, the exact failure this feature exists to
       // prevent. Tear down and re-init once the hardware recovers (bounded
       // retries so a permanently lost GPU can't spawn a retry loop).
       hdrLayerDevice.lost.then((info) => {
@@ -928,7 +928,7 @@
         });
       }
       // Render a bright extended-range pixel once so the surface genuinely
-      // carries HDR content — a transparent/black 1×1 could be optimized away.
+      // carries HDR content, a transparent/black 1×1 could be optimized away.
       hdrLayerCanvas.width = 1;
       hdrLayerCanvas.height = 1;
       const tex = hdrLayerCtx.getCurrentTexture();
@@ -946,7 +946,7 @@
   });
   // Follow HDR toggles (and the initial unknown→hdr transition) so the
   // persistent layer tracks the same format/colorSpace as the calibration
-  // canvases. Re-renders when the window becomes visible again too — the
+  // canvases. Re-renders when the window becomes visible again too, the
   // swapchain can be recreated while the app is hidden in the tray.
   $effect(() => {
     void app.hdrStatus; void windowVisible;
@@ -994,7 +994,7 @@
       })
       .catch(() => {});
     // One-time: seed display info and HDR status. Mode changes re-poll
-    // explicitly afterward — there is no periodic poll on the main thread.
+    // explicitly afterward, there is no periodic poll on the main thread.
     pollDisplayInfo();
     pollHDRStatus();
     // Seed the SDR white level used by the Brightness strip compensation
@@ -1021,8 +1021,8 @@
         refreshVendorDisplayInfo();
       }, 350);
       // Display topology changes (incl. HDR toggles, resolution/hotplug)
-      // make the WebView re-read its display info — including the SDR white
-      // level it froze at startup — so re-capture the strip's base to match.
+      // make the WebView re-read its display info, including the SDR white
+      // level it froze at startup, so re-capture the strip's base to match.
       // Debounced: hotplug emits a burst of WM_* messages, and waiting lets
       // the OS settle before the new value is read. A plain SDR-brightness
       // slider move does NOT emit this event, so the base stays frozen there
@@ -1032,6 +1032,11 @@
         sdrWhiteBaseRecaptureTimer = null;
         refreshSdrWhiteLevel(true);
       }, 150);
+      // A display topology change (driver restart, hotplug, sleep/resume)
+      // can recover a lost GPU device. Reset the persistent HDR layer
+      // retry budget so it is re-created on the next frame.
+      hdrLayerRetryCount = 0;
+      hdrLayerInitStarted = false;
     }).then((stop) => { unlistenDisplayChanged = stop; }).catch(() => {});
     listen('window-visibility', (event) => {
       const visible = event.payload !== false;
@@ -1043,6 +1048,8 @@
         // it self-heal without a periodic poll.
         pollDisplayInfo();
         refreshSdrWhiteLevel();
+        hdrLayerRetryCount = 0;
+        hdrLayerInitStarted = false;
       }
     }).then((stop) => { unlisten = stop; }).catch(() => {});
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
@@ -1079,7 +1086,7 @@
     loadConfig();
   });
 
-  // Event-driven HDR detection — matchMedia fires when Windows HDR is
+  // Event-driven HDR detection, matchMedia fires when Windows HDR is
   // toggled from Settings or via the keyboard shortcut.
   $effect(() => {
     const mq = window.matchMedia('(dynamic-range: high)');
@@ -1098,7 +1105,7 @@
   //
   // A one-shot fetch always runs on window-visible: it populates the GPU
   // vendor/model that gates NVIDIA-only UI (the RTX HDR section, vendor
-  // tags) — that must not depend on which tab is open. Entering the Crush
+  // tags), that must not depend on which tab is open. Entering the Crush
   // tab also re-fetches once so its reference-mode warning reflects the
   // current driver state even if System Info was never opened (the effect
   // re-runs on tab switches, covering that case).
@@ -1110,7 +1117,7 @@
   });
 
   // The full vendor query is needed on the tabs that consume those settings.
-  // Do not run it merely because an unrelated tab became active — that caused
+  // Do not run it merely because an unrelated tab became active, that caused
   // a full NVAPI color/VRR/reference-mode probe on every tab switch.
   $effect(() => {
     if (!windowVisible) return;
@@ -1230,11 +1237,11 @@
           </span>
           <span class="monitor-tip" role="tooltip">
             <span class="monitor-tip-title">{app.displayInfo.monitorName}</span>
-            <span class="monitor-tip-row"><span>Connector</span><strong>{app.displayInfo.connector || '—'}</strong></span>
-            <span class="monitor-tip-row"><span>Color format</span><strong>{app.displayInfo.colorFormat || '—'}{app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}</strong></span>
+            <span class="monitor-tip-row"><span>Connector</span><strong>{app.displayInfo.connector || '-'}</strong></span>
+            <span class="monitor-tip-row"><span>Color format</span><strong>{app.displayInfo.colorFormat || '-'}{app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}</strong></span>
             <span class="monitor-tip-row"><span>Desktop color</span><strong>{desktopColorDepth()}</strong></span>
-            <span class="monitor-tip-row"><span>Dynamic range</span><strong>{app.displayInfo.dynamicRange || '—'}</strong></span>
-            <span class="monitor-tip-row"><span>VRR</span><strong>{app.displayInfo.vrr || '—'}</strong></span>
+            <span class="monitor-tip-row"><span>Dynamic range</span><strong>{app.displayInfo.dynamicRange || '-'}</strong></span>
+            <span class="monitor-tip-row"><span>VRR</span><strong>{app.displayInfo.vrr || '-'}</strong></span>
             <span class="monitor-tip-row"><span>Current</span><strong>{app.displayInfo.width}×{app.displayInfo.height}{app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}</strong></span>
           </span>
         </span>
@@ -1249,7 +1256,7 @@
           disabled={app.displayModeBusy || app.refreshRateBusy || pendingModeConfirmation || app.displayInfo.resolutions.length === 0}
           onclick={toggleResMenu}
           oncontextmenu={openResContextMenu}>
-          {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '—×—'}{#if currentResolutionName()}<span class="refresh-rate-select-value"> · {currentResolutionName()}</span>{/if}
+          {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}{#if currentResolutionName()}<span class="refresh-rate-select-value"> · {currentResolutionName()}</span>{/if}
         </button>
         {#snippet resItem(resolution)}
           {@const name = resolutionName(resolution)}
@@ -1271,7 +1278,7 @@
           <div class="hz-menu res-menu" bind:this={resMenuEl} role="listbox" aria-label="Resolution options" tabindex="-1" oncontextmenu={openResContextMenu}>
             {#if app.displayInfo.resolutions.length === 0}
               <div class="hz-menu-item active">
-                {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '—×—'}
+                {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}
               </div>
             {:else if displayMenuPrefs.resolutionGroupBy === 'aspectRatio'}
               {#each groupedResolutions() as group}
@@ -1312,7 +1319,7 @@
           disabled={app.refreshRateBusy || app.displayModeBusy || pendingModeConfirmation || app.displayInfo.refreshRates.length === 0}
           onclick={toggleHzMenu}
           oncontextmenu={openHzContextMenu}>
-          {app.displayInfo.refreshRateHz ? `${app.displayInfo.refreshRateHz} Hz` : '— Hz'}{#if app.displayInfo.refreshRateHz && blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)}<span class="refresh-rate-select-value"> ({blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)})</span>{/if}
+          {app.displayInfo.refreshRateHz ? `${app.displayInfo.refreshRateHz} Hz` : '-- Hz'}{#if app.displayInfo.refreshRateHz && blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)}<span class="refresh-rate-select-value"> ({blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)})</span>{/if}
         </button>
         {#if hzMenuOpen}
           <div class="hz-menu" bind:this={hzMenuEl} role="listbox" aria-label="Refresh rate options" tabindex="-1" oncontextmenu={openHzContextMenu}>
@@ -1375,5 +1382,5 @@
 
 <!-- Persistent 1×1 HDR surface (see initHdrLayer): keeps the window in the
      HDR presentation path for the whole session so chrome brightness is
-     uniform across tabs. Invisible — 1px, near-zero opacity, no pointer events. -->
+     uniform across tabs. Invisible, 1px, near-zero opacity, no pointer events. -->
 <canvas class="hdr-layer" bind:this={hdrLayerCanvas} aria-hidden="true" tabindex="-1"></canvas>

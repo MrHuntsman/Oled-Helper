@@ -148,7 +148,7 @@ mod windows_scan {
         0xf5a79888be546336d9b324afbbbf93f6,
     ];
 
-    const DXBC_MAGIC: [u8; 4] = [b'D', b'X', b'B', b'C'];
+    const DXBC_MAGIC: [u8; 4] = *b"DXBC";
     const DX_HEADER_SIZE: usize = 32;
 
     const KNOWN_CONSTANTS: [(&str, f32); 4] = [
@@ -411,7 +411,7 @@ mod windows_scan {
 
     /// Phase 3a dry run: walks DWM virtual memory directly, finds whitelisted
     /// DXBC shaders at their real addresses, reads the full container, and
-    /// simulates patching in a copy — never touches DWM.
+    /// simulates patching in a copy ,  never touches DWM.
     fn dry_run_patch(process: &Handle, base: usize, size: usize, profile: &str) -> (u32, u32, Vec<String>) {
         if gamma_replacements(profile).is_none() {
             return (0, 0, vec!["unknown gamma profile".into()]);
@@ -663,7 +663,7 @@ mod windows_scan {
     }
 
     /// Cheap PID lookup for the auto-reapply watcher: no module enumeration,
-    /// no process open — just a Toolhelp process snapshot.
+    /// no process open ,  just a Toolhelp process snapshot.
     pub fn current_dwm_pid() -> Option<u32> {
         find_dwm_pid()
     }
@@ -759,7 +759,7 @@ mod windows_scan {
     }
 
     /// Phase 3a dry run: finds whitelisted shaders in DWM memory, builds
-    /// replacement constants in a copy, and reports what WOULD change —
+    /// replacement constants in a copy, and reports what WOULD change , 
     /// never writes to DWM, never suspends it.
     pub fn scan_dwm_dry_run(profile: &str) -> DwmEotfScanResult {
         if let Err(err) = enable_debug_privilege() {
@@ -1082,7 +1082,7 @@ mod windows_scan {
         }
         // Kill DWM and patch the freshly restarted instance. Patching the
         // long-running compositor writes memory that its GPU pipeline never
-        // recompiles — the upstream tool restarts DWM first so the patched
+        // recompiles ,  the upstream tool restarts DWM first so the patched
         // bytecode is loaded before shader compilation happens.
         let pid = match restart_dwm() {
             Ok(pid) => pid,
@@ -1188,7 +1188,7 @@ mod windows_scan {
                 let file_size = u32::from_le_bytes(
                     slice[i + 24..i + 28].try_into().unwrap_or([0u8; 4]),
                 ) as usize;
-                if file_size < DX_HEADER_SIZE || file_size > MAX_SCAN_BYTES {
+                if !(DX_HEADER_SIZE..=MAX_SCAN_BYTES).contains(&file_size) {
                     log::info!("[dwm-eotf] apply v2: bad file_size={file_size} at VA=0x{:x}", region.address.saturating_add(i));
                     i = i.saturating_add(DX_HEADER_SIZE);
                     continue;
@@ -1323,7 +1323,7 @@ mod windows_scan {
         } else if patched_count > 0 {
             format!("Patched {patched_count} of {shader_count} nested shader(s) with {profile} EOTF. DXBC checksums repaired; DWM was suspended at process level and resumed.")
         } else {
-            format!("DWM was restarted and scanned, but no whitelisted shaders needed patching (or none were found in readable memory). The fresh compositor is running unpatched with its original sRGB EOTF.")
+            "DWM was restarted and scanned, but no whitelisted shaders needed patching (or none were found in readable memory). The fresh compositor is running unpatched with its original sRGB EOTF.".to_string()
         };
         DwmEotfScanResult {
             status: status.into(),

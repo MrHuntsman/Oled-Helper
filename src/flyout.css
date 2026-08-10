@@ -1,14 +1,14 @@
-/* flyout.css — flyout-window-specific styles for the tray "Keep display mode?"
+/* flyout.css ,  flyout-window-specific styles for the tray "Keep display mode?"
    confirmation (src/lib/Flyout.svelte, mounted by src/flyout-main.js).
 
    This file is imported AFTER app.css (see flyout-main.js), so its rules win
-   the cascade against equal-specificity app.css rules — exactly what we need
+   the cascade against equal-specificity app.css rules ,  exactly what we need
    to override the shared .modal-backdrop / .modal styles for the tiny
    always-on-top window without touching the main window's styling.
 
    ── Timings ────────────────────────────────────────────────────────────────
    The animation timings and keyframes are SHARED with the main window's
-   in-app "Keep display mode?" modal — they live in app.css as --mode-confirm-*
+   in-app "Keep display mode?" modal ,  they live in app.css as --mode-confirm-*
    custom properties plus the mode-confirm-rise-in / mode-confirm-exit-in
    keyframes (app.css is imported by both windows). Flyout-specific layout
    overrides stay here; only the trigger classes differ (.flyout-visible /
@@ -37,7 +37,7 @@ html, body, #flyout-app {
 /* .modal's box-shadow (app.css: 0 16px 40px rgba(0,0,0,0.5)) needs a truly
    transparent canvas to blend its soft edge into. WebView2's transparent
    window compositing on Windows does not correctly composite that kind of
-   semi-transparent blur falloff — it renders against opaque white instead,
+   semi-transparent blur falloff ,  it renders against opaque white instead,
    producing a large white halo around the modal rather than a soft shadow.
    Dropping the shadow for the flyout specifically avoids that artifact; the
    modal's own border still gives it enough definition against the desktop. */
@@ -71,7 +71,7 @@ html, body, #flyout-app {
   width: 380px;
   margin-top: auto;
   margin-bottom: 0;
-  /* Hold the entrance animation's "from" state — no animation plays until
+  /* Hold the entrance animation's "from" state ,  no animation plays until
      .flyout-visible is added (see the flyout-shown listener in
      Flyout.svelte), which happens only after the native window is already
      visible. Without this hold, the animation would run to completion while

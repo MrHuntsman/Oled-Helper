@@ -1,6 +1,7 @@
 <script>
-  // Inlined data URI — see App.svelte for why icons never hit the network.
+  // Inlined data URI ,  see App.svelte for why icons never hit the network.
   import tabSystemIcon from './icons/tab_system.png?inline';
+  import TabHeading from './TabHeading.svelte';
   import { onMount } from 'svelte';
   import { app, envTick } from './stores.svelte.js';
 
@@ -20,22 +21,22 @@
   }
 
   // Peak luminance in nits comes from the monitor's EDID/driver via DXGI
-  // (IDXGIOutput6::GetDesc1) — see hdr_toggle.rs. Falls back to '—' when
+  // (IDXGIOutput6::GetDesc1) ,  see hdr_toggle.rs. Falls back to '-' when
   // the panel doesn't report it (some drivers return 0).
   let hdrLuminance = $derived.by(() => {
     const l = app.hdrLuminance;
-    if (!l) return '—';
+    if (!l) return '-';
     const max = fmtNits(l.maxNits);
-    return max ? `${max} nits` : '—';
+    return max ? `${max} nits` : '-';
   });
 
-  // True native resolution (EDID preferred timing) — the same data Windows
+  // True native resolution (EDID preferred timing) ,  the same data Windows
   // uses for its "(Recommended)" label. `nativeSource` says which EDID
   // location supplied it ("CEA-861" for the extension block TVs use,
   // "base EDID" for the base block, or empty when unreadable).
   let nativeResolution = $derived.by(() => {
     const d = app.displayInfo;
-    if (!d.nativeWidth || !d.nativeHeight) return '—';
+    if (!d.nativeWidth || !d.nativeHeight) return '-';
     const source = d.nativeSource === 'CEA-861' ? 'CEA-861 ext.' : d.nativeSource === 'base EDID' ? 'base EDID' : d.nativeSource;
     return `${d.nativeWidth}×${d.nativeHeight}${source ? ` · ${source}` : ''}`;
   });
@@ -75,7 +76,7 @@
         ? `WebGPU canvas (${hdr ? 'rgba16float · display-p3' : 'rgba8unorm · srgb'}; initializes in Black Crush)`
         : 'WebGPU unavailable';
     // The GPU model comes from DXGI (vendor-agnostic, available at startup)
-    // and is preferred over the WebGPU adapter label — WebView2 leaves the
+    // and is preferred over the WebGPU adapter label ,  WebView2 leaves the
     // adapter's device field blank on Windows, which is where the old
     // "nvidia / ? / ampere" came from.
     const gpuModel = (app.displayInfo.gpuModel || '').trim();
@@ -124,20 +125,20 @@
           // Signal path: how the pixels travel from the GPU to the panel.
           // These fields are also exposed in the compact monitor tooltip;
           // keeping them here makes the report canonical and copyable (and
-          // avoids a duplicate "Current" row — Screen Resolution already
+          // avoids a duplicate "Current" row ,  Screen Resolution already
           // includes the active resolution and refresh rate).
-          ['Connector', app.displayInfo.connector || '—'],
-          ['Color Format', `${app.displayInfo.colorFormat || '—'}${app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}`],
-          ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '—'],
-          ['Dynamic Range', app.displayInfo.dynamicRange || '—'],
-          ['VRR', app.displayInfo.vrr || '—'],
-          // HDR output specifics — only shown while HDR is active. Peak
+          ['Connector', app.displayInfo.connector || '-'],
+          ['Color Format', `${app.displayInfo.colorFormat || '-'}${app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}`],
+          ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '-'],
+          ['Dynamic Range', app.displayInfo.dynamicRange || '-'],
+          ['VRR', app.displayInfo.vrr || '-'],
+          // HDR output specifics ,  only shown while HDR is active. Peak
           // luminance is only meaningful then; hide it in SDR.
           ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
           // SDR white level is used as the reference for the Brightness
           // strip's HDR cells. Chromium froze the value at WebView startup,
           // so the strip encodes against that frozen base
-          // (app.sdrWhiteBaseNits), not the live slider — show the base so
+          // (app.sdrWhiteBaseNits), not the live slider ,  show the base so
           // the row matches what the strip renders.
           ...(app.hdrStatus === 'hdr' ? [['SDR White Level', `${Math.round(app.sdrWhiteBaseNits ?? app.sdrWhiteNits)} nits`]] : []),
         ],
@@ -154,7 +155,7 @@
 
   async function copySystemInfo() {
     const lines = sections.flatMap((section) => section.rows).map(([k, v]) => `${k}: ${v}`).join('\n');
-    const text = `OLED Helper — System Info\n${'='.repeat(28)}\n${lines}`;
+    const text = `OLED Helper ,  System Info\n${'='.repeat(28)}\n${lines}`;
     try {
       await navigator.clipboard.writeText(text);
       copied = true;
@@ -168,12 +169,7 @@
 </script>
 
 <div class="tab-body">
-  <div class="tab-heading">
-    <img class="tab-icon" src={tabSystemIcon} alt="" />
-    <h2>System Info</h2>
-    <span class="subtitle">— Browser & display environment</span>
-    <div class="tab-heading-spacer"></div>
-  </div>
+  <TabHeading icon={tabSystemIcon} title="System Info" subtitle="Browser & display environment" />
   <div class="separator"></div>
 
   <div class="diag-section">

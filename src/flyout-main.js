@@ -6,7 +6,7 @@ import { invoke } from '@tauri-apps/api/core'
 
 // Entry point for the tray mode-confirmation flyout window (flyout.html).
 // Deliberately minimal next to main.js: no console/log bridge, no autostart
-// plugin usage, no config loading — this window only ever renders the single
+// plugin usage, no config loading ,  this window only ever renders the single
 // confirm/revert dialog driven by events from Rust (see Flyout.svelte).
 document.title = 'OLED Helper';
 

@@ -1,5 +1,5 @@
 <script>
-  // Inlined data URI — see App.svelte for why icons never hit the network.
+  // Inlined data URI ,  see App.svelte for why icons never hit the network.
   import tabHotkeysIcon from './icons/tab_hotkeys.png?inline';
   import { hotkeys, setHotkey, resetHotkeys } from './stores.svelte.js';
 
@@ -71,7 +71,7 @@
 
   // e.code → key name for punctuation. e.key reports the SHIFTED character
   // when Shift is held (e.g. Shift+/ gives '?'), but the Rust table only holds
-  // the unshifted layout characters — so map from e.code, which is stable.
+  // the unshifted layout characters ,  so map from e.code, which is stable.
   const CODE_PUNCT = {
     Comma: ',',
     Period: '.',

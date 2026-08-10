@@ -1,4 +1,4 @@
-// gamma_ramp.rs — 256-entry 16-bit gamma ramps using a Reinhard-based shadow-recovery curve.
+// gamma_ramp.rs ,  256-entry 16-bit gamma ramps using a Reinhard-based shadow-recovery curve.
 // Pure black (index 0) is always left untouched.
 
 use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC};

@@ -1,6 +1,8 @@
 <script>
   import { gpuLogVersion, gpuLogSnapshot, clearGpuLog, runtimeLogSettings, setVerbosePeriodicLogging, setDimmerVerboseLogging, dimmerDetections, setDimmerDetection, debugSettings, setContextMenuEnabled } from './stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
+  import tabDebugIcon from './icons/tab_debug.png?inline';
+  import TabHeading from './TabHeading.svelte';
 
   let logCopied = $state(false);
   let logCopyFailed = $state(false);
@@ -17,7 +19,7 @@
   }
 
   // Re-derive off the version counter so this stays in sync without deep-watching
-  // the whole log array (which caused a startup hang — see stores.svelte.js).
+  // the whole log array (which caused a startup hang ,  see stores.svelte.js).
   // The store returns a fresh chronological snapshot from its ring buffer.
   let logEntries = $derived.by(() => { void gpuLogVersion.n; return gpuLogSnapshot(); });
 
@@ -62,7 +64,7 @@
 
   async function copyGpuLog() {
     const lines = logEntries.map(e => `[${formatTs(e.ts)}] [${e.level.toUpperCase()}] ${e.message}`).join('\n');
-    const text = `OLED Helper — Runtime Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
+    const text = `OLED Helper ,  Runtime Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
     try {
       await navigator.clipboard.writeText(text);
       logCopied = true;
@@ -76,11 +78,7 @@
 </script>
 
 <div class="tab-body">
-  <div class="tab-heading">
-    <h2>Debug</h2>
-    <span class="subtitle">— Runtime & GPU diagnostics</span>
-    <div class="tab-heading-spacer"></div>
-  </div>
+  <TabHeading icon={tabDebugIcon} title="Debug" subtitle="Runtime & GPU diagnostics" />
   <div class="separator"></div>
 
   <div class="diag-section">

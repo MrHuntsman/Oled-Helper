@@ -1,5 +1,5 @@
 <script>
-  // Vendor-exclusivity tag — a small pill shown next to settings that only
+  // Vendor-exclusivity tag ,  a small pill shown next to settings that only
   // work on one GPU vendor (e.g. "RTX HDR mode" → NVIDIA).
   //
   //   <VendorTag vendor="nvidia" />

@@ -28,13 +28,13 @@
   let sliderHovering = $state(false);
   const MIN_NITS = 80;
   const MAX_NITS = 480;
-  // ITU-R BT.2408 reference white for HDR — the standard diffuse white level
+  // ITU-R BT.2408 reference white for HDR ,  the standard diffuse white level
   // that Chromium uses when tone-mapping HDR screenshots to SDR. At this value
   // screenshots from Chromium browsers render with their intended brightness.
   const DEFAULT_NITS = 203;
   // Tick marks sit on the SAME evenly-spaced grid as the comparison squares
   // below (COMPARISON_NITS), so every tick lands exactly under a square's
-  // center — the slider and the ramp share one aligned scale.
+  // center ,  the slider and the ramp share one aligned scale.
   const TICKS_NITS = COMPARISON_NITS;
   // Drag lands within this many nits of the reference white → snap to it,
   // so the alignment point (203) is easy to hit by feel.
@@ -46,12 +46,12 @@
       const edge = (sign) => `calc((100% - 18px) * ${f} + 9px ${sign} 0.75px)`;
       // The 203 tick uses full white instead of the accent so it stays visible
       // in every thumb position: the accent fill sits to its left (slider
-      // below 203) or covers it entirely (slider above 203 — accent-on-accent
+      // below 203) or covers it entirely (slider above 203 ,  accent-on-accent
       // was invisible). White reads against both the fill and the dark track.
       const color = nits === DEFAULT_NITS ? '#fff' : 'rgba(255,255,255,0.45)';
       return `transparent ${edge('-')}, ${color} ${edge('-')}, ${color} ${edge('+')}, transparent ${edge('+')}`;
     }).join(',\n      ');
-  // Left offset for the "203 nits" caption under the track — matches the
+  // Left offset for the "203 nits" caption under the track ,  matches the
   // thumb/tick coordinate space (thumb travel is [9px, 100% - 9px]).
   const referenceLabelLeft =
     `calc(9px + (100% - 18px) * ${sliderFraction(DEFAULT_NITS).toFixed(4)})`;
@@ -60,7 +60,7 @@
   let hdrAvailable = $derived(app.hdrStatus === 'hdr');
 
   function formatNits(value) {
-    return value == null || !Number.isFinite(Number(value)) ? '—' : `${Math.round(Number(value))} nits`;
+    return value == null || !Number.isFinite(Number(value)) ? '-' : `${Math.round(Number(value))} nits`;
   }
   async function refresh() {
     error = '';
@@ -162,7 +162,7 @@
   // conflict (e.g. an external tool re-enabling Auto HDR) is not hammered
   // into a tight retry loop.
   let hdrConflictResolving = $state(false);
-  // Plain (non-reactive) marker — safe because it is only ever written in the
+  // Plain (non-reactive) marker ,  safe because it is only ever written in the
   // same synchronous block as hdrConflictResolving (a $state write), so the
   // template and this effect always observe the updated value.
   let hdrConflictResolveAt = 0;
@@ -263,7 +263,7 @@
         rtxHdrPendingFlags = value;
         hdrModePending = 'rtx';
         // Prompt UAC immediately instead of waiting for a separate button
-        // click — selecting the dropdown option is the deliberate action
+        // click ,  selecting the dropdown option is the deliberate action
         // that should trigger elevation.
         rtxHdrFlagsBusy = false;
         await relaunchRtxHdrElevated();
@@ -299,7 +299,7 @@
       if (hdrModeError.startsWith('ADMIN_REQUIRED:')) {
         hdrModePending = mode;
         // Prompt UAC immediately instead of waiting for a separate button
-        // click — selecting the mode is the deliberate action that should
+        // click ,  selecting the mode is the deliberate action that should
         // trigger elevation.
         hdrModeBusy = false;
         await relaunchRtxHdrElevated();
@@ -366,7 +366,7 @@
   });
 
   // Both Windows Auto HDR and RTX HDR enabled at once is a state the app
-  // never creates itself (every transition disables the other system) — it
+  // never creates itself (every transition disables the other system) ,  it
   // only arises from external tools (Windows Settings + NVIDIA App/Profile
   // Inspector) and double-converts the frame. Resolve it automatically toward
   // RTX HDR: RTX is already enabled in this state, so the transition only
@@ -403,13 +403,13 @@
     // Windows does NOT broadcast a display-change message when the SDR white
     // level slider moves (it is an in-place compositor update, not a display
     // topology change), so there is no event to listen for. Poll only while
-    // this tab is active — the CCD read runs on every 500 ms tick, but it is
+    // this tab is active ,  the CCD read runs on every 500 ms tick, but it is
     // cheap: the primary-HDR target lookup is cached in Rust (5 s TTL) and
     // only the single DisplayConfigGetDeviceInfo value read runs per tick.
     // Cleared on unmount.
     const poll = setInterval(() => {
       // applyTimer != null means a slider edit is still in its 60ms debounce
-      // window — don't overwrite it with the previous CCD value before the
+      // window ,  don't overwrite it with the previous CCD value before the
       // user's new value has been applied.
       if (sliderDragging || applying || applyTimer !== null) return;
       refresh();
@@ -418,7 +418,7 @@
       // registry read on every tick.
       if (hdrAvailable && (++pollTicks % 4) === 0) refreshAutoHdr();
       // RTX HDR can be changed externally (Profile Inspector, Control Panel).
-      // Poll it every tick (500 ms) while the tab is open — each read is a
+      // Poll it every tick (500 ms) while the tab is open ,  each read is a
       // handful of cheap in-process driver calls with no GPU sync, and the
       // refresh guard below prevents overlapping reads.
       if (hdrAvailable && isNvidiaGpu) refreshRtxHdr();
@@ -619,8 +619,8 @@
       {#if hdrMode === 'conflict' && !hdrModeBusy}
         <p class="gpu-error">
           {hdrConflictResolveAt === 0
-            ? 'Both HDR enhancement modes are enabled — switching to NVIDIA RTX HDR…'
-            : 'Both HDR enhancement modes are enabled. Auto-switching to NVIDIA RTX HDR failed — choose an option to resolve the conflict.'}
+            ? 'Both HDR enhancement modes are enabled ,  switching to NVIDIA RTX HDR…'
+            : 'Both HDR enhancement modes are enabled. Auto-switching to NVIDIA RTX HDR failed ,  choose an option to resolve the conflict.'}
         </p>
       {/if}
       {#if hdrModeError && !hdrModeError.startsWith('ADMIN_REQUIRED:')}

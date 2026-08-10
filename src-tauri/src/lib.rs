@@ -135,7 +135,7 @@ mod display_change_events {
         // re-enumerate promptly.
         vendor_info::invalidate_display_caches();
         // The cached primary-HDR target used by get/set_sdr_white_level is
-        // also derived from the display topology — a change can move it to a
+        // also derived from the display topology ,  a change can move it to a
         // different adapter/target, so invalidate it too.
         hdr_toggle::invalidate_hdr_target_cache();
         // Keep the tray menu's resolution/refresh-rate submenus in sync with
@@ -156,7 +156,7 @@ mod display_change_events {
     }
 }
 
-// Gamma state — synchronous apply + periodic safety restore.
+// Gamma state ,  synchronous apply + periodic safety restore.
 // The frontend calls apply_gamma_ramp on every slider change; the ramp is
 // applied immediately (no polling thread, no IPC round-trip delay). A
 // lightweight safety thread re-applies every 5 seconds so another app
@@ -216,7 +216,7 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
             continue;
         }
         let value = desired.load(Ordering::Relaxed);
-        // When black lift is zero the system ramp is linear (OS default) —
+        // When black lift is zero the system ramp is linear (OS default) , 
         // nothing to restore. Skip both the reference-mode check and the GDI
         // call to keep the thread truly idle while black crush is disabled.
         if value == 0 {
@@ -232,7 +232,7 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
     }
 }
 
-// Applies the gamma ramp synchronously — the display update happens on the
+// Applies the gamma ramp synchronously ,  the display update happens on the
 // caller's thread (the Tauri command thread) and returns immediately. No
 // background polling, no IPC delay. A separate safety thread re-applies at
 // 5-second intervals to recover from external gamma resets.
@@ -242,7 +242,7 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
 // and dimmer initialization) are emitted as events with no listener and
 // dropped. This extra Dispatch target captures those early records into a
 // bounded ring buffer, and the frontend drains them via take_log_history
-// right after it attaches the listener — so the terminal, file, Debug tab,
+// right after it attaches the listener ,  so the terminal, file, Debug tab,
 // and DevTools stay 1:1 even for startup records.
 mod log_history {
     use serde::Serialize;
@@ -417,10 +417,10 @@ async fn apply_dwm_patch(profile: String) -> Result<dwm_eotf::DwmEotfScanResult,
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_err()
     {
-        return Err("A DWM patch is already in progress — wait for it to finish before applying again.".into());
+        return Err("A DWM patch is already in progress ,  wait for it to finish before applying again.".into());
     }
     // The restart+patch flow changes the DWM PID, so record the fresh
-    // instance as "already applied" — otherwise the auto-reapply watcher
+    // instance as "already applied" ,  otherwise the auto-reapply watcher
     // would see a PID change right after this manual apply and immediately
     // run another restart+patch cycle.
     let result = tauri::async_runtime::spawn_blocking(move || dwm_eotf::apply_dwm_patch_v2(&profile))
@@ -444,7 +444,7 @@ fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
 
 // Async (not sync) commands: the apply now persists the mode to the registry
 // in the same ChangeDisplaySettingsExW call (CDS_UPDATEREGISTRY, ~245ms on
-// some driver stacks — the same cost the confirm used to carry). A sync
+// some driver stacks ,  the same cost the confirm used to carry). A sync
 // command would block the Tauri main thread for that duration while the mode
 // switch is happening. The async runtime keeps the main thread responsive.
 // The tray path already runs set_resolution/set_refresh_rate on its own
@@ -467,7 +467,7 @@ async fn set_resolution(
 // mode, which writes the user profile registry and can take hundreds of ms on
 // some driver stacks. A sync command runs on the Tauri main thread and would
 // freeze the whole app (tray, dimmer z-order repairs, WebView) for that
-// duration — the "hitch" seen after clicking Keep. Moving them onto the async
+// duration ,  the "hitch" seen after clicking Keep. Moving them onto the async
 // runtime keeps the main thread responsive.
 #[tauri::command]
 async fn confirm_display_mode_change() -> Result<(), String> {
@@ -606,7 +606,7 @@ fn parse_mode_id(value: &str) -> Option<(u32, u32)> {
 
 // Applies a mode picked from the tray menu. Always shows the small
 // always-on-top "flyout" WebviewWindow for this confirmation, never the
-// in-app modal — regardless of whether the main window happens to be open,
+// in-app modal ,  regardless of whether the main window happens to be open,
 // so a tray-driven change always surfaces its confirmation at the tray
 // rather than possibly popping the in-app dialog behind/inside a window the
 // user wasn't necessarily looking at. The in-app dropdowns (App.svelte's
@@ -699,7 +699,7 @@ fn dwm_eotf_watch_loop(app: AppHandle) {
         if last == pid {
             continue;
         }
-        // A fresh DWM instance — try once, then record the outcome so a
+        // A fresh DWM instance ,  try once, then record the outcome so a
         // persistent failure isn't retried every tick.
         let now = now_ms();
         if now.saturating_sub(LAST_AUTO_APPLY_MS.load(Ordering::Relaxed)) < 10_000 {
@@ -715,7 +715,7 @@ fn dwm_eotf_watch_loop(app: AppHandle) {
         let applied_pid = if result.dwm_pid != 0 { result.dwm_pid } else { pid };
         LAST_APPLIED_DWM_PID.store(applied_pid, Ordering::Relaxed);
         log::info!(
-            "[dwm-eotf] auto re-apply finished: {} — {} (new PID {})",
+            "[dwm-eotf] auto re-apply finished: {} ,  {} (new PID {})",
             result.status,
             result.message,
             applied_pid
@@ -759,9 +759,9 @@ static STARTUP_TAB: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::Once
 // it so a later frontend reload does not re-apply a stale tab.
 #[tauri::command]
 fn take_startup_tab() -> Option<String> {
-    let mut guard = match STARTUP_TAB.get() {
-        Some(lock) => lock.lock().ok()?,
-        None => return None,
+    let mut guard = {
+        let lock = STARTUP_TAB.get()?;
+        lock.lock().ok()?
     };
     guard.take()
 }
@@ -877,7 +877,7 @@ fn request_restart(app: &AppHandle) {
 // RTX HDR lives in the NVIDIA global driver profile, which the driver only
 // lets elevated processes write (SetSetting returns NVAPI_INVALID_USER_
 // PRIVILEGE otherwise). Reads work non-elevated, so the UI can show the
-// current mode — applying a change needs a one-time elevated restart.
+// current mode ,  applying a change needs a one-time elevated restart.
 // Relaunch via ShellExecuteW with the "runas" verb (UAC prompt), reusing the
 // --restart-parent handoff so the new instance waits for this process to
 // release WebView2's user-data folder. An optional pending RTX HDR mode is
@@ -945,18 +945,18 @@ fn relaunch_elevated(
     };
     // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
     // are failures. The one exception is ERROR_CANCELLED (1223): dismissing
-    // the UAC prompt also yields > 32, so it must be checked explicitly —
+    // the UAC prompt also yields > 32, so it must be checked explicitly , 
     // otherwise cancelling the elevation would look like success and kill
     // this instance. Keep the app fully functional whenever the launch did
     // not actually happen.
     let code = result.0 as isize;
     if code <= 32 || code == 1223 {
         // Translate the handful of codes users can actually hit into plain
-        // language instead of surfacing the raw Win32/ShellExecuteW value —
+        // language instead of surfacing the raw Win32/ShellExecuteW value , 
         // "ShellExecuteW returned 5" means nothing to someone who just wanted
         // to change an HDR setting.
         let message = match code {
-            1223 => "Elevation cancelled — no changes made.".to_string(),
+            1223 => "Elevation cancelled ,  no changes made.".to_string(),
             5 => "Administrator access denied. Choose \"Yes\" on the prompt to apply.".to_string(),
             2 | 3 => "App not found to restart. Try reinstalling.".to_string(),
             8 => "Out of memory during restart. Close some programs and retry.".to_string(),
@@ -1070,7 +1070,7 @@ pub fn run() {
 
     // An elevated relaunch (RTX HDR write) can carry the mode the user tried
     // to apply before the restart. Apply it once, shortly after startup, on a
-    // background thread — this instance is elevated, so the DRS write that
+    // background thread ,  this instance is elevated, so the DRS write that
     // failed before now succeeds.
     let pending_rtx_hdr_flags: Option<u32> = std::env::args()
         .find_map(|arg| {
@@ -1258,7 +1258,7 @@ pub fn run() {
                     .map_err(|error| format!("could not start DWM EOTF watch thread: {error}"))?;
             }
 
-            // Always-on rotating file log (not just debug builds) — GPU-init
+            // Always-on rotating file log (not just debug builds) ,  GPU-init
             // hangs/crashes can happen in release builds too, and without a
             // persistent log the only evidence is whatever DevTools happened
             // to be open and scrolled to at the time. See log_frontend above
@@ -1295,7 +1295,7 @@ pub fn run() {
             // same Svelte modal markup as the in-app confirmation. Pre-warmed
             // here (rather than lazily on first show()) so its WebView2
             // controller exists well before any display-mode change can race
-            // its creation — see flyout_window::prewarm for why.
+            // its creation ,  see flyout_window::prewarm for why.
             flyout_window::prewarm(app.handle());
             log::info!("[tray] mode flyout window ready");
 
@@ -1319,7 +1319,7 @@ pub fn run() {
                         "show" => show_main_window(app),
                         "restart" => request_restart(app),
                         "quit" => request_shutdown_and_exit(app),
-                        // "res-3840x2160" — apply keeping the current refresh
+                        // "res-3840x2160" ,  apply keeping the current refresh
                         // rate as the preferred one, mirroring the in-app
                         // dropdown's behavior. The mode switch can blank the
                         // screen for hundreds of ms, so it runs on a background
@@ -1334,7 +1334,7 @@ pub fn run() {
                                     );
                                 if already_active {
                                     // Clicking the active mode toggled its check
-                                    // mark — restore it without a mode change.
+                                    // mark ,  restore it without a mode change.
                                     rebuild_tray_menu(app);
                                     return;
                                 }
@@ -1368,7 +1368,7 @@ pub fn run() {
                                     rebuild_tray_menu(app);
                                     return;
                                 }
-                                // See the res- branch — never open the full
+                                // See the res- branch ,  never open the full
                                 // window from a tray mode change.
                                 let app_handle = app.clone();
                                 std::thread::spawn(move || {
@@ -1444,7 +1444,7 @@ pub fn run() {
             }
 
             // Tauri's runtime window icon (titlebar/taskbar while running) is blurry
-            // on Windows — it sets HICON from raw RGBA instead of reading per-size
+            // on Windows ,  it sets HICON from raw RGBA instead of reading per-size
             // frames from icon.ico like Explorer does. Fix it manually.
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {

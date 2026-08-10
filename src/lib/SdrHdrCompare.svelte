@@ -2,20 +2,20 @@
   // SDR-vs-HDR nits-matched comparison ramp (Windows HDR tab).
   //
   // Two rows of gray patches on a small WebGPU canvas:
-  //   • TOP row (SDR)     — the same nits levels shown the way SDR content
+  //   • TOP row (SDR)     ,  the same nits levels shown the way SDR content
   //     renders at the CURRENT SDR white level. Content is scaled by the
   //     white level relative to the BT.2408 reference (203 nits), and SDR
   //     content can't get brighter than its white point, so columns above it
   //     flatten to pure white. The whole row brightens/darkens as the slider
-  //     moves — exactly how Windows' SDR-vs-HDR comparison behaves.
-  //   • BOTTOM row (HDR)  — the exact same nits levels as true HDR
+  //     moves ,  exactly how Windows' SDR-vs-HDR comparison behaves.
+  //   • BOTTOM row (HDR)  ,  the exact same nits levels as true HDR
   //     luminance, fixed and unaffected by the slider.
   // At sdrWhiteNits === HDR_REFERENCE_NITS (203) both rows render the same
   // values (the "aligned" state); above that the SDR row is visibly brighter
   // than the HDR reference, below it visibly dimmer.
   //
   // Both rows are encoded against the browser's FROZEN SDR white base
-  // (app.sdrWhiteBaseNits) — Chromium/WebView2 scales the HDR canvas by that
+  // (app.sdrWhiteBaseNits) ,  Chromium/WebView2 scales the HDR canvas by that
   // startup value, so dividing by the same value makes every patch land at its
   // true nits regardless of the startup slider, matching the Brightness
   // strip's compensation in TabCrush (see patchValue).
@@ -42,7 +42,7 @@
 
   // Column ramp: 8 EQUAL-WIDTH squares on an evenly-spaced (arithmetic)
   // grid. Because the values are evenly spaced, each square can be centered
-  // EXACTLY on its value's slider position — every square is the same width,
+  // EXACTLY on its value's slider position ,  every square is the same width,
   // its number sits dead-center under it, and that same number aligns with
   // the slider tick. 203 (the BT.2408 reference) is the middle anchor; 80/480
   // are deliberately excluded since an edge square can't be centered without
@@ -55,12 +55,12 @@
   // Linear position (0..1) of a nits value on the shared slider/canvas scale.
   const nitsFrac = (nits) => (nits - MIN_NITS) / (MAX_NITS - MIN_NITS);
   // Vertical hairline gap between the two rows (fraction of height). The
-  // squares themselves are edge-to-edge — no horizontal gap.
+  // squares themselves are edge-to-edge ,  no horizontal gap.
   const VGAP = 0.006;
   // Square centers sit exactly on their values' slider positions; the uniform
   // value step makes the widths identical. The FIRST and LAST squares are
   // extended to the canvas edges so the strip fills the full width, flush with
-  // the slider's 80/480 extremes — without this the strip would end ~3px
+  // the slider's 80/480 extremes ,  without this the strip would end ~3px
   // short of the right edge (its value range covers 78–478 nits, not 480).
   const COLUMN_CENTERS = COLUMN_NITS.map((nits) => nitsFrac(nits));
   const COLUMN_WIDTH = COLUMN_CENTERS[1] - COLUMN_CENTERS[0];
@@ -82,7 +82,7 @@
   }
 
   // Match the calibration strip's canvas path exactly: browser-default tone
-  // mapping (no toneMapping dictionary — the extended-tone-mapping experiment
+  // mapping (no toneMapping dictionary ,  the extended-tone-mapping experiment
   // flattened the Crush strip's calibrated values). The rgba16float HDR
   // canvas preserves values above 1.0 on its own, so the 300/400/480-nit
   // patches stay distinct without it.
@@ -106,7 +106,7 @@
   // rows are then encoded against the browser's FROZEN SDR white base
   // (app.sdrWhiteBaseNits) instead of the fixed 203: Chromium/WebView2 scales
   // the HDR canvas by that frozen value, so dividing by the same value makes
-  // each patch land at its true nits no matter what the startup slider was —
+  // each patch land at its true nits no matter what the startup slider was , 
   // the same compensation as the Brightness strip. At live white = 203 the
   // two rows encode the same values (the aligned state).
   function patchValue(nits, row) {
@@ -216,7 +216,7 @@
       });
       currentFormat = format;
       // Entering HDR means the browser just created a fresh HDR surface and
-      // re-read its frozen SDR white level — re-capture the shared base so the
+      // re-read its frozen SDR white level ,  re-capture the shared base so the
       // comparison re-bases too (same hook as the Crush canvas).
       if (format === 'rgba16float') refreshSdrWhiteLevel(true);
     } catch (e) {
@@ -234,7 +234,7 @@
       if (w !== canvas.width || h !== canvas.height) { canvas.width = w; canvas.height = h; }
 
       // The HDR reference row (row 1) is computed from the frozen base, not
-      // the live slider — it stays fixed while the SDR row reacts to it.
+      // the live slider ,  it stays fixed while the SDR row reacts to it.
       const data = new Float32Array(196);
       for (let col = 0; col < COLS; col++) {
         for (let row = 0; row < ROWS; row++) {

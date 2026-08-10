@@ -1,6 +1,6 @@
-// hdr_toggle.rs — toggles real Windows "HDR" (Settings > System > Display >
+// hdr_toggle.rs ,  toggles real Windows "HDR" (Settings > System > Display >
 // HDR) via the CCD (DisplayConfig) API, the same mechanism used by
-// AutoActions/HDRTray. This is NOT the in-app calibration mode — it flips
+// AutoActions/HDRTray. This is NOT the in-app calibration mode ,  it flips
 // the actual Windows Advanced Color state on the display, which is what was
 // asked for instead of a synthetic Win+Alt+B keypress (unreliable: needs
 // focus, can be remapped, silently no-ops on some setups).
@@ -16,14 +16,14 @@
 //
 // NOTE ON BITFIELDS: the windows-rs bindgen for
 // DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_0_0 / DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE_0_0
-// does NOT generate named accessor methods for this crate version — both are
+// does NOT generate named accessor methods for this crate version ,  both are
 // just a raw `_bitfield: u32` (confirmed against the docs.rs page for this
 // exact type). So bits are read/written manually via the union's `value: u32`
 // field. Bit layout per wingdi.h and cross-checked against other open-source
 // callers (e.g. Kodi's xbmc PR #26140):
-//   GET struct — bit 0: advancedColorSupported, bit 1: advancedColorEnabled,
+//   GET struct ,  bit 0: advancedColorSupported, bit 1: advancedColorEnabled,
 //                bit 2: wideColorEnforced, bit 3: advancedColorForceDisabled
-//   SET struct — bit 0: enableAdvancedColor
+//   SET struct ,  bit 0: enableAdvancedColor
 
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
@@ -153,7 +153,7 @@ fn set_advanced_color_state(path: &DISPLAYCONFIG_PATH_INFO, enable: bool) -> Res
             },
             ..Default::default()
         };
-        // bit 0 = enableAdvancedColor — see module-level NOTE ON BITFIELDS.
+        // bit 0 = enableAdvancedColor ,  see module-level NOTE ON BITFIELDS.
         state.Anonymous.value = if enable { 0x1 } else { 0x0 };
         let result = DisplayConfigSetDeviceInfo(&state.header);
         if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
@@ -297,7 +297,7 @@ fn primary_hdr_path() -> Result<Option<DISPLAYCONFIG_PATH_INFO>, String> {
 // GET/SET calls address, and it only changes when the display topology or HDR
 // state changes. Resolving it via primary_hdr_path() re-walks the whole
 // display configuration (GetDisplayConfigBufferSizes + QueryDisplayConfig +
-// device enumeration + per-path DisplayConfigGetDeviceInfo) — real driver
+// device enumeration + per-path DisplayConfigGetDeviceInfo) ,  real driver
 // work that the Windows HDR tab's 500ms poll was paying on EVERY tick even
 // though the target never moved. Cache the resolved target and only re-walk
 // when it goes stale or the display topology changes.
@@ -305,7 +305,7 @@ struct CachedHdrTarget {
     captured_at: Instant,
     // None = HDR is off / no HDR-capable primary target. The timestamp is
     // cached even for the negative result so an HDR-off session doesn't
-    // re-walk the topology on every 500ms poll — the frontend's refresh()
+    // re-walk the topology on every 500ms poll ,  the frontend's refresh()
     // calls get_sdr_white_level unconditionally while the tab is open.
     target: Option<(LUID, u32)>,
 }
@@ -392,7 +392,7 @@ struct DISPLAYCONFIG_SET_SDR_WHITE_LEVEL_INTERNAL {
 }
 
 /// Sets the SDR white level through the proper CCD (Connecting and Configuring
-/// Display) API — the same mechanism Windows Settings uses. This updates the
+/// Display) API ,  the same mechanism Windows Settings uses. This updates the
 /// full display pipeline including hardware video planes (MPO/overlays),
 /// unlike DwmpSDRToHDRBoost which only updates DWM's composition surface.
 ///
@@ -436,7 +436,7 @@ pub fn get_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
 }
 
 /// Sets the SDR white level through the CCD (Connecting and Configuring
-/// Display) API — the same mechanism Windows Settings uses. This commits
+/// Display) API ,  the same mechanism Windows Settings uses. This commits
 /// through the proper display config pipeline, so DWM AND hardware video
 /// planes (MPO/overlays) both pick up the new SDR white level.
 /// Capped at 480 nits, matching Windows Settings' own range.
@@ -468,13 +468,13 @@ pub struct HdrLuminance {
 //
 // NOTE: the CCD/DisplayConfig API used by the HDR toggle above does NOT
 // expose nit values (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 in wingdi.h has
-// no luminance fields) — DXGI_OUTPUT_DESC1 is the correct source.
+// no luminance fields) ,  DXGI_OUTPUT_DESC1 is the correct source.
 // ── Output info (connector + color format/depth) ─────────────────────────
 // The status-bar tooltip on the monitor chip shows how the primary display
 // is physically connected and what color pipeline it is running. Both come
 // from the same CCD path walk used for the HDR toggle above:
-//   • connector   — DISPLAYCONFIG_TARGET_DEVICE_NAME.outputTechnology
-//   • color       — DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO.colorEncoding +
+//   • connector   ,  DISPLAYCONFIG_TARGET_DEVICE_NAME.outputTechnology
+//   • color       ,  DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO.colorEncoding +
 //                   bitsPerColorChannel (total RGB bits → per channel / 3)
 // Output dynamic range (Full/Limited) and VRR/G-Sync state are NOT exposed
 // by any public Win32 API (driver-internal), so they are intentionally
@@ -483,20 +483,20 @@ pub struct HdrLuminance {
 pub struct DisplayOutputInfo {
     // Full GPU model name of the adapter driving the primary display (DXGI
     // adapter description, e.g. "NVIDIA GeForce RTX 3080"). Vendor-agnostic
-    // and available without a driver SDK — see vendor_info.rs.
+    // and available without a driver SDK ,  see vendor_info.rs.
     pub gpu_model: String,
     pub connector: String,
     pub color_format: String,
     pub bits_per_channel: u32,
     // Desktop color depth as Windows' classic Display Properties reports it:
-    // GetDeviceCaps(BITSPIXEL) on the screen DC — 32 on virtually every
+    // GetDeviceCaps(BITSPIXEL) on the screen DC ,  32 on virtually every
     // modern setup (True Color), regardless of the panel's signal bit depth.
     pub desktop_bits: u32,
-    // Output dynamic range — driver-internal setting (NVIDIA/AMD control
+    // Output dynamic range ,  driver-internal setting (NVIDIA/AMD control
     // panel). Queried via vendor DLLs (NVAPI/ADL/IGCL). Empty string when
     // the vendor DLL couldn't be loaded or the query failed.
     pub dynamic_range: String,
-    // Variable refresh rate status — G-Sync/FreeSync/Adaptive-Sync.
+    // Variable refresh rate status ,  G-Sync/FreeSync/Adaptive-Sync.
     // Queried via vendor DLLs. Empty string on failure.
     pub vrr: String,
     // NVIDIA-only driver control state. False for non-NVIDIA GPUs and when
@@ -572,7 +572,7 @@ fn target_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_TA
     }
 }
 
-// Desktop color depth via the screen DC — matches the classic Windows
+// Desktop color depth via the screen DC ,  matches the classic Windows
 // Display Properties "32-bit" entry. Fallback 0 when the DC can't be made.
 fn query_desktop_bits() -> u32 {
     use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, BITSPIXEL};
@@ -614,7 +614,7 @@ pub fn query_display_output_info(primary_monitor_name: &str) -> Option<DisplayOu
     if let Some(aci) = get_advanced_color_info(path) {
         info.color_format = color_encoding_label(aci.colorEncoding).to_string();
         // bitsPerColorChannel is already bits-per-channel (10 for a 10-bit
-        // panel) on Windows 11 24H2+ — report it as-is. (The older
+        // panel) on Windows 11 24H2+ ,  report it as-is. (The older
         // DISPLAYCONFIG_COLOR_DEPTH values 24/30/36/48 were total RGB bits,
         // but the field in DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO is per
         // channel, confirmed against a 10-bit panel returning 10.)
@@ -692,7 +692,7 @@ pub fn get_hdr_luminance() -> Option<HdrLuminance> {
 // overrides live in the same key as per-exe values and are left untouched.
 //
 // Caveat: the flag is read when an app starts, so the change only affects
-// games launched afterwards — running games need a restart. It also only has
+// games launched afterwards ,  running games need a restart. It also only has
 // an effect while Windows HDR is enabled on the display.
 const AUTO_HDR_PREFS_SUBKEY: &str = r"Software\Microsoft\DirectX\UserGpuPreferences";
 const AUTO_HDR_SETTINGS_VALUE: &str = "DirectXUserGlobalSettings";
@@ -703,7 +703,7 @@ fn wide(value: &str) -> Vec<u16> {
 }
 
 // Reads the DirectXUserGlobalSettings string. Ok(None) when the key or value
-// does not exist yet (fresh user profile) — callers treat that as "all flags
+// does not exist yet (fresh user profile) ,  callers treat that as "all flags
 // off". A genuine registry failure is an Err so a write is never based on a
 // silently-failed read (which would clobber the user's other flags).
 fn read_directx_global_settings() -> Result<Option<String>, String> {
@@ -749,7 +749,7 @@ fn read_directx_global_settings() -> Result<Option<String>, String> {
 
         // required is the byte count (UTF-16, null-terminated); the buffer is
         // sized in u16 units so a trailing partial unit stays in bounds.
-        let mut buf = vec![0u16; (required as usize + 1) / 2];
+        let mut buf = vec![0u16; (required as usize).div_ceil(2)];
         let mut read = required;
         let query = RegQueryValueExW(
             key,
