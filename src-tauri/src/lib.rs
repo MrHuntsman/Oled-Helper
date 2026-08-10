@@ -951,11 +951,20 @@ fn relaunch_elevated(
     // not actually happen.
     let code = result.0 as isize;
     if code <= 32 || code == 1223 {
-        return Err(if code == 1223 {
-            "Elevation was cancelled — no changes were made.".to_string()
-        } else {
-            format!("could not start elevated instance (ShellExecuteW returned {code})")
-        });
+        // Translate the handful of codes users can actually hit into plain
+        // language instead of surfacing the raw Win32/ShellExecuteW value —
+        // "ShellExecuteW returned 5" means nothing to someone who just wanted
+        // to change an HDR setting.
+        let message = match code {
+            1223 => "Elevation cancelled — no changes made.".to_string(),
+            5 => "Administrator access denied. Choose \"Yes\" on the prompt to apply.".to_string(),
+            2 | 3 => "App not found to restart. Try reinstalling.".to_string(),
+            8 => "Out of memory during restart. Close some programs and retry.".to_string(),
+            26 => "A required file is in use. Close other app instances and retry.".to_string(),
+            31 => "No program is associated with the restart. Try reinstalling.".to_string(),
+            _ => format!("Restart with administrator access failed (error {code}). Restart manually as Administrator."),
+        };
+        return Err(message);
     }
 
     taskbar_dimmer::shutdown();

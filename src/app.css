@@ -615,6 +615,7 @@ button {
   transition: background 0.08s;
 }
 .tab-heading-toggle:hover { background: var(--hover); }
+.tab-heading-toggle.no-hover:hover { background: none; }
 .tab-heading-toggle.disabled { cursor: default; opacity: 0.6; pointer-events: none; }
 .tab-heading-titles {
   display: flex;
@@ -3080,6 +3081,10 @@ button {
   gap: 6px;
   margin-top: 0;
 }
+.rtx-hdr-trigger-wrap {
+  position: relative;
+  display: inline-flex;
+}
 .rtx-hdr-inline-select .admin-badge {
   flex: 0 0 auto;
 }
@@ -3150,6 +3155,30 @@ button {
   line-height: 1.3;
 }
 .hdr-mode-option.active .hdr-mode-option-desc { color: color-mix(in srgb, #fff 68%, var(--accent)); }
+
+/* Transient "Applied" confirmation shown after an HDR mode change or RTX
+   HDR debanding option is successfully applied. Fades in, holds, then the
+   component clears it after a short delay (no exit animation needed since
+   it simply unmounts). */
+.hdr-applied-msg {
+  margin-top: 6px;
+  color: #6fd26f;
+  font-size: 11px;
+  font-weight: 600;
+  animation: hdr-applied-msg-in 0.15s ease;
+}
+@keyframes hdr-applied-msg-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: none; }
+}
+.rtx-hdr-applied-msg {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 5px);
+  margin-top: 0;
+  white-space: nowrap;
+  pointer-events: none;
+}
 
 @media (max-width: 620px) {
   .hdr-mode-switch { grid-template-columns: 1fr; }

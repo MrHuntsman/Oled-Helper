@@ -133,12 +133,17 @@
   let hdrModePending = $state(null);
   let autoHdrRefreshing = false;
   let pollTicks = 0;
+  // Transient "Applied" confirmations shown after a successful mode/option
+  // change. Cleared automatically after a short delay.
+  let hdrModeApplied = $state(false);
+  let rtxHdrFlagsApplied = $state(false);
+  let hdrModeAppliedTimer = null;
+  let rtxHdrFlagsAppliedTimer = null;
 
   const RTX_HDR_OPTIONS = [
-    { value: 0x00, label: 'Off' },
-    { value: 0x06, label: 'No Debanding (Performance)' },
-    { value: 0x0A, label: 'Medium Debanding' },
-    { value: 0x02, label: 'Very High Debanding' },
+    { value: 0x06, label: 'No Deband (Performance)' },
+    { value: 0x0A, label: 'Medium Deband' },
+    { value: 0x02, label: 'High Deband' },
   ];
   let rtxHdrEnabled = $state(null);
   let rtxHdrFlags = $state(null);
@@ -152,6 +157,15 @@
   let rtxHdrMenuEl = $state(null);
   let rtxHdrPositionController = null;
   let rtxHdrRelaunching = $state(false);
+  // Auto-resolution guard for the "both modes enabled" conflict: one attempt
+  // per conflict with a cooldown after a failed attempt, so a persistent
+  // conflict (e.g. an external tool re-enabling Auto HDR) is not hammered
+  // into a tight retry loop.
+  let hdrConflictResolving = $state(false);
+  // Plain (non-reactive) marker — safe because it is only ever written in the
+  // same synchronous block as hdrConflictResolving (a $state write), so the
+  // template and this effect always observe the updated value.
+  let hdrConflictResolveAt = 0;
   const isNvidiaGpu = $derived(app.displayInfo.vendor === 'nvidia');
   const rtxHdrLabel = $derived(
     RTX_HDR_OPTIONS.find((option) => option.value === rtxHdrFlags)?.label ?? 'Unknown'
@@ -198,10 +212,6 @@
       : isNvidiaGpu && rtxHdrEnabled ? 'rtx'
       : 'off'
   );
-  const hdrModeNeedsAdmin = $derived(
-    hdrModeError.startsWith('ADMIN_REQUIRED:')
-      || rtxHdrError.startsWith('ADMIN_REQUIRED:')
-  );
   const hdrModeOptions = $derived(isNvidiaGpu
     ? [
         { value: 'off', label: 'Off', description: 'Disable all auto HDR modes.' },
@@ -243,12 +253,21 @@
       await invoke('set_rtx_hdr_state', { flags: value });
       rtxHdrPendingFlags = null;
       await refreshRtxHdr();
+      rtxHdrFlagsApplied = true;
+      clearTimeout(rtxHdrFlagsAppliedTimer);
+      rtxHdrFlagsAppliedTimer = setTimeout(() => { rtxHdrFlagsApplied = false; }, 2000);
     } catch (e) {
       rtxHdrError = String(e);
       rtxHdrFlags = previous;
       if (rtxHdrError.startsWith('ADMIN_REQUIRED:')) {
         rtxHdrPendingFlags = value;
         hdrModePending = 'rtx';
+        // Prompt UAC immediately instead of waiting for a separate button
+        // click — selecting the dropdown option is the deliberate action
+        // that should trigger elevation.
+        rtxHdrFlagsBusy = false;
+        await relaunchRtxHdrElevated();
+        return;
       }
       await refreshRtxHdr();
     } finally {
@@ -272,9 +291,20 @@
       await invoke('set_hdr_enhancement_mode', { mode });
       await refreshAutoHdr();
       await refreshRtxHdr();
+      hdrModeApplied = true;
+      clearTimeout(hdrModeAppliedTimer);
+      hdrModeAppliedTimer = setTimeout(() => { hdrModeApplied = false; }, 2000);
     } catch (e) {
       hdrModeError = String(e);
-      if (hdrModeError.startsWith('ADMIN_REQUIRED:')) hdrModePending = mode;
+      if (hdrModeError.startsWith('ADMIN_REQUIRED:')) {
+        hdrModePending = mode;
+        // Prompt UAC immediately instead of waiting for a separate button
+        // click — selecting the mode is the deliberate action that should
+        // trigger elevation.
+        hdrModeBusy = false;
+        await relaunchRtxHdrElevated();
+        return;
+      }
       await refreshAutoHdr();
       await refreshRtxHdr();
     } finally {
@@ -335,6 +365,27 @@
     if (isNvidiaGpu) refreshRtxHdr();
   });
 
+  // Both Windows Auto HDR and RTX HDR enabled at once is a state the app
+  // never creates itself (every transition disables the other system) — it
+  // only arises from external tools (Windows Settings + NVIDIA App/Profile
+  // Inspector) and double-converts the frame. Resolve it automatically toward
+  // RTX HDR: RTX is already enabled in this state, so the transition only
+  // writes the Auto HDR registry flag and needs no elevation.
+  $effect(() => {
+    if (hdrMode !== 'conflict') {
+      hdrConflictResolveAt = 0;
+      return;
+    }
+    if (!hdrAvailable) return;
+    if (hdrConflictResolving) return;
+    if (Date.now() - hdrConflictResolveAt < 10_000) return;
+    hdrConflictResolving = true;
+    selectHdrMode('rtx').finally(() => {
+      hdrConflictResolving = false;
+      hdrConflictResolveAt = Date.now();
+    });
+  });
+
   $effect(() => {
     if (!sliderDragging) return;
     function onUp() { sliderDragging = false; }
@@ -384,6 +435,8 @@
     window.addEventListener('focus', onFocus);
     return () => {
       clearTimeout(applyTimer);
+      clearTimeout(hdrModeAppliedTimer);
+      clearTimeout(rtxHdrFlagsAppliedTimer);
       clearInterval(poll);
       window.removeEventListener('focus', onFocus);
     };
@@ -410,7 +463,7 @@
 
 <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
-    <div class="tab-heading-toggle">
+    <div class="tab-heading-toggle no-hover">
       <img class="tab-icon" src={tabHdrIcon} alt="" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
@@ -521,16 +574,21 @@
             {#if option.value === 'rtx' && hdrMode === 'rtx' && rtxHdrFlags !== null}
               <span class="rtx-hdr-inline-select" bind:this={rtxHdrWrapEl}>
                 <ShieldBadge text="Admin required." />
-                <button
-                  type="button"
-                  class="rtx-hdr-trigger"
-                  aria-haspopup="listbox"
-                  aria-expanded={rtxHdrMenuOpen}
-                  disabled={rtxHdrFlagsBusy || hdrModeBusy}
-                  onclick={toggleRtxHdrMenu}>
-                  <span>{rtxHdrLabel}</span>
-                  <span class="rtx-hdr-caret" aria-hidden="true"></span>
-                </button>
+                <span class="rtx-hdr-trigger-wrap">
+                  {#if rtxHdrFlagsApplied && !rtxHdrFlagsBusy}
+                    <span class="hdr-applied-msg rtx-hdr-applied-msg">Applied</span>
+                  {/if}
+                  <button
+                    type="button"
+                    class="rtx-hdr-trigger"
+                    aria-haspopup="listbox"
+                    aria-expanded={rtxHdrMenuOpen}
+                    disabled={rtxHdrFlagsBusy || hdrModeBusy}
+                    onclick={toggleRtxHdrMenu}>
+                    <span>{rtxHdrLabel}</span>
+                    <span class="rtx-hdr-caret" aria-hidden="true"></span>
+                  </button>
+                </span>
                 {#if rtxHdrMenuOpen}
                   <div
                     class="hz-menu rtx-hdr-menu dropdown-menu-position-{rtxHdrMenuPlacement}"
@@ -555,25 +613,21 @@
           </div>
         {/each}
       </div>
-      {#if hdrMode === 'conflict' && !hdrModeBusy}
-        <p class="gpu-error">Both HDR enhancement modes are enabled outside OLED Helper. Choose one option to resolve the conflict.</p>
+      {#if hdrModeApplied && !hdrModeBusy && hdrMode !== 'conflict'}
+        <p class="hdr-applied-msg">Applied</p>
       {/if}
-      {#if hdrModeNeedsAdmin}
-        <div class="gpu-error-block">
-          <p class="gpu-error">RTX HDR changes need administrator rights. Restart OLED Helper as Administrator to apply the selected mode.</p>
-          <button
-            type="button"
-            class="restore-defaults-btn"
-            onclick={relaunchRtxHdrElevated}
-            disabled={rtxHdrRelaunching}>
-            {rtxHdrRelaunching ? 'Restarting…' : 'Restart as Administrator'}
-          </button>
-        </div>
-      {:else if hdrModeError}
+      {#if hdrMode === 'conflict' && !hdrModeBusy}
+        <p class="gpu-error">
+          {hdrConflictResolveAt === 0
+            ? 'Both HDR enhancement modes are enabled — switching to NVIDIA RTX HDR…'
+            : 'Both HDR enhancement modes are enabled. Auto-switching to NVIDIA RTX HDR failed — choose an option to resolve the conflict.'}
+        </p>
+      {/if}
+      {#if hdrModeError && !hdrModeError.startsWith('ADMIN_REQUIRED:')}
         <p class="gpu-error">{hdrModeError}</p>
       {:else if autoHdrError}
         <p class="gpu-error">{autoHdrError}</p>
-      {:else if rtxHdrError}
+      {:else if rtxHdrError && !rtxHdrError.startsWith('ADMIN_REQUIRED:')}
         <p class="gpu-error">{rtxHdrError}</p>
       {/if}
     </div>

@@ -1632,7 +1632,7 @@ fn query_nvapi() -> VendorDisplayInfo {
 // from its CustomSettingNames.xml:
 //
 //   RTX HDR - Enable       0x00DD48FB   (0 = off, 1 = on)
-//   RTX HDR - Driver Flags 0x00432F84   (mode: 0 off, 2 VeryHigh debanding,
+//   RTX HDR - Driver Flags 0x00432F84   (mode: 0 default, 2 VeryHigh debanding,
 //                                       3 +indicator, 6 No debanding,
 //                                       10 Medium debanding, 35 +indicator+debug)
 //
@@ -2118,15 +2118,11 @@ unsafe fn with_cached_drs<T>(
 
 /// Sets the global RTX HDR master switch in the driver profile.
 pub fn enable_rtx_hdr_for_mode() -> Result<(), String> {
-    // RTX HDR needs a non-zero Driver Flags value as well as the global
-    // enable bit. Profile Inspector can leave the flags at zero after a
-    // reset, which would make the UI say RTX HDR is active while the driver
-    // applies no RTX HDR processing. Use NVIDIA's known performance default
-    // only in that case; preserve an existing user-selected mode otherwise.
+    // RTX HDR only needs the global enable bit set — the driver applies its
+    // own default debanding when Driver Flags is 0x00, so never overwrite a
+    // user's existing flag selection.
     let settings = get_rtx_hdr_settings()?;
-    if settings.flags == 0 {
-        set_rtx_hdr_flags(0x06)?;
-    } else if !settings.enabled {
+    if !settings.enabled {
         set_rtx_hdr_enabled(true)?;
     }
     Ok(())
@@ -2152,9 +2148,10 @@ pub fn set_rtx_hdr_enabled(enabled: bool) -> Result<(), String> {
     }
 }
 
-/// Sets the RTX HDR mode in the global driver profile. `flags` is the
-/// "RTX HDR - Driver Flags" value (0 = off). Non-zero modes also enable the
-/// master switch so selecting a mode remains a one-step operation.
+/// Sets the RTX HDR debanding mode in the global driver profile. `flags` is
+/// the "RTX HDR - Driver Flags" value (0 = the driver's default debanding).
+/// Every value also enables the master switch so selecting a mode remains a
+/// one-step operation; use set_rtx_hdr_enabled(false) to turn RTX HDR off.
 pub fn set_rtx_hdr_flags(flags: u32) -> Result<(), String> {
     // Only the documented Driver Flags values exist.
     if !matches!(flags, 0x00 | 0x02 | 0x03 | 0x06 | 0x0A | 0x23) {
@@ -2171,10 +2168,10 @@ pub fn set_rtx_hdr_flags(flags: u32) -> Result<(), String> {
             if flags_status != NVAPI_OK {
                 return Err(drs_write_error("NvAPI_DRS_SetSetting(Driver Flags)", flags_status));
             }
-            let mut enable_setting = NvDrsSetting::dword(
-                RTX_HDR_ENABLE_ID,
-                if flags == 0x00 { 0 } else { 1 },
-            );
+            // Every Driver Flags value — including 0x00 (driver default) —
+            // keeps RTX HDR enabled. Disabling is handled separately by
+            // set_rtx_hdr_enabled(false).
+            let mut enable_setting = NvDrsSetting::dword(RTX_HDR_ENABLE_ID, 1);
             let enable_status = (cached.set_setting)(cached.session.handle, cached.profile, &mut enable_setting, 0, 0);
             if enable_status != NVAPI_OK {
                 return Err(drs_write_error("NvAPI_DRS_SetSetting(Enable)", enable_status));
@@ -2222,9 +2219,17 @@ pub fn get_rtx_hdr_settings() -> Result<RtxHdrSettings, String> {
                     Err(format!("NvAPI_DRS_GetSetting failed: {status}"))
                 }
             };
+            let mut flags = read_dword(RTX_HDR_DRIVER_FLAGS_ID)?;
+            // Driver Flags 0x00 is the driver's unset/default state. It
+            // applies the same top-tier debanding as 0x02 (Very High) —
+            // equivalent output and performance — so normalize it here so
+            // the UI always shows a known mode instead of "Unknown".
+            if flags == 0x00 {
+                flags = 0x02;
+            }
             Ok(RtxHdrSettings {
                 enabled: read_dword(RTX_HDR_ENABLE_ID)? != 0,
-                flags: read_dword(RTX_HDR_DRIVER_FLAGS_ID)?,
+                flags,
             })
         })
     }
