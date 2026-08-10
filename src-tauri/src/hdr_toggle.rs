@@ -37,8 +37,9 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID, WIN32_ERROR,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -398,6 +399,24 @@ struct DISPLAYCONFIG_SET_SDR_WHITE_LEVEL_INTERNAL {
 ///
 /// The CCD API is clamped to roughly 480 nits (matching Windows Settings);
 /// for values above that the caller should fall back to the DWM ordinal.
+// Timestamp of the last successful SDR white level write. The CCD write
+// broadcasts a settings-change message on some systems; lib.rs checks this
+// and ignores notifications that arrive right after the app's own write, so
+// a slider drag does not re-enumerate the whole display config every step.
+static LAST_SDR_WRITE_AT: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// True when an SDR white level write succeeded within the last 500 ms.
+pub fn recent_sdr_white_write() -> bool {
+    now_ms().saturating_sub(LAST_SDR_WRITE_AT.load(Ordering::Relaxed)) < 500
+}
+
 fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
     if !nits.is_finite() || nits < 80.0 {
         return Err("SDR white level must be at least 80 nits".into());
@@ -417,6 +436,10 @@ fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
                 id: target_id,
             },
             SDRWhiteLevel: raw,
+            // finalValue must stay 1: the intermediate form (0) is ignored by
+            // some driver stacks and would leave the screen unchanged while
+            // dragging. Committing per step is what makes the value apply
+            // live; the write broadcast is handled by recent_sdr_white_write.
             finalValue: 1,
         };
         let result = DisplayConfigSetDeviceInfo(&params.header);
@@ -427,6 +450,7 @@ fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
             ));
         }
     }
+    LAST_SDR_WRITE_AT.store(now_ms(), Ordering::Relaxed);
     Ok(SdrWhiteLevel { raw, nits })
 }
 

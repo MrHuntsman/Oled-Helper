@@ -3240,45 +3240,47 @@ button {
 }
 
 /* ── App updater (status-bar indicator + update modal) ───────────── */
-/* The version number in the status bar doubles as the update trigger:
-   plain text when up to date, an accent-bordered chip when a newer
-   version is available. Clicking it opens the update modal. */
-.status-version {
-  position: relative;
+/* The version in the status bar is plain text. When a newer version is
+   available, an "Update available" pill appears on the right side of the
+   bar; clicking it opens the update modal. */
+.status-bar-left {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
+}
+.status-version {
+  display: inline-flex;
+  align-items: center;
   padding: 2px 8px;
   margin-left: -8px;
   border-radius: 6px;
-  border: 1px solid transparent;
-  background: none;
   color: var(--text-weak);
   font: inherit;
-  cursor: default;
-  transition: color 0.1s, border-color 0.1s, background 0.1s;
 }
-.status-version.has-update {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  cursor: pointer;
-}
-.status-version.has-update:hover,
-.status-version.has-update:focus-visible {
+.update-available-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font: inherit;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.update-available-btn:hover,
+.update-available-btn:focus-visible {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
   outline: none;
 }
-.status-version-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 70%, transparent);
-  animation: status-version-dot-pulse 2s ease-in-out infinite;
-}
-@keyframes status-version-dot-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.45; }
+.update-available-btn:active {
+  transform: translateY(1px);
 }
 
 .update-modal {
@@ -3358,9 +3360,21 @@ button {
   border-color: var(--accent);
   color: var(--bg);
   font-weight: 600;
+  transition: background 0.12s, border-color 0.12s, color 0.12s, filter 0.12s, transform 0.12s, box-shadow 0.12s;
 }
-.update-modal-install:hover,
-.update-modal-install:focus-visible { background: var(--accent); border-color: var(--accent); }
+.update-modal-install:hover:not(:disabled),
+.update-modal-install:focus-visible:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  filter: brightness(1.18);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 35%, transparent);
+  outline: none;
+}
+.update-modal-install:active:not(:disabled) {
+  transform: translateY(0);
+  filter: brightness(1.05);
+}
 .update-modal-install:disabled { opacity: 0.6; cursor: default; }
 
 /* Compact "Check for updates" affordance used in the About tab. */

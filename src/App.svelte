@@ -1159,18 +1159,22 @@
   </main>
 
   <div class="status-bar">
-    {#if updateState.status === 'available'}
-      <button
-        type="button"
-        class="status-version has-update"
-        title={`Update available: v${updateState.version}`}
-        onclick={() => { updateState.modalOpen = true; }}>
-        <span class="status-version-dot" aria-hidden="true"></span>
-        <span>v{appVersion || '0.1.1'}</span>
-      </button>
-    {:else}
+    <div class="status-bar-left">
       <span class="status-version">v{appVersion || '0.1.1'}</span>
-    {/if}
+      {#if updateState.status === 'available'}
+        <button
+          type="button"
+          class="update-available-btn"
+          title={`Update available: v${updateState.version}`}
+          onclick={() => { updateState.modalOpen = true; }}>
+          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 1.5V9.5M8 9.5L5 6.5M8 9.5L11 6.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M2.5 13.5h11" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+          Update available
+        </button>
+      {/if}
+    </div>
     <div class="status-bar-right">
       {#if app.displayInfo.monitorName}
         <span class="monitor-tip-wrap" tabindex="0" aria-label={`Monitor info: ${app.displayInfo.monitorName}`}>

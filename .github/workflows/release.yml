@@ -48,10 +48,13 @@ jobs:
       - name: Generate latest.json
         run: node scripts/make-latest-json.mjs "${GITHUB_REF_NAME#v}"
 
+      # The release body is shown verbatim in the in-app update modal, so it
+      # stays empty here: whatever description is written by hand on the
+      # GitHub release page is what users see. No auto-generated commit log.
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             src-tauri/target/release/oled-helper.exe
             latest.json
-          generate_release_notes: true
+          generate_release_notes: false

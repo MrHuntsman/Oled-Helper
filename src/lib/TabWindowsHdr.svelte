@@ -85,6 +85,10 @@
     const requestedNits = Number(currentNits);
     lastApplyTime = Date.now();
     try {
+      // Every write commits the value so the screen updates live while
+      // dragging. The backend ignores the settings-change broadcast that the
+      // write triggers on some systems (recent_sdr_white_write), which is
+      // what used to make dragging re-enumerate the display config each step.
       const result = await invoke('set_sdr_brightness_nits', { nits: requestedNits });
       if (Number(currentNits) !== requestedNits) applyQueued = true;
       if (result?.nits && Number(currentNits) === requestedNits) currentNits = Number(result.nits);

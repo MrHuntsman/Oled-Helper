@@ -107,6 +107,15 @@ mod display_change_events {
     }
 
     fn notify_display_changed(app: &AppHandle, source: &str) {
+        log::debug!("[display] change notification ({source})");
+        // The CCD SDR white level write broadcasts a settings-change message
+        // on some systems. Reacting to the app's own write as if it were a
+        // display topology change would re-enumerate the display config
+        // (modes, EDID, vendor info) on every slider step and make dragging
+        // extremely laggy, so ignore notifications right after a write.
+        if hdr_toggle::recent_sdr_white_write() {
+            return;
+        }
         let _ = app.emit("display-changed", source);
         // The vendor caches (primary-GPU adapter info, NVAPI context and its
         // display ID, and the DRS session) are all derived from the display
@@ -719,6 +728,31 @@ fn request_restart(app: &AppHandle) {
     app.exit(0);
 }
 
+// Opens an external URL in the user's default browser via ShellExecuteW.
+// Without this the WebView would navigate to the link in-place; the
+// frontend intercepts anchor clicks and routes them through here instead.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::PCWSTR(url_w.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
+    // are failures (same convention as relaunch_elevated above).
+    let code = result.0 as isize;
+    if code <= 32 {
+        return Err(format!("could not open link (error code {code})"));
+    }
+    Ok(())
+}
+
 // RTX HDR lives in the NVIDIA global driver profile, which the driver only
 // lets elevated processes write (SetSetting returns NVAPI_INVALID_USER_
 // PRIVILEGE otherwise). Reads work non-elevated, so the UI can show the
@@ -1037,6 +1071,7 @@ pub fn run() {
             set_hdr_enhancement_mode,
             vendor_info::set_rtx_hdr_state,
             relaunch_elevated,
+            open_url,
             updater::check_for_update,
             updater::download_update,
             updater::apply_update,
