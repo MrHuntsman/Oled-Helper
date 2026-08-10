@@ -4,18 +4,17 @@ A Windows desktop utility for OLED display calibration and system tweaks, built 
 
 ## Features
 
-- **Black Crush Tweak**: Adjust near-black levels with a Reinhard gamma curve while preserving pure black. Includes an interactive HDR (PQ) and SDR (RGB) calibration strip, per-refresh-rate black-level profiles, and a high-nits (100 to 10,000 nits) grid.
-- **Taskbar Dimmer**: Dim the Windows taskbar to match your OLED panel's brightness, with configurable opacity, fade times, hover detection, and fullscreen suppression.
-- **Windows HDR**: Manage Windows Auto HDR and NVIDIA RTX HDR modes, toggle HDR, adjust SDR white level, and view HDR luminance details.
-- **Hotkeys**: Global shortcuts for common actions, including a hold-to-compare view of your calibration.
-- **Display tools**: Resolution and refresh-rate switching with safe confirmation and automatic rollback, plus a detailed system and display info tab.
-- **Auto-update**: Checks GitHub for new versions silently at startup, shows an indicator in the status bar when one is available, and updates itself with one click.
+- **Black Crush Tweak**: Fix near-black levels while preserving pure black, with HDR/SDR calibration strips and per-refresh-rate profiles.
+- **Taskbar Dimmer**: Match the taskbar to your OLED brightness with configurable opacity, fades, and hover detection.
+- **Windows HDR**: Control Windows Auto HDR, RTX HDR, HDR on/off, and SDR white level.
+- **Hotkeys**: Global shortcuts, including a hold-to-compare calibration view.
+- **Display tools**: Resolution and refresh-rate switching with auto rollback, plus detailed system info.
+- **Auto-update**: Silent checks at startup, with one-click in-app updates.
 
 ## Requirements
 
 - Windows 10 or 11
 - WebView2 Runtime (already present on most systems that have Microsoft Edge)
-- NVIDIA RTX GPU for the RTX HDR features
 
 ## Download and update
 
