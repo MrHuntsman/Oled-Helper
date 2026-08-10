@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::PCSTR;
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_DESC, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_DESC};
 use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{
@@ -1072,7 +1072,11 @@ fn query_igcl() -> VendorDisplayInfo {
         }
         let output = outputs[0];
         let mut info = VendorDisplayInfo::default();
-        let mut settings = CtlDisplaySettings { size: std::mem::size_of::<CtlDisplaySettings>() as u32, set: 0, ..Default::default() };
+        let mut settings = CtlDisplaySettings {
+            size: std::mem::size_of::<CtlDisplaySettings>() as u32,
+            set: 0,
+            ..Default::default()
+        };
         settings.size = std::mem::size_of::<CtlDisplaySettings>() as u32;
         settings.set = 0;
         if get_settings(output, &mut settings) == CTL_OK
@@ -1437,14 +1441,19 @@ fn query_nvapi() -> VendorDisplayInfo {
     let _owned_context;
     let (context, display_id) = match rtx_hdr_nvapi_with_display_id() {
         Some((context, Some(display_id))) => {
-            log_vendor(&format!("reusing cached NVAPI context, display_id={display_id}"));
+            log_vendor(&format!(
+                "reusing cached NVAPI context, display_id={display_id}"
+            ));
             (context, Some(display_id))
         }
         _ => match nvapi_init() {
             Some(context) => {
                 let display_id = enumerate_active_display_id(&context);
                 _owned_context = Some(Box::new(context));
-                (unsafe { _owned_context.as_deref().unwrap_unchecked() }, display_id)
+                (
+                    unsafe { _owned_context.as_deref().unwrap_unchecked() },
+                    display_id,
+                )
             }
             None => {
                 log_vendor_warn("NVAPI initialization failed");
@@ -1496,10 +1505,11 @@ fn query_nvapi() -> VendorDisplayInfo {
 
     // VRR/G-SYNC capability and current state.
     unsafe {
-        if let Some(get_caps) = nvapi_function::<NvapiDispGetMonitorCaps>(                        context,
-                        NVAPI_DISP_GET_MONITOR_CAPABILITIES_ID,
-                        "NvAPI_DISP_GetMonitorCapabilities",
-                    ) {
+        if let Some(get_caps) = nvapi_function::<NvapiDispGetMonitorCaps>(
+            context,
+            NVAPI_DISP_GET_MONITOR_CAPABILITIES_ID,
+            "NvAPI_DISP_GetMonitorCapabilities",
+        ) {
             let mut caps = [0u8; MONITOR_CAPS_STRUCT_SIZE];
             std::ptr::write(caps.as_mut_ptr() as *mut u32, MONITOR_CAPABILITIES_VERSION);
             std::ptr::write(
@@ -1527,10 +1537,11 @@ fn query_nvapi() -> VendorDisplayInfo {
                 } else {
                     let mut vrr_info = [0u8; VRR_INFO_SIZE];
                     std::ptr::write(vrr_info.as_mut_ptr() as *mut u32, VRR_INFO_VERSION);
-                    if let Some(get_vrr) = nvapi_function::<NvapiDispGetVrrInfo>(                            context,
-                            NVAPI_DISP_GET_VRR_INFO_ID,
-                            "NvAPI_Disp_GetVRRInfo",
-                        ) {
+                    if let Some(get_vrr) = nvapi_function::<NvapiDispGetVrrInfo>(
+                        context,
+                        NVAPI_DISP_GET_VRR_INFO_ID,
+                        "NvAPI_Disp_GetVRRInfo",
+                    ) {
                         let vrr_status = get_vrr(display_id, vrr_info.as_mut_ptr());
                         let vrr_flags = std::ptr::read(vrr_info.as_ptr().add(4) as *const u32);
                         log_vendor(&format!(
@@ -1764,7 +1775,10 @@ type NvapiDrsSetSetting = unsafe extern "system" fn(
 ) -> i32;
 
 // Loads the driver settings and returns the current global profile handle.
-unsafe fn drs_global_profile(context: &NvapiContext, session: *mut c_void) -> Result<*mut c_void, String> {
+unsafe fn drs_global_profile(
+    context: &NvapiContext,
+    session: *mut c_void,
+) -> Result<*mut c_void, String> {
     let load = nvapi_function::<NvapiDrsLoadSettings>(
         context,
         NVAPI_DRS_LOAD_SETTINGS_ID,
@@ -1779,7 +1793,9 @@ unsafe fn drs_global_profile(context: &NvapiContext, session: *mut c_void) -> Re
         NVAPI_DRS_GET_CURRENT_GLOBAL_PROFILE_ID,
         "NvAPI_DRS_GetCurrentGlobalProfile",
     )
-    .ok_or_else(|| "NvAPI_DRS_GetCurrentGlobalProfile is not available in this driver".to_string())?;
+    .ok_or_else(|| {
+        "NvAPI_DRS_GetCurrentGlobalProfile is not available in this driver".to_string()
+    })?;
     let mut profile = std::ptr::null_mut();
     if get_global(session, &mut profile) != NVAPI_OK || profile.is_null() {
         return Err("NvAPI_DRS_GetCurrentGlobalProfile failed".into());
@@ -1926,9 +1942,7 @@ impl Drop for NvapiDrsSession {
             if status == NVAPI_OK {
                 log_vendor_lifecycle("NvAPI_DRS_DestroySession completed successfully");
             } else {
-                log_vendor_warn(&format!(
-                    "NvAPI_DRS_DestroySession failed: {status}"
-                ));
+                log_vendor_warn(&format!("NvAPI_DRS_DestroySession failed: {status}"));
             }
         }
     }
@@ -1954,7 +1968,10 @@ struct DrsFileStamp {
 // rebuilding the DRS session on a timer.
 fn drs_database_stamp() -> [DrsFileStamp; 2] {
     let Some(program_data) = std::env::var_os("ProgramData") else {
-        return [DrsFileStamp { length: 0, modified_ns: 0 }; 2];
+        return [DrsFileStamp {
+            length: 0,
+            modified_ns: 0,
+        }; 2];
     };
     let root = std::path::PathBuf::from(program_data)
         .join("NVIDIA Corporation")
@@ -1962,7 +1979,10 @@ fn drs_database_stamp() -> [DrsFileStamp; 2] {
     ["nvdrsdb0.bin", "nvdrsdb1.bin"].map(|name| {
         let path = root.join(name);
         let Ok(metadata) = std::fs::metadata(path) else {
-            return DrsFileStamp { length: 0, modified_ns: 0 };
+            return DrsFileStamp {
+                length: 0,
+                modified_ns: 0,
+            };
         };
         let modified_ns = metadata
             .modified()
@@ -2034,7 +2054,9 @@ unsafe fn cached_drs_session(context: &NvapiContext) -> Option<&'static CachedDr
             Err(_) => {
                 let status = destroy(session);
                 if status == NVAPI_OK {
-                    log_vendor_lifecycle("NvAPI_DRS_DestroySession init-cleanup completed successfully");
+                    log_vendor_lifecycle(
+                        "NvAPI_DRS_DestroySession init-cleanup completed successfully",
+                    );
                 } else {
                     log_vendor_warn(&format!(
                         "NvAPI_DRS_DestroySession init-cleanup failed: {status}"
@@ -2090,7 +2112,10 @@ unsafe fn cached_drs_session(context: &NvapiContext) -> Option<&'static CachedDr
         };
         *guard = Some(CachedDrsSession {
             entry: Box::new(CachedDrsEntry {
-                session: NvapiDrsSession { handle: session, destroy },
+                session: NvapiDrsSession {
+                    handle: session,
+                    destroy,
+                },
                 profile,
                 get_setting,
                 set_setting,
@@ -2111,8 +2136,8 @@ unsafe fn with_cached_drs<T>(
     work: impl FnOnce(&CachedDrsEntry) -> Result<T, String>,
 ) -> Result<T, String> {
     let context = rtx_hdr_nvapi_context().ok_or_else(|| "NVAPI unavailable".to_string())?;
-    let cached =
-        unsafe { cached_drs_session(context) }.ok_or_else(|| "NvAPI_DRS session unavailable".to_string())?;
+    let cached = unsafe { cached_drs_session(context) }
+        .ok_or_else(|| "NvAPI_DRS session unavailable".to_string())?;
     work(cached)
 }
 
@@ -2136,7 +2161,8 @@ pub fn set_rtx_hdr_enabled(enabled: bool) -> Result<(), String> {
     unsafe {
         with_cached_drs(|cached| {
             let mut setting = NvDrsSetting::dword(RTX_HDR_ENABLE_ID, u32::from(enabled));
-            let status = (cached.set_setting)(cached.session.handle, cached.profile, &mut setting, 0, 0);
+            let status =
+                (cached.set_setting)(cached.session.handle, cached.profile, &mut setting, 0, 0);
             if status != NVAPI_OK {
                 return Err(drs_write_error("NvAPI_DRS_SetSetting(Enable)", status));
             }
@@ -2164,17 +2190,35 @@ pub fn set_rtx_hdr_flags(flags: u32) -> Result<(), String> {
     unsafe {
         with_cached_drs(|cached| {
             let mut flags_setting = NvDrsSetting::dword(RTX_HDR_DRIVER_FLAGS_ID, flags);
-            let flags_status = (cached.set_setting)(cached.session.handle, cached.profile, &mut flags_setting, 0, 0);
+            let flags_status = (cached.set_setting)(
+                cached.session.handle,
+                cached.profile,
+                &mut flags_setting,
+                0,
+                0,
+            );
             if flags_status != NVAPI_OK {
-                return Err(drs_write_error("NvAPI_DRS_SetSetting(Driver Flags)", flags_status));
+                return Err(drs_write_error(
+                    "NvAPI_DRS_SetSetting(Driver Flags)",
+                    flags_status,
+                ));
             }
-            // Every Driver Flags value ,  including 0x00 (driver default) , 
+            // Every Driver Flags value ,  including 0x00 (driver default) ,
             // keeps RTX HDR enabled. Disabling is handled separately by
             // set_rtx_hdr_enabled(false).
             let mut enable_setting = NvDrsSetting::dword(RTX_HDR_ENABLE_ID, 1);
-            let enable_status = (cached.set_setting)(cached.session.handle, cached.profile, &mut enable_setting, 0, 0);
+            let enable_status = (cached.set_setting)(
+                cached.session.handle,
+                cached.profile,
+                &mut enable_setting,
+                0,
+                0,
+            );
             if enable_status != NVAPI_OK {
-                return Err(drs_write_error("NvAPI_DRS_SetSetting(Enable)", enable_status));
+                return Err(drs_write_error(
+                    "NvAPI_DRS_SetSetting(Enable)",
+                    enable_status,
+                ));
             }
             if (cached.save_settings)(cached.session.handle) != NVAPI_OK {
                 return Err("NvAPI_DRS_SaveSettings failed".into());
@@ -2201,7 +2245,10 @@ pub fn get_rtx_hdr_settings() -> Result<RtxHdrSettings, String> {
     unsafe {
         with_cached_drs(|cached| {
             let read_dword = |setting_id| {
-                let mut setting = NvDrsSetting { version: NVDRS_SETTING_VER, ..Default::default() };
+                let mut setting = NvDrsSetting {
+                    version: NVDRS_SETTING_VER,
+                    ..Default::default()
+                };
                 let mut unknown = 0u32;
                 let status = (cached.get_setting)(
                     cached.session.handle,
@@ -2220,7 +2267,7 @@ pub fn get_rtx_hdr_settings() -> Result<RtxHdrSettings, String> {
             };
             let mut flags = read_dword(RTX_HDR_DRIVER_FLAGS_ID)?;
             // Driver Flags 0x00 is the driver's unset/default state. It
-            // applies the same top-tier debanding as 0x02 (Very High) , 
+            // applies the same top-tier debanding as 0x02 (Very High) ,
             // equivalent output and performance ,  so normalize it here so
             // the UI always shows a known mode instead of "Unknown".
             if flags == 0x00 {

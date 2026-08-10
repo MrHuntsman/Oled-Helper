@@ -108,14 +108,14 @@ fn primary_monitor_scale(fallback: f64) -> f64 {
     fallback.max(0.5)
 }
 
-// Positions the flyout anchored to the taskbar edge of the primary monitor , 
+// Positions the flyout anchored to the taskbar edge of the primary monitor ,
 // flush against the taskbar (small gap) so it reads as popping out of the
 // tray, aligned with the tray/notification side. The taskbar edge is derived
 // from the monitor's work area (rcWork = rcMonitor minus the taskbar strip):
 // the edge where the two differ is where the taskbar sits. Uses physical
 // pixels directly because monitor rectangles are already physical coordinates.
 //
-// Note: this intentionally anchors to the CURRENT (post-change) geometry , 
+// Note: this intentionally anchors to the CURRENT (post-change) geometry ,
 // the flyout is shown only after the new mode is already live, and a
 // pre-change coordinate would be outside the new screen's bounds (e.g.
 // 2160 -> 1600 leaves y=1678 beyond the 1600-tall desktop) or float far from
@@ -371,7 +371,7 @@ pub fn set_flyout_hdr(app: AppHandle, hdr: bool) {
 // `additionalBrowserArgs` (tauri.conf.json) and the flyout does not, and
 // creating a second webview with different browser args against the same
 // shared environment is a known Tauri/WebView2 issue that fails with
-// HRESULT 0x8007139F ("the group or resource is not in the correct state") , 
+// HRESULT 0x8007139F ("the group or resource is not in the correct state") ,
 // see tauri-apps/tauri#11144. A separate data_directory gives each webview
 // its own environment, avoiding the conflict entirely.
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {

@@ -25,6 +25,9 @@
 //                bit 2: wideColorEnforced, bit 3: advancedColorForceDisabled
 //   SET struct ,  bit 0: enableAdvancedColor
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
@@ -37,14 +40,6 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID, WIN32_ERROR,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    REG_VALUE_TYPE,
-};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
 };
@@ -52,6 +47,11 @@ use windows::Win32::Graphics::Gdi::{
     DISPLAYCONFIG_COLOR_ENCODING, DISPLAYCONFIG_COLOR_ENCODING_INTENSITY,
     DISPLAYCONFIG_COLOR_ENCODING_RGB, DISPLAYCONFIG_COLOR_ENCODING_YCBCR420,
     DISPLAYCONFIG_COLOR_ENCODING_YCBCR422, DISPLAYCONFIG_COLOR_ENCODING_YCBCR444,
+};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE,
 };
 
 #[derive(serde::Serialize, Clone, Copy, PartialEq, Eq)]
@@ -328,8 +328,7 @@ fn cached_primary_hdr_target() -> Result<Option<(LUID, u32)>, String> {
     {
         return Ok(cached.target);
     }
-    let resolved = primary_hdr_path()?
-        .map(|path| (path.targetInfo.adapterId, path.targetInfo.id));
+    let resolved = primary_hdr_path()?.map(|path| (path.targetInfo.adapterId, path.targetInfo.id));
     *guard = Some(CachedHdrTarget {
         captured_at: Instant::now(),
         target: resolved,

@@ -19,6 +19,16 @@ use windows::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 
+// A user-saved display mode (status-bar favorites menu): resolution + refresh
+// rate in one combo, e.g. "3840x2160 @ 144". Applies through the same safe
+// set_resolution path as the resolution dropdown (with preferred_hz).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct FavoriteDisplayMode {
+    pub width: u32,
+    pub height: u32,
+    pub hz: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     #[serde(default)]
@@ -91,6 +101,9 @@ pub struct AppConfig {
     // the user changes a binding in the Hotkeys tab.
     #[serde(default)]
     pub hotkeys: HashMap<String, String>,
+    // User-saved resolution@hz combos shown in the status-bar favorites menu.
+    #[serde(default)]
+    pub favorite_display_modes: Vec<FavoriteDisplayMode>,
 }
 
 fn default_true() -> bool {
@@ -147,6 +160,7 @@ impl Default for AppConfig {
             display_menu_show_tags: true,
             display_menu_refresh_rate_sort: default_refresh_rate_sort(),
             hotkeys: HashMap::new(),
+            favorite_display_modes: Vec::new(),
         }
     }
 }
@@ -263,6 +277,13 @@ fn emit_config_write_failed(message: &str) {
         let _ = app.emit("config-write-failed", message.to_string());
     }
 }
+fn emit_config_saved() {
+    if let Some(app) = CONFIG_APP.get() {
+        // Notifies native components (the tray menu rebuild) that the config
+        // file is on disk, so any follow-up read sees the fresh data.
+        let _ = app.emit("config-saved", ());
+    }
+}
 fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -333,6 +354,8 @@ fn config_write_worker() {
             let _ = fs::remove_file(&temp_path);
             log::warn!("save_config: {e}");
             emit_config_write_failed(&format!("could not replace {:?}: {e}", pending.path));
+        } else {
+            emit_config_saved();
         }
     }
 }

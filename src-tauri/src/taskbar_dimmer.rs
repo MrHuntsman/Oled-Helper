@@ -310,7 +310,7 @@ mod platform {
                 stop_mouse_hook();
                 // No fallback is forced here: the Debug-tab toggles are meant to
                 // be independent A/B switches, so disabling the hook leaves
-                // cursor polling exactly as the user set it (both may be off , 
+                // cursor polling exactly as the user set it (both may be off ,
                 // that is an explicit test configuration). Switching the
                 // Detection Method in the dimmer tab re-syncs both defaults via
                 // set_hover_mode instead.
@@ -1116,7 +1116,7 @@ mod platform {
                                                                               // behind the overlay, which was pushed to the front during
                                                                               // creation. Find the highest topmost window that overlaps the
                                                                               // taskbar (excluding the overlay, taskbar, and flyout) and
-                                                                              // insert the overlay directly behind it. This way any menu , 
+                                                                              // insert the overlay directly behind it. This way any menu ,
                                                                               // #32768 or custom class ,  naturally stays above.
             let mut walk = GetTopWindow(None);
             while let Ok(w) = walk {
@@ -1350,7 +1350,7 @@ mod platform {
 
     // When the foreground/minimize hook fires, request several forced
     // repairs. This is lightweight: just bumps a counter; the regular 250ms
-    // repair cycle consumes it. 5 repairs × 250ms = 1250ms recovery window , 
+    // repair cycle consumes it. 5 repairs × 250ms = 1250ms recovery window ,
     // enough for the shell to fully settle after Show Desktop.
     fn request_forced_repairs() {
         FORCE_REPAIR_COUNT.store(5, Ordering::Release);
@@ -1532,7 +1532,7 @@ mod platform {
             let mut fade = state.lock().unwrap_or_else(|e| e.into_inner());
             // Event mode: the WinEvent hook is the sole fullscreen detector.
             // The check runs only when an event (foreground switch, move/
-            // size, minimize/restore, location change) requests a recheck , 
+            // size, minimize/restore, location change) requests a recheck ,
             // no timer polling at all. Poll mode keeps the timer cadence;
             // event mode falls back to the timer only when the hook failed
             // to install so detection never silently stops.
@@ -1544,7 +1544,7 @@ mod platform {
                 && now.duration_since(fade.last_fullscreen_check).as_millis() as u64
                     >= FULLSCREEN_CHECK_INTERVAL_MS;
             if recheck_requested || timer_due {
-                // since_last_ms shows the gap between consecutive rechecks , 
+                // since_last_ms shows the gap between consecutive rechecks ,
                 // during a slow multi-step transition it grows to the full
                 // transition tail before the active flag finally drops.
                 let check_gap_ms =
@@ -1554,7 +1554,10 @@ mod platform {
                 drop(fade);
                 let active =
                     FULLSCREEN_DETECTION.load(Ordering::Relaxed) && fullscreen_app_active(hwnd);
-                state.lock().unwrap_or_else(|e| e.into_inner()).fullscreen_active = active;
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .fullscreen_active = active;
                 if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                     // fg_class helps confirm the detection source ,  e.g. the
                     // desktop (WorkerW/Progman) must never count as fullscreen.
@@ -1662,7 +1665,8 @@ mod platform {
                         taskbar_info().map(|(taskbar, rect)| (taskbar.0 as isize, rect));
                     // Keep the hook's hit-test rect in sync with the cache so
                     // the two detectors never disagree about the taskbar.
-                    *HOOK_TASKBAR_RECT.lock().unwrap_or_else(|e| e.into_inner()) = fade.cached_taskbar.map(|(_, rect)| rect);
+                    *HOOK_TASKBAR_RECT.lock().unwrap_or_else(|e| e.into_inner()) =
+                        fade.cached_taskbar.map(|(_, rect)| rect);
                     if fade.cached_taskbar != previous {
                         should_repair_zorder = true;
                     }
@@ -1835,7 +1839,7 @@ mod platform {
             // Only post z-order repairs during the recovery window after a
             // shell transition (Show Desktop, minimize/restore). The steady-
             // state cadence is a no-op via in_place during normal operation
-            // but SetWindowPos can still race with popup-menu creation , 
+            // but SetWindowPos can still race with popup-menu creation ,
             // gating it behind FORCE_REPAIR_COUNT eliminates that race
             // entirely while keeping recovery intact.
             if FORCE_REPAIR_COUNT.load(Ordering::Acquire) > 0
@@ -1860,7 +1864,10 @@ mod platform {
             }
         }
         let cached_taskbar_for_log = if let Some(state) = FADE_STATE.get() {
-            state.lock().unwrap_or_else(|e| e.into_inner()).cached_taskbar
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cached_taskbar
         } else {
             None
         };
@@ -1868,7 +1875,13 @@ mod platform {
         if let Some(alpha) = alpha_to_apply {
             let should_apply = FADE_STATE
                 .get()
-                .map(|state| state.lock().unwrap_or_else(|e| e.into_inner()).last_applied_alpha != Some(alpha))
+                .map(|state| {
+                    state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .last_applied_alpha
+                        != Some(alpha)
+                })
                 .unwrap_or(false);
             if should_apply {
                 let started = Instant::now();
@@ -2058,7 +2071,8 @@ mod platform {
         // Seed the hook's hover cache + hit-test rect so it doesn't fire a
         // spurious poke for a state that predates its installation.
         CURRENT_HOVER.store(hovered, Ordering::Relaxed);
-        *HOOK_TASKBAR_RECT.lock().unwrap_or_else(|e| e.into_inner()) = if enabled { Some(rect) } else { None };
+        *HOOK_TASKBAR_RECT.lock().unwrap_or_else(|e| e.into_inner()) =
+            if enabled { Some(rect) } else { None };
 
         let mut immediate_alpha = None;
         if let Some(state) = FADE_STATE.get() {
@@ -2231,8 +2245,14 @@ pub fn set_taskbar_dimmer(
     )?;
     *state.enabled.lock().unwrap_or_else(|e| e.into_inner()) = enabled;
     *state.opacity.lock().unwrap_or_else(|e| e.into_inner()) = opacity.clamp(0.0, 1.0);
-    *state.fade_in_duration_ms.lock().unwrap_or_else(|e| e.into_inner()) = fade_in_duration_ms;
-    *state.fade_out_duration_ms.lock().unwrap_or_else(|e| e.into_inner()) = fade_out_duration_ms;
+    *state
+        .fade_in_duration_ms
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = fade_in_duration_ms;
+    *state
+        .fade_out_duration_ms
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = fade_out_duration_ms;
     Ok(())
 }
 
@@ -2268,9 +2288,20 @@ pub fn get_taskbar_dimmer_status(state: State<TaskbarDimmerState>) -> TaskbarDim
     TaskbarDimmerStatus {
         enabled: *state.enabled.lock().unwrap_or_else(|e| e.into_inner()),
         opacity: *state.opacity.lock().unwrap_or_else(|e| e.into_inner()),
-        fade_in_duration_ms: *state.fade_in_duration_ms.lock().unwrap_or_else(|e| e.into_inner()),
-        fade_out_duration_ms: *state.fade_out_duration_ms.lock().unwrap_or_else(|e| e.into_inner()),
-        available: platform::available() && state.overlay.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+        fade_in_duration_ms: *state
+            .fade_in_duration_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        fade_out_duration_ms: *state
+            .fade_out_duration_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        available: platform::available()
+            && state
+                .overlay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some(),
     }
 }
 

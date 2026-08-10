@@ -1716,7 +1716,7 @@ pub fn confirm_mode_change() -> Result<(), String> {
     // recovery file cannot be deleted by a competing transaction.
     let _recovery_guard = lock_recovery_state()?;
     // The requested mode was already applied AND persisted by begin_mode_change
-    // (CDS_UPDATEREGISTRY), so confirm no longer touches the display at all , 
+    // (CDS_UPDATEREGISTRY), so confirm no longer touches the display at all ,
     // there is nothing to persist. It only re-checks identity and that the
     // display is still running the requested mode, then clears the recovery
     // state. The same_mode check keeps the recovery path intact if the mode

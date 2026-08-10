@@ -3283,6 +3283,129 @@ button {
   transform: translateY(1px);
 }
 
+/* ── Status-bar favorites menu (favorite resolution@hz combos) ───── */
+.favorites-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.favorites-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  transition: color 0.1s, background 0.1s, border-color 0.1s;
+}
+.favorites-btn:hover:not(:disabled),
+.favorites-btn:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+.favorites-btn:hover:not(:disabled):not(.favorited),
+.favorites-btn:focus-visible:not(.favorited) {
+  color: var(--text);
+}
+.favorites-btn.active {
+  color: var(--text);
+}
+/* Filled star when the current mode is a favorite, so the saved state is
+   visible without opening the menu. Kept after the hover rules so it also
+   wins while hovering a favorited star. */
+.favorites-btn.favorited {
+  color: var(--accent);
+}
+.favorites-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.favorites-menu {
+  right: auto;
+  left: 0;
+  max-width: 280px;
+}
+.favorites-empty {
+  padding: 8px 12px;
+  font-size: 11.5px;
+  color: var(--text-weak);
+  white-space: nowrap;
+}
+.favorites-item {
+  display: flex;
+  align-items: center;
+}
+.favorites-item.active .favorites-apply {
+  color: var(--accent);
+}
+.favorites-apply {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  white-space: nowrap;
+}
+.favorites-remove {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 4px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+.favorites-item:hover .favorites-remove,
+.favorites-remove:focus-visible {
+  opacity: 1;
+}
+.favorites-remove:hover {
+  color: #e87575;
+  background: color-mix(in srgb, #e87575 12%, transparent);
+}
+.favorites-footer {
+  border-top: 1px solid var(--divider);
+  padding: 6px;
+}
+.favorites-save-current {
+  display: block;
+  width: 100%;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.favorites-save-current:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.favorites-save-current:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.favorites-current-saved {
+  display: block;
+  padding: 5px 8px;
+  font-size: 11.5px;
+  color: var(--text-weak);
+}
+
 .update-modal {
   width: min(420px, calc(100vw - 48px));
 }

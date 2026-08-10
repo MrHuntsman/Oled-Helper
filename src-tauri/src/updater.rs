@@ -101,11 +101,15 @@ fn http_client() -> Result<reqwest::Client, String> {
 // The staged copy is written next to the running exe so the final rename in
 // apply-update mode stays on the same filesystem (cross-drive renames fail).
 fn update_staging_path() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|error| format!("could not locate the app: {error}"))?;
+    let exe =
+        std::env::current_exe().map_err(|error| format!("could not locate the app: {error}"))?;
     let dir = exe
         .parent()
         .ok_or_else(|| "could not locate the app folder".to_string())?;
-    let stem = exe.file_stem().and_then(|s| s.to_str()).unwrap_or("oled-helper");
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("oled-helper");
     Ok(dir.join(format!("{stem}.new.exe")))
 }
 
@@ -121,8 +125,14 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
         error.to_string()
     })?;
     if !response.status().is_success() {
-        log::debug!("[updater] manifest fetch returned HTTP {}", response.status());
-        return Err(format!("manifest fetch returned HTTP {}", response.status()));
+        log::debug!(
+            "[updater] manifest fetch returned HTTP {}",
+            response.status()
+        );
+        return Err(format!(
+            "manifest fetch returned HTTP {}",
+            response.status()
+        ));
     }
     let manifest: Manifest = response
         .json()
@@ -154,12 +164,17 @@ pub async fn check_for_update(app: AppHandle) -> Result<Option<UpdateInfo>, Stri
 // and verifies the sha256 from the manifest before handing off to
 // apply_update.
 #[tauri::command]
-pub async fn download_update(app: AppHandle, url: String, sha256: String) -> Result<String, String> {
+pub async fn download_update(
+    app: AppHandle,
+    url: String,
+    sha256: String,
+) -> Result<String, String> {
     // The manifest must carry a checksum. Without one, the staged exe could
     // be anything, so refuse instead of silently skipping verification.
     if sha256.trim().is_empty() {
         return Err(
-            "the update manifest is missing its checksum; the update was aborted for safety.".into(),
+            "the update manifest is missing its checksum; the update was aborted for safety."
+                .into(),
         );
     }
     let target = update_staging_path()?;
@@ -308,7 +323,10 @@ pub fn handle_apply_update_mode() -> bool {
     }
     // 3. Launch the fresh app. On failure, roll back to the old exe and
     //    relaunch that instead, so the user always gets a running app.
-    if let Err(error) = std::process::Command::new(&target).args(&launch_args).spawn() {
+    if let Err(error) = std::process::Command::new(&target)
+        .args(&launch_args)
+        .spawn()
+    {
         log::error!("[updater] update installed but could not launch the new app: {error}");
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::rename(&old_backup, &target);

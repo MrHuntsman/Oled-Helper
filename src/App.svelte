@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, updateState, checkForUpdates } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -605,13 +605,18 @@
     return resolution.width === largest.width && resolution.height === largest.height;
   }
 
-  async function changeResolution(event) {
-    const [width, height] = String(event.currentTarget.value).split('x').map(Number);
+  // Shared safe apply path for the resolution dropdown and the favorites
+  // menu: requests a mode at (width, height) with a preferred refresh rate
+  // through set_resolution (validated against the current monitor, returns a
+  // pending confirmation with automatic rollback). preferredHz 0 keeps the
+  // current rate, matching the resolution dropdown's behavior.
+  async function applyModeCombo(width, height, preferredHz) {
     const currentWidth = app.displayInfo.width;
     const currentHeight = app.displayInfo.height;
     if (!Number.isFinite(width) || !Number.isFinite(height)
       || width <= 0 || height <= 0 || app.displayModeBusy
-      || app.refreshRateBusy || pendingModeConfirmation || (width === currentWidth && height === currentHeight)) return;
+      || app.refreshRateBusy || pendingModeConfirmation
+      || (width === currentWidth && height === currentHeight && preferredHz === (app.displayInfo.refreshRateHz || 0))) return;
 
     app.displayModeBusy = true;
     // Save the profile for the mode we are leaving before the optimistic UI
@@ -624,7 +629,7 @@
       const result = await invoke('set_resolution', {
         width,
         height,
-        preferredHz: app.displayInfo.refreshRateHz || 0,
+        preferredHz,
       });
       // The backend only returns after the temporary mode has stabilized, so
       // load the profile for the newly active display/mode immediately.
@@ -641,6 +646,11 @@
       // the temporary mode Windows actually accepted.
       pollDisplayInfo();
     }
+  }
+
+  async function changeResolution(event) {
+    const [width, height] = String(event.currentTarget.value).split('x').map(Number);
+    await applyModeCombo(width, height, app.displayInfo.refreshRateHz || 0);
   }
 
   async function changeRefreshRate(event) {
@@ -673,6 +683,49 @@
       pollDisplayInfo();
     }
   }
+
+  // ── Status-bar favorites menu (favorite resolution@hz combos) ─────
+  let favoritesMenuOpen = $state(false);
+  let favoritesMenuEl = $state(null);
+  let favoritesBtnEl = $state(null);
+  const favoriteOfCurrent = $derived({
+    width: app.displayInfo.width,
+    height: app.displayInfo.height,
+    hz: app.displayInfo.refreshRateHz || 0,
+  });
+  const isCurrentFavorited = $derived(
+    favoriteOfCurrent.width > 0 && favoriteOfCurrent.height > 0 && favoriteOfCurrent.hz > 0
+      && isDisplayModeFavorited(favoriteOfCurrent.width, favoriteOfCurrent.height, favoriteOfCurrent.hz)
+  );
+  const currentComboLabel = $derived(
+    favoriteOfCurrent.width > 0 && favoriteOfCurrent.height > 0 && favoriteOfCurrent.hz > 0
+      ? `${favoriteOfCurrent.width}×${favoriteOfCurrent.height} @ ${favoriteOfCurrent.hz} Hz`
+      : ''
+  );
+  const isFavoriteCurrent = (fav) => fav.width === favoriteOfCurrent.width
+    && fav.height === favoriteOfCurrent.height
+    && fav.hz === favoriteOfCurrent.hz;
+  function toggleFavoritesMenu() {
+    favoritesMenuOpen = !favoritesMenuOpen;
+  }
+  function closeFavoritesMenu() {
+    favoritesMenuOpen = false;
+  }
+  function saveCurrentFavorite() {
+    addFavoriteDisplayMode(favoriteOfCurrent.width, favoriteOfCurrent.height, favoriteOfCurrent.hz);
+  }
+  function applyFavorite(fav) {
+    closeFavoritesMenu();
+    void applyModeCombo(fav.width, fav.height, fav.hz);
+  }
+  function removeFavorite(fav) {
+    removeFavoriteDisplayMode(fav.width, fav.height, fav.hz);
+  }
+
+  $effect(() => {
+    if (!favoritesMenuOpen) return;
+    return dropdownCloseEffect(favoritesMenuEl, favoritesBtnEl, null, closeFavoritesMenu, favoritesBtnEl);
+  });
 
   async function toggleWindowsHdr() {
     if (windowsHdrBusy || app.hdrStatus === 'unknown') return;
@@ -1176,6 +1229,67 @@
       {/if}
     </div>
     <div class="status-bar-right">
+      <div class="favorites-wrap">
+        <button
+          type="button"
+          class="favorites-btn"
+          class:active={favoritesMenuOpen}
+          class:favorited={isCurrentFavorited}
+          bind:this={favoritesBtnEl}
+          aria-label="Favorite display modes"
+          aria-haspopup="listbox"
+          aria-expanded={favoritesMenuOpen}
+          title={isCurrentFavorited ? `Current mode is favorited: ${currentComboLabel}` : 'Favorite display modes'}
+          disabled={pendingModeConfirmation || app.displayModeBusy || app.refreshRateBusy}
+          onclick={toggleFavoritesMenu}>
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={isCurrentFavorited ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        {#if favoritesMenuOpen}
+          <div class="hz-menu favorites-menu" bind:this={favoritesMenuEl} role="listbox" aria-label="Favorite display modes" tabindex="-1">
+            {#if displayFavorites.length === 0}
+              <div class="favorites-empty">No favorites yet. Save the current mode to add one.</div>
+            {:else}
+              {#each displayFavorites as fav (displayModeFavoriteKey(fav.width, fav.height, fav.hz))}
+                <div class="favorites-item" class:active={isFavoriteCurrent(fav)}>
+                  <button
+                    type="button"
+                    class="hz-menu-item favorites-apply"
+                    role="option"
+                    aria-selected={isFavoriteCurrent(fav)}
+                    onclick={() => applyFavorite(fav)}>
+                    {fav.width}×{fav.height} @ {fav.hz} Hz
+                  </button>
+                  <button
+                    type="button"
+                    class="favorites-remove"
+                    aria-label={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
+                    title="Remove favorite"
+                    onclick={() => removeFavorite(fav)}>
+                    <svg width="8" height="8" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                      <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                    </svg>
+                  </button>
+                </div>
+              {/each}
+            {/if}
+            <div class="favorites-footer">
+              {#if isCurrentFavorited}
+                <span class="favorites-current-saved">Current mode is saved</span>
+              {:else}
+                <button
+                  type="button"
+                  class="favorites-save-current"
+                  disabled={!currentComboLabel}
+                  onclick={saveCurrentFavorite}>
+                  + Save current{currentComboLabel ? `: ${currentComboLabel}` : ''}
+                </button>
+              {/if}
+            </div>
+          </div>
+        {/if}
+      </div>
       {#if app.displayInfo.monitorName}
         <span class="monitor-tip-wrap" tabindex="0" aria-label={`Monitor info: ${app.displayInfo.monitorName}`}>
           <span class="current-monitor">

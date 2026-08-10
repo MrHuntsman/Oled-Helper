@@ -206,6 +206,40 @@ export function setResolutionGroupBy(mode) { displayMenuPrefs.resolutionGroupBy 
 export function setShowTags(enabled) { displayMenuPrefs.showTags = enabled; saveConfig(); }
 export function setRefreshRateSort(dir) { displayMenuPrefs.refreshRateSort = dir; saveConfig(); }
 
+// User-saved resolution@hz combos for the status-bar favorites menu. Items
+// are { width, height, hz }; applying one goes through the same safe
+// set_resolution path as the resolution dropdown. Persisted as
+// favorite_display_modes in the config file.
+export const displayFavorites = $state([]);
+export function displayModeFavoriteKey(width, height, hz) {
+  return `${Math.round(Number(width) || 0)}x${Math.round(Number(height) || 0)}@${Math.round(Number(hz) || 0)}`;
+}
+export function isDisplayModeFavorited(width, height, hz) {
+  const key = displayModeFavoriteKey(width, height, hz);
+  return displayFavorites.some((f) => displayModeFavoriteKey(f.width, f.height, f.hz) === key);
+}
+let favoritesSaveTimer = null;
+function scheduleFavoritesSave() {
+  clearTimeout(favoritesSaveTimer);
+  favoritesSaveTimer = setTimeout(() => { favoritesSaveTimer = null; saveConfig(); }, 300);
+}
+export function addFavoriteDisplayMode(width, height, hz) {
+  const w = Math.round(Number(width) || 0);
+  const h = Math.round(Number(height) || 0);
+  const r = Math.round(Number(hz) || 0);
+  if (w <= 0 || h <= 0 || r <= 0) return;
+  if (isDisplayModeFavorited(w, h, r)) return;
+  displayFavorites.push({ width: w, height: h, hz: r });
+  scheduleFavoritesSave();
+}
+export function removeFavoriteDisplayMode(width, height, hz) {
+  const key = displayModeFavoriteKey(width, height, hz);
+  const index = displayFavorites.findIndex((f) => displayModeFavoriteKey(f.width, f.height, f.hz) === key);
+  if (index === -1) return;
+  displayFavorites.splice(index, 1);
+  scheduleFavoritesSave();
+}
+
 export const dimmerDetections = $state({
   fullscreen: true,
   taskbarCache: true,
@@ -362,6 +396,15 @@ export async function loadConfig(prefetchedCfg = null) {
         if (typeof combo === 'string') hotkeys[action] = combo;
       }
     }
+    displayFavorites.length = 0;
+    if (cfg && Array.isArray(cfg.favorite_display_modes)) {
+      for (const fav of cfg.favorite_display_modes) {
+        if (fav && Number.isFinite(fav.width) && Number.isFinite(fav.height) && Number.isFinite(fav.hz)
+          && fav.width > 0 && fav.height > 0 && fav.hz > 0) {
+          displayFavorites.push({ width: Math.round(fav.width), height: Math.round(fav.height), hz: Math.round(fav.hz) });
+        }
+      }
+    }
     try {
       const status = await invoke('get_taskbar_dimmer_status');
       if (status) taskbarDimmer.available = status.available !== false;
@@ -416,6 +459,7 @@ export function saveConfig() {
     display_menu_show_tags: displayMenuPrefs.showTags,
     display_menu_refresh_rate_sort: displayMenuPrefs.refreshRateSort,
     hotkeys: { ...hotkeys },
+    favorite_display_modes: displayFavorites.map((f) => ({ width: f.width, height: f.height, hz: f.hz })),
   } }).catch((e) => console.warn('[config] save failed', e));
 }
 export async function setTrayEnabled(enabled) {

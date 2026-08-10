@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Listener, Manager, State,
 };
 
 struct TrayState {
@@ -205,7 +205,7 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
             continue;
         }
         let value = desired.load(Ordering::Relaxed);
-        // When black lift is zero the system ramp is linear (OS default) , 
+        // When black lift is zero the system ramp is linear (OS default) ,
         // nothing to restore. Skip both the reference-mode check and the GDI
         // call to keep the thread truly idle while black crush is disabled.
         if value == 0 {
@@ -413,21 +413,30 @@ fn show_main_window(app: &AppHandle) {
 
 // ── Tray menu with resolution / refresh-rate submenus ─────────────────────────
 // The tray context menu exposes the display's supported resolutions and
-// refresh rates in their own submenus, so the app's core display controls are
-// reachable without opening the window. Check menu items mark the currently
-// active mode. The menu is rebuilt whenever the display configuration changes
-// and after every tray-driven mode change.
+// refresh rates in their own submenus, plus the user's saved resolution@Hz
+// favorites, so the app's core display controls are reachable without opening
+// the window. Check menu items mark the currently active mode. The menu is
+// rebuilt whenever the display configuration changes, after every tray-driven
+// mode change, and after the config is saved (favorites change).
+
+// Last favorites list the tray menu was built from. The config-saved listener
+// compares against this so unrelated config saves (dimmer durations, crush
+// profiles, ...) do not trigger a full menu rebuild and display query.
+static LAST_BUILT_FAVORITES: OnceLock<Mutex<Vec<config::FavoriteDisplayMode>>> = OnceLock::new();
 
 fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let show_item = MenuItem::with_id(app, "show", "Show OLED Helper", true, None::<&str>)?;
     let restart_item = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
+    let saved_config = config::load_config(app.clone());
+    let display_info = display_info::query_current_display();
+
     let res_submenu = Submenu::new(app, "Resolution", true)?;
     let hz_submenu = Submenu::new(app, "Refresh Rate", true)?;
     let mut has_resolutions = false;
     let mut has_refresh_rates = false;
-    if let Some(info) = display_info::query_current_display() {
+    if let Some(info) = &display_info {
         for resolution in &info.resolutions {
             has_resolutions = true;
             let item = CheckMenuItem::with_id(
@@ -472,12 +481,45 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         )?)?;
     }
 
+    let fav_submenu = Submenu::new(app, "Favorites", true)?;
+    let mut has_favorites = false;
+    for favorite in &saved_config.favorite_display_modes {
+        has_favorites = true;
+        let is_active = display_info.as_ref().is_some_and(|info| {
+            info.width == favorite.width
+                && info.height == favorite.height
+                && info.refresh_hz == favorite.hz
+        });
+        let item = CheckMenuItem::with_id(
+            app,
+            format!("fav-{}x{}@{}", favorite.width, favorite.height, favorite.hz),
+            format!(
+                "{}×{} @ {} Hz",
+                favorite.width, favorite.height, favorite.hz
+            ),
+            true,
+            is_active,
+            None::<&str>,
+        )?;
+        fav_submenu.append(&item)?;
+    }
+    if !has_favorites {
+        fav_submenu.append(&MenuItem::with_id(
+            app,
+            "fav-none",
+            "No favorites yet. Save one from the status bar.",
+            false,
+            None::<&str>,
+        )?)?;
+    }
+
     Menu::with_items(
         app,
         &[
             &show_item,
             &res_submenu,
             &hz_submenu,
+            &fav_submenu,
             &restart_item,
             &quit_item,
         ],
@@ -520,6 +562,11 @@ fn rebuild_tray_menu_throttled(app: &AppHandle) {
 fn parse_mode_id(value: &str) -> Option<(u32, u32)> {
     let (width, height) = value.split_once('x')?;
     Some((width.parse().ok()?, height.parse().ok()?))
+}
+fn parse_favorite_id(value: &str) -> Option<(u32, u32, u32)> {
+    let (mode, hz) = value.split_once('@')?;
+    let (width, height) = mode.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?, hz.parse().ok()?))
 }
 
 // Applies a mode picked from the tray menu. Always shows the small
@@ -781,14 +828,24 @@ fn relaunch_elevated(
     if let Some(enabled) = rtx_hdr_enabled {
         args.push(format!("--rtx-hdr-enabled={}", u8::from(enabled)).into());
     }
-    if let Some(mode) = hdr_mode.as_deref().filter(|mode| matches!(*mode, "off" | "auto" | "rtx")) {
+    if let Some(mode) = hdr_mode
+        .as_deref()
+        .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
+    {
         args.push(format!("--hdr-mode={mode}").into());
     }
     // Only forward tab ids the app actually has (see the tab switch chain in
     // App.svelte); anything else is ignored rather than carried into the
     // command line.
     const KNOWN_TABS: [&str; 8] = [
-        "crush", "dimmer", "windows-hdr", "hotkeys", "debug", "system", "settings", "about",
+        "crush",
+        "dimmer",
+        "windows-hdr",
+        "hotkeys",
+        "debug",
+        "system",
+        "settings",
+        "about",
     ];
     if let Some(tab) = tab {
         if KNOWN_TABS.contains(&tab.as_str()) {
@@ -824,14 +881,14 @@ fn relaunch_elevated(
     };
     // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
     // are failures. The one exception is ERROR_CANCELLED (1223): dismissing
-    // the UAC prompt also yields > 32, so it must be checked explicitly , 
+    // the UAC prompt also yields > 32, so it must be checked explicitly ,
     // otherwise cancelling the elevation would look like success and kill
     // this instance. Keep the app fully functional whenever the launch did
     // not actually happen.
     let code = result.0 as isize;
     if code <= 32 || code == 1223 {
         // Translate the handful of codes users can actually hit into plain
-        // language instead of surfacing the raw Win32/ShellExecuteW value , 
+        // language instead of surfacing the raw Win32/ShellExecuteW value ,
         // "ShellExecuteW returned 5" means nothing to someone who just wanted
         // to change an HDR setting.
         let message = match code {
@@ -959,20 +1016,18 @@ pub fn run() {
     // to apply before the restart. Apply it once, shortly after startup, on a
     // background thread ,  this instance is elevated, so the DRS write that
     // failed before now succeeds.
-    let pending_rtx_hdr_flags: Option<u32> = std::env::args()
-        .find_map(|arg| {
-            arg.strip_prefix("--rtx-hdr-flags=")
-                .and_then(|value| value.parse().ok())
-        });
-    let pending_rtx_hdr_enabled: Option<bool> = std::env::args()
-        .find_map(|arg| {
-            arg.strip_prefix("--rtx-hdr-enabled=")
-                .and_then(|value| match value {
-                    "1" | "true" => Some(true),
-                    "0" | "false" => Some(false),
-                    _ => None,
-                })
-        });
+    let pending_rtx_hdr_flags: Option<u32> = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--rtx-hdr-flags=")
+            .and_then(|value| value.parse().ok())
+    });
+    let pending_rtx_hdr_enabled: Option<bool> = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--rtx-hdr-enabled=")
+            .and_then(|value| match value {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                _ => None,
+            })
+    });
     let pending_hdr_mode: Option<String> = std::env::args().find_map(|arg| {
         arg.strip_prefix("--hdr-mode=")
             .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
@@ -981,8 +1036,8 @@ pub fn run() {
     // An elevated relaunch can carry the tab the user was on
     // (--open-tab=<tab>); take_startup_tab hands it to the frontend once so
     // the UI opens on the same tab after the UAC restart.
-    let startup_tab: Option<String> = std::env::args()
-        .find_map(|arg| arg.strip_prefix("--open-tab=").map(str::to_string));
+    let startup_tab: Option<String> =
+        std::env::args().find_map(|arg| arg.strip_prefix("--open-tab=").map(str::to_string));
     if let Some(tab) = startup_tab {
         if let Ok(mut guard) = STARTUP_TAB.get_or_init(|| Mutex::new(None)).lock() {
             *guard = Some(tab);
@@ -1002,8 +1057,12 @@ pub fn run() {
                 // restart cannot leave Auto HDR and RTX HDR enabled together.
                 if let Some(mode) = pending_hdr_mode.as_deref() {
                     match apply_pending_hdr_mode(mode) {
-                        Ok(()) => log::info!("applied pending HDR enhancement mode '{mode}' after elevated restart"),
-                        Err(error) => log::warn!("pending HDR enhancement mode apply failed: {error}"),
+                        Ok(()) => log::info!(
+                            "applied pending HDR enhancement mode '{mode}' after elevated restart"
+                        ),
+                        Err(error) => {
+                            log::warn!("pending HDR enhancement mode apply failed: {error}")
+                        }
                     }
                 }
                 // Legacy individual RTX arguments remain supported for older
@@ -1011,21 +1070,23 @@ pub fn run() {
                 if pending_hdr_mode.as_deref() == Some("rtx") {
                     if let Some(flags) = pending_rtx_hdr_flags {
                         match vendor_info::set_rtx_hdr_flags(flags) {
-                        Ok(()) => log::info!(
-                            "applied pending RTX HDR mode 0x{flags:02X} after elevated restart"
-                        ),
+                            Ok(()) => log::info!(
+                                "applied pending RTX HDR mode 0x{flags:02X} after elevated restart"
+                            ),
                             Err(error) => log::warn!("pending RTX HDR mode apply failed: {error}"),
                         }
                     }
                 }
                 if pending_hdr_mode.is_none() {
                     if let Some(enabled) = pending_rtx_hdr_enabled {
-                    match vendor_info::set_rtx_hdr_enabled(enabled) {
-                        Ok(()) => log::info!(
-                            "applied pending RTX HDR global enable={} after elevated restart",
-                            enabled
-                        ),
-                            Err(error) => log::warn!("pending RTX HDR global enable apply failed: {error}"),
+                        match vendor_info::set_rtx_hdr_enabled(enabled) {
+                            Ok(()) => log::info!(
+                                "applied pending RTX HDR global enable={} after elevated restart",
+                                enabled
+                            ),
+                            Err(error) => {
+                                log::warn!("pending RTX HDR global enable apply failed: {error}")
+                            }
                         }
                     }
                 }
@@ -1253,6 +1314,33 @@ pub fn run() {
                                 });
                             }
                         }
+                        // "fav-3840x2160@120" ,  apply a saved favorite exactly
+                        // as it was stored (resolution plus refresh rate),
+                        // through the same safe path as the res-/hz- items.
+                        _ if id.starts_with("fav-") => {
+                            if let Some((width, height, hz)) =
+                                id.strip_prefix("fav-").and_then(parse_favorite_id)
+                            {
+                                let already_active = display_info::query_current_display()
+                                    .as_ref()
+                                    .is_some_and(|info| {
+                                        info.width == width
+                                            && info.height == height
+                                            && info.refresh_hz == hz
+                                    });
+                                if already_active {
+                                    rebuild_tray_menu(app);
+                                    return;
+                                }
+                                let app_handle = app.clone();
+                                std::thread::spawn(move || {
+                                    tray_display_mode_change(
+                                        app_handle,
+                                        display_info::set_resolution(width, height, hz),
+                                    );
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 })
@@ -1271,6 +1359,46 @@ pub fn run() {
             if let Some(tray) = app.tray_by_id("main-tray") {
                 tray.set_visible(saved_config.tray_enabled)?;
             }
+
+            // Keep the tray's Favorites submenu in sync with the config: the
+            // frontend persists favorites through save_config, and this event
+            // fires only after the file is actually written, so the rebuild
+            // reads fresh data. Only rebuild when the favorites list actually
+            // changed, so unrelated config saves do not repeatedly re-run the
+            // display query and menu creation on the main thread. Routed
+            // through the main thread because menu rebuilds run a full display
+            // query that must stay on the UI thread (see
+            // rebuild_tray_menu_throttled).
+            if let Ok(mut guard) = LAST_BUILT_FAVORITES
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+            {
+                *guard = saved_config.favorite_display_modes.clone();
+            }
+            let config_app = app.handle().clone();
+            app.listen("config-saved", move |_| {
+                let saved = config::load_config(config_app.clone());
+                let changed = {
+                    let Ok(mut cache) = LAST_BUILT_FAVORITES
+                        .get_or_init(|| Mutex::new(Vec::new()))
+                        .lock()
+                    else {
+                        return;
+                    };
+                    if *cache == saved.favorite_display_modes {
+                        false
+                    } else {
+                        *cache = saved.favorite_display_modes.clone();
+                        true
+                    }
+                };
+                if changed {
+                    let rebuild_app = config_app.clone();
+                    let _ = config_app.run_on_main_thread(move || {
+                        crate::rebuild_tray_menu_throttled(&rebuild_app);
+                    });
+                }
+            });
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();
             if let Err(error) = taskbar_dimmer::create_overlay(app.handle(), &dimmer_state) {
