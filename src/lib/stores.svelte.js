@@ -153,11 +153,6 @@ export const traySettings = $state({ enabled: true });
 //                     (set_taskbar_dimmer_verbose_logging)
 export const runtimeLogSettings = $state({ verbosePeriodic: false, dimmerVerbose: false });
 export const debugSettings = $state({ contextMenuEnabled: false });
-// DWM EOTF gamma override (Experimental tab): the last successfully applied
-// profile ("srgb"/"2.2"/"2.4"/"2.6", empty = no override) and whether the
-// backend watcher should re-apply it after DWM restarts. Persisted in the
-// config so the override survives app relaunches too.
-export const dwmEotf = $state({ profile: '', autoReapply: true });
 
 // Global hotkey bindings: action name → combo string ("Ctrl+Alt+F9", or
 // "None" for unbound). Loaded from config on startup; changes go through
@@ -367,8 +362,6 @@ export async function loadConfig(prefetchedCfg = null) {
         if (typeof combo === 'string') hotkeys[action] = combo;
       }
     }
-    if (cfg && typeof cfg.dwm_eotf_profile === 'string') dwmEotf.profile = cfg.dwm_eotf_profile;
-    if (cfg && typeof cfg.dwm_eotf_auto_reapply === 'boolean') dwmEotf.autoReapply = cfg.dwm_eotf_auto_reapply;
     try {
       const status = await invoke('get_taskbar_dimmer_status');
       if (status) taskbarDimmer.available = status.available !== false;
@@ -423,17 +416,7 @@ export function saveConfig() {
     display_menu_show_tags: displayMenuPrefs.showTags,
     display_menu_refresh_rate_sort: displayMenuPrefs.refreshRateSort,
     hotkeys: { ...hotkeys },
-    dwm_eotf_profile: dwmEotf.profile,
-    dwm_eotf_auto_reapply: dwmEotf.autoReapply,
   } }).catch((e) => console.warn('[config] save failed', e));
-}
-export function setDwmEotfProfile(profile) {
-  dwmEotf.profile = profile;
-  saveConfig();
-}
-export function setDwmEotfAutoReapply(enabled) {
-  dwmEotf.autoReapply = !!enabled;
-  saveConfig();
 }
 export async function setTrayEnabled(enabled) {
   const previous = traySettings.enabled;

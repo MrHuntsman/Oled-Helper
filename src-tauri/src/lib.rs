@@ -1,6 +1,5 @@
 mod config;
 mod display_info;
-mod dwm_eotf;
 mod flyout_window;
 mod gamma_ramp;
 mod hdr_toggle;
@@ -13,7 +12,7 @@ mod window_icon;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
@@ -31,26 +30,6 @@ struct TrayState {
 // the vendor/EDID paths is intentionally quiet by default because those paths
 // are refreshed periodically; warnings and errors remain visible regardless.
 static DETAILED_LOGGING: AtomicBool = AtomicBool::new(false);
-
-// ── DWM EOTF auto-reapply state ───────────────────────────────────────────
-// The gamma override lives in DWM's memory, so any DWM restart (resolution
-// change, driver update, crash, sleep/resume) silently reverts it to the
-// original sRGB shaders. A background watcher compares the current dwm.exe
-// PID against the instance we last patched and, when it differs and a profile
-// is persisted (config.dwm_eotf_profile + dwm_eotf_auto_reapply), runs the
-// full restart+patch flow again. The apply command and the watcher share the
-// same "last applied PID" so a manual apply never trips the watcher.
-static LAST_APPLIED_DWM_PID: AtomicU32 = AtomicU32::new(0);
-static LAST_AUTO_APPLY_MS: AtomicU64 = AtomicU64::new(0);
-static DWM_APPLY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-static DWM_WATCHER_STOP: AtomicBool = AtomicBool::new(false);
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 pub(crate) fn detailed_logging_enabled() -> bool {
     DETAILED_LOGGING.load(Ordering::Relaxed)
@@ -368,77 +347,6 @@ fn get_display_info() -> Option<display_info::DisplayInfo> {
 }
 
 #[tauri::command]
-async fn scan_dwm_eotf() -> Result<dwm_eotf::DwmEotfScanResult, String> {
-    // The scanner performs bounded process-memory reads. Keep them off the
-    // Tauri/WebView event loop so a slow protected-page read cannot stutter
-    // the UI or taskbar handling.
-    tauri::async_runtime::spawn_blocking(dwm_eotf::scan)
-        .await
-        .map_err(|error| format!("DWM scan worker failed: {error}"))
-}
-
-#[tauri::command]
-async fn scan_dwm_eotf_debug_priv() -> Result<dwm_eotf::DwmEotfScanResult, String> {
-    tauri::async_runtime::spawn_blocking(dwm_eotf::scan_with_debug_privilege)
-        .await
-        .map_err(|error| format!("DWM scan worker failed: {error}"))
-}
-
-#[tauri::command]
-async fn scan_dwm_shaders() -> Result<dwm_eotf::DwmEotfScanResult, String> {
-    tauri::async_runtime::spawn_blocking(dwm_eotf::scan_dwm_shaders)
-        .await
-        .map_err(|error| format!("DWM shader scan worker failed: {error}"))
-}
-
-#[tauri::command]
-async fn scan_dwm_dry_run(profile: String) -> Result<dwm_eotf::DwmEotfScanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || dwm_eotf::scan_dwm_dry_run(&profile))
-        .await
-        .map_err(|error| format!("DWM dry run worker failed: {error}"))
-}
-
-// Captures every DXBC container digest in dwmcore so the shader whitelist can
-// grow to cover other Windows builds. Read-only (same permission set as the
-// dry run) and run off the event loop.
-#[tauri::command]
-async fn dump_dwm_shader_digests() -> Result<dwm_eotf::DwmShaderDigestDump, String> {
-    tauri::async_runtime::spawn_blocking(dwm_eotf::dump_shader_digests)
-        .await
-        .map_err(|error| format!("DWM digest worker failed: {error}"))
-}
-
-#[tauri::command]
-async fn apply_dwm_patch(profile: String) -> Result<dwm_eotf::DwmEotfScanResult, String> {
-    // Claim the apply guard atomically. The auto-reapply watcher holds the
-    // same flag while it restarts+patches DWM (which can take ~10–25 s), so a
-    // click during that window must not start a second concurrent
-    // TerminateProcess/NtSuspendProcess cycle against DWM.
-    if DWM_APPLY_IN_PROGRESS
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        return Err("A DWM patch is already in progress ,  wait for it to finish before applying again.".into());
-    }
-    // The restart+patch flow changes the DWM PID, so record the fresh
-    // instance as "already applied" ,  otherwise the auto-reapply watcher
-    // would see a PID change right after this manual apply and immediately
-    // run another restart+patch cycle.
-    let result = tauri::async_runtime::spawn_blocking(move || dwm_eotf::apply_dwm_patch_v2(&profile))
-        .await
-        .map_err(|error| {
-            DWM_APPLY_IN_PROGRESS.store(false, Ordering::Relaxed);
-            format!("DWM patch worker failed: {error}")
-        })?;
-    if result.dwm_pid != 0 {
-        LAST_APPLIED_DWM_PID.store(result.dwm_pid, Ordering::Relaxed);
-    }
-    LAST_AUTO_APPLY_MS.store(now_ms(), Ordering::Relaxed);
-    DWM_APPLY_IN_PROGRESS.store(false, Ordering::Relaxed);
-    Ok(result)
-}
-
-#[tauri::command]
 fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
     vendor_info::query_vendor_display_info_fresh()
 }
@@ -661,69 +569,6 @@ fn tray_display_mode_change(app: AppHandle, result: Result<display_info::Applied
     rebuild_tray_menu(&app);
 }
 
-// Background watcher for the DWM EOTF override. Every few seconds it checks
-// whether dwm.exe has been replaced (new PID) while a gamma profile is
-// persisted and auto-reapply is enabled, and if so re-runs the restart+patch
-// flow so the override survives DWM restarts. Only one patch can run at a
-// time (DWM_APPLY_IN_PROGRESS guards against the manual Apply racing this
-// thread); the cooldown prevents a burst of restarts from stacking patches.
-fn dwm_eotf_watch_loop(app: AppHandle) {
-    // Give the UI a moment to settle before the first tick; DWM may still be
-    // mid-restart from a tray relaunch or a mode change at launch.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        if DWM_WATCHER_STOP.load(Ordering::Relaxed) {
-            break;
-        }
-        if DWM_APPLY_IN_PROGRESS.load(Ordering::Relaxed) {
-            continue;
-        }
-        let cfg = config::load_config(app.clone());
-        let profile = cfg.dwm_eotf_profile.clone();
-        if profile.is_empty() || !cfg.dwm_eotf_auto_reapply {
-            continue;
-        }
-        let Some(pid) = dwm_eotf::current_dwm_pid() else {
-            continue;
-        };
-        let last = LAST_APPLIED_DWM_PID.load(Ordering::Relaxed);
-        // First tick with a persisted profile: treat the currently running DWM
-        // as already applied. DWM's memory holds the gamma across app
-        // relaunches, so restarting it just because the app started would
-        // flash the screen for nothing. The watcher only reacts to restarts
-        // that happen while this process is alive.
-        if last == 0 {
-            LAST_APPLIED_DWM_PID.store(pid, Ordering::Relaxed);
-            continue;
-        }
-        if last == pid {
-            continue;
-        }
-        // A fresh DWM instance ,  try once, then record the outcome so a
-        // persistent failure isn't retried every tick.
-        let now = now_ms();
-        if now.saturating_sub(LAST_AUTO_APPLY_MS.load(Ordering::Relaxed)) < 10_000 {
-            continue;
-        }
-        DWM_APPLY_IN_PROGRESS.store(true, Ordering::Relaxed);
-        log::info!(
-            "[dwm-eotf] DWM restarted (PID {pid}, last applied {last}); auto re-applying '{profile}'"
-        );
-        let result = dwm_eotf::apply_dwm_patch_v2(&profile);
-        LAST_AUTO_APPLY_MS.store(now_ms(), Ordering::Relaxed);
-        DWM_APPLY_IN_PROGRESS.store(false, Ordering::Relaxed);
-        let applied_pid = if result.dwm_pid != 0 { result.dwm_pid } else { pid };
-        LAST_APPLIED_DWM_PID.store(applied_pid, Ordering::Relaxed);
-        log::info!(
-            "[dwm-eotf] auto re-apply finished: {} ,  {} (new PID {})",
-            result.status,
-            result.message,
-            applied_pid
-        );
-    }
-}
-
 pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
     let state = app.state::<GammaState>();
     state.shutdown.requested.store(true, Ordering::Release);
@@ -745,7 +590,6 @@ pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
 }
 
 fn request_shutdown_and_exit(app: &AppHandle) {
-    DWM_WATCHER_STOP.store(true, Ordering::Relaxed);
     taskbar_dimmer::shutdown();
     hotkeys::shutdown();
     shutdown_gamma_worker(app);
@@ -909,8 +753,8 @@ fn relaunch_elevated(
     // Only forward tab ids the app actually has (see the tab switch chain in
     // App.svelte); anything else is ignored rather than carried into the
     // command line.
-    const KNOWN_TABS: [&str; 9] = [
-        "crush", "dimmer", "windows-hdr", "experimental", "hotkeys", "debug", "system", "settings", "about",
+    const KNOWN_TABS: [&str; 8] = [
+        "crush", "dimmer", "windows-hdr", "hotkeys", "debug", "system", "settings", "about",
     ];
     if let Some(tab) = tab {
         if KNOWN_TABS.contains(&tab.as_str()) {
@@ -1188,12 +1032,6 @@ pub fn run() {
             apply_gamma_ramp,
             log_frontend,
             get_display_info,
-            scan_dwm_eotf,
-            scan_dwm_eotf_debug_priv,
-            scan_dwm_shaders,
-            scan_dwm_dry_run,
-            dump_dwm_shader_digests,
-            apply_dwm_patch,
             refresh_vendor_display_info,
             vendor_info::get_rtx_hdr_settings_state,
             set_hdr_enhancement_mode,
@@ -1257,17 +1095,6 @@ pub fn run() {
                     .lock()
                     .map_err(|_| "gamma state was poisoned".to_string())?
                     .replace(handle);
-            }
-
-            // DWM EOTF auto-reapply: watches for dwm.exe restarts and re-applies
-            // the persisted gamma profile so the override survives resolution
-            // changes, driver updates, and DWM crashes.
-            {
-                let watch_app = app.handle().clone();
-                std::thread::Builder::new()
-                    .name("dwm-eotf-watch".into())
-                    .spawn(move || dwm_eotf_watch_loop(watch_app))
-                    .map_err(|error| format!("could not start DWM EOTF watch thread: {error}"))?;
             }
 
             // Always-on rotating file log (not just debug builds) ,  GPU-init
@@ -1511,7 +1338,6 @@ pub fn run() {
                     // the window is actually destroyed, request a synchronous
                     // worker shutdown so the display ramp is reset before the
                     // process exits.
-                    DWM_WATCHER_STOP.store(true, Ordering::Relaxed);
                     taskbar_dimmer::shutdown();
                     hotkeys::shutdown();
                     shutdown_gamma_worker(window.app_handle());

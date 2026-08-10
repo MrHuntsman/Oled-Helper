@@ -8,7 +8,6 @@
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
   import TabWindowsHdr from './lib/TabWindowsHdr.svelte';
-  import TabExperimental from './lib/TabExperimental.svelte';
   import TabDebug from './lib/TabDebug.svelte';
   import TabSystem from './lib/TabSystem.svelte';
   import TabSettings from './lib/TabSettings.svelte';
@@ -1129,9 +1128,6 @@
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'experimental'} onclick={() => app.activeTab = 'experimental'}>
-      <img class="nav-icon" src={tabDebugIcon} alt="" /> Experimental
-    </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
@@ -1148,8 +1144,6 @@
         <TabDimmer />
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
-      {:else if app.activeTab === 'experimental'}
-        <TabExperimental />
       {:else if app.activeTab === 'windows-hdr'}
         <TabWindowsHdr />
       {:else if app.activeTab === 'debug'}

@@ -91,18 +91,6 @@ pub struct AppConfig {
     // the user changes a binding in the Hotkeys tab.
     #[serde(default)]
     pub hotkeys: HashMap<String, String>,
-    // DWM EOTF gamma override: last successfully applied profile ("srgb",
-    // "2.2", "2.4", "2.6" ,  empty = no override active). A background
-    // watcher re-applies this profile whenever DWM restarts (resolution
-    // changes, driver updates, crashes), since a fresh compositor always
-    // reloads its original sRGB shaders.
-    #[serde(default)]
-    pub dwm_eotf_profile: String,
-    // Whether the watcher should re-apply dwm_eotf_profile after DWM
-    // restarts. Kept separate so the last applied gamma can survive in the
-    // config without forcing a re-apply on the user's next launch.
-    #[serde(default = "default_true")]
-    pub dwm_eotf_auto_reapply: bool,
 }
 
 fn default_true() -> bool {
@@ -159,8 +147,6 @@ impl Default for AppConfig {
             display_menu_show_tags: true,
             display_menu_refresh_rate_sort: default_refresh_rate_sort(),
             hotkeys: HashMap::new(),
-            dwm_eotf_profile: String::new(),
-            dwm_eotf_auto_reapply: true,
         }
     }
 }
