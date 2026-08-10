@@ -30,3 +30,6 @@ old_win32_rust
 diagnostic/
 *.etl
 *.etl.NGENPDB/
+
+# Tauri updater signing keys (private key must never be committed)
+.tauri/

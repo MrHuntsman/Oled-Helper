@@ -1,5 +1,6 @@
 // Svelte 5 runes stores ,  $state object pattern
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_CELLS, HIGH_NITS_MAX_CEILING, HIGH_NITS_MAX_STOPS, highNitsStepForMax } from './calibration.js';
 
 export const app = $state({
@@ -36,9 +37,6 @@ export function setGpuRenderingInfo(source, info = {}) {
   for (const key of ['api', 'runtime', 'adapter', 'format', 'colorSpace', 'toneMapping', 'hdrPath']) {
     if (typeof info[key] === 'string') target[key] = info[key];
   }
-}
-export function clearGpuRenderingInfo(source) {
-  if (source === 'main' || source === 'comparison') app.gpuRendering[source] = {};
 }
 
 export const crush = $state({
@@ -100,14 +98,6 @@ export function highNitsMaxValue() {
   return crush.highNitsMax;
 }
 
-// Kept only so any remaining caller (e.g. an old persisted config shape)
-// has somewhere safe to land ,  Min is no longer user-editable. Silently a
-// no-op besides re-deriving step/max, since Min is always NITS_MIN_FLOOR.
-export function setHighNitsMin(_value) {
-  crush.highNitsMin = NITS_MIN_FLOOR;
-  crush.highNitsStep = highNitsStepForMax(crush.highNitsMax);
-  scheduleNitsRangeSave();
-}
 export function setHighNitsMax(value) {
   const raw = Math.max(HIGH_NITS_MAX_STOPS[0], Math.min(HIGH_NITS_MAX_CEILING, Number(value) || HIGH_NITS_MAX_CEILING));
   // Snap directly to the nearest slider stop ,  the slider only ever rests on
@@ -177,7 +167,7 @@ export const hotkeys = $state({});
 // several updates in quick succession (bind, then clear) and each save
 // rewrites the whole config file.
 let hotkeySaveTimer = null;
-export function scheduleHotkeySave() {
+function scheduleHotkeySave() {
   clearTimeout(hotkeySaveTimer);
   hotkeySaveTimer = setTimeout(() => saveConfig(), 300);
 }
@@ -245,7 +235,6 @@ export function setDimmerDetection(name, enabled) {
   });
 }
 
-export function bumpDebugEnv() { envTick.n++; }
 export function adjustmentDisplay() {
   if (!crush.blackEnabled) return 'OFF';
   return `${crush.adjustment > 0 ? '+' : ''}${(crush.adjustment / 10).toFixed(1)}`;
@@ -785,4 +774,107 @@ export function clearGpuLog() {
   gpuLogEntries.length = 0;
   gpuLogStart = 0;
   if (app.activeTab === 'debug') gpuLogVersion.n++;
+}
+
+// ── App updater (portable self-updater) ─────────────────────────────
+// updateState.status is one of:
+//   'idle'       never checked yet (or check not started)
+//   'checking'   a check is in flight
+//   'available'  a newer version exists (updateInfo filled)
+//   'uptodate'   checked, no newer version
+//   'error'      the check failed (offline, no endpoint, bad manifest)
+// All check failures are silent: a missing/blocked endpoint must never
+// disturb the app, it just stays 'idle' or flips to 'error' (unused in UI
+// except for hiding the indicator). The update itself is handled by the
+// backend (updater.rs): it streams the new exe next to the running one,
+// verifies the manifest sha256, then hands off to the staged exe which
+// swaps the files and relaunches the app.
+export const updateState = $state({
+  status: 'idle',
+  // Populated when status === 'available'.
+  version: '',
+  notes: '',
+  date: '',
+  // Download details passed back to the backend on install.
+  url: '',
+  sha256: '',
+  // Install progress 0..1, or null while not downloading.
+  progress: null,
+  installing: false,
+  error: '',
+  // Whether the update modal is open. Shared by the status-bar version
+  // chip (App.svelte) and the About tab so both can open the same dialog.
+  modalOpen: false,
+});
+
+let updateInFlight = false;
+let lastCheckedAt = 0;
+const UPDATE_COOLDOWN_MS = 30 * 60 * 1000; // re-check at most every 30 min
+
+// Checks for a newer version against the GitHub release manifest. Silent on
+// failure; only surfaces the 'available' state to the UI. Cooldown prevents
+// repeated checks on every tray show / window focus. The cooldown is only
+// stamped on success, so a transient offline check (which fails) does not
+// lock out the auto re-check for the whole cooldown window.
+export async function checkForUpdates(force = false) {
+  if (updateInFlight) return;
+  if (!force && Date.now() - lastCheckedAt < UPDATE_COOLDOWN_MS) return;
+  updateInFlight = true;
+  if (updateState.status !== 'available') updateState.status = 'checking';
+  try {
+    const update = await invoke('check_for_update');
+    if (update) {
+      updateState.status = 'available';
+      updateState.version = update.version || '';
+      updateState.notes = update.notes || '';
+      updateState.date = update.date || '';
+      updateState.url = update.url || '';
+      updateState.sha256 = update.sha256 || '';
+    } else {
+      // Clear any fields from a previous 'available' state so a later
+      // up-to-date check never leaves stale update details behind.
+      updateState.status = 'uptodate';
+      updateState.version = '';
+      updateState.notes = '';
+      updateState.date = '';
+      updateState.url = '';
+      updateState.sha256 = '';
+    }
+    lastCheckedAt = Date.now();
+  } catch (e) {
+    // Never disturb the UI: offline or a blocked endpoint just leaves the
+    // indicator hidden.
+    updateState.status = 'idle';
+    updateState.error = String(e);
+  } finally {
+    updateInFlight = false;
+  }
+}
+
+// Downloads and installs the available update, reporting progress 0..1 into
+// updateState.progress. On success the backend hands off to the staged exe
+// and shuts the app down, so this resolves right as the app exits.
+export async function installUpdate() {
+  if (updateState.status !== 'available' || updateState.installing) return false;
+  updateState.installing = true;
+  updateState.error = '';
+  updateState.progress = 0;
+  let unlisten = null;
+  try {
+    unlisten = await listen('update-progress', (event) => {
+      const { downloaded = 0, total = 0 } = event.payload || {};
+      if (total > 0) updateState.progress = Math.min(1, downloaded / total);
+    });
+    await invoke('download_update', { url: updateState.url, sha256: updateState.sha256 });
+    updateState.progress = 1;
+    await invoke('apply_update');
+    return true;
+  } catch (e) {
+    updateState.error = String(e);
+    updateState.status = 'available';
+    return false;
+  } finally {
+    unlisten?.();
+    updateState.installing = false;
+  }
 }

@@ -340,3 +340,16 @@ export function computeHdrValues() {
 export function computeSdrValues() {
   return ALL_SDR_CODES.map(c => linearToSrgb(srgbToLinear(c / 255)));
 }
+
+// Human-friendly nits formatting for display values (HDR max luminance, SDR
+// white level). toPrecision() would render 800 as "8.0e+2", so round to a
+// sensible number of significant figures instead: whole nits for typical
+// panel values (100-4000), one decimal below 100, two below 10, and a
+// fallback precision below 1 nit.
+export function fmtNits(v) {
+  if (v == null) return null;
+  if (v >= 100) return String(Math.round(v));
+  if (v >= 10) return String(Math.round(v * 10) / 10);
+  if (v >= 1) return String(Math.round(v * 100) / 100);
+  return v.toPrecision(2);
+}

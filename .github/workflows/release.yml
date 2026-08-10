@@ -1,0 +1,57 @@
+name: Release
+
+# Builds a portable OLED Helper exe and publishes a GitHub release with:
+#   - oled-helper.exe   the standalone portable app
+#   - latest.json       the updater manifest (version, download url, sha256)
+# The in-app updater reads latest.json from the "latest" release, so every
+# published release must be a normal (non-draft, non-prerelease) release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `tauri build` runs the frontend build automatically (beforeBuildCommand
+      # in tauri.conf.json) and, with bundle.active=false, produces only the
+      # standalone exe at src-tauri/target/release/oled-helper.exe.
+      - name: Build portable exe
+        run: npm run tauri build
+
+      # Refuses to proceed when the tag (vX.Y.Z) does not match the version in
+      # tauri.conf.json, so the manifest always matches the built exe.
+      - name: Generate latest.json
+        run: node scripts/make-latest-json.mjs "${GITHUB_REF_NAME#v}"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/oled-helper.exe
+            latest.json
+          generate_release_notes: true

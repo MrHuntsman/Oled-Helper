@@ -3413,3 +3413,138 @@ button {
   pointer-events: none;
   z-index: 9999;
 }
+
+/* ── App updater (status-bar indicator + update modal) ───────────── */
+/* The version number in the status bar doubles as the update trigger:
+   plain text when up to date, an accent-bordered chip when a newer
+   version is available. Clicking it opens the update modal. */
+.status-version {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  margin-left: -8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-weak);
+  font: inherit;
+  cursor: default;
+  transition: color 0.1s, border-color 0.1s, background 0.1s;
+}
+.status-version.has-update {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  cursor: pointer;
+}
+.status-version.has-update:hover,
+.status-version.has-update:focus-visible {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: none;
+}
+.status-version-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: status-version-dot-pulse 2s ease-in-out infinite;
+}
+@keyframes status-version-dot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.update-modal {
+  width: min(420px, calc(100vw - 48px));
+}
+.update-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.update-modal-version {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+.update-modal-date {
+  font-weight: 400;
+  color: var(--text-weak);
+  margin-left: 6px;
+}
+.update-modal-close {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 15px;
+  line-height: 1;
+}
+.update-modal-notes {
+  max-height: 220px;
+  overflow-y: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+.update-modal-notes p { margin: 0; }
+.update-modal-notes p + p { margin-top: 8px; }
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.update-progress-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--divider);
+  overflow: hidden;
+}
+.update-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+.update-progress-label {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-weak);
+  min-width: 3ch;
+  text-align: right;
+}
+.update-error {
+  color: #e06c6c;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+.update-modal-install {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+.update-modal-install:hover,
+.update-modal-install:focus-visible { background: var(--accent); border-color: var(--accent); }
+.update-modal-install:disabled { opacity: 0.6; cursor: default; }
+
+/* Compact "Check for updates" affordance used in the About tab. */
+.update-check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-weak);
+}
+.update-check-row.has-update { color: var(--accent); }

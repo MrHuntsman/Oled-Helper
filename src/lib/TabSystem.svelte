@@ -4,6 +4,7 @@
   import TabHeading from './TabHeading.svelte';
   import { onMount } from 'svelte';
   import { app, envTick } from './stores.svelte.js';
+  import { fmtNits } from './calibration.js';
 
   let copied = $state(false);
   let copyFailed = $state(false);
@@ -11,14 +12,6 @@
   let displayType = $derived(
     app.hdrStatus === 'hdr' ? 'HDR' : app.hdrStatus === 'sdr' ? 'SDR' : 'Detecting...'
   );
-
-  function fmtNits(v) {
-    if (v == null) return null;
-    if (v >= 100) return String(Math.round(v));
-    if (v >= 10) return String(Math.round(v * 10) / 10);
-    if (v >= 1) return String(Math.round(v * 100) / 100);
-    return v.toPrecision(2);
-  }
 
   // Peak luminance in nits comes from the monitor's EDID/driver via DXGI
   // (IDXGIOutput6::GetDesc1) ,  see hdr_toggle.rs. Falls back to '-' when
@@ -123,18 +116,21 @@
             : 'Detecting...'],
           ['Display Scaling', devicePixelRatio ? `${Math.round(devicePixelRatio * 100)}%` : '?'],
           // Signal path: how the pixels travel from the GPU to the panel.
+          // Ordered like the monitor tooltip, from the panel outward to the
+          // Windows layer: panel capability (HDR max) first, then the
+          // connection, the signal, and finally how Windows renders it.
           // These fields are also exposed in the compact monitor tooltip;
           // keeping them here makes the report canonical and copyable (and
           // avoids a duplicate "Current" row ,  Screen Resolution already
           // includes the active resolution and refresh rate).
+          // HDR max luminance is only meaningful while HDR is active; hide it
+          // in SDR (same rule as the tooltip).
+          ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
           ['Connector', app.displayInfo.connector || '-'],
           ['Color Format', `${app.displayInfo.colorFormat || '-'}${app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}`],
-          ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '-'],
           ['Dynamic Range', app.displayInfo.dynamicRange || '-'],
+          ['Desktop Color', app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '-'],
           ['VRR', app.displayInfo.vrr || '-'],
-          // HDR output specifics ,  only shown while HDR is active. Peak
-          // luminance is only meaningful then; hide it in SDR.
-          ...(app.hdrStatus === 'hdr' ? [['HDR Max Luminance', hdrLuminance]] : []),
           // SDR white level is used as the reference for the Brightness
           // strip's HDR cells. Chromium froze the value at WebView startup,
           // so the strip encodes against that frozen base

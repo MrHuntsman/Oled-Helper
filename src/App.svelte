@@ -1,8 +1,9 @@
 <script>
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, updateState, checkForUpdates } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
+  import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
@@ -25,8 +26,15 @@
   import tabHdrIcon from './lib/icons/tab_hdr.png?inline';
   import tabDebugIcon from './lib/icons/tab_debug.png?inline';
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
+  import { dropdownCloseEffect, ctxMenuCloseEffect } from './lib/dropdown.js';
+  import { fmtNits } from './lib/calibration.js';
+  import UpdateModal from './lib/UpdateModal.svelte';
 
   let windowVisible = $state(true);
+  // Current app version read from the Tauri package at runtime, so the
+  // status-bar version stays in sync with the version the updater compares
+  // against (Cargo.toml / tauri.conf.json) instead of a hardcoded string.
+  let appVersion = $state('');
   // Coalesces the display-changed burst (hotplug/mode change emits several
   // WM_DISPLAYCHANGE/WM_DEVICECHANGE messages) into a single SDR-white base
   // re-capture, and gives the OS a beat to settle before the new value is read.
@@ -79,25 +87,7 @@
 
   $effect(() => {
     if (!resMenuOpen) return;
-    function onDocPointerDown(e) {
-      if (resMenuEl?.contains(e.target) || resButtonEl?.contains(e.target) || resCtxMenuEl?.contains(e.target)) return;
-      closeResMenu();
-    }
-    function onKeydown(e) {
-      if (e.key === 'Escape') { closeResMenu(); resButtonEl?.focus(); }
-    }
-    document.addEventListener('pointerdown', onDocPointerDown);
-    document.addEventListener('keydown', onKeydown);
-    // Jump the list so the currently-selected resolution is already in view
-    // (centered where possible) instead of opening scrolled to the top.
-    // matches how native <select> popups position themselves around the
-    // selected option. block:'center' with behavior:'instant' (not
-    // 'smooth') mirrors the native no-animation snap.
-    resMenuEl?.querySelector('.hz-menu-item.active')?.scrollIntoView({ block: 'center', behavior: 'instant' });
-    return () => {
-      document.removeEventListener('pointerdown', onDocPointerDown);
-      document.removeEventListener('keydown', onKeydown);
-    };
+    return dropdownCloseEffect(resMenuEl, resButtonEl, resCtxMenuEl, closeResMenu, resButtonEl);
   });
 
   // Custom click-only dropdown for refresh rate (Hz), replacing the native
@@ -138,22 +128,7 @@
 
   $effect(() => {
     if (!hzMenuOpen) return;
-    function onDocPointerDown(e) {
-      if (hzMenuEl?.contains(e.target) || hzButtonEl?.contains(e.target) || hzCtxMenuEl?.contains(e.target)) return;
-      closeHzMenu();
-    }
-    function onKeydown(e) {
-      if (e.key === 'Escape') { closeHzMenu(); hzButtonEl?.focus(); }
-    }
-    // pointerdown (not click) so the same click that opened the menu via the
-    // button doesn't immediately also count as an "outside" click closing it.
-    document.addEventListener('pointerdown', onDocPointerDown);
-    document.addEventListener('keydown', onKeydown);
-    hzMenuEl?.querySelector('.hz-menu-item.active')?.scrollIntoView({ block: 'center', behavior: 'instant' });
-    return () => {
-      document.removeEventListener('pointerdown', onDocPointerDown);
-      document.removeEventListener('keydown', onKeydown);
-    };
+    return dropdownCloseEffect(hzMenuEl, hzButtonEl, hzCtxMenuEl, closeHzMenu, hzButtonEl);
   });
 
   // ── Right-click context menus for the resolution and refresh-rate
@@ -306,9 +281,9 @@
     // (it grew with the sort/display sections), which clips the bottom when
     // opened near the status bar. Measure it after paint and pull it back
     // on-screen if it overflows the window.
-    const resMenuEl = resCtxMenuEl;
-    if (resMenuEl) {
-      const r = resMenuEl.getBoundingClientRect();
+    const menuEl = resCtxMenuEl;
+    if (menuEl) {
+      const r = menuEl.getBoundingClientRect();
       const dx = Math.min(0, window.innerWidth - r.right - 8);
       const dy = Math.min(0, window.innerHeight - r.bottom - 8);
       if (dx || dy) resCtxMenu = { ...resCtxMenu, x: r.left + dx, y: r.top + dy };
@@ -316,36 +291,15 @@
     const focusId = setTimeout(() => {
       resCtxMenuEl?.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
     }, 0);
-    function onDocClick() { closeResContextMenu(); }
-    function onDocKey(e) { if (e.key === 'Escape') closeResContextMenu(); }
-    function onDocPointerDown(e) {
-      // Any press outside the menu dismisses it. mousedown (not click) also
-      // fires for scrollbar interactions, which covers e.g. clicking the
-      // dropdown list's scrollbar while the context menu overlays it.
-      if (resCtxMenuEl?.contains(e.target)) return;
-      closeResContextMenu();
-    }
-    const id = setTimeout(() => {
-      document.addEventListener('click', onDocClick);
-      document.addEventListener('contextmenu', onDocClick);
-      document.addEventListener('mousedown', onDocPointerDown);
-      document.addEventListener('keydown', onDocKey);
-    }, 0);
-    return () => {
-      clearTimeout(focusId);
-      clearTimeout(id);
-      document.removeEventListener('click', onDocClick);
-      document.removeEventListener('contextmenu', onDocClick);
-      document.removeEventListener('mousedown', onDocPointerDown);
-      document.removeEventListener('keydown', onDocKey);
-    };
+    const cleanup = ctxMenuCloseEffect(resCtxMenuEl, closeResContextMenu);
+    return () => { clearTimeout(focusId); cleanup(); };
   });
 
   $effect(() => {
     if (!hzCtxMenu.open) return;
-    const hzMenuEl = hzCtxMenuEl;
-    if (hzMenuEl) {
-      const r = hzMenuEl.getBoundingClientRect();
+    const menuEl = hzCtxMenuEl;
+    if (menuEl) {
+      const r = menuEl.getBoundingClientRect();
       const dx = Math.min(0, window.innerWidth - r.right - 8);
       const dy = Math.min(0, window.innerHeight - r.bottom - 8);
       if (dx || dy) hzCtxMenu = { ...hzCtxMenu, x: r.left + dx, y: r.top + dy };
@@ -353,26 +307,8 @@
     const focusId = setTimeout(() => {
       hzCtxMenuEl?.querySelector('[role="menuitem"]:not(:disabled)')?.focus();
     }, 0);
-    function onDocClick() { closeHzContextMenu(); }
-    function onDocKey(e) { if (e.key === 'Escape') closeHzContextMenu(); }
-    function onDocPointerDown(e) {
-      if (hzCtxMenuEl?.contains(e.target)) return;
-      closeHzContextMenu();
-    }
-    const id = setTimeout(() => {
-      document.addEventListener('click', onDocClick);
-      document.addEventListener('contextmenu', onDocClick);
-      document.addEventListener('mousedown', onDocPointerDown);
-      document.addEventListener('keydown', onDocKey);
-    }, 0);
-    return () => {
-      clearTimeout(focusId);
-      clearTimeout(id);
-      document.removeEventListener('click', onDocClick);
-      document.removeEventListener('contextmenu', onDocClick);
-      document.removeEventListener('mousedown', onDocPointerDown);
-      document.removeEventListener('keydown', onDocKey);
-    };
+    const cleanup = ctxMenuCloseEffect(hzCtxMenuEl, closeHzContextMenu);
+    return () => { clearTimeout(focusId); cleanup(); };
   });
 
   // Toggling real Windows HDR (Settings > Display > HDR) via the backend.
@@ -573,14 +509,6 @@
 
   function currentResolutionName() {
     return resolutionNames.get(`${app.displayInfo.width}x${app.displayInfo.height}`) || '';
-  }
-
-  // Desktop color depth as Windows' classic Display Properties reports it
-  // (GetDeviceCaps BITSPIXEL on the screen DC, 32 on modern setups). The
-  // browser's screen.colorDepth reports 30 on 10-bit panels, which is the
-  // signal bit depth, not the desktop color mode.
-  function desktopColorDepth() {
-    return app.displayInfo.desktopBits ? `${app.displayInfo.desktopBits}-bit` : '-';
   }
 
   // Anything wider than a standard 16:9 panel (1.9 gives headroom above
@@ -1000,6 +928,11 @@
     // Seed the SDR white level used by the Brightness strip compensation
     // (Chromium maps the HDR calibration canvas relative to this value).
     refreshSdrWhiteLevel();
+    // Read the runtime version for the status bar (keeps it in sync with
+    // the version the updater compares against).
+    getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
+    // Silent startup update check; failure never disturbs the UI.
+    checkForUpdates();
 
     let unlisten;
     let unlistenDisplayChanged;
@@ -1050,6 +983,9 @@
         refreshSdrWhiteLevel();
         hdrLayerRetryCount = 0;
         hdrLayerInitStarted = false;
+        // Silent update check whenever the app is restored from the tray
+        // (cooldown throttles it). Never disturbs the UI on failure.
+        checkForUpdates();
       }
     }).then((stop) => { unlisten = stop; }).catch(() => {});
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
@@ -1143,15 +1079,16 @@
     return () => clearInterval(timer);
   });
 
-  // HDR luminance is a DXGI call; only refresh while the System Info tab is
-  // open (it owns the HDR Max Luminance row), at a gentle 5-second cadence
-  // (purely informational).
+  // HDR luminance is a DXGI capability read. The status-bar monitor tooltip
+  // shows the panel's HDR max nits, so fetch it once whenever the window is
+  // visible (mount, show-from-tray, sleep/resume); the System Info tab owns
+  // the 5-second refresh cadence since it displays the value live.
   $effect(() => {
-    if (app.activeTab === 'system' && windowVisible) {
-      pollHDRLuminance();
-      const timer = setInterval(() => pollHDRLuminance(), 5000);
-      return () => clearInterval(timer);
-    }
+    if (!windowVisible) return;
+    pollHDRLuminance();
+    if (app.activeTab !== 'system') return;
+    const timer = setInterval(() => pollHDRLuminance(), 5000);
+    return () => clearInterval(timer);
   });
 
   // Monitor fullscreen of the calibration strip: suspend the taskbar dimmer
@@ -1170,7 +1107,7 @@
       <img class="app-icon" src={appIcon} alt="OLED Helper" />
       <div class="title-block">
         <span class="title">OLED HELPER</span>
-        <span class="version">v0.1.0</span>
+        <span class="version">v{appVersion || '0.1.1'}</span>
       </div>
     </div>
     <div class="spacer"></div>
@@ -1228,7 +1165,18 @@
   </main>
 
   <div class="status-bar">
-    <span>v0.1.0</span>
+    {#if updateState.status === 'available'}
+      <button
+        type="button"
+        class="status-version has-update"
+        title={`Update available: v${updateState.version}`}
+        onclick={() => { updateState.modalOpen = true; }}>
+        <span class="status-version-dot" aria-hidden="true"></span>
+        <span>v{appVersion || '0.1.1'}</span>
+      </button>
+    {:else}
+      <span class="status-version">v{appVersion || '0.1.1'}</span>
+    {/if}
     <div class="status-bar-right">
       {#if app.displayInfo.monitorName}
         <span class="monitor-tip-wrap" tabindex="0" aria-label={`Monitor info: ${app.displayInfo.monitorName}`}>
@@ -1237,9 +1185,11 @@
           </span>
           <span class="monitor-tip" role="tooltip">
             <span class="monitor-tip-title">{app.displayInfo.monitorName}</span>
+            {#if app.hdrStatus === 'hdr' && app.hdrLuminance?.maxNits}
+              <span class="monitor-tip-row"><span>HDR max</span><strong>{fmtNits(app.hdrLuminance.maxNits)} nits</strong></span>
+            {/if}
             <span class="monitor-tip-row"><span>Connector</span><strong>{app.displayInfo.connector || '-'}</strong></span>
             <span class="monitor-tip-row"><span>Color format</span><strong>{app.displayInfo.colorFormat || '-'}{app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}</strong></span>
-            <span class="monitor-tip-row"><span>Desktop color</span><strong>{desktopColorDepth()}</strong></span>
             <span class="monitor-tip-row"><span>Dynamic range</span><strong>{app.displayInfo.dynamicRange || '-'}</strong></span>
             <span class="monitor-tip-row"><span>VRR</span><strong>{app.displayInfo.vrr || '-'}</strong></span>
             <span class="monitor-tip-row"><span>Current</span><strong>{app.displayInfo.width}×{app.displayInfo.height}{app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}</strong></span>
@@ -1384,3 +1334,7 @@
      HDR presentation path for the whole session so chrome brightness is
      uniform across tabs. Invisible, 1px, near-zero opacity, no pointer events. -->
 <canvas class="hdr-layer" bind:this={hdrLayerCanvas} aria-hidden="true" tabindex="-1"></canvas>
+
+{#if updateState.modalOpen}
+  <UpdateModal onclose={() => { updateState.modalOpen = false; }} />
+{/if}

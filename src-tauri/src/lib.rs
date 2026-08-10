@@ -6,6 +6,7 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
+mod updater;
 mod vendor_info;
 mod window_icon;
 
@@ -723,7 +724,7 @@ fn dwm_eotf_watch_loop(app: AppHandle) {
     }
 }
 
-fn shutdown_gamma_worker(app: &AppHandle) {
+pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
     let state = app.state::<GammaState>();
     state.shutdown.requested.store(true, Ordering::Release);
     state.shutdown.wake.notify_one();
@@ -991,9 +992,11 @@ fn set_tray_enabled(
 // When this instance was spawned by a tray Restart, --restart-parent carries
 // the old process's PID. Wait for it to fully exit before creating the
 // WebView2 environment. A vanished parent is success; a live parent remains
-// polled with low-frequency warnings until it exits.
+// polled with low-frequency warnings until it exits. Also used by the
+// updater's --apply-update mode to wait for the old process to release the
+// exe file before swapping it.
 #[cfg(target_os = "windows")]
-fn wait_for_restart_parent(parent_pid: u32) -> bool {
+pub(crate) fn wait_for_restart_parent(parent_pid: u32) -> bool {
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
     };
@@ -1042,6 +1045,12 @@ fn wait_for_restart_parent(parent_pid: u32) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Portable-update handoff: a staged copy of the new exe was spawned with
+    // --apply-update and is responsible for swapping the files and relaunching
+    // once this process exits. Must run before any Tauri/WebView2 init.
+    if updater::handle_apply_update_mode() {
+        return;
+    }
     if std::env::args().any(|arg| arg == "--display-mode-watchdog") {
         display_info::run_recovery_watchdog();
         return;
@@ -1190,6 +1199,9 @@ pub fn run() {
             set_hdr_enhancement_mode,
             vendor_info::set_rtx_hdr_state,
             relaunch_elevated,
+            updater::check_for_update,
+            updater::download_update,
+            updater::apply_update,
             take_startup_tab,
             set_refresh_rate,
             set_resolution,
