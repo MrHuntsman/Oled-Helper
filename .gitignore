@@ -33,3 +33,6 @@ diagnostic/
 
 # Tauri updater signing keys (private key must never be committed)
 .tauri/
+# Machine-specific cargo overrides (target-dir etc.) belong in the user-level
+# ~/.cargo/config.toml, never in the repo (they break CI builds).
+.cargo/config.toml
