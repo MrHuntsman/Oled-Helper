@@ -5,7 +5,7 @@ A Windows desktop utility for OLED display calibration and system tweaks, built 
 ## Features
 
 - **Black Crush Tweak**: Fix near-black levels while preserving pure black, with HDR/SDR calibration strips and per-refresh-rate profiles.
-- **Taskbar Dimmer**: Match the taskbar to your OLED brightness with configurable opacity, fades, and hover detection.
+- **Taskbar Dimmer**: Dim the taskbar to prevent OLED burn-in, with configurable opacity, fades, and hover detection.
 - **Windows HDR**: Control Windows Auto HDR, RTX HDR, HDR on/off, and SDR white level.
 - **Hotkeys**: Global shortcuts, including a hold-to-compare calibration view.
 - **Display tools**: Resolution and refresh-rate switching with auto rollback, plus detailed system info.
