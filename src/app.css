@@ -3634,9 +3634,57 @@ button {
 .tray-menu-danger:hover,.tray-menu-danger:focus-visible { color:#ff9797; background:rgba(220,70,70,.13); }
 .tray-menu-favorite-item { justify-content:flex-start; }
 .tray-menu-favorite-item .tray-menu-item-icon { flex:none; }
-.tray-menu-favorite-check { margin-left:auto; color:var(--accent); font-size:13px; font-weight:700; }
 .tray-menu-favorites-empty { display:flex; align-items:center; min-height:34px; padding:0 10px; }
 .tray-menu-favorites-empty .tray-menu-item-icon { flex:none; }
+/* Favorite stars on tray menu rows, mirroring the main app's resolution
+   dropdown: full stars (always visible) on saved combos, empty stars on
+   hover for the rest, and an armed red state before a removal confirms.
+   Each row is a flex wrapper so the star sits at the end of the subitem. */
+.tray-menu-subitem-row,
+.tray-menu-favorite-row { display:flex; align-items:center; }
+.tray-menu-subitem-row .tray-menu-subitem,
+.tray-menu-favorite-row .tray-menu-favorite-item { flex:1 1 auto; min-width:0; }
+.tray-menu-subitem-row:hover .tray-menu-subitem,
+.tray-menu-subitem-row:focus-within .tray-menu-subitem { border-radius:7px; }
+.tray-menu-star {
+  flex:0 0 auto;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:26px;
+  height:26px;
+  margin-right:4px;
+  padding:0;
+  border:0;
+  border-radius:6px;
+  background:transparent;
+  color:#858994;
+  cursor:pointer;
+  opacity:0;
+  transition:color .12s ease,background .12s ease,opacity .12s ease;
+}
+.tray-menu-subitem-row:hover .tray-menu-star,
+.tray-menu-favorite-row:hover .tray-menu-star,
+.tray-menu-star:focus-visible { opacity:1; }
+.tray-menu-star:hover { color:var(--accent); background:rgba(255,255,255,.07); }
+/* Saved combos keep their star visible at all times so favorites are
+   identifiable without hovering (same rule set as .res-item-fav). */
+.tray-menu-star.favorited { opacity:1; color:var(--accent); }
+.tray-menu-star.favorited:hover,
+.tray-menu-star.armed { color:#ff9797; background:rgba(220,70,70,.13); }
+.tray-menu-star.armed { opacity:1; }
+/* One-click removal confirmation. Clicking a filled star opens this compact
+   in-card strip (the tray popup is transparent outside the card, so a full
+   modal is not usable here); one click on Remove deletes the favorite. */
+.tray-menu-confirm-panel { display:flex; align-items:center; gap:8px; margin:0 3px 8px; padding:10px; border:1px solid rgba(220,70,70,.35); border-radius:8px; background:rgba(220,70,70,.1); animation:tray-menu-confirm-in .12s ease; }
+.tray-menu-confirm-copy { flex:1; min-width:0; color:#e8e4e4; font-size:12px; line-height:1.35; }
+.tray-menu-confirm-copy strong { color:#ff9797; font-weight:600; font-variant-numeric:tabular-nums; }
+.tray-menu-confirm-btn { flex:none; padding:5px 12px; border:0; border-radius:6px; font-family:var(--font); font-size:11px; font-weight:600; cursor:pointer; transition:background .12s ease,filter .12s ease; }
+.tray-menu-confirm-cancel { color:#c9cbd3; background:rgba(255,255,255,.09); }
+.tray-menu-confirm-cancel:hover,.tray-menu-confirm-cancel:focus-visible { background:rgba(255,255,255,.16); outline:none; }
+.tray-menu-confirm-remove { color:#fff; background:#c0392b; }
+.tray-menu-confirm-remove:hover,.tray-menu-confirm-remove:focus-visible { background:#d64537; outline:none; }
+@keyframes tray-menu-confirm-in { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
 .tray-menu-submenu { position:absolute; z-index:5; top:0; left:100%; width:max-content; min-width:110px; max-width:250px;  max-height: none;
   height: fit-content; overflow-y:auto; overflow-x:hidden; scrollbar-width:auto; scrollbar-color:rgba(255,255,255,.42) rgba(255,255,255,.08); padding:6px; border:1px solid rgba(255,255,255,.1); border-radius:10px; background:#1b1c21; box-shadow:none; }
 .tray-menu-submenu::-webkit-scrollbar { width:10px; }

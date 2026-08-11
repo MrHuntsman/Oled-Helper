@@ -1177,5 +1177,72 @@ pub fn tray_menu_select_favorite(app: AppHandle, width: u32, height: u32, hz: u3
     });
 }
 
+// The tray menu mirrors the main app's resolution-dropdown favorites: full
+// stars (always visible) on saved combos, empty stars on the rest, and a
+// click toggles a favorite. These commands mutate the config and then push a
+// fresh snapshot to the open menu so the stars update in place without
+// closing the popup.
+#[tauri::command]
+pub fn tray_menu_add_favorite(app: AppHandle, width: u32, height: u32, hz: u32) {
+    let mut config = crate::config::load_config(app.clone());
+    if !config
+        .favorite_display_modes
+        .iter()
+        .any(|f| f.width == width && f.height == height && f.hz == hz)
+    {
+        config
+            .favorite_display_modes
+            .push(crate::config::FavoriteDisplayMode { width, height, hz });
+        let _ = crate::config::save_config(app.clone(), config.clone());
+    }
+    publish_favorites_update(&app, &config);
+}
+
+#[tauri::command]
+pub fn tray_menu_remove_favorite(app: AppHandle, width: u32, height: u32, hz: u32) {
+    let mut config = crate::config::load_config(app.clone());
+    config
+        .favorite_display_modes
+        .retain(|f| !(f.width == width && f.height == height && f.hz == hz));
+    let _ = crate::config::save_config(app.clone(), config.clone());
+    publish_favorites_update(&app, &config);
+}
+
+// Replaces the favorites list in the open menu's snapshot (keeping the menu's
+// cursor geometry untouched) and emits it as tray-menu-update so the popup
+// re-renders live. Uses the already-mutated config rather than re-reading the
+// file, because config writes go through an async worker.
+fn publish_favorites_update(app: &AppHandle, config: &crate::config::AppConfig) {
+    let mut favorites: Vec<_> = config
+        .favorite_display_modes
+        .iter()
+        .map(|favorite| TrayFavorite {
+            width: favorite.width,
+            height: favorite.height,
+            hz: favorite.hz,
+        })
+        .collect();
+    favorites.sort_by(|a, b| {
+        b.width
+            .cmp(&a.width)
+            .then_with(|| b.height.cmp(&a.height))
+            .then_with(|| b.hz.cmp(&a.hz))
+    });
+    // Keep the main window in sync too: its in-memory favorites list is only
+    // refreshed on config load, so a tray-side change would otherwise stay
+    // stale in the resolution dropdown and favorites menu until restart.
+    let _ = app.emit("favorites-changed", favorites.clone());
+    let payload = state().lock().ok().and_then(|mut guard| {
+        let data = guard.data.as_mut()?;
+        data.favorites = favorites;
+        Some(data.clone())
+    });
+    if let Some(payload) = payload {
+        if let Some(window) = app.get_webview_window(MENU_LABEL) {
+            let _ = window.emit("tray-menu-update", payload);
+        }
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn show_tray_menu(_app: AppHandle) {}

@@ -3,7 +3,7 @@ import './app.css'
 import App from './App.svelte'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { pushGpuLog, debugSettings, handleTaskbarDimmerAvailable } from './lib/stores.svelte.js'
+import { pushGpuLog, debugSettings, handleTaskbarDimmerAvailable, syncFavoritesFromBackend } from './lib/stores.svelte.js'
 
 // The Rust tauri-plugin-log Webview target is the canonical fan-out path:
 // every record is written to stdout/file and emitted as `log://log`. We do not
@@ -125,6 +125,14 @@ listen('config-write-failed', (event) => {
 // taskbar dimmer overlay comes online after an initial startup failure.
 listen('taskbar-dimmer-available', () => {
   handleTaskbarDimmerAvailable();
+}).catch(() => {});
+
+// Favorites can be toggled from the tray menu (which has its own window). The
+// main window only reads config at load time, so the backend emits this with
+// the fresh list to keep the resolution dropdown stars and favorites menu in
+// sync without a full config reload.
+listen('favorites-changed', (event) => {
+  syncFavoritesFromBackend(event.payload);
 }).catch(() => {});
 
 // Capture uncaught errors before Svelte mounts. They are sent to Rust and then

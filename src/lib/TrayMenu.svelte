@@ -30,6 +30,10 @@
   $effect(() => {
     if (!snapshot.open) return;
     void activeSubmenu;
+    // The removal confirm panel adds height to the card; re-measure so the
+    // native popup grows (and re-flushes against the taskbar) in the same
+    // frame instead of clipping the new section.
+    void pendingRemove;
     measureCard();
     reportHitRects();
     const timer = setTimeout(() => {
@@ -148,9 +152,56 @@
   function isCurrentFavorite(favorite) { return data && favorite.width === data.width && favorite.height === data.height && favorite.hz === data.refresh_hz; }
   function isCurrentResolution(resolution) { return data && resolution.width === data.width && resolution.height === data.height; }
   function isCurrentRate(rate) { return data && rate === data.refresh_hz; }
+  // ── Favorite stars ────────────────────────────────────────────────────────
+  // Mirrors the main app's resolution dropdown: a resolution is favorited at
+  // the CURRENT refresh rate (favorites are res@hz combos). Full stars are
+  // always visible on saved combos; empty stars appear on hover for the rest.
+  function isResolutionFavorited(resolution) {
+    return data && data.refresh_hz > 0
+      && data.favorites.some((f) => f.width === resolution.width && f.height === resolution.height && f.hz === data.refresh_hz);
+  }
+  function favKey(width, height, hz) { return `${width}x${height}@${hz}`; }
+  // Removal confirmation, compact enough for a flyout: one click on a filled
+  // star opens a small in-card confirm panel ("Remove?"), one click on
+  // Remove deletes the favorite. Escape or Cancel closes it without removing.
+  let pendingRemove = $state(null); // { width, height, hz } awaiting confirm
+  function cancelPendingRemove() {
+    pendingRemove = null;
+  }
+  function pendingRemoveKey() {
+    return pendingRemove ? favKey(pendingRemove.width, pendingRemove.height, pendingRemove.hz) : null;
+  }
+  function confirmPendingRemove() {
+    const fav = pendingRemove;
+    cancelPendingRemove();
+    if (!fav) return;
+    invoke('tray_menu_remove_favorite', { width: fav.width, height: fav.height, hz: fav.hz }).catch(() => {});
+  }
+  function requestRemove(fav) {
+    cancelPendingRemove();
+    // A pending hover-close must not race the panel: once a removal is being
+    // confirmed, the submenu it came from stays put until the panel resolves.
+    cancelSubmenuClose();
+    pendingRemove = fav;
+  }
+  function onResStar(event, resolution) {
+    event.stopPropagation();
+    const hz = data.refresh_hz || 0;
+    if (hz <= 0) return;
+    if (isResolutionFavorited(resolution)) {
+      requestRemove({ width: resolution.width, height: resolution.height, hz });
+    } else {
+      invoke('tray_menu_add_favorite', { width: resolution.width, height: resolution.height, hz }).catch(() => {});
+    }
+  }
+  function onFavStar(event, favorite) {
+    event.stopPropagation();
+    requestRemove({ width: favorite.width, height: favorite.height, hz: favorite.hz });
+  }
   function beginClose() {
     if (!snapshot.open || closing) return;
     cancelSubmenuClose();
+    cancelPendingRemove();
     // Keep the open submenu mounted for the exit animation. It hangs off the
     // card's side, and unmounting it in the same frame the close starts makes
     // the menu look like it collapses sideways (the submenu vanishes instantly
@@ -264,6 +315,10 @@
     if (activeSubmenu === name) submenuRevealed = true;
   }
   function onMenuFocusOut(event, name) {
+    // While the removal confirm panel is open, focus naturally leaves the row
+    // (the panel auto-focuses its Cancel button). That must not schedule a
+    // hover-close, or the submenu would vanish under the cursor mid-confirm.
+    if (pendingRemove) return;
     const next = event.relatedTarget;
     const row = event.currentTarget;
     if (next && row.contains(next)) return;
@@ -307,8 +362,18 @@
     event.preventDefault();
     event.stopPropagation();
   }
+  let pendingRemoveCancelEl = $state(null);
+  // Focus the safe default when the removal panel opens so Enter/Escape
+  // cancel instead of removing.
+  $effect(() => {
+    if (pendingRemove) pendingRemoveCancelEl?.focus();
+  });
   function onKeydown(event) {
-    if (event.key === 'Escape') { event.preventDefault(); close(); }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      if (pendingRemove) { cancelPendingRemove(); return; }
+      close();
+    }
     if (event.key === 'ArrowLeft') {
       const submenu = document.activeElement?.closest('.tray-menu-submenu');
       if (submenu) {
@@ -319,7 +384,7 @@
     }
     if (event.key === 'Tab') {
       event.preventDefault();
-      const focusable = [...document.querySelectorAll('.tray-menu-item:not(:disabled), .tray-menu-subitem:not(:disabled)')];
+      const focusable = [...document.querySelectorAll('.tray-menu-item:not(:disabled), .tray-menu-subitem:not(:disabled), .tray-menu-confirm-btn:not(:disabled)')];
       const index = focusable.indexOf(document.activeElement);
       focusable[(index + 1) % focusable.length]?.focus();
     }
@@ -362,6 +427,7 @@
       snapshot = { open: true, data: event.payload };
       activeSubmenu = null;
       closing = false;
+      cancelPendingRemove();
       animating = true;
       requestAnimationFrame(playEntrance);
       tick().then(() => {
@@ -377,14 +443,34 @@
     listen('tray-menu-close', () => {
       beginClose();
     }).then((stop) => { stopClose = stop; });
+    // A favorite was added/removed from this menu: swap in the refreshed
+    // snapshot (cursor geometry stays untouched in the payload) and re-measure
+    // so hit rects and card height track the changed favorites list.
+    let stopUpdate;
+    listen('tray-menu-update', (event) => {
+      if (!snapshot.open || !event.payload) return;
+      snapshot = { ...snapshot, data: event.payload };
+      cancelPendingRemove();
+      // Removing a favorite can drop the list below 3, which swaps the
+      // favorites submenu for inline rows; the parent row would otherwise
+      // keep its open state with no flyout mounted.
+      if (activeSubmenu === 'favorites' && (event.payload.favorites?.length ?? 0) < 3) {
+        activeSubmenu = null;
+      }
+      measureCard();
+      if (activeSubmenu) positionSubmenu(activeSubmenu);
+      reportHitRects();
+    }).then((stop) => { stopUpdate = stop; });
     return () => {
       clearTimeout(submenuCloseTimer);
       clearTimeout(closeTimer);
+      cancelPendingRemove();
       window.removeEventListener('resize', updateViewport);
       document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('contextmenu', onContextMenu, true);
       stopOpen?.();
       stopClose?.();
+      stopUpdate?.();
     };
   });
 </script>
@@ -396,15 +482,22 @@
     <div class="tray-menu-card" style={cardStyle} role="menu" aria-label="OLED Helper tray menu">
       <div class="tray-menu-header"><img src={appIcon} alt="" class="tray-menu-app-icon" /><div class="tray-menu-header-copy"><div class="tray-menu-title">{data.title}</div><div class="tray-menu-subtitle">{data.monitor_name}</div><div class="tray-menu-mode">{currentMode}</div></div><button class="tray-menu-close" type="button" aria-label="Close menu" onclick={close}>×</button></div>
       <div class="tray-menu-divider"></div>
+      {#if pendingRemove}
+        <div class="tray-menu-confirm-panel" role="alertdialog" aria-label="Remove favorite">
+          <span class="tray-menu-confirm-copy">Remove <strong>{pendingRemove.width}×{pendingRemove.height} @ {pendingRemove.hz} Hz</strong> from favorites?</span>
+          <button class="tray-menu-confirm-btn tray-menu-confirm-cancel" type="button" bind:this={pendingRemoveCancelEl} onclick={cancelPendingRemove}>Cancel</button>
+          <button class="tray-menu-confirm-btn tray-menu-confirm-remove" type="button" onclick={confirmPendingRemove}>Remove</button>
+        </div>
+      {/if}
       <div class="tray-menu-content">
-        <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'resolution'} onpointerenter={() => openSubmenu('resolution')} onpointerleave={(event) => scheduleSubmenuClose(event, 'resolution')} onfocusout={(event) => onMenuFocusOut(event, 'resolution')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'resolution'} onfocus={() => openSubmenu('resolution')} onkeydown={(event) => onParentKeydown(event, 'resolution')} onclick={() => openSubmenu('resolution')}><span class="tray-menu-item-icon">▦</span><span>Resolution</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'resolution'}<div class="tray-menu-submenu tray-menu-submenu-resolution" data-tray-submenu="resolution" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'resolution')}>{#each data.resolutions as resolution}                    <button class="tray-menu-subitem" class:tray-menu-selected={isCurrentResolution(resolution)} type="button" role="menuitem" onclick={() => selectResolution(resolution)}><span class="tray-menu-check">{isCurrentResolution(resolution) ? '✓' : ''}</span><span class="tray-menu-resolution-value">{resolution.width}×{resolution.height}</span>{#if resolution.ultrawide}<span class="tray-menu-resolution-tag">UW</span>{/if}{#if resolution.name}<span class="tray-menu-resolution-tag">{resolution.name}</span>{/if}{#if resolution.native}<span class="tray-menu-resolution-native">Native</span>{/if}</button>{:else}<div class="tray-menu-empty">No resolutions available</div>{/each}</div>{/if}</div>
+        <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'resolution'} onpointerenter={() => openSubmenu('resolution')} onpointerleave={(event) => scheduleSubmenuClose(event, 'resolution')} onfocusout={(event) => onMenuFocusOut(event, 'resolution')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'resolution'} onfocus={() => openSubmenu('resolution')} onkeydown={(event) => onParentKeydown(event, 'resolution')} onclick={() => openSubmenu('resolution')}><span class="tray-menu-item-icon">▦</span><span>Resolution</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'resolution'}<div class="tray-menu-submenu tray-menu-submenu-resolution" data-tray-submenu="resolution" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'resolution')}>{#each data.resolutions as resolution}{@const favKey2 = favKey(resolution.width, resolution.height, data.refresh_hz || 0)}{@const resFav = isResolutionFavorited(resolution)}                    <div class="tray-menu-subitem-row"><button class="tray-menu-subitem" class:tray-menu-selected={isCurrentResolution(resolution)} type="button" role="menuitem" onclick={() => selectResolution(resolution)}><span class="tray-menu-check">{isCurrentResolution(resolution) ? '✓' : ''}</span><span class="tray-menu-resolution-value">{resolution.width}×{resolution.height}</span>{#if resolution.ultrawide}<span class="tray-menu-resolution-tag">UW</span>{/if}{#if resolution.name}<span class="tray-menu-resolution-tag">{resolution.name}</span>{/if}{#if resolution.native}<span class="tray-menu-resolution-native">Native</span>{/if}</button><button class="tray-menu-star" class:favorited={resFav} class:armed={pendingRemoveKey() === favKey2} type="button" title={resFav ? `Remove ${resolution.width}×${resolution.height} @ ${data.refresh_hz} Hz from favorites` : `Favorite ${resolution.width}×${resolution.height} @ ${data.refresh_hz} Hz`} aria-label={resFav ? `Remove ${resolution.width}×${resolution.height} @ ${data.refresh_hz} Hz from favorites` : `Favorite ${resolution.width}×${resolution.height} @ ${data.refresh_hz} Hz`} onclick={(event) => onResStar(event, resolution)}><svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={resFav ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></button></div>{:else}<div class="tray-menu-empty">No resolutions available</div>{/each}</div>{/if}</div>
         <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'refresh'} onpointerenter={() => openSubmenu('refresh')} onpointerleave={(event) => scheduleSubmenuClose(event, 'refresh')} onfocusout={(event) => onMenuFocusOut(event, 'refresh')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'refresh'} onfocus={() => openSubmenu('refresh')} onkeydown={(event) => onParentKeydown(event, 'refresh')} onclick={() => openSubmenu('refresh')}><span class="tray-menu-item-icon">◷</span><span>Refresh Rate</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'refresh'}<div class="tray-menu-submenu tray-menu-submenu-refresh" data-tray-submenu="refresh" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'refresh')}>{#each data.refresh_rates as rate}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentRate(rate)} type="button" role="menuitem" onclick={() => selectRate(rate)}><span class="tray-menu-check">{isCurrentRate(rate) ? '✓' : ''}</span>{rate} Hz</button>{:else}<div class="tray-menu-empty">No refresh rates available</div>{/each}</div>{/if}</div>
         <div class="tray-menu-divider tray-menu-section-divider"></div>
         {#if data.favorites.length >= 3}
-          <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'favorites'} onpointerenter={() => openSubmenu('favorites')} onpointerleave={(event) => scheduleSubmenuClose(event, 'favorites')} onfocusout={(event) => onMenuFocusOut(event, 'favorites')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'favorites'} onfocus={() => openSubmenu('favorites')} onkeydown={(event) => onParentKeydown(event, 'favorites')} onclick={() => openSubmenu('favorites')}><span class="tray-menu-item-icon">★</span><span>Favorites</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'favorites'}<div class="tray-menu-submenu tray-menu-submenu-favorites" data-tray-submenu="favorites" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'favorites')}>{#each data.favorites as favorite}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" role="menuitem" onclick={() => selectFavorite(favorite)}><span class="tray-menu-check">{isCurrentFavorite(favorite) ? '✓' : ''}</span>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</button>{/each}</div>{/if}</div>
+          <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'favorites'} onpointerenter={() => openSubmenu('favorites')} onpointerleave={(event) => scheduleSubmenuClose(event, 'favorites')} onfocusout={(event) => onMenuFocusOut(event, 'favorites')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'favorites'} onfocus={() => openSubmenu('favorites')} onkeydown={(event) => onParentKeydown(event, 'favorites')} onclick={() => openSubmenu('favorites')}><span class="tray-menu-item-icon">★</span><span>Favorites</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'favorites'}<div class="tray-menu-submenu tray-menu-submenu-favorites" data-tray-submenu="favorites" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'favorites')}>{#each data.favorites as favorite}{@const favKey2 = favKey(favorite.width, favorite.height, favorite.hz)}<div class="tray-menu-subitem-row"><button class="tray-menu-subitem" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" role="menuitem" onclick={() => selectFavorite(favorite)}>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</button><button class="tray-menu-star" class:favorited={true} class:armed={pendingRemoveKey() === favKey2} type="button" title={`Remove ${favorite.width}×${favorite.height} @ ${favorite.hz} Hz from favorites`} aria-label={`Remove ${favorite.width}×${favorite.height} @ ${favorite.hz} Hz from favorites`} onclick={(event) => onFavStar(event, favorite)}><svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></button></div>{/each}</div>{/if}</div>
         {:else if data.favorites.length > 0}
-          {#each data.favorites as favorite}
-            <button class="tray-menu-item tray-menu-favorite-item" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" onclick={() => selectFavorite(favorite)}><span class="tray-menu-item-icon">★</span><span>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</span><span class="tray-menu-favorite-check">{isCurrentFavorite(favorite) ? '✓' : ''}</span></button>
+          {#each data.favorites as favorite}{@const favKey2 = favKey(favorite.width, favorite.height, favorite.hz)}
+            <div class="tray-menu-favorite-row"><button class="tray-menu-item tray-menu-favorite-item" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" onclick={() => selectFavorite(favorite)}><span class="tray-menu-item-icon">★</span><span>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</span></button><button class="tray-menu-star" class:favorited={true} class:armed={pendingRemoveKey() === favKey2} type="button" title={`Remove ${favorite.width}×${favorite.height} @ ${favorite.hz} Hz from favorites`} aria-label={`Remove ${favorite.width}×${favorite.height} @ ${favorite.hz} Hz from favorites`} onclick={(event) => onFavStar(event, favorite)}><svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg></button></div>
           {/each}
         {:else}
           <div class="tray-menu-empty tray-menu-favorites-empty"><span class="tray-menu-item-icon">★</span><span>No favorites yet</span></div>

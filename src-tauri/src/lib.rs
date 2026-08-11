@@ -42,6 +42,10 @@ mod tray_menu {
     #[tauri::command]
     pub fn tray_menu_select_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
     #[tauri::command]
+    pub fn tray_menu_add_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
+    #[tauri::command]
+    pub fn tray_menu_remove_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
+    #[tauri::command]
     pub fn tray_menu_set_hit_rects(_rects: Vec<serde_json::Value>) {}
     #[tauri::command]
     pub fn tray_menu_set_card_height(_height_css: f64) {}
@@ -1044,6 +1048,8 @@ pub fn run() {
             tray_menu::tray_menu_select_resolution,
             tray_menu::tray_menu_select_refresh_rate,
             tray_menu::tray_menu_select_favorite,
+            tray_menu::tray_menu_add_favorite,
+            tray_menu::tray_menu_remove_favorite,
             tray_menu::tray_menu_set_hit_rects,
             tray_menu::tray_menu_set_card_height,
             set_tray_enabled,

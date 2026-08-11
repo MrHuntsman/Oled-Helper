@@ -239,6 +239,22 @@ export function removeFavoriteDisplayMode(width, height, hz) {
   displayFavorites.splice(index, 1);
   scheduleFavoritesSave();
 }
+// Replaces the favorites list from the backend (tray menu toggles emit
+// favorites-changed). The main window only reads config at load time, so a
+// tray-side add/remove would otherwise stay stale in the resolution dropdown
+// and favorites menu until restart. Mutating in place keeps the same array
+// identity, so reactive consumers re-render without a state swap.
+export function syncFavoritesFromBackend(list) {
+  displayFavorites.length = 0;
+  if (Array.isArray(list)) {
+    for (const fav of list) {
+      if (fav && Number.isFinite(fav.width) && Number.isFinite(fav.height) && Number.isFinite(fav.hz)
+        && fav.width > 0 && fav.height > 0 && fav.hz > 0) {
+        displayFavorites.push({ width: Math.round(fav.width), height: Math.round(fav.height), hz: Math.round(fav.hz) });
+      }
+    }
+  }
+}
 
 export const dimmerDetections = $state({
   fullscreen: true,
