@@ -5,7 +5,38 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
+#[cfg(target_os = "windows")]
+mod tray_menu;
 mod updater;
+// Non-Windows builds cannot compile the raw Win32 tray menu (tray_menu.rs),
+// but the tray icon handler still references show_tray_menu.
+#[cfg(not(target_os = "windows"))]
+mod tray_menu {
+    #[tauri::command]
+    pub fn show_tray_menu(_app: tauri::AppHandle) {}
+    pub fn toggle_tray_menu(_app: &tauri::AppHandle) {}
+    pub fn prewarm(_app: &tauri::AppHandle) {}
+    #[tauri::command]
+    pub fn tray_menu_get_snapshot() -> serde_json::Value {
+        serde_json::json!({"open": false, "data": null})
+    }
+    #[tauri::command]
+    pub fn tray_menu_close(_app: tauri::AppHandle) {}
+    #[tauri::command]
+    pub fn tray_menu_hide_native(_app: tauri::AppHandle) {}
+    #[tauri::command]
+    pub fn tray_menu_restart(_app: tauri::AppHandle) {}
+    #[tauri::command]
+    pub fn tray_menu_quit(_app: tauri::AppHandle) {}
+    #[tauri::command]
+    pub fn tray_menu_select_resolution(_app: tauri::AppHandle, _width: u32, _height: u32) {}
+    #[tauri::command]
+    pub fn tray_menu_select_refresh_rate(_app: tauri::AppHandle, _hz: u32) {}
+    #[tauri::command]
+    pub fn tray_menu_select_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
+    #[tauri::command]
+    pub fn tray_menu_set_hit_rects(_rects: Vec<serde_json::Value>) {}
+}
 mod vendor_info;
 mod window_icon;
 
@@ -17,9 +48,8 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, Submenu},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 
 struct TrayState {
@@ -127,10 +157,8 @@ mod display_change_events {
         // also derived from the display topology ,  a change can move it to a
         // different adapter/target, so invalidate it too.
         hdr_toggle::invalidate_hdr_target_cache();
-        // Keep the tray menu's resolution/refresh-rate submenus in sync with
-        // the active display configuration. Coalesced because a single display
-        // change often arrives as a burst of several window messages.
-        crate::rebuild_tray_menu_throttled(app);
+        // The native tray menu (tray_menu.rs) queries display info fresh on
+        // every open, so there is nothing to rebuild here.
     }
 
     pub fn install(window_handle: isize, app: AppHandle) -> Result<(), String> {
@@ -404,169 +432,27 @@ fn get_display_target() -> Option<display_info::DisplayTargetInfo> {
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let is_minimized = window.is_minimized().unwrap_or(false);
+        let is_visible = window.is_visible().unwrap_or(false);
+
+        // Windows transfers focus to the taskbar while the tray icon is being
+        // clicked, so is_focused() is already false by the time this callback
+        // runs. Visibility and minimized state are the reliable toggle inputs.
+        if is_visible && !is_minimized {
+            if window.minimize().is_ok() {
+                let _ = app.emit("window-visibility", false);
+            }
+            return;
+        }
+
+        if is_minimized {
+            let _ = window.unminimize();
+        }
         if window.show().is_ok() {
             let _ = window.set_focus();
             let _ = app.emit("window-visibility", true);
         }
     }
-}
-
-// ── Tray menu with resolution / refresh-rate submenus ─────────────────────────
-// The tray context menu exposes the display's supported resolutions and
-// refresh rates in their own submenus, plus the user's saved resolution@Hz
-// favorites, so the app's core display controls are reachable without opening
-// the window. Check menu items mark the currently active mode. The menu is
-// rebuilt whenever the display configuration changes, after every tray-driven
-// mode change, and after the config is saved (favorites change).
-
-// Last favorites list the tray menu was built from. The config-saved listener
-// compares against this so unrelated config saves (dimmer durations, crush
-// profiles, ...) do not trigger a full menu rebuild and display query.
-static LAST_BUILT_FAVORITES: OnceLock<Mutex<Vec<config::FavoriteDisplayMode>>> = OnceLock::new();
-
-fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
-    let show_item = MenuItem::with_id(app, "show", "Show OLED Helper", true, None::<&str>)?;
-    let restart_item = MenuItem::with_id(app, "restart", "Restart", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-
-    let saved_config = config::load_config(app.clone());
-    let display_info = display_info::query_current_display();
-
-    let res_submenu = Submenu::new(app, "Resolution", true)?;
-    let hz_submenu = Submenu::new(app, "Refresh Rate", true)?;
-    let mut has_resolutions = false;
-    let mut has_refresh_rates = false;
-    if let Some(info) = &display_info {
-        for resolution in &info.resolutions {
-            has_resolutions = true;
-            let item = CheckMenuItem::with_id(
-                app,
-                format!("res-{}x{}", resolution.width, resolution.height),
-                format!("{}×{}", resolution.width, resolution.height),
-                true,
-                info.width == resolution.width && info.height == resolution.height,
-                None::<&str>,
-            )?;
-            res_submenu.append(&item)?;
-        }
-        for hz in &info.refresh_rates {
-            has_refresh_rates = true;
-            let item = CheckMenuItem::with_id(
-                app,
-                format!("hz-{hz}"),
-                format!("{hz} Hz"),
-                true,
-                *hz == info.refresh_hz,
-                None::<&str>,
-            )?;
-            hz_submenu.append(&item)?;
-        }
-    }
-    if !has_resolutions {
-        res_submenu.append(&MenuItem::with_id(
-            app,
-            "res-none",
-            "No resolutions available",
-            false,
-            None::<&str>,
-        )?)?;
-    }
-    if !has_refresh_rates {
-        hz_submenu.append(&MenuItem::with_id(
-            app,
-            "hz-none",
-            "No refresh rates available",
-            false,
-            None::<&str>,
-        )?)?;
-    }
-
-    let fav_submenu = Submenu::new(app, "Favorites", true)?;
-    let mut has_favorites = false;
-    for favorite in &saved_config.favorite_display_modes {
-        has_favorites = true;
-        let is_active = display_info.as_ref().is_some_and(|info| {
-            info.width == favorite.width
-                && info.height == favorite.height
-                && info.refresh_hz == favorite.hz
-        });
-        let item = CheckMenuItem::with_id(
-            app,
-            format!("fav-{}x{}@{}", favorite.width, favorite.height, favorite.hz),
-            format!(
-                "{}×{} @ {} Hz",
-                favorite.width, favorite.height, favorite.hz
-            ),
-            true,
-            is_active,
-            None::<&str>,
-        )?;
-        fav_submenu.append(&item)?;
-    }
-    if !has_favorites {
-        fav_submenu.append(&MenuItem::with_id(
-            app,
-            "fav-none",
-            "No favorites yet. Save one from the status bar.",
-            false,
-            None::<&str>,
-        )?)?;
-    }
-
-    Menu::with_items(
-        app,
-        &[
-            &show_item,
-            &res_submenu,
-            &hz_submenu,
-            &fav_submenu,
-            &restart_item,
-            &quit_item,
-        ],
-    )
-}
-
-fn rebuild_tray_menu(app: &AppHandle) {
-    let Some(tray) = app.tray_by_id("main-tray") else {
-        return;
-    };
-    match build_tray_menu(app) {
-        Ok(menu) => {
-            if let Err(error) = tray.set_menu(Some(menu)) {
-                log::warn!("[tray] could not update tray menu: {error}");
-            }
-        }
-        Err(error) => log::warn!("[tray] could not rebuild tray menu: {error}"),
-    }
-}
-
-// A single display topology change often arrives as a burst of window messages
-// (WM_DISPLAYCHANGE + WM_DEVICECHANGE + WM_SETTINGCHANGE, several of each).
-// Every rebuild runs a full display query on the main thread, so coalesce
-// notification-driven rebuilds. Tray-click paths call rebuild_tray_menu
-// directly and are never throttled.
-fn rebuild_tray_menu_throttled(app: &AppHandle) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST_REBUILD: AtomicU64 = AtomicU64::new(0);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
-    if now_ms.saturating_sub(LAST_REBUILD.load(Ordering::Relaxed)) < 300 {
-        return;
-    }
-    LAST_REBUILD.store(now_ms, Ordering::Relaxed);
-    rebuild_tray_menu(app);
-}
-
-fn parse_mode_id(value: &str) -> Option<(u32, u32)> {
-    let (width, height) = value.split_once('x')?;
-    Some((width.parse().ok()?, height.parse().ok()?))
-}
-fn parse_favorite_id(value: &str) -> Option<(u32, u32, u32)> {
-    let (mode, hz) = value.split_once('@')?;
-    let (width, height) = mode.split_once('x')?;
-    Some((width.parse().ok()?, height.parse().ok()?, hz.parse().ok()?))
 }
 
 // Applies a mode picked from the tray menu. Always shows the small
@@ -622,7 +508,6 @@ fn tray_display_mode_change(app: AppHandle, result: Result<display_info::Applied
         }
         Err(error) => log::warn!("[tray] display mode change failed: {error}"),
     }
-    rebuild_tray_menu(&app);
 }
 
 pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
@@ -1142,6 +1027,15 @@ pub fn run() {
             confirm_display_mode_change,
             rollback_display_mode_change,
             get_display_target,
+            tray_menu::tray_menu_get_snapshot,
+            tray_menu::tray_menu_close,
+            tray_menu::tray_menu_hide_native,
+            tray_menu::tray_menu_restart,
+            tray_menu::tray_menu_quit,
+            tray_menu::tray_menu_select_resolution,
+            tray_menu::tray_menu_select_refresh_rate,
+            tray_menu::tray_menu_select_favorite,
+            tray_menu::tray_menu_set_hit_rects,
             set_tray_enabled,
             config::load_config,
             config::save_config,
@@ -1225,6 +1119,11 @@ pub fn run() {
                     .build(),
             )?;
 
+            // The custom Steam-style tray menu is a pre-warmed WebView popup.
+            // It stays hidden until the tray right-click handler opens it.
+            tray_menu::prewarm(app.handle());
+            log::info!("[tray] custom tray menu ready");
+
             // The hidden-tray confirmation is a second small Tauri WebviewWindow
             // ("flyout", see tauri.conf.json + flyout_window.rs) rendering the
             // same Svelte modal markup as the in-app confirmation. Pre-warmed
@@ -1239,166 +1138,38 @@ pub fn run() {
                 .enabled
                 .store(saved_config.tray_enabled, Ordering::Relaxed);
 
-            let tray_menu = build_tray_menu(app.handle())?;
             let tray_image = window_icon::crisp_tray_image()
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
 
+            // No native menu is attached. Right-click opens the custom
+            // Steam-style WebView popup from tray_menu.rs.
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_image)
-                .menu(&tray_menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| {
-                    let id = event.id.as_ref();
-                    match id {
-                        "show" => show_main_window(app),
-                        "restart" => request_restart(app),
-                        "quit" => request_shutdown_and_exit(app),
-                        // "res-3840x2160" ,  apply keeping the current refresh
-                        // rate as the preferred one, mirroring the in-app
-                        // dropdown's behavior. The mode switch can blank the
-                        // screen for hundreds of ms, so it runs on a background
-                        // thread and the result is handed back via an event.
-                        _ if id.starts_with("res-") => {
-                            if let Some((width, height)) =
-                                id.strip_prefix("res-").and_then(parse_mode_id)
-                            {
-                                let already_active =
-                                    display_info::query_current_display().as_ref().is_some_and(
-                                        |info| info.width == width && info.height == height,
-                                    );
-                                if already_active {
-                                    // Clicking the active mode toggled its check
-                                    // mark ,  restore it without a mode change.
-                                    rebuild_tray_menu(app);
-                                    return;
-                                }
-                                // Do NOT show the main window here: the mode
-                                // change itself may open the mini confirmation
-                                // dialog, and forcing the full interface open
-                                // defeats that. tray_display_mode_change routes
-                                // the confirmation appropriately.
-                                let app_handle = app.clone();
-                                std::thread::spawn(move || {
-                                    let preferred_hz = display_info::query_current_display()
-                                        .map(|info| info.refresh_hz)
-                                        .unwrap_or(0);
-                                    tray_display_mode_change(
-                                        app_handle,
-                                        display_info::set_resolution(width, height, preferred_hz),
-                                    );
-                                });
-                            }
-                        }
-                        // "hz-144"
-                        _ if id.starts_with("hz-") => {
-                            if let Some(hz) = id
-                                .strip_prefix("hz-")
-                                .and_then(|text| text.parse::<u32>().ok())
-                            {
-                                let already_active = display_info::query_current_display()
-                                    .as_ref()
-                                    .is_some_and(|info| info.refresh_hz == hz);
-                                if already_active {
-                                    rebuild_tray_menu(app);
-                                    return;
-                                }
-                                // See the res- branch ,  never open the full
-                                // window from a tray mode change.
-                                let app_handle = app.clone();
-                                std::thread::spawn(move || {
-                                    tray_display_mode_change(
-                                        app_handle,
-                                        display_info::set_refresh_rate(hz),
-                                    );
-                                });
-                            }
-                        }
-                        // "fav-3840x2160@120" ,  apply a saved favorite exactly
-                        // as it was stored (resolution plus refresh rate),
-                        // through the same safe path as the res-/hz- items.
-                        _ if id.starts_with("fav-") => {
-                            if let Some((width, height, hz)) =
-                                id.strip_prefix("fav-").and_then(parse_favorite_id)
-                            {
-                                let already_active = display_info::query_current_display()
-                                    .as_ref()
-                                    .is_some_and(|info| {
-                                        info.width == width
-                                            && info.height == height
-                                            && info.refresh_hz == hz
-                                    });
-                                if already_active {
-                                    rebuild_tray_menu(app);
-                                    return;
-                                }
-                                let app_handle = app.clone();
-                                std::thread::spawn(move || {
-                                    tray_display_mode_change(
-                                        app_handle,
-                                        display_info::set_resolution(width, height, hz),
-                                    );
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
+                .on_tray_icon_event(|tray, event| match event {
+                    // Left-click opens the main window.
+                    TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
-                    } = event
-                    {
-                        show_main_window(tray.app_handle());
-                    }
+                    } => show_main_window(tray.app_handle()),
+                    // Right-click toggles the custom Steam-style WebView menu:
+                    // open when closed, close when open (the menu can also
+                    // close itself via focus loss, so the toggle avoids
+                    // reopening what this same click just closed).
+                    TrayIconEvent::Click {
+                        button: MouseButton::Right,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => tray_menu::toggle_tray_menu(tray.app_handle()),
+                    _ => {}
                 })
                 .build(app)?;
 
             if let Some(tray) = app.tray_by_id("main-tray") {
                 tray.set_visible(saved_config.tray_enabled)?;
             }
-
-            // Keep the tray's Favorites submenu in sync with the config: the
-            // frontend persists favorites through save_config, and this event
-            // fires only after the file is actually written, so the rebuild
-            // reads fresh data. Only rebuild when the favorites list actually
-            // changed, so unrelated config saves do not repeatedly re-run the
-            // display query and menu creation on the main thread. Routed
-            // through the main thread because menu rebuilds run a full display
-            // query that must stay on the UI thread (see
-            // rebuild_tray_menu_throttled).
-            if let Ok(mut guard) = LAST_BUILT_FAVORITES
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-            {
-                *guard = saved_config.favorite_display_modes.clone();
-            }
-            let config_app = app.handle().clone();
-            app.listen("config-saved", move |_| {
-                let saved = config::load_config(config_app.clone());
-                let changed = {
-                    let Ok(mut cache) = LAST_BUILT_FAVORITES
-                        .get_or_init(|| Mutex::new(Vec::new()))
-                        .lock()
-                    else {
-                        return;
-                    };
-                    if *cache == saved.favorite_display_modes {
-                        false
-                    } else {
-                        *cache = saved.favorite_display_modes.clone();
-                        true
-                    }
-                };
-                if changed {
-                    let rebuild_app = config_app.clone();
-                    let _ = config_app.run_on_main_thread(move || {
-                        crate::rebuild_tray_menu_throttled(&rebuild_app);
-                    });
-                }
-            });
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();
             if let Err(error) = taskbar_dimmer::create_overlay(app.handle(), &dimmer_state) {

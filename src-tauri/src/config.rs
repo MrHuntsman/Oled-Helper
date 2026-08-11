@@ -277,13 +277,6 @@ fn emit_config_write_failed(message: &str) {
         let _ = app.emit("config-write-failed", message.to_string());
     }
 }
-fn emit_config_saved() {
-    if let Some(app) = CONFIG_APP.get() {
-        // Notifies native components (the tray menu rebuild) that the config
-        // file is on disk, so any follow-up read sees the fresh data.
-        let _ = app.emit("config-saved", ());
-    }
-}
 fn replace_config_file(temp_path: &Path, path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -354,8 +347,6 @@ fn config_write_worker() {
             let _ = fs::remove_file(&temp_path);
             log::warn!("save_config: {e}");
             emit_config_write_failed(&format!("could not replace {:?}: {e}", pending.path));
-        } else {
-            emit_config_saved();
         }
     }
 }

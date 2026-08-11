@@ -34,7 +34,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 /// Writes the embedded icon bytes to a stable temp path once, reusing it on
 /// subsequent launches instead of rewriting every time.
-fn materialize_icon_file() -> Option<PathBuf> {
+pub(crate) fn materialize_icon_file() -> Option<PathBuf> {
     let mut path = std::env::temp_dir();
     path.push("oled_helper_app_icon.ico");
 
@@ -50,7 +50,7 @@ fn materialize_icon_file() -> Option<PathBuf> {
     Some(path)
 }
 
-unsafe fn load_icon(
+pub(crate) unsafe fn load_icon(
     path: &Path,
     cx: i32,
     cy: i32,
