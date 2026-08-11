@@ -1228,6 +1228,7 @@ button {
 .mode-confirm-backdrop { z-index: 11000; }
 .mode-confirm-modal { max-width: min(430px, calc(100vw - 32px)); }
 .mode-confirm-modal .modal-desc strong { color: var(--text); font-weight: 600; }
+.modal-backdrop:has(.modal [id='favorite-confirm-title']) .modal-desc strong { color: var(--text); font-weight: 600; }
 .mode-confirm-modal .modal-error { margin-top: 8px; color: #e87575; font-size: 11px; line-height: 1.35; }
 
 /* Reverse loading bar pinned to the modal's bottom edge, draining left→right
@@ -2467,10 +2468,64 @@ button {
   padding: 6px 10px 3px;
 }
 .res-menu { min-width: 100%; width: max-content; max-width: 320px; }
-.res-menu .hz-menu-item {
+/* Each resolution listing is a row: the picker button plus a hover-only
+   favorite star at the end that saves that resolution at the current
+   refresh rate. The star stays hidden (but focusable) until the row is
+   hovered, so it never crowds the listing. */
+.res-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 5px;
+}
+.res-item .res-item-main {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The base .hz-menu-item shifts right 2px on hover; inside the row that
+   would slide the text under the star. Keep the picker button stable so
+   only the star's own hover state gives feedback. */
+.res-item .res-item-main:hover {
+  transform: none;
+}
+.res-item-fav {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: 3px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+.res-item:hover .res-item-fav,
+.res-item-fav:focus-visible {
+  opacity: 1;
+}
+.res-item-fav:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+/* When the combo is already saved, the star stays visible at all times
+   (filled, accent color) so saved resolutions are identifiable at a glance
+   without hovering. Unfavorited rows keep the hover-only star. */
+.res-item-fav.favorited {
+  color: var(--accent);
+  opacity: 1;
+}
+.res-item-fav.favorited:hover {
+  color: #e87575;
+  background: color-mix(in srgb, #e87575 12%, transparent);
 }
 .res-menu .hz-menu-group-label:not(:first-child) {
   margin-top: 4px;
@@ -3284,6 +3339,27 @@ button {
 }
 
 /* ── Status-bar favorites menu (favorite resolution@hz combos) ───── */
+/* Transient confirmation shown to the left of the favorites icon. Appears
+   only when a favorite is added or removed and auto-clears after a short
+   delay (same pattern as the HDR tab's transient "Applied" messages). */
+.favorites-status-msg {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #6fd26f;
+  white-space: nowrap;
+  animation: favorites-status-in 0.15s ease;
+  pointer-events: none;
+}
+.favorites-status-msg.favorites-status-remove {
+  color: #e87575;
+}
+@keyframes favorites-status-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: none; }
+}
 .favorites-wrap {
   position: relative;
   display: inline-flex;
@@ -3325,9 +3401,19 @@ button {
   cursor: default;
 }
 .favorites-menu {
-  right: auto;
-  left: 0;
+  /* Right-align with the icon (base .hz-menu is right:0), the menu opens
+     upward from the star's bottom-right corner. */
   max-width: 280px;
+}
+.favorites-title {
+  padding: 5px 10px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-weak);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  border-bottom: 1px solid var(--divider);
+  margin-bottom: 2px;
 }
 .favorites-empty {
   padding: 8px 12px;
@@ -3342,70 +3428,48 @@ button {
 .favorites-item.active .favorites-apply {
   color: var(--accent);
 }
+/* The current mode always appears as the first row so it can be saved
+   (empty star). A subtle divider separates it from the saved list. */
+.favorites-current {
+  border-bottom: 1px solid var(--divider);
+  margin-bottom: 2px;
+}
 .favorites-apply {
   flex: 1;
   min-width: 0;
   text-align: left;
   white-space: nowrap;
 }
-.favorites-remove {
+/* Star shown at the end of each row: empty on the current-mode row to
+   save it, filled on saved favorites to remove them. Always visible so
+   the saved state is obvious without hovering. */
+.favorites-star {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
-  margin-right: 4px;
+  width: 24px;
+  height: 24px;
+  margin-right: 3px;
   padding: 0;
   border: none;
   border-radius: 4px;
   background: none;
   color: var(--text-weak);
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.1s, color 0.1s, background 0.1s;
+  transition: color 0.1s, background 0.1s;
 }
-.favorites-item:hover .favorites-remove,
-.favorites-remove:focus-visible {
-  opacity: 1;
+.favorites-star:hover {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
-.favorites-remove:hover {
+.favorites-star.filled {
+  color: var(--accent);
+}
+.favorites-star.filled:hover {
   color: #e87575;
   background: color-mix(in srgb, #e87575 12%, transparent);
 }
-.favorites-footer {
-  border-top: 1px solid var(--divider);
-  padding: 6px;
-}
-.favorites-save-current {
-  display: block;
-  width: 100%;
-  padding: 5px 8px;
-  border: none;
-  border-radius: 5px;
-  background: none;
-  color: var(--accent);
-  font: inherit;
-  font-size: 11.5px;
-  font-weight: 600;
-  text-align: left;
-  cursor: pointer;
-  transition: background 0.1s;
-}
-.favorites-save-current:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-}
-.favorites-save-current:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.favorites-current-saved {
-  display: block;
-  padding: 5px 8px;
-  font-size: 11.5px;
-  color: var(--text-weak);
-}
-
 .update-modal {
   width: min(420px, calc(100vw - 48px));
 }
@@ -3537,20 +3601,21 @@ button {
 .tray-menu-divider { height:1px; margin:8px 3px; background:rgba(255,255,255,.09); }
 .tray-menu-content { padding:2px 0 4px; }
 .tray-menu-row { position:relative; }
-/* Hover bridge: the submenu floats 8px to the side of its parent row and that
-   8px gap belongs to no element. Crossing it fires the row's pointerleave,
-   which schedules a close; pausing in the gap closes the submenu before the
-   submenu's own pointerenter can cancel it. An invisible extension of the row
-   spans the gap, it is part of the row's box so the cursor never actually
-   leaves the row while crossing. Only present while that row's submenu is
-   open (tray-menu-row-open). z-index stays below the submenu (5). */
+/* Hover bridge: the submenu is flush with the parent row, but the bridge
+   keeps pointer tracking continuous across the shared edge and the flyout's
+   entrance animation. Without it, a sub-pixel transition can fire the row's
+   pointerleave before the submenu's pointerenter cancels the close timer.
+   Only present while that row's submenu is open. z-index stays below the
+   submenu (5). */
 .tray-menu-row.tray-menu-row-open::after {
   content:'';
   position:absolute;
   top:0;
   bottom:0;
   left:100%;
-  width:12px; /* 8px gap + 4px overlap into the submenu, sub-pixel safe */
+  width:8px;
+  background:transparent;
+  pointer-events:auto;
   z-index:4;
 }
 .tray-menu-shell.tray-menu-submenus-left .tray-menu-row.tray-menu-row-open::after {
@@ -3572,14 +3637,26 @@ button {
 .tray-menu-favorite-check { margin-left:auto; color:var(--accent); font-size:13px; font-weight:700; }
 .tray-menu-favorites-empty { display:flex; align-items:center; min-height:34px; padding:0 10px; }
 .tray-menu-favorites-empty .tray-menu-item-icon { flex:none; }
-.tray-menu-submenu { position:absolute; z-index:5; top:0; left:calc(100% + 8px); width:250px; max-height:430px; overflow-y:scroll; overflow-x:hidden; scrollbar-width:auto; scrollbar-color:rgba(255,255,255,.42) rgba(255,255,255,.08); padding:5px; border:1px solid rgba(255,255,255,.1); border-radius:10px; background:#1b1c21; box-shadow:none; }
+.tray-menu-submenu { position:absolute; z-index:5; top:0; left:100%; width:max-content; min-width:110px; max-width:250px;  max-height: none;
+  height: fit-content; overflow-y:auto; overflow-x:hidden; scrollbar-width:auto; scrollbar-color:rgba(255,255,255,.42) rgba(255,255,255,.08); padding:6px; border:1px solid rgba(255,255,255,.1); border-radius:10px; background:#1b1c21; box-shadow:none; }
 .tray-menu-submenu::-webkit-scrollbar { width:10px; }
 .tray-menu-submenu::-webkit-scrollbar-track { background:rgba(255,255,255,.06); border-radius:5px; }
 .tray-menu-submenu::-webkit-scrollbar-thumb { background:rgba(255,255,255,.42); border:2px solid #1b1c21; border-radius:5px; }
 .tray-menu-submenu::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,.62); }
-.tray-menu-subitem { min-height:30px; padding:0 8px; font-size:12px; white-space:nowrap; }
+.tray-menu-subitem { min-height:36px; padding:0 10px; font-size:12px; white-space:nowrap; }
 .tray-menu-check { width:18px; margin-right:2px; color:var(--accent); font-size:13px; font-weight:700; }
 .tray-menu-selected { color:#fff; background:color-mix(in srgb,var(--accent) 10%,transparent); }
+.tray-menu-resolution-value { flex:0 0 auto; }
+.tray-menu-resolution-tag,
+.tray-menu-resolution-native {
+  flex:0 0 auto;
+  margin-left:6px;
+  color:var(--text-weak);
+  font-size:10px;
+  font-weight:600;
+  letter-spacing:.2px;
+}
+.tray-menu-resolution-native { color:var(--accent); }
 .tray-menu-at { margin:0 5px; color:#858994; }
 .tray-menu-empty { padding:12px 10px; color:#858994; font-size:11px; line-height:1.45; }
 /* Submenu reveal ease: quick fade with a small slide emerging from the parent
@@ -3609,7 +3686,7 @@ button {
   .tray-menu-shell .tray-menu-submenu { animation:none; }
 }
 
-.tray-menu-shell.tray-menu-submenus-left .tray-menu-submenu { left:auto; right:calc(100% + 8px); }
+.tray-menu-shell.tray-menu-submenus-left .tray-menu-submenu { left:auto; right:100%; }
 /* Submenus stay hidden until the native hit region has been extended to cover
    them (SetWindowRgn clips rendering too; revealing earlier shows the submenu
    partially clipped while the region update is in flight). The hidden state
@@ -3621,7 +3698,7 @@ button {
    extending toward the taskbar. The viewport cap also keeps long mode lists
    scrollable on shorter displays. */
 .tray-menu-shell .tray-menu-submenu {
-  max-height:calc(100vh - 32px);
+  max-height: none;
 }
 /* Resolution and refresh rows are near the top of the card, so their flyouts
    grow down into the work area. Favorites are near the bottom, so a long
@@ -3629,16 +3706,10 @@ button {
 .tray-menu-shell.tray-menu-edge-bottom .tray-menu-submenu-resolution,
 .tray-menu-shell.tray-menu-edge-bottom .tray-menu-submenu-refresh,
 .tray-menu-shell.tray-menu-edge-top .tray-menu-submenu-resolution,
-.tray-menu-shell.tray-menu-edge-top .tray-menu-submenu-refresh {
-  top:0;
-  bottom:auto;
-}
-.tray-menu-shell.tray-menu-edge-bottom .tray-menu-submenu-favorites {
-  top:auto;
-  bottom:0;
-}
+.tray-menu-shell.tray-menu-edge-top .tray-menu-submenu-refresh,
+.tray-menu-shell.tray-menu-edge-bottom .tray-menu-submenu-favorites,
 .tray-menu-shell.tray-menu-edge-top .tray-menu-submenu-favorites {
-  top:0;
+  top:auto;
   bottom:auto;
 }
 .tray-menu-shell.tray-menu-edge-top { align-items:flex-start; }

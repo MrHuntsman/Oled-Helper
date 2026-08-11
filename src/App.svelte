@@ -706,13 +706,50 @@
     && fav.height === favoriteOfCurrent.height
     && fav.hz === favoriteOfCurrent.hz;
   function toggleFavoritesMenu() {
+    clearTimeout(favoritesHoverTimer);
     favoritesMenuOpen = !favoritesMenuOpen;
   }
   function closeFavoritesMenu() {
+    clearTimeout(favoritesHoverTimer);
     favoritesMenuOpen = false;
+  }
+  // Hover-open for the favorites menu: a short delay so a quick pass over the
+  // star in the status bar does not flash the menu, and a grace period on
+  // leave so moving the pointer from the icon into the menu itself (or across
+  // its edge) does not close it. The menu is a child of .favorites-wrap, so
+  // pointerenter/pointerleave on the wrap cover the icon and the open menu.
+  let favoritesHoverTimer = null;
+  function favoritesCanOpen() {
+    return !pendingModeConfirmation && !app.displayModeBusy && !app.refreshRateBusy;
+  }
+  function openFavoritesOnHover() {
+    if (!favoritesCanOpen()) return;
+    clearTimeout(favoritesHoverTimer);
+    favoritesHoverTimer = setTimeout(() => { favoritesMenuOpen = true; }, 120);
+  }
+  function closeFavoritesOnHoverLeave() {
+    clearTimeout(favoritesHoverTimer);
+    favoritesHoverTimer = setTimeout(() => { favoritesMenuOpen = false; }, 200);
+  }
+  // Transient confirmation shown in the status bar to the left of the
+  // favorites icon. Appears only while a favorite is actually added or
+  // removed, then auto-clears after a short delay (same pattern as the HDR
+  // tab's transient "Applied" messages).
+  let favoritesStatusMsg = $state('');
+  let favoritesStatusIsRemove = $state(false);
+  let favoritesStatusTimer = null;
+  function flashFavoritesStatus(text, isRemove) {
+    favoritesStatusMsg = text;
+    favoritesStatusIsRemove = isRemove;
+    clearTimeout(favoritesStatusTimer);
+    favoritesStatusTimer = setTimeout(() => {
+      favoritesStatusMsg = '';
+      favoritesStatusIsRemove = false;
+    }, 2000);
   }
   function saveCurrentFavorite() {
     addFavoriteDisplayMode(favoriteOfCurrent.width, favoriteOfCurrent.height, favoriteOfCurrent.hz);
+    flashFavoritesStatus('Saved', false);
   }
   function applyFavorite(fav) {
     closeFavoritesMenu();
@@ -720,6 +757,44 @@
   }
   function removeFavorite(fav) {
     removeFavoriteDisplayMode(fav.width, fav.height, fav.hz);
+    flashFavoritesStatus('Removed', true);
+  }
+  // Confirmation dialog before removing a saved favorite, reusing the app's
+  // modal styles. Removing is destructive (the entry is gone until re-saved),
+  // so a stray star click should not drop it silently.
+  let favoritePendingRemove = $state(null);
+  let favoriteConfirmCancelEl = $state(null);
+  function askRemoveFavorite(fav) { favoritePendingRemove = fav; }
+  function cancelRemoveFavorite() { favoritePendingRemove = null; }
+  function confirmRemoveFavorite() {
+    if (!favoritePendingRemove) return;
+    removeFavorite(favoritePendingRemove);
+    favoritePendingRemove = null;
+  }
+  function onFavoriteConfirmKeydown(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelRemoveFavorite();
+    }
+  }
+  // Focus the safe action (Cancel) when the dialog opens, like the mode
+  // confirm modal defaults to Revert so Enter/Escape do the safe thing.
+  $effect(() => {
+    if (favoritePendingRemove) favoriteConfirmCancelEl?.focus();
+  });
+  // Star icon on each resolution row: favorites that resolution at the
+  // current refresh rate, or removes it if already favorited. Adding is
+  // instant; removing goes through the same confirmation dialog as the
+  // favorites menu so a stray click does not drop a saved combo.
+  function toggleResolutionFavorite(resolution) {
+    const hz = app.displayInfo.refreshRateHz || 0;
+    if (hz <= 0) return;
+    if (isDisplayModeFavorited(resolution.width, resolution.height, hz)) {
+      askRemoveFavorite({ width: resolution.width, height: resolution.height, hz });
+    } else {
+      addFavoriteDisplayMode(resolution.width, resolution.height, hz);
+      flashFavoritesStatus('Saved', false);
+    }
   }
 
   $effect(() => {
@@ -1229,7 +1304,19 @@
       {/if}
     </div>
     <div class="status-bar-right">
-      <div class="favorites-wrap">
+      {#if favoritesStatusMsg}
+        <span
+          class="favorites-status-msg"
+          class:favorites-status-remove={favoritesStatusIsRemove}
+          aria-live="polite"
+          role="status">
+          {favoritesStatusMsg}
+        </span>
+      {/if}
+      <div
+        class="favorites-wrap"
+        onpointerenter={openFavoritesOnHover}
+        onpointerleave={closeFavoritesOnHoverLeave}>
         <button
           type="button"
           class="favorites-btn"
@@ -1248,6 +1335,29 @@
         </button>
         {#if favoritesMenuOpen}
           <div class="hz-menu favorites-menu" bind:this={favoritesMenuEl} role="listbox" aria-label="Favorite display modes" tabindex="-1">
+            <div class="favorites-title">Favorites</div>
+            {#if currentComboLabel && !isCurrentFavorited}
+              <div class="favorites-item favorites-current">
+                <button
+                  type="button"
+                  class="hz-menu-item favorites-apply"
+                  role="option"
+                  aria-selected={false}
+                  onclick={saveCurrentFavorite}>
+                  {currentComboLabel}
+                </button>
+                <button
+                  type="button"
+                  class="favorites-star"
+                  aria-label={`Save current: ${currentComboLabel}`}
+                  title={`Save current: ${currentComboLabel}`}
+                  onclick={saveCurrentFavorite}>
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+              </div>
+            {/if}
             {#if displayFavorites.length === 0}
               <div class="favorites-empty">No favorites yet. Save the current mode to add one.</div>
             {:else}
@@ -1263,30 +1373,18 @@
                   </button>
                   <button
                     type="button"
-                    class="favorites-remove"
+                    class="favorites-star"
+                    class:filled={true}
                     aria-label={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
-                    title="Remove favorite"
-                    onclick={() => removeFavorite(fav)}>
-                    <svg width="8" height="8" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-                      <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                    title={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
+                    onclick={() => askRemoveFavorite(fav)}>
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
                     </svg>
                   </button>
                 </div>
               {/each}
             {/if}
-            <div class="favorites-footer">
-              {#if isCurrentFavorited}
-                <span class="favorites-current-saved">Current mode is saved</span>
-              {:else}
-                <button
-                  type="button"
-                  class="favorites-save-current"
-                  disabled={!currentComboLabel}
-                  onclick={saveCurrentFavorite}>
-                  + Save current{currentComboLabel ? `: ${currentComboLabel}` : ''}
-                </button>
-              {/if}
-            </div>
           </div>
         {/if}
       </div>
@@ -1325,16 +1423,33 @@
           {@const current = resolution.width === app.displayInfo.width && resolution.height === app.displayInfo.height}
           {@const recommended = isRecommendedResolution(resolution)}
           {@const ultrawide = isUltrawide(resolution.width, resolution.height)}
-          <button type="button" class="hz-menu-item" class:active={current}
-            role="option" aria-selected={current}
-            onclick={() => pickResolution(resolution.width, resolution.height)}>
-            {resolution.width}×{resolution.height}
-            {#if displayMenuPrefs.showTags}
-              {#if ultrawide}<span class="ultrawide-tag"><span class="ultrawide-separator">·</span><svg class="ultrawide-icon" viewBox="0 0 32 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="30.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="16" y="10.8" text-anchor="middle" fill="currentColor" font-size="9" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}
-              {name ? ` · ${name}` : ''}
+          {@const hz = app.displayInfo.refreshRateHz || 0}
+          {@const favored = hz > 0 && isDisplayModeFavorited(resolution.width, resolution.height, hz)}
+          <div class="res-item" class:active={current}>
+            <button type="button" class="hz-menu-item res-item-main" class:active={current}
+              role="option" aria-selected={current}
+              onclick={() => pickResolution(resolution.width, resolution.height)}>
+              {resolution.width}×{resolution.height}
+              {#if displayMenuPrefs.showTags}
+                {#if ultrawide}<span class="ultrawide-tag"><span class="ultrawide-separator">·</span><svg class="ultrawide-icon" viewBox="0 0 32 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="30.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="16" y="10.8" text-anchor="middle" fill="currentColor" font-size="9" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}
+                {name ? ` · ${name}` : ''}
+              {/if}
+              {recommended ? ' (Native)' : ''}
+            </button>
+            {#if hz > 0}
+              <button
+                type="button"
+                class="res-item-fav"
+                class:favorited={favored}
+                title={favored ? `Remove ${resolution.width}×${resolution.height} @ ${hz} Hz from favorites` : `Favorite ${resolution.width}×${resolution.height} @ ${hz} Hz`}
+                aria-label={favored ? `Remove ${resolution.width}×${resolution.height} @ ${hz} Hz from favorites` : `Favorite ${resolution.width}×${resolution.height} @ ${hz} Hz`}
+                onclick={() => toggleResolutionFavorite(resolution)}>
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={favored ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                </svg>
+              </button>
             {/if}
-            {recommended ? ' (Native)' : ''}
-          </button>
+          </div>
         {/snippet}
         {#if resMenuOpen}
           <div class="hz-menu res-menu" bind:this={resMenuEl} role="listbox" aria-label="Resolution options" tabindex="-1" oncontextmenu={openResContextMenu}>
@@ -1437,6 +1552,21 @@
           <button bind:this={modeConfirmRevertBtnEl} class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert (<span class="modal-btn-countdown">{pendingModeConfirmation.remaining}</span>s)</button>
         </div>
         <div class="mode-confirm-timerbar" style="animation-duration: {pendingModeConfirmation.totalSeconds || 15}s" role="presentation" aria-hidden="true"></div>
+      </div>
+    </div>
+  {/if}
+
+  {#if favoritePendingRemove}
+    <div class="modal-backdrop" role="presentation" onpointerdown={(e) => { if (e.target === e.currentTarget) cancelRemoveFavorite(); }}>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="favorite-confirm-title" aria-describedby="favorite-confirm-desc" tabindex="-1" onkeydown={onFavoriteConfirmKeydown}>
+        <h2 id="favorite-confirm-title" class="modal-title">Remove favorite?</h2>
+        <p id="favorite-confirm-desc" class="modal-desc">
+          Remove <strong>{favoritePendingRemove.width}×{favoritePendingRemove.height} @ {favoritePendingRemove.hz} Hz</strong> from your favorites?
+        </p>
+        <div class="modal-actions">
+          <button bind:this={favoriteConfirmCancelEl} class="modal-btn modal-btn-cancel" onclick={cancelRemoveFavorite}>Cancel</button>
+          <button class="modal-btn" onclick={confirmRemoveFavorite}>Remove</button>
+        </div>
       </div>
     </div>
   {/if}

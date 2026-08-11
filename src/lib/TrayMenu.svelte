@@ -11,7 +11,16 @@
   let animating = $state(false);
   let closing = $state(false);
   let submenuRevealed = $state(true);
+  // Keep the flyout directly adjacent to its parent row. A visible gap can
+  // trigger pointerleave before the pointer reaches the submenu, especially
+  // when the row and flyout are vertically offset.
+  const submenuGap = 0;
   let receivedOpenEvent = false;
+  // Actual rendered card height, measured once the card is mounted. The flip
+  // math in cardStyle uses it so the card's far edge lands exactly at the
+  // cursor instead of an arbitrary max-height estimate.
+  let cardHeight = $state(0);
+  let viewport = $state({ width: 0, height: 0, dpr: 1 });
   const data = $derived(snapshot.data);
   const currentMode = $derived(data ? `${data.width}×${data.height} @ ${data.refresh_hz} Hz` : 'No display detected');
   // Track the card + submenu layout while the menu is open so the backend can
@@ -21,25 +30,107 @@
   $effect(() => {
     if (!snapshot.open) return;
     void activeSubmenu;
+    measureCard();
     reportHitRects();
-    const timer = setTimeout(reportHitRects, 170);
+    const timer = setTimeout(() => {
+      measureCard();
+      if (activeSubmenu) positionSubmenu(activeSubmenu);
+      reportHitRects();
+    }, 170);
     return () => clearTimeout(timer);
   });
-  const submenuDirection = $derived(data?.taskbar_edge === 'bottom' || data?.taskbar_edge === 'right' ? 'left' : 'right');
+  // Report the rendered card height so the backend can place the popup with
+  // its taskbar-facing edge exactly flush (the backend's initial placement
+  // assumes a taller default card, which leaves a gap for shorter menus such
+  // as 0-1 favorites). Only send when the height actually changed, a submenu
+  // opening does not alter the card height and must not re-trigger placement.
+  let lastReportedCardHeight = 0;
+  function measureCard() {
+    const card = document.querySelector('.tray-menu-card');
+    if (!card) return;
+    cardHeight = card.offsetHeight;
+    if (cardHeight > 0 && Math.abs(cardHeight - lastReportedCardHeight) >= 1) {
+      lastReportedCardHeight = cardHeight;
+      invoke('tray_menu_set_card_height', { heightCss: cardHeight }).catch(() => {});
+    }
+  }
+  function updateViewport() {
+    viewport = {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      dpr: window.devicePixelRatio || 1,
+    };
+  }
+  function logGeometry(source) {
+    if (!data) return;
+    const card = document.querySelector('.tray-menu-card');
+    const rect = card?.getBoundingClientRect();
+    const cardText = rect
+      ? `card_css=(${rect.left.toFixed(1)},${rect.top.toFixed(1)},${rect.width.toFixed(1)}x${rect.height.toFixed(1)})`
+      : 'card_css=missing';
+    invoke('log_frontend', {
+      level: 'debug',
+      message: `[tray] frontend geometry source=${source} viewport_css=${viewport.width}x${viewport.height} dpr=${viewport.dpr.toFixed(2)} target_frac=(${data.cursor_x.toFixed(3)},${data.cursor_y.toFixed(3)}) work_frac=(${data.work_left.toFixed(3)},${data.work_top.toFixed(3)},${data.work_right.toFixed(3)},${data.work_bottom.toFixed(3)}) ${cardText}`,
+    }).catch(() => {});
+  }
+  // The native popup is positioned and sized around the card before it is
+  // shown. Keep the card local to that compact viewport instead of creating a
+  // transparent surface over the desktop. The native origin includes the
+  // 24px hit cushion, so the visible card begins at this local inset.
+  const cardGeometry = $derived.by(() => {
+    if (!data) return null;
+    return {
+      left: 24,
+      top: 24,
+      vw: viewport.width || window.innerWidth,
+      vh: viewport.height || window.innerHeight,
+    };
+  });
+  const cardStyle = $derived.by(() => {
+    const g = cardGeometry;
+    if (!g) return null;
+    // Svelte treats an object passed to the generic style attribute as a
+    // string value, which becomes "[object Object]" and is ignored by the
+    // browser. Return serialized CSS so the inline position actually
+    // overrides the shell's default bottom-right flex alignment.
+    return `position: absolute; left: ${g.left}px; right: auto; top: ${g.top}px; bottom: auto;`;
+  });
+  // This starts as the normal right-opening direction. It is updated after a
+  // submenu is mounted, using its actual rendered width, instead of comparing
+  // the left and right margins of the card. A large empty margin on the left
+  // must not force a left flyout when the right side can fit the submenu.
+  let submenuDirection = $state('right');
+  function updateSubmenuDirection(name) {
+    const card = document.querySelector('.tray-menu-card');
+    const submenu = document.querySelector(`[data-tray-submenu="${name}"]`);
+    if (!card || !submenu) return;
 
-  // Report the clickable bounds (card + open submenu) to the backend. The
-  // native window is a full-work-area transparent WebView; without this, the OS
-  // hit-tests the whole window and swallows mouse input for the desktop and
-  // other apps beneath it. Rects are client-space physical px (getBoundingClientRect
-  // is already relative to the undecorated window's client area, scaled by dpr).
-  // The cushion keeps a hover margin around each element so moving the cursor
-  // just outside the card still delivers events to the WebView and pointerleave
-  // can close an open submenu.
+    const cardRect = card.getBoundingClientRect();
+    const submenuWidth = submenu.getBoundingClientRect().width;
+    const gap = submenuGap;
+    const margin = 12;
+    const rightSpace = window.innerWidth - cardRect.right - margin;
+    const leftSpace = cardRect.left - margin;
+    const required = submenuWidth + gap;
+
+    if (rightSpace >= required) {
+      submenuDirection = 'right';
+    } else if (leftSpace >= required) {
+      submenuDirection = 'left';
+    } else {
+      // If neither side fully fits, use the side with more room and let the
+      // submenu's max-width/scrolling behavior handle the remaining pixels.
+      submenuDirection = rightSpace >= leftSpace ? 'right' : 'left';
+    }
+  }
+
+  // Keep this command for layout diagnostics and compatibility with older
+  // native builds. The current native window is already content-sized, so it
+  // does not apply a region to the WebView2 surface.
   function reportHitRects() {
-    const scale = window.devicePixelRatio || 1;
-    // Hover margin around each element; must be >= the entrance animation's
-    // translateY offset (18px in tray-menu-card-in) so the region never clips
-    // the card while it is rising into place.
+    const scale = viewport.dpr || window.devicePixelRatio || 1;
+    // Retain the cushion in the payload for compatibility with the native
+    // command, even though the current backend no longer applies a region.
     const cushion = 24;
     const rects = [...document.querySelectorAll('.tray-menu-card, .tray-menu-submenu')]
       .map((el) => {
@@ -100,39 +191,72 @@
     if (!submenu || !row) return;
 
     const rowRect = row.getBoundingClientRect();
+    const card = document.querySelector('.tray-menu-card');
+    const cardRect = card?.getBoundingClientRect();
+    const menuHeight = cardRect?.height || cardHeight || 430;
+    // The submenu is nested inside one row, so its available space must be
+    // measured from the card bounds, not from the row. Measuring from the row
+    // made a resolution list stop halfway down the card even when the card had
+    // plenty of empty space below it.
+    const cardTop = cardRect?.top ?? rowRect.top;
+    const cardBottom = cardRect?.bottom ?? (cardTop + menuHeight);
     const viewportPadding = 12;
-    const availableAbove = Math.max(120, rowRect.bottom - viewportPadding);
-    const availableBelow = Math.max(120, window.innerHeight - rowRect.top - viewportPadding);
-    const growDown = availableBelow >= availableAbove || availableBelow >= 430;
+    const fitsCardBounds = cardTop >= viewportPadding
+      && cardBottom <= window.innerHeight - viewportPadding;
+    const availableAbove = Math.max(1, cardBottom - viewportPadding);
+    const availableBelow = Math.max(1, window.innerHeight - cardTop - viewportPadding);
+    const growDown = fitsCardBounds || availableBelow >= availableAbove;
     const available = growDown ? availableBelow : availableAbove;
+    const submenuHeight = fitsCardBounds ? menuHeight : Math.min(menuHeight, available);
+    const topOffset = cardTop - rowRect.top;
+    const bottomOffset = rowRect.bottom - cardBottom;
 
-    submenu.style.maxHeight = `${Math.min(430, available)}px`;
-    submenu.style.top = growDown ? '0' : 'auto';
-    submenu.style.bottom = growDown ? 'auto' : '0';
+    submenu.style.height = `${submenuHeight}px`;
+    submenu.style.maxHeight = `${submenuHeight}px`;
+    submenu.style.top = growDown ? `${topOffset}px` : 'auto';
+    submenu.style.bottom = growDown ? 'auto' : `${bottomOffset}px`;
   }
   function cancelSubmenuClose() {
     clearTimeout(submenuCloseTimer);
     submenuCloseTimer = null;
   }
-  function scheduleSubmenuClose(name) {
+  function scheduleSubmenuClose(event, name) {
+    // The parent row and its flyout are one interactive region. Returning
+    // from the flyout to the active parent row should cancel the close rather
+    // than briefly unmounting the submenu under the cursor.
+    const row = event?.currentTarget?.closest?.('.tray-menu-row');
+    const next = event?.relatedTarget;
+    if (next && row?.contains(next)) {
+      cancelSubmenuClose();
+      return;
+    }
     cancelSubmenuClose();
     submenuCloseTimer = setTimeout(() => {
       if (activeSubmenu === name) activeSubmenu = null;
       submenuCloseTimer = null;
-    }, 120);
+    }, 220);
   }
   async function openSubmenu(name) {
     cancelSubmenuClose();
-    // Keep the submenu hidden until the native hit region has been extended to
-    // cover it. SetWindowRgn clips rendering too, and the region update goes
-    // through an async IPC round-trip, so revealing the submenu before the
-    // region is applied shows it partially clipped ("opens in two stages").
+    // Pointer-enter, focus, and click can all request the same submenu during
+    // one interaction. Do not restart its reveal sequence when it is already
+    // active, otherwise the hidden class and entrance animation briefly reset
+    // and make a right-click look like the submenu closed and reopened.
+    if (activeSubmenu === name) return;
+    // Keep the submenu hidden until its layout has settled. This avoids a
+    // clipped first frame while the small native popup is being shown.
     submenuRevealed = false;
+    submenuDirection = 'right';
     activeSubmenu = name;
     await tick();
     positionSubmenu(name);
-    // Race the region update against a short grace period so the submenu can
-    // never stay hidden if the IPC round-trip hangs (e.g. during teardown).
+    updateSubmenuDirection(name);
+    await tick();
+    // Reapply the vertical placement after the direction class has rerendered
+    // so the hit region matches the final flyout geometry.
+    positionSubmenu(name);
+    // Race the layout report against a short grace period so the submenu can
+    // never stay hidden if IPC hangs during teardown.
     await Promise.race([
       reportHitRects(),
       new Promise((resolve) => setTimeout(resolve, 150)),
@@ -143,7 +267,7 @@
     const next = event.relatedTarget;
     const row = event.currentTarget;
     if (next && row.contains(next)) return;
-    scheduleSubmenuClose(name);
+    scheduleSubmenuClose(event, name);
   }
   function onParentKeydown(event, name) {
     if (event.key !== 'ArrowRight') return;
@@ -155,8 +279,33 @@
   }
   function onPointerDown(event) {
     const card = document.querySelector('.tray-menu-card');
-    if (!card || event.composedPath().includes(card)) return;
+    if (!card) return;
+    const path = event.composedPath();
+    const insideCard = path.includes(card);
+    const insideSubmenu = event.target?.closest?.('.tray-menu-submenu');
+
+    // A right-button press on a submenu item should be inert. Letting the
+    // browser focus the button during pointerdown can fire the parent row's
+    // focusout/pointerenter handlers and replay openSubmenu once, which looks
+    // like the submenu closes and immediately reopens. The contextmenu
+    // handler suppresses the browser menu itself; this also suppresses the
+    // focus transition that causes the one-frame flicker. Keep the guard
+    // limited to the submenu so the rest of the card keeps its normal behavior.
+    if (insideSubmenu && event.button === 2) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (insideCard) return;
     close();
+  }
+  function onContextMenu(event) {
+    // The tray menu is an application menu, not a browser document. Suppress
+    // WebView2's native page context menu everywhere inside the popup,
+    // including submenu rows and its scrollbar. Keep the right-button event
+    // from reaching any row-level focus or pointer handler as well.
+    event.preventDefault();
+    event.stopPropagation();
   }
   function onKeydown(event) {
     if (event.key === 'Escape') { event.preventDefault(); close(); }
@@ -177,12 +326,24 @@
   }
   onMount(() => {
     let stopOpen; let stopClose;
+    updateViewport();
+    window.addEventListener('resize', updateViewport);
     document.addEventListener('pointerdown', onPointerDown, true);
+    // The native tray window includes a transparent hit cushion around the
+    // visible card. The shell element does not receive contextmenu events in
+    // that blank document area, so WebView2 can otherwise show its browser
+    // menu there. Capture at document level to suppress it across the entire
+    // popup surface, including transparent padding and submenu overflow.
+    document.addEventListener('contextmenu', onContextMenu, true);
     invoke('tray_menu_get_snapshot').then((value) => {
       if (receivedOpenEvent || !value.open || !value.data) return;
       snapshot = value;
       animating = true;
       requestAnimationFrame(playEntrance);
+      tick().then(() => {
+        measureCard();
+        logGeometry('snapshot');
+      });
     }).catch(() => {});
     function playEntrance() {
       const shell = document.querySelector('.tray-menu-shell');
@@ -203,7 +364,15 @@
       closing = false;
       animating = true;
       requestAnimationFrame(playEntrance);
-      setTimeout(() => document.querySelector('.tray-menu-close')?.focus(), 0);
+      tick().then(() => {
+        measureCard();
+        logGeometry('open');
+      });
+      setTimeout(() => {
+        measureCard();
+        logGeometry('open-settled');
+        document.querySelector('.tray-menu-close')?.focus();
+      }, 170);
     }).then((stop) => { stopOpen = stop; });
     listen('tray-menu-close', () => {
       beginClose();
@@ -211,7 +380,9 @@
     return () => {
       clearTimeout(submenuCloseTimer);
       clearTimeout(closeTimer);
+      window.removeEventListener('resize', updateViewport);
       document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('contextmenu', onContextMenu, true);
       stopOpen?.();
       stopClose?.();
     };
@@ -221,16 +392,16 @@
 <svelte:window onkeydown={onKeydown} />
 
 {#if data && snapshot.open}
-  <div class="tray-menu-shell" class:tray-menu-enter={animating} class:tray-menu-closing={closing} class:tray-menu-edge-top={data.taskbar_edge === 'top'} class:tray-menu-edge-bottom={data.taskbar_edge === 'bottom'} class:tray-menu-edge-left={data.taskbar_edge === 'left'} class:tray-menu-edge-right={data.taskbar_edge === 'right'} class:tray-menu-submenus-left={submenuDirection === 'left'} class:tray-menu-submenus-hidden={!submenuRevealed} role="presentation">
-    <div class="tray-menu-card" role="menu" aria-label="OLED Helper tray menu">
+  <div class="tray-menu-shell" class:tray-menu-enter={animating} class:tray-menu-closing={closing} class:tray-menu-edge-top={data.taskbar_edge === 'top'} class:tray-menu-edge-bottom={data.taskbar_edge === 'bottom'} class:tray-menu-edge-left={data.taskbar_edge === 'left'} class:tray-menu-edge-right={data.taskbar_edge === 'right'} class:tray-menu-submenus-left={submenuDirection === 'left'} class:tray-menu-submenus-hidden={!submenuRevealed} role="presentation" oncontextmenu={onContextMenu}>
+    <div class="tray-menu-card" style={cardStyle} role="menu" aria-label="OLED Helper tray menu">
       <div class="tray-menu-header"><img src={appIcon} alt="" class="tray-menu-app-icon" /><div class="tray-menu-header-copy"><div class="tray-menu-title">{data.title}</div><div class="tray-menu-subtitle">{data.monitor_name}</div><div class="tray-menu-mode">{currentMode}</div></div><button class="tray-menu-close" type="button" aria-label="Close menu" onclick={close}>×</button></div>
       <div class="tray-menu-divider"></div>
       <div class="tray-menu-content">
-        <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'resolution'} onpointerenter={() => openSubmenu('resolution')} onpointerleave={() => scheduleSubmenuClose('resolution')} onfocusout={(event) => onMenuFocusOut(event, 'resolution')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'resolution'} onfocus={() => openSubmenu('resolution')} onkeydown={(event) => onParentKeydown(event, 'resolution')} onclick={() => openSubmenu('resolution')}><span class="tray-menu-item-icon">▦</span><span>Resolution</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'resolution'}<div class="tray-menu-submenu tray-menu-submenu-resolution" data-tray-submenu="resolution" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={() => scheduleSubmenuClose('resolution')}>{#each data.resolutions as resolution}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentResolution(resolution)} type="button" role="menuitem" onclick={() => selectResolution(resolution)}><span class="tray-menu-check">{isCurrentResolution(resolution) ? '✓' : ''}</span>{resolution.width}×{resolution.height}</button>{:else}<div class="tray-menu-empty">No resolutions available</div>{/each}</div>{/if}</div>
-        <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'refresh'} onpointerenter={() => openSubmenu('refresh')} onpointerleave={() => scheduleSubmenuClose('refresh')} onfocusout={(event) => onMenuFocusOut(event, 'refresh')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'refresh'} onfocus={() => openSubmenu('refresh')} onkeydown={(event) => onParentKeydown(event, 'refresh')} onclick={() => openSubmenu('refresh')}><span class="tray-menu-item-icon">◷</span><span>Refresh Rate</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'refresh'}<div class="tray-menu-submenu tray-menu-submenu-refresh" data-tray-submenu="refresh" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={() => scheduleSubmenuClose('refresh')}>{#each data.refresh_rates as rate}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentRate(rate)} type="button" role="menuitem" onclick={() => selectRate(rate)}><span class="tray-menu-check">{isCurrentRate(rate) ? '✓' : ''}</span>{rate} Hz</button>{:else}<div class="tray-menu-empty">No refresh rates available</div>{/each}</div>{/if}</div>
+        <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'resolution'} onpointerenter={() => openSubmenu('resolution')} onpointerleave={(event) => scheduleSubmenuClose(event, 'resolution')} onfocusout={(event) => onMenuFocusOut(event, 'resolution')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'resolution'} onfocus={() => openSubmenu('resolution')} onkeydown={(event) => onParentKeydown(event, 'resolution')} onclick={() => openSubmenu('resolution')}><span class="tray-menu-item-icon">▦</span><span>Resolution</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'resolution'}<div class="tray-menu-submenu tray-menu-submenu-resolution" data-tray-submenu="resolution" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'resolution')}>{#each data.resolutions as resolution}                    <button class="tray-menu-subitem" class:tray-menu-selected={isCurrentResolution(resolution)} type="button" role="menuitem" onclick={() => selectResolution(resolution)}><span class="tray-menu-check">{isCurrentResolution(resolution) ? '✓' : ''}</span><span class="tray-menu-resolution-value">{resolution.width}×{resolution.height}</span>{#if resolution.ultrawide}<span class="tray-menu-resolution-tag">UW</span>{/if}{#if resolution.name}<span class="tray-menu-resolution-tag">{resolution.name}</span>{/if}{#if resolution.native}<span class="tray-menu-resolution-native">Native</span>{/if}</button>{:else}<div class="tray-menu-empty">No resolutions available</div>{/each}</div>{/if}</div>
+        <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'refresh'} onpointerenter={() => openSubmenu('refresh')} onpointerleave={(event) => scheduleSubmenuClose(event, 'refresh')} onfocusout={(event) => onMenuFocusOut(event, 'refresh')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'refresh'} onfocus={() => openSubmenu('refresh')} onkeydown={(event) => onParentKeydown(event, 'refresh')} onclick={() => openSubmenu('refresh')}><span class="tray-menu-item-icon">◷</span><span>Refresh Rate</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'refresh'}<div class="tray-menu-submenu tray-menu-submenu-refresh" data-tray-submenu="refresh" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'refresh')}>{#each data.refresh_rates as rate}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentRate(rate)} type="button" role="menuitem" onclick={() => selectRate(rate)}><span class="tray-menu-check">{isCurrentRate(rate) ? '✓' : ''}</span>{rate} Hz</button>{:else}<div class="tray-menu-empty">No refresh rates available</div>{/each}</div>{/if}</div>
         <div class="tray-menu-divider tray-menu-section-divider"></div>
         {#if data.favorites.length >= 3}
-          <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'favorites'} onpointerenter={() => openSubmenu('favorites')} onpointerleave={() => scheduleSubmenuClose('favorites')} onfocusout={(event) => onMenuFocusOut(event, 'favorites')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'favorites'} onfocus={() => openSubmenu('favorites')} onkeydown={(event) => onParentKeydown(event, 'favorites')} onclick={() => openSubmenu('favorites')}><span class="tray-menu-item-icon">★</span><span>Favorites</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'favorites'}<div class="tray-menu-submenu tray-menu-submenu-favorites" data-tray-submenu="favorites" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={() => scheduleSubmenuClose('favorites')}>{#each data.favorites as favorite}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" role="menuitem" onclick={() => selectFavorite(favorite)}><span class="tray-menu-check">{isCurrentFavorite(favorite) ? '✓' : ''}</span>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</button>{/each}</div>{/if}</div>
+          <div class="tray-menu-row" class:tray-menu-row-open={activeSubmenu === 'favorites'} onpointerenter={() => openSubmenu('favorites')} onpointerleave={(event) => scheduleSubmenuClose(event, 'favorites')} onfocusout={(event) => onMenuFocusOut(event, 'favorites')}><button class="tray-menu-item tray-menu-parent" type="button" aria-haspopup="menu" aria-expanded={activeSubmenu === 'favorites'} onfocus={() => openSubmenu('favorites')} onkeydown={(event) => onParentKeydown(event, 'favorites')} onclick={() => openSubmenu('favorites')}><span class="tray-menu-item-icon">★</span><span>Favorites</span><span class="tray-menu-chevron">›</span></button>{#if activeSubmenu === 'favorites'}<div class="tray-menu-submenu tray-menu-submenu-favorites" data-tray-submenu="favorites" role="menu" onpointerenter={cancelSubmenuClose} onpointerleave={(event) => scheduleSubmenuClose(event, 'favorites')}>{#each data.favorites as favorite}<button class="tray-menu-subitem" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" role="menuitem" onclick={() => selectFavorite(favorite)}><span class="tray-menu-check">{isCurrentFavorite(favorite) ? '✓' : ''}</span>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</button>{/each}</div>{/if}</div>
         {:else if data.favorites.length > 0}
           {#each data.favorites as favorite}
             <button class="tray-menu-item tray-menu-favorite-item" class:tray-menu-selected={isCurrentFavorite(favorite)} type="button" onclick={() => selectFavorite(favorite)}><span class="tray-menu-item-icon">★</span><span>{favorite.width}×{favorite.height}<span class="tray-menu-at">@</span>{favorite.hz} Hz</span><span class="tray-menu-favorite-check">{isCurrentFavorite(favorite) ? '✓' : ''}</span></button>
@@ -238,6 +409,7 @@
         {:else}
           <div class="tray-menu-empty tray-menu-favorites-empty"><span class="tray-menu-item-icon">★</span><span>No favorites yet</span></div>
         {/if}
+        <div class="tray-menu-divider tray-menu-section-divider"></div>
         <button class="tray-menu-item" type="button" onclick={restart}><span class="tray-menu-item-icon">↻</span><span>Restart</span></button><button class="tray-menu-item tray-menu-danger" type="button" onclick={quit}><span class="tray-menu-item-icon">×</span><span>Quit</span></button>
       </div>
     </div>

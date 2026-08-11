@@ -16,6 +16,13 @@ mod tray_menu {
     pub fn show_tray_menu(_app: tauri::AppHandle) {}
     pub fn toggle_tray_menu(_app: &tauri::AppHandle) {}
     pub fn prewarm(_app: &tauri::AppHandle) {}
+    pub fn set_click_anchor(_x: f64, _y: f64) {}
+    pub fn set_tray_icon_rect(_x: i32, _y: i32, _width: i32, _height: i32) {}
+    pub fn handle_global_mouse_down(_x: i32, _y: i32, _msg_type: u32) {}
+    pub fn handle_tray_right_down(_app: &tauri::AppHandle) {}
+    pub fn consume_tray_right_up() -> bool {
+        false
+    }
     #[tauri::command]
     pub fn tray_menu_get_snapshot() -> serde_json::Value {
         serde_json::json!({"open": false, "data": null})
@@ -36,6 +43,8 @@ mod tray_menu {
     pub fn tray_menu_select_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
     #[tauri::command]
     pub fn tray_menu_set_hit_rects(_rects: Vec<serde_json::Value>) {}
+    #[tauri::command]
+    pub fn tray_menu_set_card_height(_height_css: f64) {}
 }
 mod vendor_info;
 mod window_icon;
@@ -1036,6 +1045,7 @@ pub fn run() {
             tray_menu::tray_menu_select_refresh_rate,
             tray_menu::tray_menu_select_favorite,
             tray_menu::tray_menu_set_hit_rects,
+            tray_menu::tray_menu_set_card_height,
             set_tray_enabled,
             config::load_config,
             config::save_config,
@@ -1146,6 +1156,8 @@ pub fn run() {
             // Steam-style WebView popup from tray_menu.rs.
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_image)
+                // The popup is fully custom. No native menu is attached, so
+                // tray-icon has nothing to show automatically on right-click.
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| match event {
                     // Left-click opens the main window.
@@ -1157,17 +1169,92 @@ pub fn run() {
                     // Right-click toggles the custom Steam-style WebView menu:
                     // open when closed, close when open (the menu can also
                     // close itself via focus loss, so the toggle avoids
-                    // reopening what this same click just closed).
+                    // reopening what this same click just closed). The
+                    // event's own `rect` is the tray icon's screen bounds ,
+                    // far more reliable than a later GetCursorPos call, which
+                    // can race the dimmer's async cursor cache or simply
+                    // sample after the cursor has moved. Anchor to the
+                    // icon's center.
+                    TrayIconEvent::Click {
+                        button: MouseButton::Right,
+                        button_state: MouseButtonState::Down,
+                        ..
+                    } => {
+                        // Refresh the tray icon rectangle from this Down event
+                        // before any global hook dismissal work can run.
+                        if let Ok(Some(tray_rect)) = tray.rect() {
+                            let position = match tray_rect.position {
+                                tauri::Position::Physical(value) => value,
+                                tauri::Position::Logical(value) => value.to_physical(1.0),
+                            };
+                            let size = match tray_rect.size {
+                                tauri::Size::Physical(value) => value,
+                                tauri::Size::Logical(value) => value.to_physical(1.0),
+                            };
+                            tray_menu::set_tray_icon_rect(
+                                position.x,
+                                position.y,
+                                size.width.min(i32::MAX as u32) as i32,
+                                size.height.min(i32::MAX as u32) as i32,
+                            );
+                        }
+                        tray_menu::handle_tray_right_down(tray.app_handle());
+                    }
                     TrayIconEvent::Click {
                         button: MouseButton::Right,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
-                    } => tray_menu::toggle_tray_menu(tray.app_handle()),
+                    } => {
+                        if tray_menu::consume_tray_right_up() {
+                            return;
+                        }
+                        log::info!("[tray] raw click rect={:?}", rect);
+                        // rect.position/size are tauri::Position/Size, which
+                        // can be Physical or Logical depending on platform.
+                        // Tray icon rects on Windows are always physical;
+                        // handle Logical too via to_physical(1.0) (identity
+                        // when already physical) so this stays correct if
+                        // that ever changes.
+                        let physical_position = match rect.position {
+                            tauri::Position::Physical(position) => position,
+                            tauri::Position::Logical(position) => position.to_physical(1.0),
+                        };
+                        let physical_size = match rect.size {
+                            tauri::Size::Physical(size) => size,
+                            tauri::Size::Logical(size) => size.to_physical(1.0),
+                        };
+                        log::info!(
+                            "[tray] raw click physical_position=({},{}) physical_size=({},{})",
+                            physical_position.x, physical_position.y,
+                            physical_size.width, physical_size.height
+                        );
+                        tray_menu::set_tray_icon_rect(
+                            physical_position.x,
+                            physical_position.y,
+                            physical_size.width.min(i32::MAX as u32) as i32,
+                            physical_size.height.min(i32::MAX as u32) as i32,
+                        );
+                        let center_x =
+                            physical_position.x as f64 + physical_size.width as f64 / 2.0;
+                        let center_y =
+                            physical_position.y as f64 + physical_size.height as f64 / 2.0;
+                        tray_menu::set_click_anchor(center_x, center_y);
+                        tray_menu::toggle_tray_menu(tray.app_handle());
+                    }
                     _ => {}
                 })
                 .build(app)?;
 
+            // Tauri's wrapper does not expose the right-click switch on its
+            // builder, so disable tray-icon's underlying automatic native
+            // menu explicitly after creation. This is important even without
+            // an attached menu because it removes the shell menu path before
+            // the custom WebView popup is used.
             if let Some(tray) = app.tray_by_id("main-tray") {
+                tray.with_inner_tray_icon(|inner| {
+                    inner.set_show_menu_on_right_click(false);
+                })?;
                 tray.set_visible(saved_config.tray_enabled)?;
             }
 

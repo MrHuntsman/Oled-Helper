@@ -195,11 +195,67 @@ mod platform {
     static ELEVATION_WINEVENT_THREAD_ID: AtomicU32 = AtomicU32::new(0);
     static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0); // HHOOK handle, 0 = not installed
     static MOUSE_HOOK_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+    // Serializes tray-only hook startup with its delayed cleanup. Without this
+    // lock, a rapid reopen could install a new hook between the cleanup check
+    // and stop_mouse_hook().
+    static MOUSE_HOOK_LIFECYCLE: Mutex<()> = Mutex::new(());
     static MOUSE_HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
     static MOUSE_HOOK_TOGGLE: AtomicBool = AtomicBool::new(true);
+    static TRAY_MENU_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    pub fn set_tray_menu_active(active: bool) {
+        TRAY_MENU_ACTIVE.store(active, Ordering::Release);
+        // The tray popup also needs the low-level hook when the taskbar
+        // dimmer itself is disabled. Otherwise the second right-click can
+        // reach the tray icon's native message window after the custom popup
+        // closes and open a context menu. The hook remains the shared path for
+        // both outside-click dismissal and tray-click suppression.
+        if active {
+            ensure_mouse_hook_ready();
+        } else {
+            let dimmer_enabled = FADE_STATE
+                .get()
+                .map(|state| {
+                    state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .enabled
+                })
+                .unwrap_or(false);
+            if !dimmer_enabled {
+                // Keep the tray-only hook alive long enough to consume the
+                // WM_RBUTTONUP paired with the WM_RBUTTONDOWN that just
+                // closed the popup. Stopping it immediately here races that
+                // up event and lets Windows create its native context menu.
+                // Do not stop it if the popup is reopened during the grace
+                // period or a right-up is still pending.
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(900));
+                    stop_tray_only_mouse_hook_if_unused();
+                });
+            }
+        }
+    }
     // Taskbar rect the hook hit-tests against, kept in sync with the cached
     // taskbar geometry refreshed by update_fade and apply().
     static HOOK_TASKBAR_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+    // Last cursor position seen by the mouse hook (or the poll fallback), in
+    // physical screen coordinates. The custom tray menu reuses this instead of
+    // installing its own cursor tracking: the WH_MOUSE_LL hook fires on the
+    // tray right-click that opens the menu, so the position recorded here is
+    // exactly where the user clicked.
+    static LAST_CURSOR_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+    pub fn last_cursor_position() -> Option<(i32, i32)> {
+        *LAST_CURSOR_POS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // The tray menu refreshes the shared cursor store at open time so it is
+    // never stale (the dimmer's hook/poll may not be running, which would
+    // otherwise leave the last recorded position forever).
+    pub fn set_cursor_position(x: i32, y: i32) {
+        *LAST_CURSOR_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
+    }
     // Last hover state seen by either the hook (instant) or the poll
     // fallback in update_fade. Written by both, read by update_fade.
     static CURRENT_HOVER: AtomicBool = AtomicBool::new(false);
@@ -1064,6 +1120,9 @@ mod platform {
                 return (false, point);
             }
         }
+        // Keep the shared last-position (reused by the tray menu) in sync from
+        // the poll path too, so it stays fresh when the hook isn't installed.
+        *LAST_CURSOR_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((point.x, point.y));
         (
             point.x >= rect.left
                 && point.x < rect.right
@@ -1390,19 +1449,64 @@ mod platform {
         wparam: WPARAM,
         _lparam: LPARAM,
     ) -> LRESULT {
-        if code >= 0 && MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed) {
+        if code >= 0
+            && (MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed)
+                || crate::tray_menu::tray_right_click_hook_needed())
+        {
             // Any mouse message (move, button, wheel) is a hover candidate,
             // so react to the whole mouse message range WM_MOUSEFIRST..=
             // WM_MOUSEHWHEEL (0x0200..=0x020E).
             let msg_type = wparam.0 as u32;
             if (WM_MOUSEFIRST..=WM_MOUSEHWHEEL).contains(&msg_type) {
+                // Record the position for the tray menu unconditionally: the
+                // low-level hook sees the tray right-click itself, so this is
+                // the exact click location, and recording must not depend on
+                // the taskbar-rect cache being populated.
+                let mut point = windows::Win32::Foundation::POINT::default();
+                if GetCursorPos(&mut point).is_ok() {
+                    *LAST_CURSOR_POS.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((point.x, point.y));
+                    // Consume both halves of a right-click on the tray icon
+                    // while the custom popup is open. This is deliberately
+                    // done in the low-level hook, before the message reaches
+                    // tray-icon's hidden window, because closing on Down alone
+                    // still lets Windows show its native context menu on Up.
+                    // Returning nonzero suppresses the message globally for
+                    // this click sequence. Right-clicks elsewhere continue to
+                    // use the normal outside-click dismissal path.
+                    if matches!(msg_type, 0x0204 | 0x0205)
+                        && crate::tray_menu::suppress_tray_icon_right_button(
+                            point.x, point.y, msg_type,
+                        )
+                    {
+                        return LRESULT(1);
+                    }
+
+                    // The tray popup is intentionally non-activating so Edge
+                    // keeps its compositor active. Use the existing global
+                    // hook to dismiss it when a button press lands outside
+                    // the compact popup instead of relying on Focused(false).
+                    // Wheel messages are intentionally excluded, so scrolling
+                    // another app does not dismiss the menu. Right-button
+                    // messages outside the tray icon still dismiss without
+                    // racing the tray click.
+                    if TRAY_MENU_ACTIVE.load(Ordering::Acquire)
+                        && matches!(msg_type, 0x0201 | 0x0204 | 0x0207 | 0x020B)
+                    {
+                        // The hook callback must remain tiny. Defer the
+                        // window query and close work to the Tauri thread.
+                        let x = point.x;
+                        let y = point.y;
+                        std::thread::spawn(move || {
+                            crate::tray_menu::handle_global_mouse_down(x, y, msg_type);
+                        });
+                    }
+                }
                 let hovered = {
                     let guard = HOOK_TASKBAR_RECT.lock().unwrap_or_else(|e| e.into_inner());
                     match *guard {
                         Some(rect) => {
-                            let mut point = windows::Win32::Foundation::POINT::default();
-                            GetCursorPos(&mut point).is_ok()
-                                && point.x >= rect.left
+                            point.x >= rect.left
                                 && point.x < rect.right
                                 && point.y >= rect.top
                                 && point.y < rect.bottom
@@ -1455,7 +1559,14 @@ mod platform {
     }
 
     fn ensure_mouse_hook() {
-        if !MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed) {
+        let _lifecycle_guard = MOUSE_HOOK_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // The tray popup requires the hook even when the user disabled the
+        // dimmer's hover hook in Debug. The tray-specific path only runs while
+        // the popup is open and consumes right-clicks on the icon, preventing
+        // Windows from creating its native context menu.
+        if !MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed) && !TRAY_MENU_ACTIVE.load(Ordering::Acquire) {
             return;
         }
         let threads = MOUSE_HOOK_THREAD.get_or_init(|| Mutex::new(None));
@@ -1470,7 +1581,49 @@ mod platform {
         *guard = Some(handle);
     }
 
+    fn ensure_mouse_hook_ready() {
+        ensure_mouse_hook();
+        // Do not expose the popup until the hook has either installed or
+        // reported failure. This removes the small startup window in which a
+        // very fast second right-click could reach tray-icon unfiltered.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while MOUSE_HOOK.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn stop_tray_only_mouse_hook_if_unused() {
+        let _lifecycle_guard = MOUSE_HOOK_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Recheck ownership while startup is serialized against cleanup. A
+        // rapid reopen cannot install a new hook between this check and stop.
+        let dimmer_enabled = FADE_STATE
+            .get()
+            .map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .enabled
+            })
+            .unwrap_or(false);
+        if dimmer_enabled
+            || MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed)
+            || crate::tray_menu::tray_right_click_hook_needed()
+        {
+            return;
+        }
+        stop_mouse_hook_unlocked();
+    }
+
     fn stop_mouse_hook() {
+        let _lifecycle_guard = MOUSE_HOOK_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        stop_mouse_hook_unlocked();
+    }
+
+    fn stop_mouse_hook_unlocked() {
         // If no hook thread was ever spawned (dimmer never enabled) there is
         // nothing to stop ,  bail immediately so disable/shutdown paths with
         // the dimmer off don't pay the registration-wait below.
@@ -2198,12 +2351,16 @@ mod platform {
         false
     }
     pub fn set_verbose_logging(_enabled: bool) {}
-
     pub fn set_detection(_name: &str, _enabled: bool) {}
     pub fn set_hover_mode(_mode: &str) {}
     pub fn set_poll_interval_ms(_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
     pub fn set_flyout_hwnd(_raw: isize) {}
+    pub fn last_cursor_position() -> Option<(i32, i32)> {
+        None
+    }
+    pub fn set_cursor_position(_x: i32, _y: i32) {}
+    pub fn set_tray_menu_active(_active: bool) {}
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
@@ -2320,4 +2477,19 @@ pub fn shutdown() {
 // z-order repair never fights the flyout for the front of the topmost band.
 pub fn set_flyout_hwnd(raw: isize) {
     platform::set_flyout_hwnd(raw);
+}
+
+// Last cursor position recorded by the dimmer's mouse hook (or its poll
+// fallback), in physical screen coordinates. Reused by the custom tray menu so
+// it can anchor to the tray-icon click without its own cursor tracking.
+pub fn last_cursor_position() -> Option<(i32, i32)> {
+    platform::last_cursor_position()
+}
+
+pub fn set_cursor_position(x: i32, y: i32) {
+    platform::set_cursor_position(x, y);
+}
+
+pub fn set_tray_menu_active(active: bool) {
+    platform::set_tray_menu_active(active);
 }
