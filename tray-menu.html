@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>OLED Helper</title>
+    <style>
+      html, body, #tray-menu-app {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: transparent;
+      }
+      /* app.css (imported by tray-menu-main.js for shared tokens) sets
+         html, body { overflow: hidden } for the main window's scroll
+         containment. That rule loads AFTER this inline style (via the JS
+         module import) and would win the cascade, clipping the resolution
+         submenu, which is a flex sibling that extends past body's own box
+         width. !important guarantees this window keeps overflow visible
+         regardless of app.css load order. app.css also paints html/body
+         with the opaque --bg color (for the main window's chrome), which
+         would fill this whole transparent popup window with a solid dark
+         rectangle behind the actual card, so it's forced back to
+         transparent here too. */
+      html, body {
+        overflow: visible !important;
+        background: transparent !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="tray-menu-app"></div>
+    <script type="module" src="/src/tray-menu-main.js"></script>
+  </body>
+</html>

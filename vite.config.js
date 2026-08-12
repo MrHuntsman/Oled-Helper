@@ -16,6 +16,7 @@ export default defineConfig({
       input: {
         main: resolve(__dirname, 'index.html'),
         flyout: resolve(__dirname, 'flyout.html'),
+        trayMenu: resolve(__dirname, 'tray-menu.html'),
       },
     },
   },

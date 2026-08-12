@@ -21,6 +21,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 # Direct dependency for the custom TargetKind::Dispatch target that captures
 # pre-WebView log records for the startup replay (already in the lock file as
 # a transitive dep of tauri-plugin-log).

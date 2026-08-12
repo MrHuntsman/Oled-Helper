@@ -6,6 +6,7 @@ mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
 mod tray_menu;
+mod tray_menu_window;
 mod updater;
 mod vendor_info;
 mod window_icon;
@@ -968,11 +969,18 @@ pub fn run() {
             flyout_window::flyout_layout_ready,
             flyout_window::flyout_hidden,
             flyout_window::show_mode_confirmation,
+            tray_menu_window::tray_menu_get_display_info,
+            tray_menu_window::tray_menu_set_resolution,
+            tray_menu_window::tray_menu_hide,
+            tray_menu_window::tray_menu_restart,
+            tray_menu_window::tray_menu_quit,
+            tray_menu_window::tray_menu_set_expanded,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             // Gamma safety thread: re-applies the last known ramp every 5
             // seconds so another app resetting the system gamma (fullscreen
@@ -1033,6 +1041,12 @@ pub fn run() {
             flyout_window::prewarm(app.handle());
             log::info!("[tray] mode flyout window ready");
 
+            // Custom CSS tray popup (test replacement for the native menu on
+            // right-click). Pre-warmed for the same reason as the flyout: its
+            // WebView2 controller should exist before the first click.
+            tray_menu_window::prewarm(app.handle());
+            log::info!("[tray] custom tray menu window ready");
+
             let saved_config = config::load_config(app.handle().clone());
             app.state::<TrayState>()
                 .enabled
@@ -1042,28 +1056,33 @@ pub fn run() {
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
 
-            // Initialize Windows 11 dark mode for native popup menus.
+            // Native dark-mode init kept for now in case tray_menu.rs's
+            // build_menu is reinstated as a fallback later.
             tray_menu::init_dark_mode();
 
-            // Build the native dark-mode tray context menu.
-            let native_menu = tray_menu::build_menu(app.handle())
-                .unwrap_or_else(|error| {
-                    log::warn!("[tray] could not build native menu: {error}");
-                    // Fallback: empty menu — tray icon still works for left-click.
-                    tauri::menu::MenuBuilder::new(app.handle()).build().unwrap()
-                });
-
+            // TEST: right-click now opens the custom CSS popup
+            // (tray_menu_window) instead of the native muda menu. No native
+            // menu is attached to the tray icon, so Tauri/muda won't show its
+            // own popup on right-click ,  we handle Click ourselves for both
+            // buttons.
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_image)
-                .menu(&native_menu)
                 .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } => show_main_window(tray.app_handle()),
-                    _ => {}
+                .on_tray_icon_event(|tray, event| {
+                    tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+                    match event {
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } => show_main_window(tray.app_handle()),
+                        TrayIconEvent::Click {
+                            button: MouseButton::Right,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } => tray_menu_window::toggle(tray.app_handle()),
+                        _ => {}
+                    }
                 })
                 .build(app)?;
 
