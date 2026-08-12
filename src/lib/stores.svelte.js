@@ -1,6 +1,6 @@
 // Svelte 5 runes stores ,  $state object pattern
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_CELLS, HIGH_NITS_MAX_CEILING, HIGH_NITS_MAX_STOPS, highNitsStepForMax } from './calibration.js';
 
 export const app = $state({
@@ -201,10 +201,32 @@ export const displayMenuPrefs = $state({
   showTags: true,               // resolution name tags (4K, QHD, UW badge, etc.)
   refreshRateSort: 'desc',      // 'asc' | 'desc'
 });
-export function setResolutionSort(dir) { displayMenuPrefs.resolutionSort = dir; saveConfig(); }
+function emitDisplayMenuSortingChanged() {
+  emit('display-menu-sorting-changed', {
+    resolutionSort: displayMenuPrefs.resolutionSort,
+    refreshRateSort: displayMenuPrefs.refreshRateSort,
+  }).catch(() => {});
+}
+export function setResolutionSort(dir) {
+  if (dir !== 'asc' && dir !== 'desc') return;
+  displayMenuPrefs.resolutionSort = dir;
+  saveConfig();
+  emitDisplayMenuSortingChanged();
+}
 export function setResolutionGroupBy(mode) { displayMenuPrefs.resolutionGroupBy = mode; saveConfig(); }
-export function setShowTags(enabled) { displayMenuPrefs.showTags = enabled; saveConfig(); }
-export function setRefreshRateSort(dir) { displayMenuPrefs.refreshRateSort = dir; saveConfig(); }
+export function setShowTags(enabled) {
+  displayMenuPrefs.showTags = enabled;
+  saveConfig();
+  // Keep both tray implementations in sync immediately; the custom tray may
+  // already be prewarmed, while the native menu is rebuilt from this event.
+  emit('display-menu-tags-changed', enabled).catch(() => {});
+}
+export function setRefreshRateSort(dir) {
+  if (dir !== 'asc' && dir !== 'desc') return;
+  displayMenuPrefs.refreshRateSort = dir;
+  saveConfig();
+  emitDisplayMenuSortingChanged();
+}
 
 // User-saved resolution@hz combos for the status-bar favorites menu. Items
 // are { width, height, hz }; applying one goes through the same safe

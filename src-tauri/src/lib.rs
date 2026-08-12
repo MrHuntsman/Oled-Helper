@@ -27,6 +27,14 @@ struct TrayState {
     enabled: AtomicBool,
 }
 
+#[derive(serde::Deserialize)]
+struct DisplayMenuSortingEvent {
+    #[serde(rename = "resolutionSort")]
+    resolution_sort: Option<String>,
+    #[serde(rename = "refreshRateSort")]
+    refresh_rate_sort: Option<String>,
+}
+
 // Shared by the Debug tab's "Detailed logging" toggle. Diagnostic info from
 // the vendor/EDID paths is intentionally quiet by default because those paths
 // are refreshed periodically; warnings and errors remain visible regardless.
@@ -971,6 +979,7 @@ pub fn run() {
             flyout_window::show_mode_confirmation,
             tray_menu_window::tray_menu_get_display_info,
             tray_menu_window::tray_menu_set_resolution,
+            tray_menu_window::tray_menu_set_refresh_rate,
             tray_menu_window::tray_menu_hide,
             tray_menu_window::tray_menu_restart,
             tray_menu_window::tray_menu_quit,
@@ -1079,8 +1088,9 @@ pub fn run() {
                         TrayIconEvent::Click {
                             button: MouseButton::Right,
                             button_state: MouseButtonState::Up,
+                            position,
                             ..
-                        } => tray_menu_window::toggle(tray.app_handle()),
+                        } => tray_menu_window::toggle(tray.app_handle(), position.x),
                         _ => {}
                     }
                 })
@@ -1101,6 +1111,23 @@ pub fn run() {
             let refresh_app = app.handle().clone();
             app.handle().listen("display-changed", move |_| {
                 tray_menu::refresh_menu(&refresh_app).ok();
+            });
+            let refresh_tag_app = app.handle().clone();
+            app.handle().listen("display-menu-tags-changed", move |event| {
+                if let Ok(show_tags) = event.payload().parse::<bool>() {
+                    tray_menu::refresh_menu_with_tag_override(&refresh_tag_app, show_tags).ok();
+                }
+            });
+            let refresh_sort_app = app.handle().clone();
+            app.handle().listen("display-menu-sorting-changed", move |event| {
+                if let Ok(prefs) = serde_json::from_str::<DisplayMenuSortingEvent>(event.payload()) {
+                    tray_menu::refresh_menu_with_sort_overrides(
+                        &refresh_sort_app,
+                        prefs.resolution_sort.as_deref(),
+                        prefs.refresh_rate_sort.as_deref(),
+                    )
+                    .ok();
+                }
             });
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();

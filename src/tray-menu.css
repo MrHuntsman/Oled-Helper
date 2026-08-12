@@ -49,6 +49,19 @@
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
+/* Flatten only the two facing edges while a submenu is open. This removes
+   the tiny visual corner seam that otherwise matches the rounded-region
+   hit-test cutout at the pane boundary. */
+.tray-menu-wrap.tray-submenu-open .tray-menu {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.tray-menu-wrap.tray-submenu-open .tray-submenu {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
 .tray-item {
   position: relative;
   display: flex;
@@ -81,8 +94,42 @@
 
 .tray-item-label {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tray-resolution-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tray-resolution-tag,
+.tray-resolution-native {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.tray-resolution-tag {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.tray-resolution-native {
+  color: var(--text-weak);
+}
+
+.tray-favorite-item .tray-item-label {
+  font-variant-numeric: tabular-nums;
+}
+
+.tray-favorite-current .tray-item-label {
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .tray-item-chevron {
@@ -107,4 +154,12 @@
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   padding: 6px;
+}
+
+/* Resolution tags can make a row wider than the refresh/favorites panes.
+   The Rust window reserves the additional left-side space while keeping the
+   main tray card anchored at the same right edge. */
+.tray-resolution-submenu {
+  width: 230px;
+  max-width: 230px;
 }

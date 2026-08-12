@@ -9,6 +9,7 @@
 // only centers on the tray icon at a fixed offset, not flush to the edge).
 
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -36,10 +37,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const LABEL: &str = "tray-menu";
-const FULL_WIDTH: f64 = 420.0;
+static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
+static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
+// The resolution submenu includes the same friendly/UW/native labels as the
+// main app, so reserve enough left-side space to keep those tags readable.
+const FULL_WIDTH: f64 = 500.0;
 const FULL_HEIGHT: f64 = 340.0;
 const BASE_WIDTH: f64 = 259.0;
-const BASE_HEIGHT_ESTIMATE: f64 = 122.0;
+// Estimate for the collapsed base menu: Resolution / Refresh Rate /
+// Favorites / separator / Restart / Quit (6 rows + 1 separator). Only used
+// as the initial native hit-region before the first real Svelte layout
+// measurement replaces it via tray_menu_set_expanded (see below), so an
+// approximate value is fine — it only has to be roughly right for the very
+// first frame after the window is created.
+const BASE_HEIGHT_ESTIMATE: f64 = 220.0;
 // The window is built once at this full footprint (base menu + resolution
 // submenu both visible) and never resized while shown; CSS/Svelte alone
 // show or hide the submenu pane inside that fixed canvas. An earlier
@@ -157,25 +168,56 @@ fn primary_monitor_info() -> Option<MONITORINFO> {
 // rcMonitor minus the taskbar strip): the edge where the two differ is where
 // the taskbar sits. Called once when the menu opens (see toggle below); the
 // window is never resized or moved again while visible.
+//
+// anchor_x_px, when given, is the tray icon's click x-position in physical
+// pixels (from the TrayIconEvent) — the visible base-menu card (which sits
+// flush against the window's right edge, see tray-menu.css's row-reverse
+// layout and apply_default_hit_region's BASE_WIDTH offset) is centered on
+// that x instead of the window always hugging the work area's right edge.
+// card_width_px is the base menu card's width, so the card itself ends up
+// centered on the icon rather than the invisible full window (which is
+// wider, to also fit the resolution submenu) being centered on it — that
+// would visually offset the card away from the icon.
 #[cfg(target_os = "windows")]
-fn taskbar_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
+fn taskbar_position(
+    width_px: i32,
+    height_px: i32,
+    anchor_x_px: Option<i32>,
+    card_width_px: i32,
+) -> Option<(i32, i32)> {
     let info = primary_monitor_info()?;
     let work = info.rcWork;
     let monitor = info.rcMonitor;
     let gap = 6;
     let max_x = (work.right - width_px).max(work.left);
     let max_y = (work.bottom - height_px).max(work.top);
+    // When an anchor x is available and the taskbar runs along the top or
+    // bottom edge (the horizontal case where a left/right x position is
+    // meaningful), center the visible base-menu card on it instead of
+    // pinning the window to the work area's right edge. Vertical taskbars
+    // (left/right edge) keep the existing bottom-aligned behavior, since the
+    // icon's y position — not x — is what varies there. The card sits at the
+    // window's right edge, so window_x = desired_card_x - (width_px -
+    // card_width_px).
+    let horizontal_taskbar = monitor.bottom - work.bottom > 0 || work.top - monitor.top > 0;
+    let anchored_x = anchor_x_px.filter(|_| horizontal_taskbar).map(|anchor_x| {
+        let card_x = anchor_x - card_width_px / 2;
+        let window_x = card_x - (width_px - card_width_px);
+        window_x.clamp(work.left, max_x)
+    });
     let (x, y) = if monitor.bottom - work.bottom > 0 {
-        // Taskbar along the bottom edge — pin just above it, right-aligned
-        // near the tray/notification area.
+        // Taskbar along the bottom edge — pin just above it, centered on the
+        // tray icon's x position when known, otherwise right-aligned near
+        // the tray/notification area.
         (
-            (work.right - width_px - gap).max(work.left),
+            anchored_x.unwrap_or((work.right - width_px - gap).max(work.left)),
             (work.bottom - height_px - gap).max(work.top),
         )
     } else if work.top - monitor.top > 0 {
-        // Taskbar along the top edge — just below it, near the tray.
+        // Taskbar along the top edge — just below it, centered on the tray
+        // icon's x position when known, otherwise near the tray on the right.
         (
-            (work.right - width_px - gap).max(work.left),
+            anchored_x.unwrap_or((work.right - width_px - gap).max(work.left)),
             (work.top + gap).min(max_y),
         )
     } else if work.left - monitor.left > 0 {
@@ -202,19 +244,33 @@ fn taskbar_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn taskbar_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
+fn taskbar_position(
+    _width_px: i32,
+    _height_px: i32,
+    _anchor_x_px: Option<i32>,
+    _card_width_px: i32,
+) -> Option<(i32, i32)> {
     None
 }
 
 // Re-anchors the window to the taskbar edge. Called once when the menu
-// opens (see toggle below).
+// opens (see toggle below). anchor_x_px is the tray icon's click x-position
+// in physical pixels, used to center the visible base-menu card on the icon
+// when the taskbar runs horizontally (see taskbar_position).
 #[cfg(target_os = "windows")]
-fn reposition_to_taskbar(window: &tauri::WebviewWindow) {
+fn reposition_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
     let Ok(hwnd) = window.hwnd() else { return };
     let Ok(size) = window.outer_size() else {
         return;
     };
-    let Some((x, y)) = taskbar_position(size.width as i32, size.height as i32) else {
+    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+    let card_width_px = (BASE_WIDTH * scale).round() as i32;
+    let Some((x, y)) = taskbar_position(
+        size.width as i32,
+        size.height as i32,
+        anchor_x_px,
+        card_width_px,
+    ) else {
         return;
     };
     unsafe {
@@ -231,7 +287,7 @@ fn reposition_to_taskbar(window: &tauri::WebviewWindow) {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn reposition_to_taskbar(_window: &tauri::WebviewWindow) {}
+fn reposition_to_taskbar(_window: &tauri::WebviewWindow, _anchor_x_px: Option<i32>) {}
 
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(LABEL) {
@@ -275,7 +331,22 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     let blur_window = window.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(false) = event {
-            let _ = blur_window.hide();
+            // The native region is updated asynchronously when a submenu
+            // opens. Delay the blur dismissal long enough for the preinstalled
+            // bridge/exact region to arrive; if the submenu is still open,
+            // the pointer crossed internally and the popup must remain visible.
+            // Capture the menu generation so an old blur callback can never
+            // hide a newly reopened tray menu.
+            let generation = MENU_GENERATION.load(Ordering::Acquire);
+            let delayed_window = blur_window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                if MENU_GENERATION.load(Ordering::Acquire) == generation
+                    && !SUBMENU_EXPANDED.load(Ordering::Acquire)
+                {
+                    let _ = delayed_window.hide();
+                }
+            });
         }
     });
     Ok(window)
@@ -289,8 +360,10 @@ pub fn prewarm(app: &AppHandle) {
 }
 
 /// Show (or hide, if already visible) the custom tray menu, anchored flush
-/// against the taskbar edge near the tray icon.
-pub fn toggle(app: &AppHandle) {
+/// against the taskbar edge near the tray icon. anchor_x is the click's
+/// physical-pixel x-coordinate from the TrayIconEvent, used to center the
+/// popup on wherever the tray icon actually sits.
+pub fn toggle(app: &AppHandle, anchor_x: f64) {
     let window = match get_or_create_window(app) {
         Ok(w) => w,
         Err(e) => {
@@ -298,16 +371,18 @@ pub fn toggle(app: &AppHandle) {
             return;
         }
     };
+    MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
     if window.is_visible().unwrap_or(false) {
         let _ = window.hide();
         return;
     }
+    SUBMENU_EXPANDED.store(false, Ordering::Release);
     // A click outside the region can hide the window before Svelte gets a
     // chance to close its submenu state. Reset the native region before the
     // next show so a stale expanded shape can never intercept the first frame.
     apply_default_hit_region(&window);
     let _ = window.emit_to(LABEL, "tray-menu-show", ());
-    reposition_to_taskbar(&window);
+    reposition_to_taskbar(&window, Some(anchor_x.round() as i32));
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -328,15 +403,32 @@ pub fn tray_menu_set_expanded(
     base: TrayMenuRect,
     submenu: Option<TrayMenuRect>,
 ) {
+    SUBMENU_EXPANDED.store(expanded, Ordering::Release);
     #[cfg(target_os = "windows")]
     if let Some(window) = app.get_webview_window(LABEL) {
-        let rects = if expanded {
-            submenu.into_iter().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let mut rects = rects;
-        rects.insert(0, base);
+        let mut rects = vec![base];
+        if expanded {
+            if let Some(submenu) = submenu {
+                // The two cards touch visually, but their individual rounded
+                // regions (and IPC/layout rounding) can leave a thin seam that
+                // routes the cursor through the transparent window. Add one
+                // shared bridge covering only their vertical overlap; the
+                // surrounding canvas remains click-through.
+                let left = base.x.min(submenu.x);
+                let right = (base.x + base.width).max(submenu.x + submenu.width);
+                let top = base.y.max(submenu.y);
+                let bottom = (base.y + base.height).min(submenu.y + submenu.height);
+                if right > left && bottom > top {
+                    rects.push(TrayMenuRect {
+                        x: left,
+                        y: top,
+                        width: right - left,
+                        height: bottom - top,
+                    });
+                }
+                rects.push(submenu);
+            }
+        }
         apply_hit_region(&window, &rects);
     }
 }
@@ -350,18 +442,50 @@ pub fn tray_menu_get_display_info() -> Result<crate::display_info::DisplayInfo, 
 }
 
 /// Frontend command: apply a resolution pick from the custom menu, same
-/// behavior as the native menu's tray:res: handler (tray_menu.rs).
+/// behavior as the native menu's tray:res: handler (tray_menu.rs). hz is
+/// optional: favorites need an exact width×height@hz triple, while the
+/// plain Resolution submenu keeps the display's current refresh rate (same
+/// behavior as tray_menu.rs's tray:res: handler).
 #[tauri::command]
-pub fn tray_menu_set_resolution(app: AppHandle, width: u32, height: u32) {
+pub fn tray_menu_set_resolution(app: AppHandle, width: u32, height: u32, hz: Option<u32>) {
     std::thread::spawn(move || {
-        let current_hz = crate::display_info::query_current_display()
-            .map(|d| d.refresh_hz)
-            .unwrap_or(0);
-        match crate::display_info::set_resolution(width, height, current_hz) {
+        let current = crate::display_info::query_current_display();
+        let target_hz = hz.unwrap_or_else(|| current.as_ref().map(|d| d.refresh_hz).unwrap_or(0));
+        // The tray resolution list keeps the current refresh rate. Applying
+        // the active width/height again is therefore a guaranteed no-op and
+        // must not open the Keep display mode? confirmation.
+        if current
+            .as_ref()
+            .is_some_and(|d| d.width == width && d.height == height && d.refresh_hz == target_hz)
+        {
+            return;
+        }
+        match crate::display_info::set_resolution(width, height, target_hz) {
             Ok(mode) => {
                 crate::flyout_window::show_after_ready(&app, mode).ok();
             }
             Err(e) => log::warn!("[tray-menu] resolution change failed: {e}"),
+        }
+    });
+}
+
+/// Frontend command: apply a refresh-rate pick from the Refresh Rate
+/// submenu, same behavior as the native menu's tray:hz: handler
+/// (tray_menu.rs).
+#[tauri::command]
+pub fn tray_menu_set_refresh_rate(app: AppHandle, hz: u32) {
+    std::thread::spawn(move || {
+        if crate::display_info::query_current_display()
+            .as_ref()
+            .is_some_and(|d| d.refresh_hz == hz)
+        {
+            return;
+        }
+        match crate::display_info::set_refresh_rate(hz) {
+            Ok(mode) => {
+                crate::flyout_window::show_after_ready(&app, mode).ok();
+            }
+            Err(e) => log::warn!("[tray-menu] refresh rate change failed: {e}"),
         }
     });
 }
