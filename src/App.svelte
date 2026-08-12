@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { listen } from '@tauri-apps/api/event';
+  import { emit, listen } from '@tauri-apps/api/event';
   import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
@@ -187,12 +187,12 @@
     dismissCtxMenus();
     closeResMenu();
     closeResContextMenu();
-    hzCtxMenu = clampCtxMenu(e.clientX, e.clientY, 140, 90);
+    hzCtxMenu = clampCtxMenu(e.clientX, e.clientY, 190, 190);
   }
   function repositionHzContextMenu(e) {
     e.preventDefault();
     e.stopPropagation();
-    hzCtxMenu = clampCtxMenu(e.clientX, e.clientY, 140, 90);
+    hzCtxMenu = clampCtxMenu(e.clientX, e.clientY, 190, 190);
   }
   function closeHzContextMenu() {
     hzCtxMenu = { ...hzCtxMenu, open: false };
@@ -710,7 +710,10 @@
           if (target === current) continue;
           const result = await invoke('set_sdr_brightness_nits', { nits: target });
           const applied = Number(result?.nits);
-          if (Number.isFinite(applied)) setSdrWhiteNits(applied);
+          if (Number.isFinite(applied)) {
+            setSdrWhiteNits(applied);
+            emit('sdr-content-brightness-main-changed', { nits: applied }).catch(() => {});
+          }
         } catch (error) {
           console.warn('[sdr-brightness-hotkey] update failed', error);
         }
@@ -848,22 +851,29 @@
     if (hdrLayerCanvas && hdrLayerInitStarted) configureHdrLayer();
   });
 
+  function emitBlackLevelMainChanged() {
+    emit('black-level-main-changed', { adjustment: crush.adjustment, enabled: crush.blackEnabled }).catch(() => {});
+  }
+
   function handleHotkeyAction(action) {
     switch (action) {
       case 'toggle_black_crush':
         crush.blackEnabled = !crush.blackEnabled;
         applyGammaForHotkey();
         scheduleHotkeyConfigSave();
+        emitBlackLevelMainChanged();
         break;
       case 'decrease_black_crush':
         crush.adjustment = Math.max(-150, crush.adjustment - 10);
         applyGammaForHotkey();
         scheduleHotkeyConfigSave();
+        emitBlackLevelMainChanged();
         break;
       case 'increase_black_crush':
         crush.adjustment = Math.min(150, crush.adjustment + 10);
         applyGammaForHotkey();
         scheduleHotkeyConfigSave();
+        emitBlackLevelMainChanged();
         break;
       case 'toggle_taskbar_dimmer':
         setTaskbarDimmer(!taskbarDimmer.enabled);
@@ -1325,7 +1335,7 @@
             <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.resolutionSort === 'asc'} onclick={() => resCtxAction(() => setResolutionSort('asc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Ascending</button>
             <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.resolutionSort === 'desc'} onclick={() => resCtxAction(() => setResolutionSort('desc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Descending</button>
             <div class="ctx-menu-sep"></div>
-            <div class="ctx-menu-subheading">Display</div>
+            <div class="ctx-menu-subheading">Resolution</div>
             <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.resolutionGroupBy === 'aspectRatio'} onclick={() => resCtxAction(() => setResolutionGroupBy(displayMenuPrefs.resolutionGroupBy === 'aspectRatio' ? 'none' : 'aspectRatio'))}><span class="ctx-checkbox" aria-hidden="true"></span>Group by aspect ratio</button>
             <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.showTags} onclick={() => resCtxAction(() => setShowTags(!displayMenuPrefs.showTags))}><span class="ctx-checkbox" aria-hidden="true"></span>Show tags (4K, QHD, UW)</button>
           </div>
@@ -1348,7 +1358,7 @@
         </button>
         {#if hzMenuOpen}
           <div class="hz-menu" bind:this={hzMenuEl} role="listbox" aria-label="Refresh rate options" tabindex="-1" oncontextmenu={openHzContextMenu}>
-            {#each [...app.displayInfo.refreshRates].sort((a, b) => (displayMenuPrefs.refreshRateSort === 'asc' ? a - b : b - a)) as hz}
+            {#each [...app.displayInfo.refreshRates].sort((a, b) => (displayMenuPrefs.resolutionSort === 'asc' ? a - b : b - a)) as hz}
               <button type="button" class="hz-menu-item" class:active={hz === app.displayInfo.refreshRateHz}
                 role="option" aria-selected={hz === app.displayInfo.refreshRateHz}
                 onclick={() => pickHz(hz)}>
@@ -1361,8 +1371,12 @@
         {#if hzCtxMenu.open}
           <div class="ctx-menu compact" bind:this={hzCtxMenuEl} style="left:{hzCtxMenu.x}px; top:{hzCtxMenu.y}px;" role="menu" aria-label="Refresh rate list options" tabindex="-1" onmousedown={(e) => ctxChromeDismiss(e, closeHzContextMenu)} onclick={(e) => e.stopPropagation()} onkeydown={(e) => handleCtxMenuKeydown(e, closeHzContextMenu)} oncontextmenu={repositionHzContextMenu}>
             <div class="ctx-menu-subheading">Sort</div>
-            <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.refreshRateSort === 'asc'} onclick={() => hzCtxAction(() => setRefreshRateSort('asc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Ascending</button>
-            <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.refreshRateSort === 'desc'} onclick={() => hzCtxAction(() => setRefreshRateSort('desc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Descending</button>
+            <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.resolutionSort === 'asc'} onclick={() => hzCtxAction(() => setResolutionSort('asc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Ascending</button>
+            <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.resolutionSort === 'desc'} onclick={() => hzCtxAction(() => setResolutionSort('desc'))}><span class="ctx-radio-dot" aria-hidden="true"></span>Descending</button>
+            <div class="ctx-menu-sep"></div>
+            <div class="ctx-menu-subheading">Resolution</div>
+            <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.resolutionGroupBy === 'aspectRatio'} onclick={() => hzCtxAction(() => setResolutionGroupBy(displayMenuPrefs.resolutionGroupBy === 'aspectRatio' ? 'none' : 'aspectRatio'))}><span class="ctx-checkbox" aria-hidden="true"></span>Group by aspect ratio</button>
+            <button class="ctx-item" role="menuitem" class:active={displayMenuPrefs.showTags} onclick={() => hzCtxAction(() => setShowTags(!displayMenuPrefs.showTags))}><span class="ctx-checkbox" aria-hidden="true"></span>Show tags (4K, QHD, UW)</button>
           </div>
         {/if}
         {#if refreshRateError}

@@ -7,11 +7,15 @@
   display: flex;
   position: relative;
   /* The native window is a fixed canvas. Give the flex wrapper that same
-     height so align-items:flex-end is relative to the window, not to the
+     height so the bottom alignment is relative to the window, not to the
      currently visible pane. Without this, opening the submenu increases the
      wrapper's content height and moves the base menu downward. */
   width: 100%;
   height: 100%;
+  /* Bottom-align the panes so the base menu hugs the taskbar. The submenu
+     is shorter than the base menu, so TrayMenu.svelte lifts it with a
+     measured margin-bottom (submenuLift) to align its top edge with the
+     base menu's top edge. */
   align-items: flex-end;
   /* Row order is reversed (submenu first in DOM, rendered on the right via
      row-reverse) so the base menu pane is the one flush against the
@@ -31,8 +35,8 @@
 
 .tray-menu {
   /* Width is the content width; Rust's fixed canvas uses the resulting
-     254px outer width (including padding and borders). */
-  width: 240px;
+     284px outer width (including padding and borders). */
+  width: 270px;
   flex: 0 0 auto;
   border-radius: 10px;
   background: var(--panel);
@@ -49,6 +53,95 @@
 
 @keyframes tray-menu-in {
   to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.tray-menu-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Extra vertical room so the title/monitor copy and the bottom-right
+     SDR/HDR switch both fit comfortably. */
+  padding: 6px 8px 10px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--divider);
+}
+
+/* The Windows HDR switch (same .hdr-switch component as the main app's
+   status bar) lives on its own bottom row with the monitor name, so the
+   title/version row keeps the full header width. */
+.tray-menu-header-bottom-row {
+  display: flex;
+  /* Top-align the monitor text so it hugs the app title above. */
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 0;
+}
+
+.tray-menu-header-icon {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+}
+
+.tray-menu-header-copy {
+  /* Grow to fill the header so the bottom row's space-between pushes the
+     SDR/HDR switch flush against the right edge of the menu. */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tray-menu-header-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* The Windows HDR switch sits at the top right of the header (title row)
+   and is sized a bit smaller than the main app's status-bar switch. */
+.tray-menu-header-title-row .hdr-switch {
+  flex: 0 0 auto;
+  width: 78px;
+  height: 18px;
+  padding: 2px;
+}
+
+.tray-menu-header-title-row .hdr-switch-opt {
+  padding: 0 4px;
+  font-size: 8.5px;
+}
+
+.tray-menu-header-title-row .hdr-switch-arrow {
+  width: 7px;
+  height: 7px;
+  /* Re-center for the smaller 7px arrow (base rule assumes 9px). */
+  margin-left: -0.5px;
+}
+
+.tray-menu-header-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tray-menu-header-monitor {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Flatten only the two facing edges while a submenu is open. This removes
@@ -106,6 +199,23 @@
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.tray-item-value {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--text-weak);
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.tray-refresh-black-level {
+  flex: 0 0 auto;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .tray-resolution-label {
@@ -255,6 +365,247 @@
   background: var(--divider);
 }
 
+.tray-dimmer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  transition: background 0.08s;
+}
+
+.tray-dimmer-row:hover {
+  background: var(--hover);
+}
+
+.tray-dimmer-row.unavailable {
+  opacity: 0.45;
+}
+
+.tray-dimmer-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 2px;
+  border-radius: 5px;
+  color: var(--text-weak);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s, transform 0.1s;
+}
+
+.tray-dimmer-toggle img {
+  display: block;
+  width: 18px;
+  height: 18px;
+  opacity: 0.65;
+  transition: opacity 0.1s, transform 0.1s;
+}
+
+.tray-dimmer-toggle:hover:not(:disabled),
+.tray-dimmer-toggle:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: none;
+}
+
+.tray-dimmer-toggle:hover:not(:disabled) img,
+.tray-dimmer-toggle:focus-visible img {
+  opacity: 0.9;
+  transform: scale(1.06);
+}
+
+.tray-dimmer-toggle.enabled img {
+  opacity: 1;
+}
+
+.tray-dimmer-toggle:disabled {
+  cursor: default;
+}
+
+.tray-dimmer-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+}
+
+.tray-dimmer-slider {
+  display: block;
+  min-width: 0;
+  flex: 1;
+  width: 100%;
+  height: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 3px;
+  outline: none;
+  background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill, 50%), #31313f var(--fill, 50%), #31313f 100%);
+  cursor: pointer;
+}
+
+.tray-dimmer-slider:hover:not(:disabled) {
+  height: 6px;
+}
+
+.tray-dimmer-slider::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+
+.tray-dimmer-slider:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.tray-dimmer-slider:disabled::-webkit-slider-thumb {
+  cursor: default;
+}
+
+.tray-dimmer-value {
+  flex: 0 0 29px;
+  color: var(--text-weak);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Black Level and SDR Content Brightness share one compact control group
+   directly below the Taskbar Dimmer row. There are deliberately no dividers
+   between these three related controls. */
+.tray-quick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  transition: background 0.08s;
+}
+
+.tray-quick-row:hover {
+  background: var(--hover);
+}
+
+.tray-quick-row.unavailable {
+  opacity: 0.45;
+}
+
+.tray-quick-toggle,
+.tray-quick-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 2px;
+  border-radius: 5px;
+}
+
+.tray-quick-toggle {
+  color: var(--text-weak);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.tray-quick-toggle img,
+.tray-quick-icon img {
+  display: block;
+  width: 18px;
+  height: 18px;
+  opacity: 0.65;
+  transition: opacity 0.1s, transform 0.1s;
+}
+
+.tray-quick-toggle:hover,
+.tray-quick-toggle:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: none;
+}
+
+.tray-quick-toggle:hover img,
+.tray-quick-toggle:focus-visible img {
+  opacity: 0.9;
+  transform: scale(1.06);
+}
+
+.tray-quick-toggle.enabled img {
+  opacity: 1;
+}
+
+.tray-quick-icon {
+  pointer-events: none;
+}
+
+.tray-quick-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex: 1;
+}
+
+.tray-quick-slider {
+  display: block;
+  min-width: 0;
+  flex: 1;
+  width: 100%;
+  height: 4px;
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 3px;
+  outline: none;
+  background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill, 50%), #31313f var(--fill, 50%), #31313f 100%);
+  cursor: pointer;
+}
+
+.tray-quick-slider:hover:not(:disabled) {
+  height: 6px;
+}
+
+.tray-quick-slider::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+
+.tray-quick-slider:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.tray-quick-slider:disabled::-webkit-slider-thumb {
+  cursor: default;
+}
+
+.tray-quick-value {
+  flex: 0 0 34px;
+  color: var(--text-weak);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.tray-sdr-value {
+  flex-basis: 48px;
+}
+
 .tray-submenu {
   flex: 0 0 auto;
   min-width: 140px;
@@ -280,6 +631,21 @@
   width: 13px;
 }
 
+/* Aspect-ratio group headers inside the resolution submenu, matching the
+   main app's .hz-menu-group-label dropdown style. */
+.tray-submenu-group-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-weak);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 6px 10px 3px;
+}
+
+.tray-submenu-group-label:not(:first-child) {
+  margin-top: 4px;
+}
+
 .tray-submenu .tray-favorite-star {
   width: 20px;
   height: 20px;
@@ -291,11 +657,31 @@
 }
 
 /* Resolution tags can make a row wider than the refresh/favorites panes.
-   The Rust window reserves the additional left-side space while keeping the
-   main tray card anchored at the same right edge. */
+   Match the main app's dropdown sizing: rows expand to fit their content
+   (resolution + tags + native badge + star) up to the same 320px ceiling,
+   and shrink to the narrowest row when tags are off. The Rust window's
+   fixed canvas reserves the matching width on the left, and the native
+   hit-region bridge follows the measured DOM rectangle, so the wider pane
+   stays clickable. */
 .tray-resolution-submenu {
-  /* Width is the content width; the rendered pane is 244px wide after
-     padding and borders, which is mirrored by the native hit-region bridge. */
-  width: 230px;
-  max-width: 230px;
+  min-width: 140px;
+  width: max-content;
+  max-width: 320px;
+}
+
+.tray-favorites-submenu {
+  /* Same auto sizing as the other submenus: rows expand to fit their
+     content (label + star) up to the shared 320px content ceiling. */
+  min-width: 140px;
+  width: max-content;
+  max-width: 320px;
+}
+
+.tray-refresh-submenu {
+  /* Match the main app's dropdown sizing: rows expand to fit their content
+     (Hz + Black Level) up to the same 320px ceiling, with the Black Level
+     value pushed to the right edge. */
+  min-width: 140px;
+  width: max-content;
+  max-width: 320px;
 }

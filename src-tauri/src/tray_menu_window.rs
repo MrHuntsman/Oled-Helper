@@ -10,7 +10,9 @@
 
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
+};
 
 #[derive(Debug, Deserialize, Clone, Copy)]
 pub struct TrayMenuRect {
@@ -29,8 +31,10 @@ use windows::Win32::Graphics::Dwm::{
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn,
-    HRGN, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, RGN_ERROR, RGN_OR,
+    HMONITOR, HRGN, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, RGN_ERROR, RGN_OR,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
@@ -43,18 +47,26 @@ static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
 // main app, so reserve enough left-side space to keep those tags readable.
 // These are the rendered outer widths: the CSS declarations add 12px of
 // horizontal padding and 1px borders on both sides of each pane.
-// 254px base + 244px resolution submenu.
-const FULL_WIDTH: f64 = 498.0;
-const FULL_HEIGHT: f64 = 340.0;
-// CSS width 240px + padding/borders.
-const BASE_WIDTH: f64 = 254.0;
+// 284px base + up to 334px auto-sized resolution submenu. The submenu's
+// CSS max-width:320px caps the content box; its own 12px horizontal padding
+// and 2px borders make the widest rendered pane 334px (same reasoning as
+// the 230px→244px note below). The base menu stays flush against the
+// window's right edge, so the extra canvas is reserved on the left for
+// whichever submenu is open.
+const FULL_WIDTH: f64 = 618.0;
+const FULL_HEIGHT: f64 = 460.0;
+// CSS width 270px + padding/borders.
+const BASE_WIDTH: f64 = 284.0;
 // Estimate for the collapsed base menu: Resolution / Refresh Rate /
 // Favorites / separator / Restart / Quit (6 rows + 1 separator). Only used
 // as the initial native hit-region before the first real Svelte layout
 // measurement replaces it via tray_menu_set_expanded (see below), so an
 // approximate value is fine — it only has to be roughly right for the very
 // first frame after the window is created.
-const BASE_HEIGHT_ESTIMATE: f64 = 220.0;
+// Includes the title/monitor/current-mode header, the three compact quick
+// control rows, separators, plus the largest inline favorites layout (up to
+// three favorites) before exact DOM measurement.
+const BASE_HEIGHT_ESTIMATE: f64 = 425.0;
 // The window is built once at this full footprint (base menu + resolution
 // submenu both visible) and never resized while shown; CSS/Svelte alone
 // show or hide the submenu pane inside that fixed canvas. An earlier
@@ -149,7 +161,7 @@ fn disable_dwm_corner_rounding(_app: &AppHandle) {}
 // Returns the primary monitor's full geometry (used to find the taskbar
 // edge, mirroring flyout_window.rs's primary_monitor_info).
 #[cfg(target_os = "windows")]
-fn primary_monitor_info() -> Option<MONITORINFO> {
+fn primary_monitor_info() -> Option<(HMONITOR, MONITORINFO)> {
     unsafe {
         let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
         if monitor.is_invalid() {
@@ -162,8 +174,37 @@ fn primary_monitor_info() -> Option<MONITORINFO> {
         if !GetMonitorInfoW(monitor, &mut info).as_bool() {
             return None;
         }
-        Some(info)
+        Some((monitor, info))
     }
+}
+
+// Reads the primary monitor's effective DPI as a scale factor. The tray
+// window's own scale factor (GetDpiForWindow / window.scale_factor()) can
+// retain the pre-change DPI context briefly after a display-mode switch,
+// which made the first menu open after a resolution change land at the wrong
+// y — the physical size derived from the stale scale no longer matches the
+// new work area. Querying the monitor directly (mirroring
+// flyout_window.rs's primary_monitor_scale) is independent of the hidden
+// window's previous scale, with a short retry budget for the DWM/monitor
+// init race on cold start.
+#[cfg(target_os = "windows")]
+fn primary_monitor_scale(fallback: f64) -> f64 {
+    for _ in 0..6 {
+        if let Some((monitor, _)) = primary_monitor_info() {
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            let result =
+                unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+            if result.is_ok() {
+                let dpi = dpi_x.max(dpi_y);
+                if dpi > 0 {
+                    return dpi as f64 / 96.0;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    fallback.max(0.5)
 }
 
 // Positions the tray menu flush against the taskbar edge, near the tray icon
@@ -189,7 +230,7 @@ fn taskbar_position(
     anchor_x_px: Option<i32>,
     card_width_px: i32,
 ) -> Option<(i32, i32)> {
-    let info = primary_monitor_info()?;
+    let (_monitor_handle, info) = primary_monitor_info()?;
     let work = info.rcWork;
     let monitor = info.rcMonitor;
     let gap = 6;
@@ -261,17 +302,26 @@ fn taskbar_position(
 // opens (see toggle below). anchor_x_px is the tray icon's click x-position
 // in physical pixels, used to center the visible base-menu card on the icon
 // when the taskbar runs horizontally (see taskbar_position).
+//
+// The window's own scale factor can lag the monitor's after a display-mode
+// switch (the first open after a resolution change landed at the wrong y for
+// exactly this reason), so the physical size is derived from the monitor's
+// effective DPI instead of the window's possibly-stale DPI context. The
+// hidden window is resized to that physical size before positioning, so the
+// first visible frame already uses the final CSS scale.
 #[cfg(target_os = "windows")]
 fn reposition_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
     let Ok(hwnd) = window.hwnd() else { return };
-    let Ok(size) = window.outer_size() else {
-        return;
-    };
-    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+    let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
+    let width_px = (FULL_WIDTH * scale).round().max(1.0) as u32;
+    let height_px = (FULL_HEIGHT * scale).round().max(1.0) as u32;
+    if let Err(e) = window.set_size(PhysicalSize::new(width_px, height_px)) {
+        log::warn!("[tray-menu] reposition resize failed: {e}");
+    }
     let card_width_px = (BASE_WIDTH * scale).round() as i32;
     let Some((x, y)) = taskbar_position(
-        size.width as i32,
-        size.height as i32,
+        width_px as i32,
+        height_px as i32,
         anchor_x_px,
         card_width_px,
     ) else {
@@ -360,6 +410,13 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
 pub fn prewarm(app: &AppHandle) {
     if let Err(e) = get_or_create_window(app) {
         log::warn!("[tray-menu] prewarm failed: {e}");
+    }
+    // Warm up the DPI query (mirrors flyout_window.rs's prewarm): on a cold
+    // start it can still be racing DWM/monitor init, and losing that race on
+    // the very first open would anchor the menu at a stale y.
+    #[cfg(target_os = "windows")]
+    {
+        let _ = primary_monitor_scale(1.0);
     }
 }
 

@@ -3,7 +3,7 @@ import './app.css'
 import App from './App.svelte'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { pushGpuLog, debugSettings, handleTaskbarDimmerAvailable, syncFavoritesFromBackend } from './lib/stores.svelte.js'
+import { pushGpuLog, debugSettings, app, crush, taskbarDimmer, handleTaskbarDimmerAvailable, syncFavoritesFromBackend } from './lib/stores.svelte.js'
 
 // The Rust tauri-plugin-log Webview target is the canonical fan-out path:
 // every record is written to stdout/file and emitted as `log://log`. We do not
@@ -133,6 +133,30 @@ listen('taskbar-dimmer-available', () => {
 // sync without a full config reload.
 listen('favorites-changed', (event) => {
   syncFavoritesFromBackend(event.payload);
+}).catch(() => {});
+
+// The custom tray window uses the same backend dimmer command but has a
+// separate Svelte store instance. Mirror its state here so the Taskbar Dimmer
+// tab's switch and slider update immediately after a tray interaction.
+listen('taskbar-dimmer-changed', (event) => {
+  const status = event.payload;
+  if (!status) return;
+  if (typeof status.enabled === 'boolean') taskbarDimmer.enabled = status.enabled;
+  if (typeof status.opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, status.opacity));
+  if (typeof status.fadeInDurationMs === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(status.fadeInDurationMs)));
+  if (typeof status.fadeOutDurationMs === 'number') taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(status.fadeOutDurationMs)));
+}).catch(() => {});
+
+listen('black-level-changed', (event) => {
+  const status = event.payload;
+  if (!status) return;
+  if (typeof status.adjustment === 'number') crush.adjustment = Math.max(-150, Math.min(150, Math.round(status.adjustment)));
+  if (typeof status.enabled === 'boolean') crush.blackEnabled = status.enabled;
+}).catch(() => {});
+
+listen('sdr-content-brightness-changed', (event) => {
+  const nits = Number(event.payload?.nits);
+  if (Number.isFinite(nits) && nits >= 80 && nits <= 480) app.sdrWhiteNits = nits;
 }).catch(() => {});
 
 // Capture uncaught errors before Svelte mounts. They are sent to Rust and then

@@ -264,7 +264,23 @@
       win.setFocus().catch(() => {});
     }).then((stop) => { unlistenShown = stop; }).catch((e) => diag(`[flyout] listen(flyout-shown) failed: ${e}`));
     // Keep the accent (--accent-hdr vs --accent-sdr) in sync with the main
-    // window's HDR/SDR status, same as the old set_flyout_hdr command did.
+    // window's HDR/SDR status. The set_flyout_hdr command is registered but
+    // never actually invoked, so probe the mode directly with the same
+    // matchMedia query the main app and tray menu use; the flyout-hdr event
+    // listener below is kept as a harmless belt-and-braces fallback.
+    let hdrMq = null;
+    function syncFlyoutHdrAccent() {
+      // Reuse the created query when available; fall back to a fresh probe
+      // for the synchronous initial call before hdrMq is assigned.
+      let hdr = false;
+      try { hdr = (hdrMq ?? window.matchMedia('(dynamic-range: high)')).matches; } catch {}
+      document.documentElement.setAttribute('data-hdr', hdr ? 'true' : 'false');
+    }
+    syncFlyoutHdrAccent();
+    try {
+      hdrMq = window.matchMedia('(dynamic-range: high)');
+      hdrMq.addEventListener('change', syncFlyoutHdrAccent);
+    } catch {}
     listen('flyout-hdr', (event) => {
       document.documentElement.setAttribute('data-hdr', event.payload ? 'true' : 'false');
     }).then((stop) => { unlistenHdr = stop; }).catch(() => {});
@@ -272,6 +288,7 @@
       unlistenShow?.();
       unlistenShown?.();
       unlistenHdr?.();
+      try { hdrMq?.removeEventListener('change', syncFlyoutHdrAccent); } catch {}
       clearTimer();
       clearShownFallback();
     };

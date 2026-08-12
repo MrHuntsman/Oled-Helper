@@ -1,6 +1,7 @@
 <script>
   import { onMount, untrack } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { emit, listen } from '@tauri-apps/api/event';
   import { app, pollHDRLuminance, setSdrWhiteNits } from './stores.svelte.js';
   import { COMPARISON_NITS } from './calibration.js';
   import tabHdrIcon from './icons/tab_hdr.png?inline';
@@ -93,6 +94,7 @@
       if (Number(currentNits) !== requestedNits) applyQueued = true;
       if (result?.nits && Number(currentNits) === requestedNits) currentNits = Number(result.nits);
       setSdrWhiteNits(currentNits);
+      emit('sdr-content-brightness-main-changed', { nits: Number(currentNits) }).catch(() => {});
     } catch (e) { error = String(e); }
     finally {
       applying = false;
@@ -404,6 +406,15 @@
   onMount(() => {
     pollHDRLuminance();
     refresh();
+    let stopSdrBrightnessListener = null;
+    listen('sdr-content-brightness-changed', (event) => {
+      const nits = Number(event.payload?.nits);
+      if (!Number.isFinite(nits) || nits < MIN_NITS || nits > MAX_NITS) return;
+      if (sliderDragging || applying || applyTimer !== null) return;
+      currentNits = nits;
+      detectedNits = nits;
+      setSdrWhiteNits(nits);
+    }).then((stop) => { stopSdrBrightnessListener = stop; }).catch(() => {});
     // Windows does NOT broadcast a display-change message when the SDR white
     // level slider moves (it is an in-place compositor update, not a display
     // topology change), so there is no event to listen for. Poll only while
@@ -443,6 +454,7 @@
       clearTimeout(rtxHdrFlagsAppliedTimer);
       clearInterval(poll);
       window.removeEventListener('focus', onFocus);
+      stopSdrBrightnessListener?.();
     };
   });
 

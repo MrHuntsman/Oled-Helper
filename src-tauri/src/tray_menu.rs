@@ -155,7 +155,8 @@ fn build_menu_with_overrides(
 
     // Resolution submenu
     {
-        let mut sub = SubmenuBuilder::new(app, "Resolution");
+        let resolution_title = format!("Resolution ({}×{})", display.width, display.height);
+        let mut sub = SubmenuBuilder::new(app, &resolution_title);
         for res in sorted_resolutions(&display, resolution_sort) {
             let id = format!("tray:res:{}x{}", res.width, res.height);
             let label = resolution_label(&display, res.width, res.height, show_resolution_tags);
@@ -173,7 +174,8 @@ fn build_menu_with_overrides(
 
     // Refresh Rate submenu
     {
-        let mut sub = SubmenuBuilder::new(app, "Refresh Rate");
+        let refresh_title = format!("Refresh Rate ({} Hz)", display.refresh_hz);
+        let mut sub = SubmenuBuilder::new(app, &refresh_title);
         for hz in sorted_refresh_rates(&display, refresh_rate_sort) {
             let id = format!("tray:hz:{hz}");
             let label = format!("{hz} Hz");
@@ -191,6 +193,9 @@ fn build_menu_with_overrides(
 
     // Favorites: keep small lists visible without another submenu. Larger
     // lists retain the Favorites submenu so the main tray menu stays compact.
+    if !config.favorite_display_modes.is_empty() {
+        menu = menu.item(&PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?);
+    }
     if config.favorite_display_modes.len() <= 3 {
         for (i, fav) in config.favorite_display_modes.iter().enumerate() {
             let id = format!("tray:fav:{i}");

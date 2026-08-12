@@ -209,11 +209,22 @@ function emitDisplayMenuSortingChanged() {
 }
 export function setResolutionSort(dir) {
   if (dir !== 'asc' && dir !== 'desc') return;
+  // One sort direction drives both the resolution and refresh-rate lists;
+  // the refresh dropdown reuses the resolution context menu and its sort.
+  // refreshRateSort is kept in sync for config/tray backward compatibility.
   displayMenuPrefs.resolutionSort = dir;
+  displayMenuPrefs.refreshRateSort = dir;
   saveConfig();
   emitDisplayMenuSortingChanged();
 }
-export function setResolutionGroupBy(mode) { displayMenuPrefs.resolutionGroupBy = mode; saveConfig(); }
+export function setResolutionGroupBy(mode) {
+  if (mode !== 'none' && mode !== 'aspectRatio') return;
+  displayMenuPrefs.resolutionGroupBy = mode;
+  saveConfig();
+  // Keep the custom tray popup's resolution submenu in sync immediately (it
+  // listens on the frontend side), mirroring the tags/sorting events.
+  emit('display-menu-groupby-changed', mode).catch(() => {});
+}
 export function setShowTags(enabled) {
   displayMenuPrefs.showTags = enabled;
   saveConfig();
@@ -221,8 +232,12 @@ export function setShowTags(enabled) {
   // already be prewarmed, while the native menu is rebuilt from this event.
   emit('display-menu-tags-changed', enabled).catch(() => {});
 }
+// Kept as a public API for callers that adjust the refresh-rate list sort
+// directly; the UI no longer calls it (the refresh dropdown reuses the
+// resolution sort), so it simply keeps both fields in sync.
 export function setRefreshRateSort(dir) {
   if (dir !== 'asc' && dir !== 'desc') return;
+  displayMenuPrefs.resolutionSort = dir;
   displayMenuPrefs.refreshRateSort = dir;
   saveConfig();
   emitDisplayMenuSortingChanged();
@@ -526,6 +541,14 @@ let taskbarDimmerUpdateVersion = 0;
 // config stuck on the old value. Remember the save intent and flush it once
 // the pipeline settles.
 let taskbarDimmerSaveQueued = false;
+function emitTaskbarDimmerChanged() {
+  emit('taskbar-dimmer-changed', {
+    enabled: taskbarDimmer.enabled,
+    opacity: taskbarDimmer.opacity,
+    fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
+    fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs,
+  }).catch(() => {});
+}
 function flushTaskbarDimmerUpdate() {
   if (taskbarDimmerUpdateInFlight) return;
   const update = pendingTaskbarDimmerUpdate;
@@ -544,6 +567,7 @@ function flushTaskbarDimmerUpdate() {
       if (update.version === taskbarDimmerUpdateVersion) {
         // This is the latest update ,  it owns the save decision. Also honor a
         // save that an earlier persist=true update queued.
+        emitTaskbarDimmerChanged();
         if (update.persist || taskbarDimmerSaveQueued) {
           taskbarDimmerSaveQueued = false;
           saveConfig();
@@ -556,7 +580,10 @@ function flushTaskbarDimmerUpdate() {
     })
     .catch((e) => {
       console.warn('[taskbar-dimmer] update failed', e);
-      if (update.version === taskbarDimmerUpdateVersion) taskbarDimmer.enabled = false;
+      if (update.version === taskbarDimmerUpdateVersion) {
+        taskbarDimmer.enabled = false;
+        emitTaskbarDimmerChanged();
+      }
       // A failed persist=true update still represents the user's intent ,  queue
       // the save so the drained pipeline writes the current store state.
       if (update.persist) taskbarDimmerSaveQueued = true;

@@ -5,6 +5,9 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
+// Kept (with dead_code allowed) because the native muda menu is retired but
+// may be reinstated as a fallback: see the DISABLED blocks in setup().
+#[allow(dead_code)]
 mod tray_menu;
 mod tray_menu_window;
 mod updater;
@@ -20,13 +23,16 @@ use std::sync::{
 use std::thread::JoinHandle;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, Manager, State,
+    AppHandle, Emitter, Manager, State,
 };
 
 struct TrayState {
     enabled: AtomicBool,
 }
 
+// Only consumed by the disabled native tray menu listener (see the DISABLED
+// block in setup), kept around in case that menu is reinstated.
+#[allow(dead_code)]
 #[derive(serde::Deserialize)]
 struct DisplayMenuSortingEvent {
     #[serde(rename = "resolutionSort")]
@@ -1067,7 +1073,11 @@ pub fn run() {
 
             // Native dark-mode init kept for now in case tray_menu.rs's
             // build_menu is reinstated as a fallback later.
-            tray_menu::init_dark_mode();
+            //
+            // DISABLED: the custom CSS tray popup (tray_menu_window) fully
+            // replaces the older native muda menu, so the native dark-mode
+            // init is intentionally not called.
+            // tray_menu::init_dark_mode();
 
             // TEST: right-click now opens the custom CSS popup
             // (tray_menu_window) instead of the native muda menu. No native
@@ -1100,35 +1110,43 @@ pub fn run() {
                 tray.set_visible(saved_config.tray_enabled)?;
             }
 
-            // Handle native tray menu item clicks.
-            let menu_app = app.handle().clone();
-            app.on_menu_event(move |_app, event| {
-                tray_menu::handle_menu_event(&menu_app, event);
-            });
-
-            // Refresh the tray menu when display info changes so the
-            // resolution / refresh-rate submenus stay current.
-            let refresh_app = app.handle().clone();
-            app.handle().listen("display-changed", move |_| {
-                tray_menu::refresh_menu(&refresh_app).ok();
-            });
-            let refresh_tag_app = app.handle().clone();
-            app.handle().listen("display-menu-tags-changed", move |event| {
-                if let Ok(show_tags) = event.payload().parse::<bool>() {
-                    tray_menu::refresh_menu_with_tag_override(&refresh_tag_app, show_tags).ok();
-                }
-            });
-            let refresh_sort_app = app.handle().clone();
-            app.handle().listen("display-menu-sorting-changed", move |event| {
-                if let Ok(prefs) = serde_json::from_str::<DisplayMenuSortingEvent>(event.payload()) {
-                    tray_menu::refresh_menu_with_sort_overrides(
-                        &refresh_sort_app,
-                        prefs.resolution_sort.as_deref(),
-                        prefs.refresh_rate_sort.as_deref(),
-                    )
-                    .ok();
-                }
-            });
+            // DISABLED: the older native muda tray menu is retired in favor of
+            // the custom CSS popup (tray_menu_window). The menu-event handler
+            // and the display/tag/sort listeners below were only used to
+            // handle clicks on and refresh that native menu; they are kept in
+            // the codebase (commented out) so the native menu can be
+            // reinstated as a fallback later. The custom popup updates itself
+            // from the same events on the frontend side.
+            //
+            // // Handle native tray menu item clicks.
+            // let menu_app = app.handle().clone();
+            // app.on_menu_event(move |_app, event| {
+            //     tray_menu::handle_menu_event(&menu_app, event);
+            // });
+            //
+            // // Refresh the tray menu when display info changes so the
+            // // resolution / refresh-rate submenus stay current.
+            // let refresh_app = app.handle().clone();
+            // app.handle().listen("display-changed", move |_| {
+            //     tray_menu::refresh_menu(&refresh_app).ok();
+            // });
+            // let refresh_tag_app = app.handle().clone();
+            // app.handle().listen("display-menu-tags-changed", move |event| {
+            //     if let Ok(show_tags) = event.payload().parse::<bool>() {
+            //         tray_menu::refresh_menu_with_tag_override(&refresh_tag_app, show_tags).ok();
+            //     }
+            // });
+            // let refresh_sort_app = app.handle().clone();
+            // app.handle().listen("display-menu-sorting-changed", move |event| {
+            //     if let Ok(prefs) = serde_json::from_str::<DisplayMenuSortingEvent>(event.payload()) {
+            //         tray_menu::refresh_menu_with_sort_overrides(
+            //             &refresh_sort_app,
+            //             prefs.resolution_sort.as_deref(),
+            //             prefs.refresh_rate_sort.as_deref(),
+            //         )
+            //         .ok();
+            //     }
+            // });
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();
             if let Err(error) = taskbar_dimmer::create_overlay(app.handle(), &dimmer_state) {

@@ -11,6 +11,7 @@
   const derr = (msg) => { console.error('[gpu]', msg); };
   import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_SDR_RANGE, HIGH_NITS_CELLS, HIGH_NITS_COLS, HIGH_NITS_ROWS, HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_MAX_STOPS, highNitsGridCodes, highNitsSdrCodes, computeHdrValues, computeSdrValues, computeHighNitsValues, CELL_GRID_SHADER } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
+  import { emit } from '@tauri-apps/api/event';
   import { onDestroy, untrack } from 'svelte';
   import { setGpuRenderingInfo, refreshSdrWhiteLevel } from './stores.svelte.js';
 
@@ -584,6 +585,10 @@
       fsSliderHovering = false;
     }
     requestGammaRamp();
+    emit('black-level-main-changed', {
+      adjustment: crush.adjustment,
+      enabled: crush.blackEnabled,
+    }).catch(() => {});
     // No config save here: the adjustment changes on every pointer event
     // during a drag, and saving is now tied to discrete events only (drag
     // release, wheel, keyboard, toggle, restore defaults).
