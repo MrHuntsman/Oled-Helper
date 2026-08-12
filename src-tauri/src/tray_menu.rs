@@ -34,20 +34,28 @@ const MENU_HEIGHT: f64 = 700.0;
 
 // The popup is a compact content-sized viewport rather than a transparent
 // work-area-sized window (a large topmost WebView2 surface made Edge defer
-// compositor paints and video frames). The card sits at local
-// (HIT_CUSHION_CSS, HIT_CUSHION_CSS) with extra width to the right reserved
-// for a right-opening flyout. A flyout that flips LEFT is rendered at
-// negative window-local x, so the window slides left via
-// tray_menu_shift_submenu instead of reserving symmetric space.
-const INITIAL_VIEWPORT_WIDTH_CSS: f64 = 640.0;
-const INITIAL_VIEWPORT_HEIGHT_CSS: f64 = 430.0;
+// compositor paints and video frames). The card sits horizontally centered in
+// this fixed viewport, with SUBMENU_WIDTH_CSS reserved on BOTH sides so a
+// submenu opening either right (the common case) or left (near a screen edge)
+// always has room in a zone that is already part of the native window. This
+// means a submenu's open/close is pure CSS (see .tray-menu-submenu in
+// app.css) with no native window move involved: the window is placed once by
+// place_window and never moves again while the popup is open. An earlier
+// design only reserved space on the right and slid the whole native window
+// left via a Rust round-trip (tray_menu_shift_submenu) when a submenu flipped
+// left; that native move and the frontend's compensating CSS shift landed in
+// different frames, which showed up as a brief ghost of the old window
+// position. Reserving both sides up front removes the need for that entirely.
+const SUBMENU_WIDTH_CSS: f64 = 250.0;
 const CARD_WIDTH_CSS: f64 = 340.0;
+const VIEWPORT_WIDTH_CSS: f64 = SUBMENU_WIDTH_CSS + CARD_WIDTH_CSS + SUBMENU_WIDTH_CSS;
 // Fallback until the frontend reports the rendered card height (the card is
 // shorter with 0-1 favorites, taller with many rows). The measured height
 // keeps the taskbar-facing edge exactly on the work-area boundary.
 const CARD_HEIGHT_DEFAULT_CSS: f64 = 361.0;
 const CARD_PAD_CSS: f64 = 0.0;
 const HIT_CUSHION_CSS: f64 = 24.0;
+const VIEWPORT_HEIGHT_CSS: f64 = CARD_HEIGHT_DEFAULT_CSS + HIT_CUSHION_CSS * 2.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TrayFavorite {
@@ -230,62 +238,6 @@ pub fn tray_menu_set_card_height(app: AppHandle, height_css: f64) {
 #[cfg(not(target_os = "windows"))]
 pub fn tray_menu_set_card_height(_app: AppHandle, _height_css: f64) {}
 
-// The frontend flips a submenu to the LEFT of the card when there is not
-// enough room on the right. That flyout renders at negative window-local x,
-// outside the content-sized popup, so the window must slide left to make it
-// visible. dx is a physical offset relative to the ORIGINAL placement
-// (negative = slide left, 0 = back at the placed position); the frontend only
-// requests a left slide when the direction math guarantees the flyout fits on
-// screen, so no off-screen clamp is needed beyond keeping the popup inside the
-// work area as a safety net.
-#[tauri::command]
-#[cfg(target_os = "windows")]
-pub fn tray_menu_shift_submenu(app: AppHandle, dx: i32) {
-    if !MENU_ACTIVE.load(Ordering::Acquire) {
-        return;
-    }
-    let Some(window) = app.get_webview_window(MENU_LABEL) else {
-        return;
-    };
-    let Ok(hwnd) = window.hwnd() else {
-        return;
-    };
-    let Some((_monitor, work)) = menu_monitor_work_area() else {
-        return;
-    };
-    let Some(base_x) = PLACED_WINDOW_X.lock().ok().and_then(|guard| *guard) else {
-        return;
-    };
-    let x = base_x + dx;
-    if x < work.left {
-        log::warn!("[tray] submenu shift would leave the work area (dx={dx}px, x={x}), skipping");
-        return;
-    }
-    let mut rect = RECT::default();
-    if unsafe { GetWindowRect(HWND(hwnd.0), &mut rect) }.is_err() {
-        return;
-    }
-    if x == rect.left {
-        return;
-    }
-    unsafe {
-        let _ = SetWindowPos(
-            HWND(hwnd.0),
-            Some(HWND_TOPMOST),
-            x,
-            rect.top,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
-    log::debug!("[tray] submenu shift dx={dx}px -> x={x}");
-}
-
-#[tauri::command]
-#[cfg(not(target_os = "windows"))]
-pub fn tray_menu_shift_submenu(_app: AppHandle, _dx: i32) {}
-
 // Timestamp (ms) of the last time the menu was closed, by any path. The tray
 // right-click toggle uses it so a click landing right after a close is treated
 // as a toggle-off instead of reopening. Reopening while the exit fade is still
@@ -309,10 +261,6 @@ struct PlacementState {
     top_flush: bool,
 }
 static LAST_PLACEMENT: Mutex<Option<PlacementState>> = Mutex::new(None);
-// Placed window origin (physical x) from the last place_window. The frontend
-// slides the popup left for a left-opening submenu via tray_menu_shift_submenu
-// and restores it on close, both relative to this origin.
-static PLACED_WINDOW_X: Mutex<Option<i32>> = Mutex::new(None);
 // A right-click on the tray icon produces both Down and Up events. When the
 // popup is already open, close it on Down and consume the matching Up so the
 // same click cannot close, then reopen the menu after a focus-loss callback.
@@ -976,14 +924,18 @@ fn place_window(window: &WebviewWindow) -> Result<(), String> {
     // Use a small content-sized viewport rather than a transparent
     // work-area-sized window. A large topmost WebView2 surface can make Edge
     // defer compositor paints and video frames even though input still gets
-    // processed. The frontend uses local coordinates inside this viewport.
-    // The card is 340px wide. Reserve room for a flyout on the right, while
-    // keeping the native surface compact enough that its right/bottom edge
-    // does not force the card back to the screen's left/top corner. A flyout
-    // that flips left slides the window left via tray_menu_shift_submenu.
-    let width = (INITIAL_VIEWPORT_WIDTH_CSS + HIT_CUSHION_CSS * 2.0) * p.scale;
-    let height = (INITIAL_VIEWPORT_HEIGHT_CSS + HIT_CUSHION_CSS * 2.0) * p.scale;
-    let x = p.work.left as f64 + (p.card_left_css - HIT_CUSHION_CSS) * p.scale;
+    // processed. The card sits horizontally centered in this fixed viewport,
+    // at local x = SUBMENU_WIDTH_CSS, with an equal SUBMENU_WIDTH_CSS reserved
+    // on the right. Both zones are part of the native window from the start,
+    // so a submenu opening either direction is pure CSS (see
+    // .tray-menu-submenu / .tray-menu-submenus-left in app.css) and the
+    // window itself never moves again after this call, for as long as the
+    // popup stays open (no tray_menu_shift_submenu round-trip, no risk of the
+    // native move and the frontend's compensating layout landing in different
+    // frames).
+    let width = VIEWPORT_WIDTH_CSS * p.scale;
+    let height = VIEWPORT_HEIGHT_CSS * p.scale;
+    let x = p.work.left as f64 + (p.card_left_css - SUBMENU_WIDTH_CSS) * p.scale;
     let y = p.work.top as f64 + (p.card_top_css - HIT_CUSHION_CSS) * p.scale;
     // Capture the placement inputs so a later measured-height report can shift
     // the already-visible popup flush with the taskbar. The height delta is
@@ -996,14 +948,6 @@ fn place_window(window: &WebviewWindow) -> Result<(), String> {
             bottom_flush: p.bottom_flush,
             top_flush: p.top_flush,
         });
-    }
-    // Remember the placed origin so tray_menu_shift_submenu can slide the
-    // window left for a flipped flyout and restore it on close. The window is
-    // deliberately not clamped to the monitor: the card was already clamped
-    // inside the work area, and clamping the larger viewport would shift the
-    // card away from the tray click even when the card itself fits perfectly.
-    if let Ok(mut guard) = PLACED_WINDOW_X.lock() {
-        *guard = Some(x.round() as i32);
     }
     unsafe {
         SetWindowPos(
