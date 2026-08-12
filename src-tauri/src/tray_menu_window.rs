@@ -41,9 +41,13 @@ static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
 static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
 // The resolution submenu includes the same friendly/UW/native labels as the
 // main app, so reserve enough left-side space to keep those tags readable.
-const FULL_WIDTH: f64 = 500.0;
+// These are the rendered outer widths: the CSS declarations add 12px of
+// horizontal padding and 1px borders on both sides of each pane.
+// 254px base + 244px resolution submenu.
+const FULL_WIDTH: f64 = 498.0;
 const FULL_HEIGHT: f64 = 340.0;
-const BASE_WIDTH: f64 = 259.0;
+// CSS width 240px + padding/borders.
+const BASE_WIDTH: f64 = 254.0;
 // Estimate for the collapsed base menu: Resolution / Refresh Rate /
 // Favorites / separator / Restart / Quit (6 rows + 1 separator). Only used
 // as the initial native hit-region before the first real Svelte layout

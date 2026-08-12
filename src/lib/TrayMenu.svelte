@@ -25,6 +25,15 @@
   let refreshRateSort = $state('desc');
   // Which submenu (if any) is currently open: null | 'resolution' | 'refresh' | 'favorites'.
   let openSubmenu = $state(null);
+  // The main app confirms destructive removals. Keep the same safeguard in
+  // the tray without using a blocking browser confirm dialog.
+  let pendingFavoriteRemove = $state(null);
+  // Serialize favorite writes and hold the latest cross-window event until
+  // the local write queue drains, so concurrent stars cannot overwrite one
+  // another or lose a newer change from the main window.
+  let favoritesSaveInFlight = 0;
+  let favoritesSaveQueue = Promise.resolve();
+  let pendingExternalFavorites = null;
   let closeSubmenuTimer = null;
   // Serialize native region updates so a quick enter/leave cannot apply an
   // older submenu shape after the current one. The OS region, not just CSS,
@@ -59,23 +68,55 @@
     }
   }
 
-  async function saveFavorites(next) {
+  function normalizeFavorites(list) {
+    return Array.isArray(list)
+      ? list
+          .filter((f) => f && f.width > 0 && f.height > 0 && f.hz > 0)
+          .map((f) => ({ width: Math.round(f.width), height: Math.round(f.height), hz: Math.round(f.hz) }))
+      : [];
+  }
+
+  function applyFavoritesList(next) {
     favorites = next;
+    pendingFavoriteRemove = null;
+    syncHitRegion();
+  }
+
+  function setFavoritesFromEvent(list) {
+    const next = normalizeFavorites(list);
+    if (favoritesSaveInFlight > 0) {
+      pendingExternalFavorites = next;
+      return;
+    }
+    applyFavoritesList(next);
+  }
+
+  async function saveFavorites(next) {
+    const savedFavorites = normalizeFavorites(next);
+    favorites = savedFavorites;
+    favoritesSaveInFlight++;
     // The inline/direct layout can change immediately at the 3→4 boundary;
     // update the native hit region without waiting for disk I/O.
     syncHitRegion();
-    try {
+    const operation = favoritesSaveQueue.then(async () => {
       const cfg = await invoke('load_config');
       await invoke('save_config', {
-        config: { ...cfg, favorite_display_modes: favorites.map((f) => ({ width: f.width, height: f.height, hz: f.hz })) },
+        config: { ...cfg, favorite_display_modes: savedFavorites },
       });
-      await emit('favorites-changed', favorites.map((fav) => ({
-        width: fav.width,
-        height: fav.height,
-        hz: fav.hz,
-      })));
+      await emit('favorites-changed', savedFavorites);
+    });
+    favoritesSaveQueue = operation.catch(() => {});
+    try {
+      await operation;
     } catch (e) {
       console.error('tray-menu: failed to save favorites', e);
+    } finally {
+      favoritesSaveInFlight--;
+      if (favoritesSaveInFlight === 0 && pendingExternalFavorites) {
+        const external = pendingExternalFavorites;
+        pendingExternalFavorites = null;
+        applyFavoritesList(external);
+      }
     }
   }
 
@@ -171,9 +212,13 @@
       : null;
     const preinstall = preBase
       ? {
-          x: Math.max(0, preBase.x - 230),
+          // The CSS width excludes the submenu's 12px horizontal padding
+          // and 1px borders on each side, so its rendered outer width is
+          // 244px. Match that here to keep the preinstalled native region
+          // continuous until the exact DOM measurement arrives.
+          x: Math.max(0, preBase.x - 244),
           y: preBase.y,
-          width: 230,
+          width: 244,
           height: preBase.height,
         }
       : null;
@@ -207,6 +252,39 @@
         console.error('tray-menu: failed to update hit region', e);
       }
     });
+  }
+
+  function isFavoriteMode(width, height, hz) {
+    return favorites.some((fav) => favoriteKey(fav) === `${width}x${height}@${hz}`);
+  }
+
+  function requestFavoriteRemove(fav) {
+    pendingFavoriteRemove = { width: fav.width, height: fav.height, hz: fav.hz };
+    closeSubmenu();
+    syncHitRegion();
+  }
+
+  function cancelFavoriteRemove() {
+    pendingFavoriteRemove = null;
+    syncHitRegion();
+  }
+
+  async function confirmFavoriteRemove() {
+    if (!pendingFavoriteRemove) return;
+    const key = favoriteKey(pendingFavoriteRemove);
+    pendingFavoriteRemove = null;
+    syncHitRegion();
+    await saveFavorites(favorites.filter((fav) => favoriteKey(fav) !== key));
+  }
+
+  async function toggleFavoriteMode(width, height, hz) {
+    if (!width || !height || !hz) return;
+    const fav = { width, height, hz };
+    if (isFavoriteMode(width, height, hz)) {
+      requestFavoriteRemove(fav);
+      return;
+    }
+    await saveFavorites([...favorites, fav]);
   }
 
   async function pickResolution(res) {
@@ -278,18 +356,6 @@
       && fav.hz === display.refresh_hz;
   }
 
-  async function addCurrentFavorite() {
-    if (!display) return;
-    const fav = { width: display.width, height: display.height, hz: display.refresh_hz };
-    const key = favoriteKey(fav);
-    // Treat Add Current like a normal tray command: dismiss it even when the
-    // current mode is already saved, rather than leaving the popup open.
-    closeSubmenu();
-    await invoke('tray_menu_hide');
-    if (favorites.some((f) => favoriteKey(f) === key)) return;
-    await saveFavorites([...favorites, fav]);
-  }
-
   async function restart() {
     await invoke('tray_menu_restart');
   }
@@ -304,6 +370,7 @@
     loadFavorites();
     const unlisten = listen('tray-menu-show', () => {
       openSubmenu = null;
+      pendingFavoriteRemove = null;
       syncHitRegion();
       loadDisplayInfo();
       loadFavorites();
@@ -321,10 +388,14 @@
       }
       resetSubmenuScroll();
     });
+    const unlistenFavorites = listen('favorites-changed', (event) => {
+      setFavoritesFromEvent(event.payload);
+    });
     return () => {
       unlisten.then((stop) => stop());
       unlistenTags.then((stop) => stop());
       unlistenSort.then((stop) => stop());
+      unlistenFavorites.then((stop) => stop());
     };
   });
 </script>
@@ -338,6 +409,18 @@
   onmouseleave={scheduleSubmenuClose}
 >
   <div class="tray-menu">
+    {#if pendingFavoriteRemove}
+      <div class="tray-favorite-confirm" role="dialog" aria-modal="true" aria-labelledby="tray-favorite-confirm-title">
+        <div id="tray-favorite-confirm-title" class="tray-favorite-confirm-title">Remove favorite?</div>
+        <div class="tray-favorite-confirm-copy">
+          Remove {pendingFavoriteRemove.width}×{pendingFavoriteRemove.height} @ {pendingFavoriteRemove.hz} Hz?
+        </div>
+        <div class="tray-favorite-confirm-actions">
+          <button type="button" class="tray-favorite-confirm-btn" onclick={cancelFavoriteRemove}>Cancel</button>
+          <button type="button" class="tray-favorite-confirm-btn tray-favorite-confirm-danger" onclick={confirmFavoriteRemove}>Remove</button>
+        </div>
+      </div>
+    {:else}
     <div
       class="tray-item"
       class:open={openSubmenu === 'resolution'}
@@ -377,9 +460,7 @@
         <div
           class="tray-item tray-favorite-item"
           class:tray-favorite-current={current}
-          class:disabled={current}
           role="menuitem"
-          aria-disabled={current}
           tabindex={current ? -1 : 0}
           onmouseenter={closeSubmenu}
           onclick={() => !current && pickFavorite(fav)}
@@ -387,20 +468,22 @@
         >
           <span class="tray-item-check">{current ? '✓' : ''}</span>
           <span class="tray-item-label">{favoriteLabel(fav)}</span>
+          <button
+            type="button"
+            class="tray-favorite-star"
+            class:filled={true}
+            aria-label={`Remove ${favoriteLabel(fav)} from favorites`}
+            title={`Remove ${favoriteLabel(fav)} from favorites`}
+            onclick={(event) => { event.stopPropagation(); requestFavoriteRemove(fav); }}
+            onkeydown={(event) => event.stopPropagation()}
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       {/each}
     {/if}
-
-    <div
-      class="tray-item"
-      role="menuitem"
-      tabindex="0"
-      onmouseenter={closeSubmenu}
-      onclick={addCurrentFavorite}
-      onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && addCurrentFavorite()}
-    >
-      <span class="tray-item-label">Add Current</span>
-    </div>
 
     <div class="tray-sep"></div>
 
@@ -410,6 +493,7 @@
     <div class="tray-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={quit} onkeydown={(e) => e.key === 'Enter' && quit()}>
       <span class="tray-item-label">Quit</span>
     </div>
+    {/if}
   </div>
 
   {#if openSubmenu === 'resolution' && display}
@@ -421,7 +505,7 @@
         {@const recommended = isRecommendedResolution(res)}
         <div
           class="tray-item"
-          class:disabled={checked}
+          class:tray-current={checked}
           role="menuitemradio"
           aria-checked={checked}
           aria-disabled={checked}
@@ -436,6 +520,19 @@
             {#if showResolutionTags && name}<span class="tray-resolution-tag">{name}</span>{/if}
             {#if recommended}<span class="tray-resolution-native">(Native)</span>{/if}
           </span>
+          <button
+            type="button"
+            class="tray-favorite-star"
+            class:filled={isFavoriteMode(res.width, res.height, display.refresh_hz)}
+            aria-label={isFavoriteMode(res.width, res.height, display.refresh_hz) ? `Remove ${res.width}×${res.height} @ ${display.refresh_hz} Hz from favorites` : `Favorite ${res.width}×${res.height} @ ${display.refresh_hz} Hz`}
+            title={isFavoriteMode(res.width, res.height, display.refresh_hz) ? 'Remove from favorites' : 'Add to favorites'}
+            onclick={(event) => { event.stopPropagation(); toggleFavoriteMode(res.width, res.height, display.refresh_hz); }}
+            onkeydown={(event) => event.stopPropagation()}
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={isFavoriteMode(res.width, res.height, display.refresh_hz) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       {/each}
     </div>
@@ -447,7 +544,7 @@
         {@const checked = hz === display.refresh_hz}
         <div
           class="tray-item"
-          class:disabled={checked}
+          class:tray-current={checked}
           role="menuitemradio"
           aria-checked={checked}
           aria-disabled={checked}
@@ -457,6 +554,19 @@
         >
           <span class="tray-item-check">{checked ? '✓' : ''}</span>
           <span class="tray-item-label">{hz} Hz</span>
+          <button
+            type="button"
+            class="tray-favorite-star"
+            class:filled={isFavoriteMode(display.width, display.height, hz)}
+            aria-label={isFavoriteMode(display.width, display.height, hz) ? `Remove ${display.width}×${display.height} @ ${hz} Hz from favorites` : `Favorite ${display.width}×${display.height} @ ${hz} Hz`}
+            title={isFavoriteMode(display.width, display.height, hz) ? 'Remove from favorites' : 'Add to favorites'}
+            onclick={(event) => { event.stopPropagation(); toggleFavoriteMode(display.width, display.height, hz); }}
+            onkeydown={(event) => event.stopPropagation()}
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={isFavoriteMode(display.width, display.height, hz) ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       {/each}
     </div>
@@ -469,15 +579,26 @@
         <div
           class="tray-item tray-favorite-item"
           class:tray-favorite-current={current}
-          class:disabled={current}
           role="menuitem"
-          aria-disabled={current}
           tabindex={current ? -1 : 0}
           onclick={() => !current && pickFavorite(fav)}
           onkeydown={(e) => !current && (e.key === 'Enter' || e.key === ' ') && pickFavorite(fav)}
         >
           <span class="tray-item-check">{current ? '✓' : ''}</span>
           <span class="tray-item-label">{favoriteLabel(fav)}</span>
+          <button
+            type="button"
+            class="tray-favorite-star"
+            class:filled={true}
+            aria-label={`Remove ${favoriteLabel(fav)} from favorites`}
+            title={`Remove ${favoriteLabel(fav)} from favorites`}
+            onclick={(event) => { event.stopPropagation(); requestFavoriteRemove(fav); }}
+            onkeydown={(event) => event.stopPropagation()}
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       {/each}
     </div>

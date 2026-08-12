@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use tauri::menu::{
     CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 static DARK_MODE_INIT: OnceLock<()> = OnceLock::new();
 
@@ -223,13 +223,6 @@ fn build_menu_with_overrides(
         menu = menu.item(&sub.build().map_err(|e| e.to_string())?);
     }
 
-    // Adding the current mode is always a top-level action, even when the
-    // saved list itself needs a submenu.
-    menu = menu.item(
-        &MenuItemBuilder::with_id("tray:fav:add", "Add Current")
-            .build(app)
-            .map_err(|e| e.to_string())?,
-    );
     menu = menu.item(&PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?);
     menu = menu.item(
         &MenuItemBuilder::with_id("tray:restart", "Restart")
@@ -298,23 +291,6 @@ pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                         }
                         Err(e) => log::warn!("[tray] refresh rate change failed: {e}"),
                     });
-                }
-            }
-        }
-        "tray:fav:add" => {
-            if let Some(display) = crate::display_info::query_current_display() {
-                let mut config = crate::config::load_config(app.clone());
-                let fav = crate::config::FavoriteDisplayMode {
-                    width: display.width,
-                    height: display.height,
-                    hz: display.refresh_hz,
-                };
-                if !config.favorite_display_modes.contains(&fav) {
-                    config.favorite_display_modes.push(fav);
-                    let favorites = config.favorite_display_modes.clone();
-                    crate::config::save_config(app.clone(), config).ok();
-                    let _ = app.emit("favorites-changed", favorites);
-                    refresh_menu(app).ok();
                 }
             }
         }

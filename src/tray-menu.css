@@ -30,7 +30,9 @@
 }
 
 .tray-menu {
-  width: 259px;
+  /* Width is the content width; Rust's fixed canvas uses the resulting
+     254px outer width (including padding and borders). */
+  width: 240px;
   flex: 0 0 auto;
   border-radius: 10px;
   background: var(--panel);
@@ -85,6 +87,13 @@
   pointer-events: none;
 }
 
+/* Current display modes cannot be selected again, but their star remains
+   independently interactive so the current resolution/refresh combination
+   can still be saved or removed. */
+.tray-item.tray-current > .tray-item-label {
+  color: var(--text-weak);
+}
+
 .tray-item-check {
   display: inline-flex;
   width: 14px;
@@ -132,6 +141,109 @@
   font-weight: 500;
 }
 
+.tray-favorite-star {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: 1px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-weak);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+}
+
+/* Direct favorites share the regular main-menu row height. The larger
+   submenu star remains overridden below, where its denser row has its own
+   compact sizing. */
+.tray-menu > .tray-favorite-item > .tray-favorite-star {
+  width: 20px;
+  height: 18px;
+}
+
+/* Empty stars stay out of the way until their row is hovered or keyboard
+   focused. Filled stars opt out of this rule below and remain visible. */
+.tray-item:hover > .tray-favorite-star:not(.filled),
+.tray-favorite-star:focus-visible:not(.filled) {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.tray-favorite-star:hover,
+.tray-favorite-star:focus-visible {
+  color: var(--accent-hdr);
+  background: color-mix(in srgb, var(--accent-hdr) 12%, transparent);
+  outline: none;
+}
+
+.tray-favorite-star.filled {
+  color: var(--accent-hdr);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.tray-favorite-star.filled:hover,
+.tray-favorite-star.filled:focus-visible {
+  color: var(--accent-hdr);
+  background: color-mix(in srgb, var(--accent-hdr) 18%, transparent);
+}
+
+.tray-favorite-confirm {
+  padding: 12px 12px 10px;
+}
+
+.tray-favorite-confirm-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 7px;
+}
+
+.tray-favorite-confirm-copy {
+  color: var(--text-weak);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.tray-favorite-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.tray-favorite-confirm-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-weak);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tray-favorite-confirm-btn:hover,
+.tray-favorite-confirm-btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  outline: none;
+}
+
+.tray-favorite-confirm-danger {
+  color: var(--accent);
+}
+
 .tray-item-chevron {
   flex: 0 0 auto;
   opacity: 0.55;
@@ -156,10 +268,34 @@
   padding: 6px;
 }
 
+/* Keep the main card's comfortable spacing, but make submenu listings denser
+   so more resolutions, rates, and favorites fit before scrolling. */
+.tray-submenu .tray-item {
+  gap: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.tray-submenu .tray-item-check {
+  width: 13px;
+}
+
+.tray-submenu .tray-favorite-star {
+  width: 20px;
+  height: 20px;
+  margin-right: 0;
+}
+
+.tray-submenu .tray-resolution-label {
+  gap: 4px;
+}
+
 /* Resolution tags can make a row wider than the refresh/favorites panes.
    The Rust window reserves the additional left-side space while keeping the
    main tray card anchored at the same right edge. */
 .tray-resolution-submenu {
+  /* Width is the content width; the rendered pane is 244px wide after
+     padding and borders, which is mirrored by the native hit-region bridge. */
   width: 230px;
   max-width: 230px;
 }

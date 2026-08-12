@@ -245,6 +245,13 @@ function scheduleFavoritesSave() {
   clearTimeout(favoritesSaveTimer);
   favoritesSaveTimer = setTimeout(() => { favoritesSaveTimer = null; saveConfig(); }, 300);
 }
+function emitFavoritesChanged() {
+  emit('favorites-changed', displayFavorites.map((fav) => ({
+    width: fav.width,
+    height: fav.height,
+    hz: fav.hz,
+  }))).catch(() => {});
+}
 export function addFavoriteDisplayMode(width, height, hz) {
   const w = Math.round(Number(width) || 0);
   const h = Math.round(Number(height) || 0);
@@ -252,6 +259,7 @@ export function addFavoriteDisplayMode(width, height, hz) {
   if (w <= 0 || h <= 0 || r <= 0) return;
   if (isDisplayModeFavorited(w, h, r)) return;
   displayFavorites.push({ width: w, height: h, hz: r });
+  emitFavoritesChanged();
   scheduleFavoritesSave();
 }
 export function removeFavoriteDisplayMode(width, height, hz) {
@@ -259,6 +267,7 @@ export function removeFavoriteDisplayMode(width, height, hz) {
   const index = displayFavorites.findIndex((f) => displayModeFavoriteKey(f.width, f.height, f.hz) === key);
   if (index === -1) return;
   displayFavorites.splice(index, 1);
+  emitFavoritesChanged();
   scheduleFavoritesSave();
 }
 // Replaces the favorites list from the backend (tray menu toggles emit
