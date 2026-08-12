@@ -59,7 +59,7 @@
   let resButtonEl = $state(null);
 
   function toggleResMenu() {
-    if (app.displayModeBusy || app.refreshRateBusy || pendingModeConfirmation || app.displayInfo.resolutions.length === 0) return;
+    if (app.displayModeBusy || app.refreshRateBusy || app.displayInfo.resolutions.length === 0) return;
     resMenuOpen = !resMenuOpen;
   }
   function closeResMenu() {
@@ -103,7 +103,7 @@
   let hzButtonEl = $state(null);
 
   function toggleHzMenu() {
-    if (app.refreshRateBusy || app.displayModeBusy || pendingModeConfirmation || app.displayInfo.refreshRates.length === 0) return;
+    if (app.refreshRateBusy || app.displayModeBusy || app.displayInfo.refreshRates.length === 0) return;
     hzMenuOpen = !hzMenuOpen;
   }
   function closeHzMenu() {
@@ -317,177 +317,21 @@
   let windowsHdrError = $state('');
   let refreshRateError = $state('');
   let resolutionError = $state('');
-  let pendingModeConfirmation = $state(null);
-  let modeConfirmationTimer = $state(null);
-  let modeConfirmationBusy = $state(false);
-  let modeConfirmationError = $state('');
-  // Plays the shared exit ease (mode-confirm-exit-in) before the modal is
-  // removed, mirrors Flyout.svelte's `exiting` state so the in-app modal
-  // and the tray flyout animate identically.
-  let modeConfirmationExiting = $state(false);
-  let modeConfirmKeepBtnEl = $state(null);
-  let modeConfirmRevertBtnEl = $state(null);
-  // Element that had focus before the modal opened; restored on close so
-  // keyboard users don't get stranded on <body> after the modal unmounts.
-  let modeConfirmLastFocused = null;
 
-  // Keyboard handling for the confirmation dialog, mirroring Flyout.svelte's
-  // onDialogKeydown and Windows' own display-confirm semantics: Revert is the
-  // default action (initial focus), Enter on the focused button is native,
-  // Enter/Escape with no focused button reverts, and Tab stays trapped
-  // between the two buttons.
-  function onModeConfirmKeydown(e) {
-    if (modeConfirmationBusy) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      rollbackModeChange();
-    } else if (e.key === 'Enter') {
-      if (e.target?.closest?.('button')) return;
-      e.preventDefault();
-      rollbackModeChange();
-    } else if (e.key === 'Tab') {
-      const first = modeConfirmKeepBtnEl;
-      const last = modeConfirmRevertBtnEl;
-      if (!first || !last) return;
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-  }
-
-  function clearModeConfirmationTimer() {
-    if (modeConfirmationTimer) clearInterval(modeConfirmationTimer);
-    modeConfirmationTimer = null;
-  }
-
-  function clearModeConfirmation() {
-    clearModeConfirmationTimer();
-    pendingModeConfirmation = null;
-    modeConfirmationExiting = false;
-    // The modal is about to unmount; put focus back where it was before it
-    // opened (the dropdown button that triggered the change, etc.).
-    modeConfirmLastFocused?.focus?.();
-    modeConfirmLastFocused = null;
-  }
-
-  function startModeConfirmation(result) {
-    clearModeConfirmation();
-    modeConfirmationError = '';
-    const seconds = Number(result?.confirmation_seconds) || 15;
-    const started = Date.now();
-    // Capture what had focus BEFORE the modal renders (still the dropdown
-    // button that triggered the change) so closeModeConfirmation can restore
-    // it. Must happen here, not in an $effect: the countdown reassigns
-    // pendingModeConfirmation every 250ms, and an effect keyed on it would
-    // re-run each tick, stealing focus back to Revert after the user tabs
-    // to Keep this mode, and re-capturing the Revert button as the restore
-    // target just before it unmounts.
-    modeConfirmLastFocused = document.activeElement;
-    pendingModeConfirmation = { ...result, remaining: seconds, totalSeconds: seconds };
-    // Windows' display-confirm dialogs default to Revert: focus it as the
-    // safe action (after the modal is in the DOM, so the ref is bound).
-    setTimeout(() => modeConfirmRevertBtnEl?.focus(), 0);
-    modeConfirmationTimer = setInterval(() => {
-      const remaining = Math.max(0, seconds - Math.ceil((Date.now() - started) / 1000));
-      if (remaining <= 0) {
-        // Let the frontend perform the same rollback as the backend watchdog.
-        // Keeping the modal until the command succeeds gives the user a
-        // visible retry path if the display driver temporarily refuses restore.
-        clearInterval(modeConfirmationTimer);
-        modeConfirmationTimer = null;
-        if (pendingModeConfirmation && !modeConfirmationBusy) rollbackModeChange();
-      } else if (pendingModeConfirmation) {
-        pendingModeConfirmation = { ...pendingModeConfirmation, remaining };
-      }
-    }, 250);
-  }
-
-  // Shared close path for Keep and Revert, mirroring Flyout.svelte's
-  // closeFlyout. The exit ease plays FIRST with nothing running concurrently
-  //, confirm_mode_change / rollback both re-apply the display mode via
-  // ChangeDisplaySettingsExW, and doing that while the animation plays stalls
-  // the compositor and makes it stutter. So the order is: play the exit
-  // animation (smooth), then run the mode-change invoke. On success the modal
-  // is removed; on failure it is re-shown (removing the exiting class
-  // re-applies the entrance animation) so the error is visible and retryable.
-  async function closeModeConfirmation(action) {
-    if (modeConfirmationBusy || !pendingModeConfirmation) return;
-    modeConfirmationBusy = true;
-    modeConfirmationError = '';
-    // Scope to the mode-confirm modal specifically, the generic
-    // .modal-backdrop .modal selector could match TabSettings' reset-all
-    // confirm if both were ever open at once.
-    const modal = document.querySelector('.mode-confirm-backdrop .modal');
-    modeConfirmationExiting = true;
-    const exitFinished = modal
-      ? new Promise((resolve) => {
-          let settled = false;
-          const finish = () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(failsafe);
-            modal.removeEventListener('animationend', onEnd);
-            modal.removeEventListener('animationcancel', onCancel);
-            resolve();
-          };
-          // Only the exit animation ends the dialog, a leftover entrance
-          // animationend (mode-confirm-rise-in) must not resolve this early.
-          const onEnd = (event) => {
-            if (event.animationName === 'mode-confirm-exit-in') finish();
-          };
-          // If the exit class is removed before the animation completes
-          // (error path), the exit is cancelled rather than ended. Resolve
-          // and detach there too, or repeated attempts would accumulate
-          // listeners on the same modal.
-          const onCancel = (event) => {
-            if (event.animationName === 'mode-confirm-exit-in') finish();
-          };
-          modal.addEventListener('animationend', onEnd);
-          modal.addEventListener('animationcancel', onCancel);
-          // Safety net: never wait forever if the event is missed.
-          const failsafe = setTimeout(finish, 600);
-        })
-      : Promise.resolve();
-    try {
-      // Exit animation plays first, smooth, nothing concurrent yet.
-      await exitFinished;
-      // The mode change runs now; its display re-apply happens after the
-      // modal has faded out, so the compositor hiccup is invisible.
-      await invoke(action);
-      clearModeConfirmationTimer();
-      clearModeConfirmation();
-      resolutionError = '';
-      refreshRateError = '';
-    } catch (e) {
-      modeConfirmationError = String(e);
-      // Re-show the dialog: removing the exiting class re-applies the
-      // entrance animation, keeping the error visible and retryable.
-      modeConfirmationExiting = false;
-      // Re-focus the default action so keyboard users can immediately retry.
-      modeConfirmRevertBtnEl?.focus();
-    } finally {
-      modeConfirmationBusy = false;
-      // Confirming persists the already-active mode via CDS_NORESET, so the
-      // display is unchanged and a full re-poll (mode enumeration + EDID
-      // reads) right after the commit is redundant work landing in the same
-      // frame as the registry persist. Rollback genuinely changes the mode
-      // and re-polls; a failed invoke re-polls to resync the dropdowns.
-      if (action !== 'confirm_display_mode_change' || modeConfirmationError) {
-        pollDisplayInfo();
-      }
-    }
-  }
-
-  async function confirmModeChange() {
-    await closeModeConfirmation('confirm_display_mode_change');
-  }
-
-  async function rollbackModeChange() {
-    await closeModeConfirmation('rollback_display_mode_change');
+  // Show the flyout confirmation dialog centered on screen.
+  function showFlyoutConfirmation(result) {
+    invoke('show_mode_confirmation', {
+      width: result.width,
+      height: result.height,
+      refresh_hz: result.refresh_hz,
+      monitor_name: result.monitor_name,
+      confirmation_seconds: result.confirmation_seconds,
+    }).catch((e) => {
+      resolutionError = String(e);
+      app.displayModeBusy = false;
+      app.refreshRateBusy = false;
+      pollDisplayInfo();
+    });
   }
 
   const resolutionNames = new Map([
@@ -615,7 +459,7 @@
     const currentHeight = app.displayInfo.height;
     if (!Number.isFinite(width) || !Number.isFinite(height)
       || width <= 0 || height <= 0 || app.displayModeBusy
-      || app.refreshRateBusy || pendingModeConfirmation
+      || app.refreshRateBusy
       || (width === currentWidth && height === currentHeight && preferredHz === (app.displayInfo.refreshRateHz || 0))) return;
 
     app.displayModeBusy = true;
@@ -634,16 +478,13 @@
       // The backend only returns after the temporary mode has stabilized, so
       // load the profile for the newly active display/mode immediately.
       applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
-      startModeConfirmation(result);
+      showFlyoutConfirmation(result);
     } catch (e) {
       resolutionError = String(e);
       app.displayInfo.width = currentWidth;
       app.displayInfo.height = currentHeight;
       applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
-    } finally {
       app.displayModeBusy = false;
-      // Re-query the mode so the dropdown and available refresh rates reflect
-      // the temporary mode Windows actually accepted.
       pollDisplayInfo();
     }
   }
@@ -656,7 +497,7 @@
   async function changeRefreshRate(event) {
     const hz = Number(event.currentTarget.value);
     const currentHz = app.displayInfo.refreshRateHz;
-    if (!Number.isFinite(hz) || hz <= 0 || app.refreshRateBusy || app.displayModeBusy || pendingModeConfirmation || hz === currentHz) return;
+    if (!Number.isFinite(hz) || hz <= 0 || app.refreshRateBusy || app.displayModeBusy || hz === currentHz) return;
 
     // Save the profile for the mode we are leaving before changing the mode.
     persistCurrentBlackLevelProfile();
@@ -665,7 +506,7 @@
     refreshRateError = '';
     try {
       const result = await invoke('set_refresh_rate', { hz });
-      startModeConfirmation(result);
+      showFlyoutConfirmation(result);
       // Apply the profile immediately; the next display poll still confirms
       // the temporary mode, and rollback restores the previous display state.
       applyBlackLevelProfileForRefreshRate(hz);
@@ -676,10 +517,7 @@
       app.displayInfo.refreshRateHz = currentHz;
       applyBlackLevelProfileForRefreshRate(currentHz);
       saveConfig();
-    } finally {
       app.refreshRateBusy = false;
-      // Read the mode back after Windows has accepted or rejected the change.
-      // This also restores the old value if the command failed.
       pollDisplayInfo();
     }
   }
@@ -720,7 +558,7 @@
   // pointerenter/pointerleave on the wrap cover the icon and the open menu.
   let favoritesHoverTimer = null;
   function favoritesCanOpen() {
-    return !pendingModeConfirmation && !app.displayModeBusy && !app.refreshRateBusy;
+    return !app.displayModeBusy && !app.refreshRateBusy;
   }
   function openFavoritesOnHover() {
     if (!favoritesCanOpen()) return;
@@ -1128,15 +966,23 @@
       if (mode?.height) app.displayInfo.height = mode.height;
       if (mode?.refresh_hz) app.displayInfo.refreshRateHz = mode.refresh_hz;
       applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
-      startModeConfirmation(mode);
-      pollDisplayInfo();
+      showFlyoutConfirmation(mode);
     }).then((stop) => { unlistenTrayMode = stop; }).catch(() => {});
+    // When the flyout confirmation dialog completes (confirm/rollback),
+    // clear busy flags and re-poll display info.
+    let unlistenFlyoutCompleted;
+    listen('flyout-completed', () => {
+      app.displayModeBusy = false;
+      app.refreshRateBusy = false;
+      pollDisplayInfo();
+    }).then((stop) => { unlistenFlyoutCompleted = stop; }).catch(() => {});
     return () => {
       unlisten?.();
       unlistenDisplayChanged?.();
       clearTimeout(vendorDisplayRefreshTimer);
       unlistenHotkeyPressed?.();
       unlistenTrayMode?.();
+      unlistenFlyoutCompleted?.();
     };
   });
 
@@ -1327,7 +1173,7 @@
           aria-haspopup="listbox"
           aria-expanded={favoritesMenuOpen}
           title={isCurrentFavorited ? `Current mode is favorited: ${currentComboLabel}` : 'Favorite display modes'}
-          disabled={pendingModeConfirmation || app.displayModeBusy || app.refreshRateBusy}
+          disabled={app.displayModeBusy || app.refreshRateBusy}
           onclick={toggleFavoritesMenu}>
           <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
             <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={isCurrentFavorited ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
@@ -1413,7 +1259,7 @@
           aria-haspopup="listbox"
           aria-expanded={resMenuOpen}
           title={resolutionError || 'Choose resolution · right-click for list options'}
-          disabled={app.displayModeBusy || app.refreshRateBusy || pendingModeConfirmation || app.displayInfo.resolutions.length === 0}
+          disabled={app.displayModeBusy || app.refreshRateBusy || app.displayInfo.resolutions.length === 0}
           onclick={toggleResMenu}
           oncontextmenu={openResContextMenu}>
           {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}{#if currentResolutionName()}<span class="refresh-rate-select-value"> · {currentResolutionName()}</span>{/if}
@@ -1493,7 +1339,7 @@
           aria-haspopup="listbox"
           aria-expanded={hzMenuOpen}
           title={refreshRateError || 'Choose refresh rate · right-click for list options'}
-          disabled={app.refreshRateBusy || app.displayModeBusy || pendingModeConfirmation || app.displayInfo.refreshRates.length === 0}
+          disabled={app.refreshRateBusy || app.displayModeBusy || app.displayInfo.refreshRates.length === 0}
           onclick={toggleHzMenu}
           oncontextmenu={openHzContextMenu}>
           {app.displayInfo.refreshRateHz ? `${app.displayInfo.refreshRateHz} Hz` : '-- Hz'}{#if app.displayInfo.refreshRateHz && blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)}<span class="refresh-rate-select-value"> ({blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)})</span>{/if}
@@ -1536,25 +1382,6 @@
       </div>
     </div>
   </div>
-
-  {#if pendingModeConfirmation}
-    <div class="modal-backdrop mode-confirm-backdrop" role="presentation">
-      <div class="modal mode-confirm-modal" class:mode-confirm-exiting={modeConfirmationExiting} role="dialog" aria-modal="true" aria-labelledby="mode-confirm-title" aria-describedby="mode-confirm-desc" tabindex="-1" onkeydown={onModeConfirmKeydown}>
-        <h2 id="mode-confirm-title" class="modal-title">Keep display mode?</h2>
-        <p id="mode-confirm-desc" class="modal-desc">
-          {pendingModeConfirmation.monitor_name || 'Current monitor'} is temporarily using
-          <strong>{pendingModeConfirmation.width}×{pendingModeConfirmation.height} at {pendingModeConfirmation.refresh_hz} Hz</strong>.
-          Confirm if the picture looks correct. It will automatically revert in {pendingModeConfirmation.remaining}s.
-        </p>
-        {#if modeConfirmationError}<p class="modal-error">Rollback failed: {modeConfirmationError}</p>{/if}
-        <div class="modal-actions">
-          <button bind:this={modeConfirmKeepBtnEl} class="modal-btn" onclick={confirmModeChange} disabled={modeConfirmationBusy}>Keep this mode</button>
-          <button bind:this={modeConfirmRevertBtnEl} class="modal-btn modal-btn-cancel" onclick={rollbackModeChange} disabled={modeConfirmationBusy}>Revert (<span class="modal-btn-countdown">{pendingModeConfirmation.remaining}</span>s)</button>
-        </div>
-        <div class="mode-confirm-timerbar" style="animation-duration: {pendingModeConfirmation.totalSeconds || 15}s" role="presentation" aria-hidden="true"></div>
-      </div>
-    </div>
-  {/if}
 
   {#if favoritePendingRemove}
     <div class="modal-backdrop" role="presentation" onpointerdown={(e) => { if (e.target === e.currentTarget) cancelRemoveFavorite(); }}>

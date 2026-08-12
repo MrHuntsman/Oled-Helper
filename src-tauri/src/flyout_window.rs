@@ -26,10 +26,16 @@
 // additionalBrowserArgs, and the initial-size transparency bug below), so
 // shadow(false) no longer reproduces the dead-window failure here.
 use crate::display_info::AppliedMode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
 };
+
+// When true, the flyout is positioned centered on the primary monitor instead
+// of near the tray icon. Set by show_mode_confirmation before calling
+// show_after_ready, read by the positioning helpers on the main thread.
+static FLYOUT_CENTERED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HWND;
@@ -180,7 +186,12 @@ fn place_hidden_at_final_position(
     let hwnd = window
         .hwnd()
         .map_err(|error| format!("could not get flyout HWND: {error}"))?;
-    let (x, y) = taskbar_position(width_px, height_px)
+    let position_fn = if FLYOUT_CENTERED.load(Ordering::Relaxed) {
+        centered_position
+    } else {
+        taskbar_position
+    };
+    let (x, y) = position_fn(width_px, height_px)
         .ok_or_else(|| "could not determine primary monitor geometry".to_string())?;
     // Move and size the hidden HWND before the payload is rendered. This
     // causes Windows/WebView2 to process the target monitor's DPI while the
@@ -218,8 +229,13 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
     let current_size = window
         .outer_size()
         .map_err(|error| format!("could not read flyout size: {error}"))?;
-    let (x, y) = taskbar_position(current_size.width as i32, current_size.height as i32)
-        .ok_or_else(|| "could not determine final taskbar geometry".to_string())?;
+    let position_fn = if FLYOUT_CENTERED.load(Ordering::Relaxed) {
+        centered_position
+    } else {
+        taskbar_position
+    };
+    let (x, y) = position_fn(current_size.width as i32, current_size.height as i32)
+        .ok_or_else(|| "could not determine final flyout geometry".to_string())?;
     // No SWP_NOACTIVATE on purpose: the confirmation dialog must take
     // keyboard focus so Enter (revert) and Escape (revert) work immediately,
     // like Windows' own display-mode confirm dialog. Showing with activation
@@ -248,6 +264,21 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
     }
 }
 
+// Centers the flyout on the primary monitor's work area.
+#[cfg(target_os = "windows")]
+fn centered_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
+    let (_monitor_handle, info) = primary_monitor_info()?;
+    let work = info.rcWork;
+    let x = work.left + (work.right - work.left - width_px) / 2;
+    let y = work.top + (work.bottom - work.top - height_px) / 2;
+    Some((x, y))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn centered_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
+    None
+}
+
 #[cfg(not(target_os = "windows"))]
 fn taskbar_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
     None
@@ -262,6 +293,7 @@ fn taskbar_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
 // has stopped moving. A bounded fallback keeps a broken/virtual display driver
 // from delaying the confirmation forever.
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 pub fn wait_for_display_geometry(width: u32, height: u32) -> bool {
     const MIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
     const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -315,6 +347,7 @@ pub fn wait_for_display_geometry(width: u32, height: u32) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub fn wait_for_display_geometry(_width: u32, _height: u32) -> bool {
     true
 }
@@ -649,7 +682,38 @@ pub fn hide(app: &AppHandle) {
 // yielding z-order to a flyout HWND that is no longer showing, which is
 // harmless (active_flyout_window checks IsWindowVisible) but leaves a stale
 // pointer around until the next show. Clearing it here keeps the state tidy.
+// Also emits a flyout-completed event to the main window so the in-app UI
+// can clear its busy state and re-poll display info.
 #[tauri::command]
-pub fn flyout_hidden() {
+pub fn flyout_hidden(app: AppHandle) {
     crate::taskbar_dimmer::set_flyout_hwnd(0);
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.emit("flyout-completed", ());
+    }
+}
+
+// Shows the flyout confirmation dialog centered on screen. Called from the
+// in-app resolution/refresh-rate dropdowns. The mode data is forwarded to
+// the flyout's Svelte frontend via the standard flyout-show event.
+#[tauri::command]
+pub fn show_mode_confirmation(
+    app: AppHandle,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+    monitor_name: Option<String>,
+    confirmation_seconds: Option<u32>,
+) -> Result<(), String> {
+    FLYOUT_CENTERED.store(true, Ordering::Release);
+    let mode = AppliedMode {
+        width,
+        height,
+        refresh_hz,
+        monitor_name: monitor_name.unwrap_or_default(),
+        confirmation_seconds: confirmation_seconds.unwrap_or(15),
+    };
+    let result = show_after_ready(&app, mode);
+    // Clear centered flag after the flyout has been positioned and shown.
+    FLYOUT_CENTERED.store(false, Ordering::Release);
+    result
 }

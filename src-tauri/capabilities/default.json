@@ -4,8 +4,7 @@
   "description": "enables the default permissions",
   "windows": [
     "main",
-    "flyout",
-    "tray-menu"
+    "flyout"
   ],
   "permissions": [
     "core:default",

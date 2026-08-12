@@ -5,51 +5,8 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
-#[cfg(target_os = "windows")]
 mod tray_menu;
 mod updater;
-// Non-Windows builds cannot compile the raw Win32 tray menu (tray_menu.rs),
-// but the tray icon handler still references show_tray_menu.
-#[cfg(not(target_os = "windows"))]
-mod tray_menu {
-    #[tauri::command]
-    pub fn show_tray_menu(_app: tauri::AppHandle) {}
-    pub fn toggle_tray_menu(_app: &tauri::AppHandle) {}
-    pub fn prewarm(_app: &tauri::AppHandle) {}
-    pub fn set_click_anchor(_x: f64, _y: f64) {}
-    pub fn set_tray_icon_rect(_x: i32, _y: i32, _width: i32, _height: i32) {}
-    pub fn handle_global_mouse_down(_x: i32, _y: i32, _msg_type: u32) {}
-    pub fn handle_tray_right_down(_app: &tauri::AppHandle) {}
-    pub fn consume_tray_right_up() -> bool {
-        false
-    }
-    #[tauri::command]
-    pub fn tray_menu_get_snapshot() -> serde_json::Value {
-        serde_json::json!({"open": false, "data": null})
-    }
-    #[tauri::command]
-    pub fn tray_menu_close(_app: tauri::AppHandle) {}
-    #[tauri::command]
-    pub fn tray_menu_hide_native(_app: tauri::AppHandle) {}
-    #[tauri::command]
-    pub fn tray_menu_restart(_app: tauri::AppHandle) {}
-    #[tauri::command]
-    pub fn tray_menu_quit(_app: tauri::AppHandle) {}
-    #[tauri::command]
-    pub fn tray_menu_select_resolution(_app: tauri::AppHandle, _width: u32, _height: u32) {}
-    #[tauri::command]
-    pub fn tray_menu_select_refresh_rate(_app: tauri::AppHandle, _hz: u32) {}
-    #[tauri::command]
-    pub fn tray_menu_select_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
-    #[tauri::command]
-    pub fn tray_menu_add_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
-    #[tauri::command]
-    pub fn tray_menu_remove_favorite(_app: tauri::AppHandle, _width: u32, _height: u32, _hz: u32) {}
-    #[tauri::command]
-    pub fn tray_menu_set_hit_rects(_rects: Vec<serde_json::Value>) {}
-    #[tauri::command]
-    pub fn tray_menu_set_card_height(_height_css: f64) {}
-}
 mod vendor_info;
 mod window_icon;
 
@@ -62,7 +19,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Listener, Manager, State,
 };
 
 struct TrayState {
@@ -170,8 +127,6 @@ mod display_change_events {
         // also derived from the display topology ,  a change can move it to a
         // different adapter/target, so invalidate it too.
         hdr_toggle::invalidate_hdr_target_cache();
-        // The native tray menu (tray_menu.rs) queries display info fresh on
-        // every open, so there is nothing to rebuild here.
     }
 
     pub fn install(window_handle: isize, app: AppHandle) -> Result<(), String> {
@@ -465,61 +420,6 @@ fn show_main_window(app: &AppHandle) {
             let _ = window.set_focus();
             let _ = app.emit("window-visibility", true);
         }
-    }
-}
-
-// Applies a mode picked from the tray menu. Always shows the small
-// always-on-top "flyout" WebviewWindow for this confirmation, never the
-// in-app modal ,  regardless of whether the main window happens to be open,
-// so a tray-driven change always surfaces its confirmation at the tray
-// rather than possibly popping the in-app dialog behind/inside a window the
-// user wasn't necessarily looking at. The in-app dropdowns (App.svelte's
-// changeResolution/changeRefreshRate) remain the only path that shows the
-// in-app modal, since those calls only happen while the window is visible
-// and focused.
-fn tray_display_mode_change(app: AppHandle, result: Result<display_info::AppliedMode, String>) {
-    match result {
-        Ok(mode) => {
-            // ChangeDisplaySettingsExW and wait_for_mode verify the new
-            // DEVMODE, but Windows updates DWM, the shell taskbar, and the
-            // monitor work area asynchronously afterward. Wait on this tray
-            // worker until the requested monitor size is observed and the
-            // monitor/work-area rectangles are stable across samples; never
-            // block the Tauri/UI thread while the shell catches up.
-            flyout_window::wait_for_display_geometry(mode.width, mode.height);
-
-            // Give Windows/DWM/WebView2 a moment to finish settling display
-            // and DPI changes before the flyout renders and positions itself.
-            // wait_for_display_geometry already confirms the monitor rect is
-            // stable, but downstream consumers (taskbar redraw, WebView2's
-            // own DPI-changed handling) can still be catching up for a bit
-            // longer; a fixed pause here is simpler and more predictable than
-            // chasing every one of those signals individually.
-            std::thread::sleep(std::time::Duration::from_secs(1));
-
-            // Keep the handshake on this background worker. It waits for
-            // frontend readiness and schedules only the short native prepare
-            // and final-show operations on the Tauri thread; calling it from
-            // run_on_main_thread would deadlock that thread while JavaScript
-            // tries to deliver the readiness events.
-            let window_app = app.clone();
-            let shown_mode = mode.clone();
-            if let Err(error) = flyout_window::show_after_ready(&window_app, shown_mode.clone()) {
-                // The existing watchdog will safely restore the previous mode
-                // even if the flyout window fails to show.
-                log::error!(
-                    "[tray] mode flyout window failed; mode will auto-revert safely: {error}"
-                );
-            } else {
-                log::info!(
-                    "[tray] mode flyout window shown for {}x{}@{}Hz",
-                    shown_mode.width,
-                    shown_mode.height,
-                    shown_mode.refresh_hz
-                );
-            }
-        }
-        Err(error) => log::warn!("[tray] display mode change failed: {error}"),
     }
 }
 
@@ -1040,18 +940,6 @@ pub fn run() {
             confirm_display_mode_change,
             rollback_display_mode_change,
             get_display_target,
-            tray_menu::tray_menu_get_snapshot,
-            tray_menu::tray_menu_close,
-            tray_menu::tray_menu_hide_native,
-            tray_menu::tray_menu_restart,
-            tray_menu::tray_menu_quit,
-            tray_menu::tray_menu_select_resolution,
-            tray_menu::tray_menu_select_refresh_rate,
-            tray_menu::tray_menu_select_favorite,
-            tray_menu::tray_menu_add_favorite,
-            tray_menu::tray_menu_remove_favorite,
-            tray_menu::tray_menu_set_hit_rects,
-            tray_menu::tray_menu_set_card_height,
             set_tray_enabled,
             config::load_config,
             config::save_config,
@@ -1079,6 +967,7 @@ pub fn run() {
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,
             flyout_window::flyout_hidden,
+            flyout_window::show_mode_confirmation,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1135,11 +1024,6 @@ pub fn run() {
                     .build(),
             )?;
 
-            // The custom Steam-style tray menu is a pre-warmed WebView popup.
-            // It stays hidden until the tray right-click handler opens it.
-            tray_menu::prewarm(app.handle());
-            log::info!("[tray] custom tray menu ready");
-
             // The hidden-tray confirmation is a second small Tauri WebviewWindow
             // ("flyout", see tauri.conf.json + flyout_window.rs) rendering the
             // same Svelte modal markup as the in-app confirmation. Pre-warmed
@@ -1158,111 +1042,47 @@ pub fn run() {
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
 
-            // No native menu is attached. Right-click opens the custom
-            // Steam-style WebView popup from tray_menu.rs.
+            // Initialize Windows 11 dark mode for native popup menus.
+            tray_menu::init_dark_mode();
+
+            // Build the native dark-mode tray context menu.
+            let native_menu = tray_menu::build_menu(app.handle())
+                .unwrap_or_else(|error| {
+                    log::warn!("[tray] could not build native menu: {error}");
+                    // Fallback: empty menu — tray icon still works for left-click.
+                    tauri::menu::MenuBuilder::new(app.handle()).build().unwrap()
+                });
+
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_image)
-                // The popup is fully custom. No native menu is attached, so
-                // tray-icon has nothing to show automatically on right-click.
+                .menu(&native_menu)
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| match event {
-                    // Left-click opens the main window.
                     TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
                     } => show_main_window(tray.app_handle()),
-                    // Right-click toggles the custom Steam-style WebView menu:
-                    // open when closed, close when open (the menu can also
-                    // close itself via focus loss, so the toggle avoids
-                    // reopening what this same click just closed). The
-                    // event's own `rect` is the tray icon's screen bounds ,
-                    // far more reliable than a later GetCursorPos call, which
-                    // can race the dimmer's async cursor cache or simply
-                    // sample after the cursor has moved. Anchor to the
-                    // icon's center.
-                    TrayIconEvent::Click {
-                        button: MouseButton::Right,
-                        button_state: MouseButtonState::Down,
-                        ..
-                    } => {
-                        // Refresh the tray icon rectangle from this Down event
-                        // before any global hook dismissal work can run.
-                        if let Ok(Some(tray_rect)) = tray.rect() {
-                            let position = match tray_rect.position {
-                                tauri::Position::Physical(value) => value,
-                                tauri::Position::Logical(value) => value.to_physical(1.0),
-                            };
-                            let size = match tray_rect.size {
-                                tauri::Size::Physical(value) => value,
-                                tauri::Size::Logical(value) => value.to_physical(1.0),
-                            };
-                            tray_menu::set_tray_icon_rect(
-                                position.x,
-                                position.y,
-                                size.width.min(i32::MAX as u32) as i32,
-                                size.height.min(i32::MAX as u32) as i32,
-                            );
-                        }
-                        tray_menu::handle_tray_right_down(tray.app_handle());
-                    }
-                    TrayIconEvent::Click {
-                        button: MouseButton::Right,
-                        button_state: MouseButtonState::Up,
-                        rect,
-                        ..
-                    } => {
-                        if tray_menu::consume_tray_right_up() {
-                            return;
-                        }
-                        log::info!("[tray] raw click rect={:?}", rect);
-                        // rect.position/size are tauri::Position/Size, which
-                        // can be Physical or Logical depending on platform.
-                        // Tray icon rects on Windows are always physical;
-                        // handle Logical too via to_physical(1.0) (identity
-                        // when already physical) so this stays correct if
-                        // that ever changes.
-                        let physical_position = match rect.position {
-                            tauri::Position::Physical(position) => position,
-                            tauri::Position::Logical(position) => position.to_physical(1.0),
-                        };
-                        let physical_size = match rect.size {
-                            tauri::Size::Physical(size) => size,
-                            tauri::Size::Logical(size) => size.to_physical(1.0),
-                        };
-                        log::info!(
-                            "[tray] raw click physical_position=({},{}) physical_size=({},{})",
-                            physical_position.x, physical_position.y,
-                            physical_size.width, physical_size.height
-                        );
-                        tray_menu::set_tray_icon_rect(
-                            physical_position.x,
-                            physical_position.y,
-                            physical_size.width.min(i32::MAX as u32) as i32,
-                            physical_size.height.min(i32::MAX as u32) as i32,
-                        );
-                        let center_x =
-                            physical_position.x as f64 + physical_size.width as f64 / 2.0;
-                        let center_y =
-                            physical_position.y as f64 + physical_size.height as f64 / 2.0;
-                        tray_menu::set_click_anchor(center_x, center_y);
-                        tray_menu::toggle_tray_menu(tray.app_handle());
-                    }
                     _ => {}
                 })
                 .build(app)?;
 
-            // Tauri's wrapper does not expose the right-click switch on its
-            // builder, so disable tray-icon's underlying automatic native
-            // menu explicitly after creation. This is important even without
-            // an attached menu because it removes the shell menu path before
-            // the custom WebView popup is used.
             if let Some(tray) = app.tray_by_id("main-tray") {
-                tray.with_inner_tray_icon(|inner| {
-                    inner.set_show_menu_on_right_click(false);
-                })?;
                 tray.set_visible(saved_config.tray_enabled)?;
             }
+
+            // Handle native tray menu item clicks.
+            let menu_app = app.handle().clone();
+            app.on_menu_event(move |_app, event| {
+                tray_menu::handle_menu_event(&menu_app, event);
+            });
+
+            // Refresh the tray menu when display info changes so the
+            // resolution / refresh-rate submenus stay current.
+            let refresh_app = app.handle().clone();
+            app.handle().listen("display-changed", move |_| {
+                tray_menu::refresh_menu(&refresh_app).ok();
+            });
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();
             if let Err(error) = taskbar_dimmer::create_overlay(app.handle(), &dimmer_state) {
