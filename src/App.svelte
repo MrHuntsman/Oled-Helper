@@ -319,13 +319,15 @@
   let resolutionError = $state('');
 
   // Show the flyout confirmation dialog centered on screen.
+  // Tauri 2 commands expect camelCase argument keys (refreshHz, monitorName,
+  // confirmationSeconds), not snake_case, or the invoke is rejected.
   function showFlyoutConfirmation(result) {
     invoke('show_mode_confirmation', {
       width: result.width,
       height: result.height,
-      refresh_hz: result.refresh_hz,
-      monitor_name: result.monitor_name,
-      confirmation_seconds: result.confirmation_seconds,
+      refreshHz: result.refresh_hz,
+      monitorName: result.monitor_name,
+      confirmationSeconds: result.confirmation_seconds,
     }).catch((e) => {
       resolutionError = String(e);
       app.displayModeBusy = false;

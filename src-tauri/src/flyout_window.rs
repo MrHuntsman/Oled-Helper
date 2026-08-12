@@ -630,6 +630,13 @@ fn finish_show(app: &AppHandle) -> Result<(), String> {
 // Full hidden-WebView handshake. This is called from the tray worker, not the
 // Tauri/UI thread, so waiting for JavaScript never freezes event processing.
 pub fn show_after_ready(app: &AppHandle, mode: AppliedMode) -> Result<(), String> {
+    log::debug!(
+        "[flyout] show_after_ready called for {}x{}@{} from thread {:?}",
+        mode.width,
+        mode.height,
+        mode.refresh_hz,
+        std::thread::current().id()
+    );
     if !wait_for_frontend_ready() {
         log::warn!("[flyout] frontend handshake timed out; attempting legacy hidden show");
     }
@@ -695,6 +702,13 @@ pub fn flyout_hidden(app: AppHandle) {
 // Shows the flyout confirmation dialog centered on screen. Called from the
 // in-app resolution/refresh-rate dropdowns. The mode data is forwarded to
 // the flyout's Svelte frontend via the standard flyout-show event.
+//
+// This command must NOT run the show_after_ready handshake on its own thread:
+// it's a sync command, so it executes on the Tauri main thread, and
+// show_after_ready blocks waiting for work it schedules back onto that same
+// main thread (run_on_main_thread + channel recv) — a guaranteed deadlock
+// until the channel timeout. Spawn a worker thread so the handshake behaves
+// exactly like the tray path always did.
 #[tauri::command]
 pub fn show_mode_confirmation(
     app: AppHandle,
@@ -704,7 +718,6 @@ pub fn show_mode_confirmation(
     monitor_name: Option<String>,
     confirmation_seconds: Option<u32>,
 ) -> Result<(), String> {
-    FLYOUT_CENTERED.store(true, Ordering::Release);
     let mode = AppliedMode {
         width,
         height,
@@ -712,8 +725,19 @@ pub fn show_mode_confirmation(
         monitor_name: monitor_name.unwrap_or_default(),
         confirmation_seconds: confirmation_seconds.unwrap_or(15),
     };
-    let result = show_after_ready(&app, mode);
-    // Clear centered flag after the flyout has been positioned and shown.
-    FLYOUT_CENTERED.store(false, Ordering::Release);
-    result
+    std::thread::spawn(move || {
+        FLYOUT_CENTERED.store(true, Ordering::Release);
+        let result = show_after_ready(&app, mode);
+        FLYOUT_CENTERED.store(false, Ordering::Release);
+        if let Err(error) = result {
+            log::error!("[flyout] mode confirmation failed to show: {error}");
+        }
+    });
+    log::debug!(
+        "[flyout] show_mode_confirmation accepted {}x{}@{} and returned",
+        width,
+        height,
+        refresh_hz
+    );
+    Ok(())
 }

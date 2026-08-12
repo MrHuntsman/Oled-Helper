@@ -138,17 +138,16 @@ pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 ) {
                     let app = app.clone();
                     std::thread::spawn(move || {
-                        match crate::display_info::set_resolution(w, h, 0) {
+                        // set_resolution requires an exact supported mode
+                        // (width×height@Hz). Pass the current refresh rate so
+                        // the resolution changes at the rate already in use,
+                        // matching the main app's dropdown behavior.
+                        let current_hz = crate::display_info::query_current_display()
+                            .map(|d| d.refresh_hz)
+                            .unwrap_or(0);
+                        match crate::display_info::set_resolution(w, h, current_hz) {
                             Ok(mode) => {
-                                crate::flyout_window::show_mode_confirmation(
-                                    app,
-                                    mode.width,
-                                    mode.height,
-                                    mode.refresh_hz,
-                                    Some(mode.monitor_name),
-                                    Some(mode.confirmation_seconds),
-                                )
-                                .ok();
+                                crate::flyout_window::show_after_ready(&app, mode).ok();
                             }
                             Err(e) => log::warn!("[tray] resolution change failed: {e}"),
                         }
@@ -162,15 +161,7 @@ pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                     let app = app.clone();
                     std::thread::spawn(move || match crate::display_info::set_refresh_rate(hz) {
                         Ok(mode) => {
-                            crate::flyout_window::show_mode_confirmation(
-                                app,
-                                mode.width,
-                                mode.height,
-                                mode.refresh_hz,
-                                Some(mode.monitor_name),
-                                Some(mode.confirmation_seconds),
-                            )
-                            .ok();
+                            crate::flyout_window::show_after_ready(&app, mode).ok();
                         }
                         Err(e) => log::warn!("[tray] refresh rate change failed: {e}"),
                     });
@@ -208,15 +199,7 @@ pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                         std::thread::spawn(move || {
                             match crate::display_info::set_resolution(w, h, hz) {
                                 Ok(mode) => {
-                                    crate::flyout_window::show_mode_confirmation(
-                                        app,
-                                        mode.width,
-                                        mode.height,
-                                        mode.refresh_hz,
-                                        Some(mode.monitor_name),
-                                        Some(mode.confirmation_seconds),
-                                    )
-                                    .ok();
+                                    crate::flyout_window::show_after_ready(&app, mode).ok();
                                 }
                                 Err(e) => log::warn!("[tray] favorite apply failed: {e}"),
                             }
