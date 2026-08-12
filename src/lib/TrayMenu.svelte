@@ -36,10 +36,14 @@
     void pendingRemove;
     measureCard();
     reportHitRects();
+    // Keep the native popup covering the card + open submenu (left flips need
+    // the window slid left; closing the submenu slides it back).
+    applySubmenuShift();
     const timer = setTimeout(() => {
       measureCard();
       if (activeSubmenu) positionSubmenu(activeSubmenu);
       reportHitRects();
+      applySubmenuShift();
     }, 170);
     return () => clearTimeout(timer);
   });
@@ -96,14 +100,24 @@
     // Svelte treats an object passed to the generic style attribute as a
     // string value, which becomes "[object Object]" and is ignored by the
     // browser. Return serialized CSS so the inline position actually
-    // overrides the shell's default bottom-right flex alignment.
-    return `position: absolute; left: ${g.left}px; right: auto; top: ${g.top}px; bottom: auto;`;
+    // overrides the shell's default bottom-right flex alignment. The left
+    // inset grows by leftSubmenuSlideCss when a left-flipped submenu is open
+    // so the card keeps its screen position while the native window slides.
+    return `position: absolute; left: ${g.left + leftSubmenuSlideCss}px; right: auto; top: ${g.top}px; bottom: auto;`;
   });
   // This starts as the normal right-opening direction. It is updated after a
   // submenu is mounted, using its actual rendered width, instead of comparing
   // the left and right margins of the card. A large empty margin on the left
   // must not force a left flyout when the right side can fit the submenu.
   let submenuDirection = $state('right');
+  // When a submenu flips left, the card's local left position shifts right by
+  // this many CSS px so its SCREEN position stays anchored while the native
+  // window slides left underneath it (see applySubmenuShift). 0 = normal.
+  let leftSubmenuSlideCss = $state(0);
+  // The (submenu, direction) pair whose slide was already computed. Reusing it
+  // avoids re-measuring the shifted layout, which would compute slide=0 and
+  // oscillate the card back and forth.
+  let appliedSubmenuKey = null;
   function updateSubmenuDirection(name) {
     const card = document.querySelector('.tray-menu-card');
     const submenu = document.querySelector(`[data-tray-submenu="${name}"]`);
@@ -113,8 +127,16 @@
     const submenuWidth = submenu.getBoundingClientRect().width;
     const gap = submenuGap;
     const margin = 12;
-    const rightSpace = window.innerWidth - cardRect.right - margin;
-    const leftSpace = cardRect.left - margin;
+    // Decide from REAL screen space, not the popup's own viewport. The native
+    // window is content-sized, so window.innerWidth is just the popup width
+    // and would report a tiny "left space" for any card, never flipping left
+    // and letting wide submenus run past the screen edge. The card's position
+    // and the work-area width are computed by the native placement and sent
+    // with the open payload.
+    const cardLeftScreen = data?.card_left_css ?? cardRect.left;
+    const workWidth = data?.work_width_css || window.innerWidth;
+    const rightSpace = workWidth - (cardLeftScreen + cardRect.width) - margin;
+    const leftSpace = cardLeftScreen - margin;
     const required = submenuWidth + gap;
 
     if (rightSpace >= required) {
@@ -126,6 +148,40 @@
       // submenu's max-width/scrolling behavior handle the remaining pixels.
       submenuDirection = rightSpace >= leftSpace ? 'right' : 'left';
     }
+  }
+  // A submenu flipped to the left renders at negative window-local x, outside
+  // the content-sized popup. Slide the native window left so the flyout is
+  // visible, and shift the card's local position right by the same amount so
+  // its SCREEN position stays anchored (otherwise the menu detaches from the
+  // tray icon and the row leaves the cursor, which would close the submenu on
+  // the first mouse move). Restores both when no (left) submenu is open. The
+  // backend treats dx as an offset from the original placement, so repeated
+  // reports with the same dx are idempotent.
+  function applySubmenuShift() {
+    const scale = viewport.dpr || window.devicePixelRatio || 1;
+    const submenu = document.querySelector('.tray-menu-submenu');
+    if (activeSubmenu && submenuDirection === 'left' && submenu) {
+      const key = `${activeSubmenu}|left`;
+      if (appliedSubmenuKey !== key) {
+        const r = submenu.getBoundingClientRect();
+        // Measure against the un-shifted layout: while switching submenus the
+        // card may still carry the previous submenu's slide, so subtract it
+        // before computing the new one. Keeps equal-width submenus stable.
+        const unshiftedLeft = r.left - leftSubmenuSlideCss;
+        leftSubmenuSlideCss = Math.max(0, 12 - unshiftedLeft);
+        appliedSubmenuKey = key;
+      }
+      invoke('tray_menu_shift_submenu', {
+        dx: Math.round(-leftSubmenuSlideCss * scale),
+      }).catch(() => {});
+    } else if (!activeSubmenu) {
+      // No submenu: restore the card and the window to their placed position.
+      leftSubmenuSlideCss = 0;
+      appliedSubmenuKey = null;
+      invoke('tray_menu_shift_submenu', { dx: 0 }).catch(() => {});
+    }
+    // Mid-switch (activeSubmenu set, direction still 'right'): keep the
+    // previous slide; openSubmenu applies the new one on its next tick.
   }
 
   // Keep this command for layout diagnostics and compatibility with older
@@ -306,6 +362,13 @@
     // Reapply the vertical placement after the direction class has rerendered
     // so the hit region matches the final flyout geometry.
     positionSubmenu(name);
+    // If the flyout flipped left it now renders at negative window-local x;
+    // slide the native popup so it becomes visible (and shift the card's
+    // local position so its screen position is unchanged).
+    applySubmenuShift();
+    // Let the card shift render before measuring hit rects, so the reported
+    // flyout bounds match the shifted layout.
+    await tick();
     // Race the layout report against a short grace period so the submenu can
     // never stay hidden if IPC hangs during teardown.
     await Promise.race([

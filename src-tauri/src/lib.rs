@@ -1052,6 +1052,7 @@ pub fn run() {
             tray_menu::tray_menu_remove_favorite,
             tray_menu::tray_menu_set_hit_rects,
             tray_menu::tray_menu_set_card_height,
+            tray_menu::tray_menu_shift_submenu,
             set_tray_enabled,
             config::load_config,
             config::save_config,

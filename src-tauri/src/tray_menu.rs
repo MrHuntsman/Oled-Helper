@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -31,6 +31,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const MENU_LABEL: &str = "tray-menu";
 const MENU_WIDTH: f64 = 700.0;
 const MENU_HEIGHT: f64 = 700.0;
+
+// The popup is a compact content-sized viewport rather than a transparent
+// work-area-sized window (a large topmost WebView2 surface made Edge defer
+// compositor paints and video frames). The card sits at local
+// (HIT_CUSHION_CSS, HIT_CUSHION_CSS) with extra width to the right reserved
+// for a right-opening flyout. A flyout that flips LEFT is rendered at
+// negative window-local x, so the window slides left via
+// tray_menu_shift_submenu instead of reserving symmetric space.
+const INITIAL_VIEWPORT_WIDTH_CSS: f64 = 640.0;
+const INITIAL_VIEWPORT_HEIGHT_CSS: f64 = 430.0;
+const CARD_WIDTH_CSS: f64 = 340.0;
+// Fallback until the frontend reports the rendered card height (the card is
+// shorter with 0-1 favorites, taller with many rows). The measured height
+// keeps the taskbar-facing edge exactly on the work-area boundary.
+const CARD_HEIGHT_DEFAULT_CSS: f64 = 361.0;
+const CARD_PAD_CSS: f64 = 0.0;
+const HIT_CUSHION_CSS: f64 = 24.0;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TrayFavorite {
@@ -73,6 +90,13 @@ pub struct TrayMenuData {
     pub work_top: f64,
     pub work_right: f64,
     pub work_bottom: f64,
+    // Card placement and work-area width in work-area-local CSS pixels, from
+    // the same native placement math that positions the popup. The frontend
+    // needs real screen space to decide which side a submenu can open toward;
+    // the popup's own viewport width (window.innerWidth) is content-sized and
+    // does not reflect the screen, so it cannot make that decision.
+    pub card_left_css: f64,
+    pub work_width_css: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -206,6 +230,62 @@ pub fn tray_menu_set_card_height(app: AppHandle, height_css: f64) {
 #[cfg(not(target_os = "windows"))]
 pub fn tray_menu_set_card_height(_app: AppHandle, _height_css: f64) {}
 
+// The frontend flips a submenu to the LEFT of the card when there is not
+// enough room on the right. That flyout renders at negative window-local x,
+// outside the content-sized popup, so the window must slide left to make it
+// visible. dx is a physical offset relative to the ORIGINAL placement
+// (negative = slide left, 0 = back at the placed position); the frontend only
+// requests a left slide when the direction math guarantees the flyout fits on
+// screen, so no off-screen clamp is needed beyond keeping the popup inside the
+// work area as a safety net.
+#[tauri::command]
+#[cfg(target_os = "windows")]
+pub fn tray_menu_shift_submenu(app: AppHandle, dx: i32) {
+    if !MENU_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(window) = app.get_webview_window(MENU_LABEL) else {
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let Some((_monitor, work)) = menu_monitor_work_area() else {
+        return;
+    };
+    let Some(base_x) = PLACED_WINDOW_X.lock().ok().and_then(|guard| *guard) else {
+        return;
+    };
+    let x = base_x + dx;
+    if x < work.left {
+        log::warn!("[tray] submenu shift would leave the work area (dx={dx}px, x={x}), skipping");
+        return;
+    }
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(HWND(hwnd.0), &mut rect) }.is_err() {
+        return;
+    }
+    if x == rect.left {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(hwnd.0),
+            Some(HWND_TOPMOST),
+            x,
+            rect.top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    log::debug!("[tray] submenu shift dx={dx}px -> x={x}");
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "windows"))]
+pub fn tray_menu_shift_submenu(_app: AppHandle, _dx: i32) {}
+
 // Timestamp (ms) of the last time the menu was closed, by any path. The tray
 // right-click toggle uses it so a click landing right after a close is treated
 // as a toggle-off instead of reopening. Reopening while the exit fade is still
@@ -229,6 +309,10 @@ struct PlacementState {
     top_flush: bool,
 }
 static LAST_PLACEMENT: Mutex<Option<PlacementState>> = Mutex::new(None);
+// Placed window origin (physical x) from the last place_window. The frontend
+// slides the popup left for a left-opening submenu via tray_menu_shift_submenu
+// and restores it on close, both relative to this origin.
+static PLACED_WINDOW_X: Mutex<Option<i32>> = Mutex::new(None);
 // A right-click on the tray icon produces both Down and Up events. When the
 // popup is already open, close it on Down and consume the matching Up so the
 // same click cannot close, then reopen the menu after a focus-loss callback.
@@ -615,6 +699,7 @@ fn build_data(app: &AppHandle) -> TrayMenuData {
     refresh_rates.sort_unstable_by(|a, b| b.cmp(a));
 
     let (cursor_x, cursor_y, work_left, work_top, work_right, work_bottom) = cursor_and_work_area();
+    let (card_left_css, work_width_css) = tray_placement_css();
     TrayMenuData {
         title: "OLED Helper 2".to_string(),
         monitor_name,
@@ -631,6 +716,8 @@ fn build_data(app: &AppHandle) -> TrayMenuData {
         work_top,
         work_right,
         work_bottom,
+        card_left_css,
+        work_width_css,
     }
 }
 
@@ -779,43 +866,29 @@ fn anchor_screen_point() -> Option<(f64, f64)> {
     CLICK_ANCHOR.lock().ok().and_then(|guard| *guard)
 }
 
+// Result of the shared card-placement math. Both build_data (which sends the
+// card's work-area CSS position to the frontend so it can pick a submenu
+// side from real screen space) and place_window (which positions the native
+// popup) derive from the same click anchor, so they always agree.
 #[cfg(target_os = "windows")]
-fn place_window(window: &WebviewWindow) -> Result<(), String> {
-    let hwnd = window
-        .hwnd()
-        .map_err(|error| format!("could not get tray menu HWND: {error}"))?;
-    let Some((_monitor_rect, work)) = menu_monitor_work_area() else {
-        return Err("could not determine the tray monitor work area".to_string());
-    };
+#[derive(Clone, Copy)]
+struct CardPlacement {
+    work: RECT,
+    scale: f64,
+    card_left_css: f64,
+    card_top_css: f64,
+    card_height_css: f64,
+    work_width_css: f64,
+    bottom_flush: bool,
+    top_flush: bool,
+}
 
-    // Use a small content-sized viewport rather than a transparent
-    // work-area-sized window. A large topmost WebView2 surface can make Edge
-    // defer compositor paints and video frames even though input still gets
-    // processed. The frontend uses local coordinates inside this viewport.
-    // The card is 340px wide. Reserve room for a flyout on either side,
-    // while keeping the native surface compact enough that its right/bottom
-    // edge does not force the card back to the screen's left/top corner.
-    const INITIAL_VIEWPORT_WIDTH_CSS: f64 = 640.0;
-    const INITIAL_VIEWPORT_HEIGHT_CSS: f64 = 430.0;
-    const CARD_WIDTH_CSS: f64 = 340.0;
-    // Fallback until the frontend reports the rendered card height (the card
-    // is shorter with 0-1 favorites, taller with many rows). The measured
-    // height keeps the taskbar-facing edge exactly on the work-area boundary.
-    const CARD_HEIGHT_DEFAULT_CSS: f64 = 361.0;
-    let measured_height = MEASURED_CARD_HEIGHT_CSS.load(Ordering::Acquire) as f64;
-    let card_height_css = if measured_height >= 120.0 {
-        measured_height
-    } else {
-        CARD_HEIGHT_DEFAULT_CSS
-    };
-    // The work area already ends exactly at the taskbar boundary. Keep the
-    // visible card flush with that edge instead of adding another visual
-    // margin; HIT_CUSHION_CSS still keeps the transparent native hit area
-    // outside the card without moving the card away from the taskbar.
-    const CARD_PAD_CSS: f64 = 0.0;
-    const HIT_CUSHION_CSS: f64 = 24.0; // Query DPI from the monitor selected by the current click anchor. The
-                                       // hidden window can retain the old monitor's DPI after a resolution or
-                                       // display transition, so its own scale factor is not authoritative here.
+#[cfg(target_os = "windows")]
+fn card_placement() -> Option<CardPlacement> {
+    let (_monitor_rect, work) = menu_monitor_work_area()?;
+    // Query DPI from the monitor selected by the current click anchor. The
+    // hidden window can retain the old monitor's DPI after a resolution or
+    // display transition, so its own scale factor is not authoritative here.
     let target_monitor = unsafe {
         MonitorFromPoint(
             POINT {
@@ -855,32 +928,83 @@ fn place_window(window: &WebviewWindow) -> Result<(), String> {
     let cursor_local_y = ((cursor_y - work.top as f64) / scale).clamp(0.0, work_height / scale);
     let work_width_css = work_width / scale;
     let work_height_css = work_height / scale;
+    let measured_height = MEASURED_CARD_HEIGHT_CSS.load(Ordering::Acquire) as f64;
+    let card_height_css = if measured_height >= 120.0 {
+        measured_height
+    } else {
+        CARD_HEIGHT_DEFAULT_CSS
+    };
     let max_card_left = (work_width_css - CARD_PAD_CSS - CARD_WIDTH_CSS).max(CARD_PAD_CSS);
     let max_card_top = (work_height_css - CARD_PAD_CSS - card_height_css).max(CARD_PAD_CSS);
     let card_left = (cursor_local_x - CARD_WIDTH_CSS / 2.0).clamp(CARD_PAD_CSS, max_card_left);
     let card_top = (cursor_local_y - card_height_css / 2.0).clamp(CARD_PAD_CSS, max_card_top);
+    Some(CardPlacement {
+        work,
+        scale,
+        card_left_css: card_left,
+        card_top_css: card_top,
+        card_height_css,
+        work_width_css,
+        bottom_flush: card_top >= max_card_top - 0.5,
+        top_flush: card_top <= CARD_PAD_CSS + 0.5,
+    })
+}
+
+// Cross-platform: the frontend needs the card's work-area CSS position and
+// the work-area CSS width to decide which side has room for a submenu.
+#[cfg(target_os = "windows")]
+fn tray_placement_css() -> (f64, f64) {
+    card_placement()
+        .map(|p| (p.card_left_css, p.work_width_css))
+        .unwrap_or((0.0, 0.0))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn tray_placement_css() -> (f64, f64) {
+    (0.0, 0.0)
+}
+
+#[cfg(target_os = "windows")]
+fn place_window(window: &WebviewWindow) -> Result<(), String> {
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("could not get tray menu HWND: {error}"))?;
+    let Some(p) = card_placement() else {
+        return Err("could not determine the tray monitor work area".to_string());
+    };
+
+    // Use a small content-sized viewport rather than a transparent
+    // work-area-sized window. A large topmost WebView2 surface can make Edge
+    // defer compositor paints and video frames even though input still gets
+    // processed. The frontend uses local coordinates inside this viewport.
+    // The card is 340px wide. Reserve room for a flyout on the right, while
+    // keeping the native surface compact enough that its right/bottom edge
+    // does not force the card back to the screen's left/top corner. A flyout
+    // that flips left slides the window left via tray_menu_shift_submenu.
+    let width = (INITIAL_VIEWPORT_WIDTH_CSS + HIT_CUSHION_CSS * 2.0) * p.scale;
+    let height = (INITIAL_VIEWPORT_HEIGHT_CSS + HIT_CUSHION_CSS * 2.0) * p.scale;
+    let x = p.work.left as f64 + (p.card_left_css - HIT_CUSHION_CSS) * p.scale;
+    let y = p.work.top as f64 + (p.card_top_css - HIT_CUSHION_CSS) * p.scale;
     // Capture the placement inputs so a later measured-height report can shift
     // the already-visible popup flush with the taskbar. The height delta is
     // applied relative to the current window rect, so the work area and cursor
     // do not need to be re-derived (the click anchor is consumed on show).
     if let Ok(mut guard) = LAST_PLACEMENT.lock() {
         *guard = Some(PlacementState {
-            scale,
-            used_height_css: card_height_css,
-            bottom_flush: card_top >= max_card_top - 0.5,
-            top_flush: card_top <= CARD_PAD_CSS + 0.5,
+            scale: p.scale,
+            used_height_css: p.card_height_css,
+            bottom_flush: p.bottom_flush,
+            top_flush: p.top_flush,
         });
     }
-    let width = (INITIAL_VIEWPORT_WIDTH_CSS + HIT_CUSHION_CSS * 2.0) * scale;
-    let height = (INITIAL_VIEWPORT_HEIGHT_CSS + HIT_CUSHION_CSS * 2.0) * scale;
-    let desired_x = work.left as f64 + (card_left - HIT_CUSHION_CSS) * scale;
-    let desired_y = work.top as f64 + (card_top - HIT_CUSHION_CSS) * scale;
-    // Do not clamp the native viewport itself to the monitor. The visible
-    // card was already clamped above, and the flyout can extend beyond the
-    // card toward the monitor edge. Clamping the larger viewport shifts the
+    // Remember the placed origin so tray_menu_shift_submenu can slide the
+    // window left for a flipped flyout and restore it on close. The window is
+    // deliberately not clamped to the monitor: the card was already clamped
+    // inside the work area, and clamping the larger viewport would shift the
     // card away from the tray click even when the card itself fits perfectly.
-    let x = desired_x;
-    let y = desired_y;
+    if let Ok(mut guard) = PLACED_WINDOW_X.lock() {
+        *guard = Some(x.round() as i32);
+    }
     unsafe {
         SetWindowPos(
             HWND(hwnd.0),
