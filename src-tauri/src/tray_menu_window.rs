@@ -421,11 +421,13 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
             // bridge/exact region to arrive; if the submenu is still open,
             // the pointer crossed internally and the popup must remain visible.
             // Capture the menu generation so an old blur callback can never
-            // hide a newly reopened tray menu.
+            // hide a newly reopened tray menu. Kept short (60ms) since there
+            // is no exit animation to wait for — the window hides instantly
+            // once this guard clears, so a long delay only reads as sluggish.
             let generation = MENU_GENERATION.load(Ordering::Acquire);
             let delayed_window = blur_window.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::thread::sleep(std::time::Duration::from_millis(60));
                 if MENU_GENERATION.load(Ordering::Acquire) == generation
                     && !SUBMENU_EXPANDED.load(Ordering::Acquire)
                 {

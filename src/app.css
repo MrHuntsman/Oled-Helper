@@ -2643,6 +2643,13 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* With tags off the label is just the resolution (e.g. "3840×2160"), which
+   no longer fills the 110px min-width and would leave dead space on the
+   right. Drop back to the shared 72px floor so the button hugs its content;
+   the dropdown menu is width: max-content, so it is unaffected. */
+.resolution-select.no-tags {
+  min-width: 72px;
+}
 /* Fixed width (not content-sized like .resolution-select), this button's
    label includes the black-level value in parens (e.g. "144 Hz (+0.9)"),
    which changes digit count as the user adjusts black level. A content-fit
@@ -2699,6 +2706,14 @@ button {
 .refresh-rate-select-value {
   color: var(--text-weak);
   font-weight: 500;
+}
+/* Keep the active resolution's name tag clearly separated from the
+   resolution digits in the status-bar button. The separator itself is
+   non-breaking (matching the refresh-rate button's NBSP convention); this
+   margin adds a hair more room so the · never reads as glued to the
+   resolution at the small 11px size. Scoped to the resolution button only. */
+.resolution-select .refresh-rate-select-value {
+  margin-left: 1px;
 }
 .refresh-rate-select.active .refresh-rate-select-value,
 .refresh-rate-select:hover:not(:disabled) .refresh-rate-select-value {

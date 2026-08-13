@@ -713,7 +713,7 @@ fn relaunch_elevated(
         // to change an HDR setting.
         let message = match code {
             1223 => "Elevation cancelled ,  no changes made.".to_string(),
-            5 => "Administrator access denied. Choose \"Yes\" on the prompt to apply.".to_string(),
+            5 => "Administrator access denied.".to_string(),
             2 | 3 => "App not found to restart. Try reinstalling.".to_string(),
             8 => "Out of memory during restart. Close some programs and retry.".to_string(),
             26 => "A required file is in use. Close other app instances and retry.".to_string(),

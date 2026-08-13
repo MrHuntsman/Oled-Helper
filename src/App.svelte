@@ -1260,7 +1260,7 @@
         </span>
       {/if}
       <div class="resolution-wrap">
-        <button type="button" class="resolution-select" class:active={resMenuOpen}
+        <button type="button" class="resolution-select" class:active={resMenuOpen} class:no-tags={!displayMenuPrefs.showTags}
           bind:this={resButtonEl}
           aria-label="Resolution"
           aria-haspopup="listbox"
@@ -1268,8 +1268,7 @@
           title={resolutionError || 'Choose resolution · right-click for list options'}
           disabled={app.displayModeBusy || app.refreshRateBusy || app.displayInfo.resolutions.length === 0}
           onclick={toggleResMenu}
-          oncontextmenu={openResContextMenu}>
-          {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}{#if currentResolutionName()}<span class="refresh-rate-select-value"> · {currentResolutionName()}</span>{/if}
+          oncontextmenu={openResContextMenu}>          {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}{#if displayMenuPrefs.showTags && currentResolutionName()}<span class="refresh-rate-select-value"> · {currentResolutionName()}</span>{/if}
         </button>
         {#snippet resItem(resolution)}
           {@const name = resolutionName(resolution)}

@@ -1145,8 +1145,8 @@
               <span class="tray-item-check">{checked ? '✓' : ''}</span>
               <span class="tray-item-label tray-resolution-label">
                 <span>{res.width}×{res.height}</span>
-                {#if showResolutionTags && ultrawide}<span class="tray-resolution-tag">UW</span>{/if}
-                {#if showResolutionTags && name}<span class="tray-resolution-tag">{name}</span>{/if}
+                {#if showResolutionTags && ultrawide}<span class="tray-ultrawide-tag"><span class="tray-ultrawide-separator">·</span><svg class="tray-ultrawide-icon" viewBox="0 0 32 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="30.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="16" y="10.8" text-anchor="middle" fill="currentColor" font-size="9" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}
+                {#if showResolutionTags && name}<span class="tray-resolution-tag"> · {name}</span>{/if}
                 {#if recommended}<span class="tray-resolution-native">(Native)</span>{/if}
               </span>
               <button
@@ -1184,8 +1184,8 @@
             <span class="tray-item-check">{checked ? '✓' : ''}</span>
             <span class="tray-item-label tray-resolution-label">
               <span>{res.width}×{res.height}</span>
-              {#if showResolutionTags && ultrawide}<span class="tray-resolution-tag">UW</span>{/if}
-              {#if showResolutionTags && name}<span class="tray-resolution-tag">{name}</span>{/if}
+              {#if showResolutionTags && ultrawide}<span class="tray-ultrawide-tag"><span class="tray-ultrawide-separator">·</span><svg class="tray-ultrawide-icon" viewBox="0 0 32 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="30.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="16" y="10.8" text-anchor="middle" fill="currentColor" font-size="9" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}
+              {#if showResolutionTags && name}<span class="tray-resolution-tag"> · {name}</span>{/if}
               {#if recommended}<span class="tray-resolution-native">(Native)</span>{/if}
             </span>
             <button

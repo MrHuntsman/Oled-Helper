@@ -249,6 +249,25 @@
   font-weight: 500;
 }
 
+.tray-ultrawide-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--accent);
+}
+
+.tray-ultrawide-separator {
+  line-height: 1;
+}
+
+.tray-ultrawide-icon {
+  width: 24px;
+  height: 11px;
+  flex-shrink: 0;
+  color: inherit;
+  vertical-align: middle;
+}
+
 .tray-resolution-native {
   color: var(--text-weak);
 }
