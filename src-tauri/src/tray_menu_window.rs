@@ -605,7 +605,7 @@ pub fn tray_menu_hide(app: AppHandle) {
 #[tauri::command]
 pub fn tray_menu_restart(app: AppHandle) {
     hide(&app);
-    crate::request_restart(&app);
+    crate::request_restart(&app, None);
 }
 
 #[tauri::command]

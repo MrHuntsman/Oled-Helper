@@ -5,6 +5,7 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
+mod text_rendering;
 mod tray_balloon;
 // Kept (with dead_code allowed) because the native muda menu is retired but
 // may be reinstated as a fallback: see the DISABLED blocks in setup().
@@ -610,7 +611,21 @@ fn apply_pending_hdr_mode(mode: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn request_restart(app: &AppHandle) {
+// Tab ids the app actually renders (see the tab switch chain in App.svelte);
+// used to validate --open-tab forwarding on restart.
+const KNOWN_TABS: [&str; 9] = [
+    "crush",
+    "dimmer",
+    "windows-hdr",
+    "hotkeys",
+    "text",
+    "debug",
+    "system",
+    "settings",
+    "about",
+];
+
+fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
     // Always perform a real process restart, including when launched through
     // `tauri dev`. Spawn first so a failure leaves the current instance fully
     // functional rather than closing the app.
@@ -624,6 +639,11 @@ fn request_restart(app: &AppHandle) {
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     args.push("--restart-parent".into());
     args.push(std::process::id().to_string().into());
+    if let Some(tab) = open_tab {
+        if KNOWN_TABS.contains(&tab) {
+            args.push(format!("--open-tab={tab}").into());
+        }
+    }
     if let Err(error) = std::process::Command::new(exe).args(args).spawn() {
         log::error!("failed to spawn replacement instance: {error}");
         return;
@@ -704,19 +724,8 @@ fn relaunch_elevated(
     {
         args.push(format!("--hdr-mode={mode}").into());
     }
-    // Only forward tab ids the app actually has (see the tab switch chain in
-    // App.svelte); anything else is ignored rather than carried into the
-    // command line.
-    const KNOWN_TABS: [&str; 8] = [
-        "crush",
-        "dimmer",
-        "windows-hdr",
-        "hotkeys",
-        "debug",
-        "system",
-        "settings",
-        "about",
-    ];
+    // Only forward tab ids the app actually has; anything else is ignored
+    // rather than carried into the command line.
     if let Some(tab) = tab {
         if KNOWN_TABS.contains(&tab.as_str()) {
             args.push(format!("--open-tab={tab}").into());
@@ -1017,6 +1026,16 @@ pub fn run() {
             hdr_toggle::set_sdr_brightness_nits,
             hdr_toggle::get_auto_hdr_enabled,
             hdr_toggle::set_auto_hdr_enabled,
+            text_rendering::text_rendering_get_state,
+            text_rendering::text_rendering_set_mode,
+            text_rendering::text_rendering_set_gamma,
+            text_rendering::text_rendering_set_contrast,
+            text_rendering::text_rendering_reset,
+            text_rendering::text_rendering_restart_app,
+            text_rendering::text_preview_show,
+            text_rendering::text_preview_update,
+            text_rendering::text_preview_set_bounds,
+            text_rendering::text_preview_hide,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,

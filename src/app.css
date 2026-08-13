@@ -3651,3 +3651,77 @@ button {
 .update-check-row.has-update { color: var(--accent); }
 .update-check-row.has-error { color: #e06c6c; flex-wrap: wrap; }
 .update-check-error { min-width: 0; overflow-wrap: anywhere; }
+
+/* ── Text tab (ClearType / subpixel tuning) ──────────────────────────── */
+.text-render-intro {
+  margin: 0 0 12px;
+  color: var(--text-weak);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.text-render-note {
+  margin: 6px 0 10px;
+  color: var(--text-weak);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.text-render-native-preview-host {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 224px;
+  min-height: 224px;
+  margin: 8px 0;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+.text-render-native-preview-fallback {
+  color: var(--text);
+  font: 16px/1.3 'Segoe UI', Inter, system-ui, sans-serif;
+  white-space: nowrap;
+}
+.text-render-inline-modes {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 2px;
+  margin: 8px 0 4px;
+  padding: 2px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--hover) 55%, transparent);
+}
+.text-render-inline-mode {
+  min-width: 78px;
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-weak);
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.text-render-inline-mode:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+.text-render-inline-mode.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.text-render-inline-mode:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.text-render-inline-mode:disabled { cursor: default; opacity: 0.6; }
+.text-render-slider-heading { margin-top: 14px; }
+.text-render-error {
+  margin-top: 12px;
+  color: #E05555;
+  font-size: 12px;
+  line-height: 1.4;
+}

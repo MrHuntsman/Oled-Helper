@@ -897,7 +897,7 @@
       <img class="tray-menu-header-icon" src={appIcon} alt="" aria-hidden="true" />
       <div class="tray-menu-header-copy">
         <div class="tray-menu-header-title-row">
-          <div class="tray-menu-header-title">OLED HELPER<span class="tray-menu-header-version">v{appVersion || '0.1.1'}</span></div>
+          <div class="tray-menu-header-title">OLED HELPER</div>
           <button
             type="button"
             class="hdr-switch"
@@ -914,13 +914,7 @@
           </button>
         </div>
         <div class="tray-menu-header-bottom-row">
-          <div class="tray-menu-header-monitor">
-            {#if display}
-              {display.monitor_name || 'Main display'}
-            {:else}
-              Current display
-            {/if}
-          </div>
+          <div class="tray-menu-header-monitor">v{appVersion || '0.1.1'}</div>
         </div>
       </div>
     </div>

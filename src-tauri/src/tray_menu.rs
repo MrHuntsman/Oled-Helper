@@ -328,7 +328,7 @@ pub fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 }
             }
         }
-        "tray:restart" => crate::request_restart(app),
+        "tray:restart" => crate::request_restart(app, None),
         "tray:quit" => crate::request_shutdown_and_exit(app),
         _ => {}
     }
