@@ -142,6 +142,13 @@ mod display_change_events {
         // also derived from the display topology ,  a change can move it to a
         // different adapter/target, so invalidate it too.
         hdr_toggle::invalidate_hdr_target_cache();
+        // The hidden tray-menu window keeps the DPI context it was born with
+        // (Windows defers a hidden window's DPI transition until it is
+        // shown), so the first open after a mode switch rendered stale-scale
+        // content in two steps. Recreate it in the background so the next
+        // open uses a window born at the current DPI (see
+        // tray_menu_window::handle_display_change).
+        tray_menu_window::handle_display_change(app);
     }
 
     pub fn install(window_handle: isize, app: AppHandle) -> Result<(), String> {

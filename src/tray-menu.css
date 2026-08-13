@@ -124,13 +124,24 @@
 .tray-menu-header-title {
   min-width: 0;
   overflow: hidden;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   color: var(--text);
   font-size: 14px;
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: -0.01em;
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tray-menu-header-version {
+  flex: 0 0 auto;
+  color: var(--text-weak);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
 }
 
 .tray-menu-header-monitor {
@@ -474,7 +485,7 @@
 .tray-dimmer-value {
   flex: 0 0 29px;
   color: var(--text-weak);
-  font-size: 10px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
@@ -596,7 +607,7 @@
 .tray-quick-value {
   flex: 0 0 34px;
   color: var(--text-weak);
-  font-size: 10px;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-align: right;
   white-space: nowrap;
@@ -625,6 +636,18 @@
   gap: 6px;
   padding: 4px 8px;
   font-size: 12px;
+  transition: background 0.08s, color 0.08s, transform 0.08s;
+}
+
+/* Same hover ease as the main app's status-bar dropdowns (.hz-menu-item):
+   a small rightward slide on top of the highlight, applied to the whole
+   row so Resolution and Refresh Rate submenu items move together with
+   their favorite star. Current-mode rows are excluded, they're disabled
+   (aria-disabled, non-interactive), so they should feel static. */
+.tray-submenu .tray-item:hover:not(.tray-current) {
+  background: var(--hover);
+  color: #fff;
+  transform: translateX(2px);
 }
 
 .tray-submenu .tray-item-check {

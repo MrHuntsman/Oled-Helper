@@ -43,6 +43,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const LABEL: &str = "tray-menu";
 static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
 static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
+// Set while a display-change rebuild is in flight so the rapid
+// WM_DISPLAYCHANGE + WM_SETTINGCHANGE pair (and any other burst) coalesces
+// into a single destroy/recreate instead of churning through two of them.
+static REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
 // The resolution submenu includes the same friendly/UW/native labels as the
 // main app, so reserve enough left-side space to keep those tags readable.
 // These are the rendered outer widths: the CSS declarations add 12px of
@@ -204,6 +208,9 @@ fn primary_monitor_scale(fallback: f64) -> f64 {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    log::warn!(
+        "[tray-menu] GetDpiForMonitor failed all 6 attempts; falling back to window scale {fallback}"
+    );
     fallback.max(0.5)
 }
 
@@ -211,8 +218,10 @@ fn primary_monitor_scale(fallback: f64) -> f64 {
 // corner, the same way flyout_window.rs anchors the mode-confirmation popup.
 // The taskbar edge is derived from the monitor's work area (rcWork =
 // rcMonitor minus the taskbar strip): the edge where the two differ is where
-// the taskbar sits. Called once when the menu opens (see toggle below); the
-// window is never resized or moved again while visible.
+// the taskbar sits. Called on each anchor pass when the menu opens (see
+// toggle below); the window is never resized while visible — the final
+// post-show pass only re-applies the position, which is what corrects the
+// DPI-transition shift after a mode switch.
 //
 // anchor_x_px, when given, is the tray icon's click x-position in physical
 // pixels (from the TrayIconEvent) — the visible base-menu card (which sits
@@ -298,26 +307,53 @@ fn taskbar_position(
     None
 }
 
-// Re-anchors the window to the taskbar edge. Called once when the menu
-// opens (see toggle below). anchor_x_px is the tray icon's click x-position
-// in physical pixels, used to center the visible base-menu card on the icon
+// Re-anchors the window to the taskbar edge. Called when the menu opens
+// (see toggle below). anchor_x_px is the tray icon's click x-position in
+// physical pixels, used to center the visible base-menu card on the icon
 // when the taskbar runs horizontally (see taskbar_position).
 //
 // The window's own scale factor can lag the monitor's after a display-mode
 // switch (the first open after a resolution change landed at the wrong y for
 // exactly this reason), so the physical size is derived from the monitor's
-// effective DPI instead of the window's possibly-stale DPI context. The
-// hidden window is resized to that physical size before positioning, so the
-// first visible frame already uses the final CSS scale.
+// effective DPI instead of the window's possibly-stale DPI context.
+//
+// resize=true is the sizing pass: it derives the physical footprint from
+// the monitor's fresh DPI and applies it natively while hidden (set_size
+// alone only updates Tauri's bookkeeping; the native SetWindowPos is what
+// actually moves/resizes the HWND). resize=false is a reposition-only pass
+// (SWP_NOSIZE) that re-samples the taskbar position — Explorer can update
+// rcWork (the taskbar-excluded work area) after rcMonitor has already
+// settled, so the first open after a mode switch can otherwise land a few
+// dozen px off.
+//
+// IMPORTANT (learned from the diagnostic logs): the hidden window's DPI
+// context is NOT updated by these passes. Windows defers a hidden window's
+// DPI transition until the window is shown, and applies it by rescaling the
+// window's pre-change geometry *during* show() — which is why the first
+// open after a resolution change used to land at the old y scaled by the
+// DPI ratio (e.g. y=711 instead of 959 in the logs). toggle() therefore
+// calls this with resize=false once more AFTER show(), when the transition
+// is complete and the position sticks.
 #[cfg(target_os = "windows")]
-fn reposition_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
+fn anchor_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>, resize: bool) {
     let Ok(hwnd) = window.hwnd() else { return };
+    let (width_px, height_px) = if resize {
+        let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
+        let width = (FULL_WIDTH * scale).round().max(1.0) as u32;
+        let height = (FULL_HEIGHT * scale).round().max(1.0) as u32;
+        // Keep Tauri's size bookkeeping in sync so the post-show pass's
+        // outer_size() read reflects the new physical size.
+        if let Err(e) = window.set_size(PhysicalSize::new(width, height)) {
+            log::warn!("[tray-menu] reposition resize failed: {e}");
+        }
+        (width, height)
+    } else {
+        match window.outer_size() {
+            Ok(size) => (size.width as u32, size.height as u32),
+            Err(_) => return,
+        }
+    };
     let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
-    let width_px = (FULL_WIDTH * scale).round().max(1.0) as u32;
-    let height_px = (FULL_HEIGHT * scale).round().max(1.0) as u32;
-    if let Err(e) = window.set_size(PhysicalSize::new(width_px, height_px)) {
-        log::warn!("[tray-menu] reposition resize failed: {e}");
-    }
     let card_width_px = (BASE_WIDTH * scale).round() as i32;
     let Some((x, y)) = taskbar_position(
         width_px as i32,
@@ -327,21 +363,20 @@ fn reposition_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>
     ) else {
         return;
     };
+    let flags = if resize {
+        SWP_NOACTIVATE | SWP_NOZORDER
+    } else {
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE
+    };
+    let size_w = if resize { width_px as i32 } else { 0 };
+    let size_h = if resize { height_px as i32 } else { 0 };
     unsafe {
-        let _ = SetWindowPos(
-            HWND(hwnd.0),
-            None,
-            x,
-            y,
-            0,
-            0,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE,
-        );
+        let _ = SetWindowPos(HWND(hwnd.0), None, x, y, size_w, size_h, flags);
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn reposition_to_taskbar(_window: &tauri::WebviewWindow, _anchor_x_px: Option<i32>) {}
+fn anchor_to_taskbar(_window: &tauri::WebviewWindow, _anchor_x_px: Option<i32>, _resize: bool) {}
 
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(LABEL) {
@@ -420,6 +455,104 @@ pub fn prewarm(app: &AppHandle) {
     }
 }
 
+/// Called when the system reports a display configuration change (mode
+/// switch, topology change). The tray window is pre-warmed once at startup,
+/// so it keeps the DPI context it was born with; Windows only applies a
+/// hidden window's DPI transition when it is shown, which made the first
+/// open after a resolution change render stale-scale content (the two-step
+/// appearance: the WebView's inner height read 736px at the old scale before
+/// snapping to 460px) before the post-show re-anchor repositioned it.
+/// Recreating the window after the mode switch settles gives the next open a
+/// window born at the current monitor's DPI — the first frame is already at
+/// the final scale, so the menu appears in one step.
+///
+/// The rebuild runs on a background thread (the display-change notification
+/// arrives on the main thread) with a short settle so the new mode's monitor
+/// DPI has propagated before the comparison (mirroring flyout_window.rs's
+/// wait_for_display_geometry rationale: DEVMODE can report the mode active
+/// slightly before Windows updates the monitor geometry). Skipped while the
+/// popup is visible (the user is interacting), and skipped when the window's
+/// DPI context already matches the monitor (e.g. a settings broadcast with
+/// no scale change).
+pub fn handle_display_change(app: &AppHandle) {
+    // Coalesce the rapid event bursts (WM_DISPLAYCHANGE + WM_SETTINGCHANGE
+    // arrive ~80ms apart) into a single rebuild.
+    if REBUILD_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // The monitor's DPI can take a moment to propagate after a mode
+        // switch, so poll a couple of times instead of trusting a single
+        // reading — a slow settle must still trigger the rebuild, while an
+        // unrelated settings broadcast (no DPI change) never does.
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // Separate clone for the main-thread closure: run_on_main_thread
+            // borrows `app` (its receiver) while the closure needs to own one.
+            // The closure must return (), so a channel carries the verdict.
+            let (stale_tx, stale_rx) = std::sync::mpsc::channel();
+            let closure_app = app.clone();
+            if app
+                .run_on_main_thread(move || {
+                    let stale = match closure_app.get_webview_window(LABEL) {
+                        Some(window) if !window.is_visible().unwrap_or(false) => {
+                            // Only rebuild when the window's DPI context is
+                            // actually stale relative to the monitor — avoids
+                            // needless churn when an unrelated settings
+                            // broadcast fires with no scale change.
+                            #[cfg(target_os = "windows")]
+                            {
+                                let window_scale = window.scale_factor().unwrap_or(1.0);
+                                let monitor_scale = primary_monitor_scale(window_scale);
+                                (window_scale - monitor_scale).abs() >= 0.05
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                true
+                            }
+                        }
+                        // No window, or the popup is visible (user is
+                        // interacting) — nothing to rebuild.
+                        _ => false,
+                    };
+                    let _ = stale_tx.send(stale);
+                })
+                .is_err()
+            {
+                break;
+            }
+            // Timeout guard (mirrors flyout_window.rs's recv_timeout): if the
+            // scheduled closure is dropped during shutdown it never sends, and
+            // a bare recv() would hang this thread forever.
+            let stale = stale_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or(false);
+            if !stale {
+                continue;
+            }
+            let closure_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                let Some(window) = closure_app.get_webview_window(LABEL) else {
+                    return;
+                };
+                if window.is_visible().unwrap_or(false) {
+                    return;
+                }
+                log::info!("[tray-menu] display change: rebuilding tray window at the new DPI");
+                SUBMENU_EXPANDED.store(false, Ordering::Release);
+                MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
+                let _ = window.destroy();
+                if let Err(e) = get_or_create_window(&closure_app) {
+                    log::warn!("[tray-menu] rebuild after display change failed: {e}");
+                }
+            });
+            break;
+        }
+        REBUILD_PENDING.store(false, Ordering::Release);
+    });
+}
+
 /// Show (or hide, if already visible) the custom tray menu, anchored flush
 /// against the taskbar edge near the tray icon. anchor_x is the click's
 /// physical-pixel x-coordinate from the TrayIconEvent, used to center the
@@ -443,8 +576,21 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     // next show so a stale expanded shape can never intercept the first frame.
     apply_default_hit_region(&window);
     let _ = window.emit_to(LABEL, "tray-menu-show", ());
-    reposition_to_taskbar(&window, Some(anchor_x.round() as i32));
+    // Two-step anchoring (mirrors flyout_window.rs): step 1 moves and sizes
+    // the hidden window at the monitor's fresh DPI (the window's own DPI
+    // context can be stale after a mode switch). Windows defers a hidden
+    // window's DPI transition until it is shown and applies it by rescaling
+    // the window's pre-change geometry *during* show(), which used to put
+    // the first open after a resolution change at the wrong y (e.g. 711
+    // instead of 959). Step 2 runs right after show(), when the transition
+    // is complete and the window's scale matches the monitor, and re-applies
+    // the anchor — it sticks this time. Both steps run in the same
+    // synchronous main-thread block, so no intermediate frame is ever
+    // painted at the stale position.
+    let anchor = Some(anchor_x.round() as i32);
+    anchor_to_taskbar(&window, anchor, true);
     let _ = window.show();
+    anchor_to_taskbar(&window, anchor, false);
     let _ = window.set_focus();
 }
 

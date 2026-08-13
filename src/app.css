@@ -2477,6 +2477,15 @@ button {
   align-items: center;
   gap: 2px;
   border-radius: 5px;
+  transition: background 0.08s, transform 0.08s;
+}
+/* Row-level hover, same highlight + slide as a plain .hz-menu-item (Hz
+   dropdown), applied to the whole row (text + star move together) instead
+   of just the picker button, so hovering anywhere on the row, including the
+   star, gives the same feedback the Hz list has. */
+.res-item:hover:not(.active) {
+  background: var(--hover);
+  transform: translateX(2px);
 }
 .res-item .res-item-main {
   flex: 1 1 auto;
@@ -2485,11 +2494,15 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* The base .hz-menu-item shifts right 2px on hover; inside the row that
-   would slide the text under the star. Keep the picker button stable so
-   only the star's own hover state gives feedback. */
+/* The base .hz-menu-item's own hover (background + its own translateX) is
+   redundant now that the row itself carries both, and would double up the
+   slide. Neutralize it here so only the row-level hover above applies. */
 .res-item .res-item-main:hover {
+  background: none;
   transform: none;
+}
+.res-item:hover .res-item-main {
+  color: #fff;
 }
 .res-item-fav {
   flex: 0 0 auto;

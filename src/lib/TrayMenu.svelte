@@ -12,6 +12,7 @@
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { emit, listen } from '@tauri-apps/api/event';
+  import { getVersion } from '@tauri-apps/api/app';
   import appIcon from './icons/app-icon.png?inline';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
   import tabCrushIcon from './icons/tab_crush.png?inline';
@@ -22,6 +23,10 @@
   let trayBlackProfiles = $state({});
   let trayLegacyBlackProfiles = $state({});
   let traySdrBrightness = $state({ available: false, nits: null });
+  // App version for the tray header, read the same way App.svelte reads it
+  // for the main window's status bar (keeps both in sync with the version
+  // the updater compares against).
+  let appVersion = $state('');
   // Mirror of the main window's Windows HDR state ('unknown' | 'hdr' | 'sdr'),
   // read through the same matchMedia probe the main app uses. Drives the
   // header's SDR/HDR switch and hides the SDR Content Brightness row in SDR.
@@ -803,6 +808,7 @@
     loadTaskbarDimmer();
     loadSdrContentBrightness();
     pollTrayHdrStatus();
+    getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
     const unlisten = listen('tray-menu-show', () => {
       openSubmenu = null;
       pendingFavoriteRemove = null;
@@ -887,7 +893,7 @@
       <img class="tray-menu-header-icon" src={appIcon} alt="" aria-hidden="true" />
       <div class="tray-menu-header-copy">
         <div class="tray-menu-header-title-row">
-          <div class="tray-menu-header-title">OLED HELPER</div>
+          <div class="tray-menu-header-title">OLED HELPER<span class="tray-menu-header-version">v{appVersion || '0.1.1'}</span></div>
           <button
             type="button"
             class="hdr-switch"
