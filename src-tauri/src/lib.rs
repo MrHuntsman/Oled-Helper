@@ -600,6 +600,13 @@ fn request_restart(app: &AppHandle) {
 // frontend intercepts anchor clicks and routes them through here instead.
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
+    // Only allow http/https. ShellExecuteW would otherwise happily launch
+    // arbitrary protocols (file:, cmd:, ms-settings:, javascript:, ...) with
+    // whatever string the webview passes, so constrain the scheme here.
+    let scheme = url.trim().to_ascii_lowercase();
+    if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
+        return Err("only http and https links can be opened".into());
+    }
     let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     let result = unsafe {
         windows::Win32::UI::Shell::ShellExecuteW(

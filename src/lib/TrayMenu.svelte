@@ -616,7 +616,7 @@
     // Without this first pass, the submenu is visible in the browser while
     // Windows still has only the collapsed base-menu region; a fast pointer
     // crossing can blur/hide the window before the exact measurement arrives.
-    const preBase = openSubmenu !== null
+    const preBase = (openSubmenu !== null || pendingFavoriteRemove !== null)
       ? menuRect(document.querySelector('.tray-menu'))
       : null;
     const preinstall = preBase
@@ -648,7 +648,7 @@
       await tick();
       const base = menuRect(document.querySelector('.tray-menu'));
       if (!base) return;
-      const expanded = openSubmenu !== null;
+      const expanded = openSubmenu !== null || pendingFavoriteRemove !== null;
       const submenuEl = expanded
         ? document.querySelector('.tray-submenu')
         : null;
@@ -882,7 +882,7 @@
 
 <div
   class="tray-menu-wrap"
-  class:tray-submenu-open={openSubmenu !== null}
+  class:tray-submenu-open={openSubmenu !== null || pendingFavoriteRemove !== null}
   role="menu"
   tabindex="-1"
   onmouseenter={cancelScheduledSubmenuClose}
@@ -921,18 +921,6 @@
       </div>
     </div>
 
-    {#if pendingFavoriteRemove}
-      <div class="tray-favorite-confirm" role="dialog" aria-modal="true" aria-labelledby="tray-favorite-confirm-title">
-        <div id="tray-favorite-confirm-title" class="tray-favorite-confirm-title">Remove favorite?</div>
-        <div class="tray-favorite-confirm-copy">
-          Remove {pendingFavoriteRemove.width}×{pendingFavoriteRemove.height} @ {pendingFavoriteRemove.hz} Hz?
-        </div>
-        <div class="tray-favorite-confirm-actions">
-          <button type="button" class="tray-favorite-confirm-btn" onclick={cancelFavoriteRemove}>Cancel</button>
-          <button type="button" class="tray-favorite-confirm-btn tray-favorite-confirm-danger" onclick={confirmFavoriteRemove}>Remove</button>
-        </div>
-      </div>
-    {:else}
     <div
       class="tray-item"
       class:open={openSubmenu === 'resolution'}
@@ -1101,8 +1089,20 @@
     <div class="tray-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={quit} onkeydown={(e) => e.key === 'Enter' && quit()}>
       <span class="tray-item-label">Quit</span>
     </div>
-    {/if}
   </div>
+
+  {#if pendingFavoriteRemove}
+    <div class="tray-submenu tray-favorite-confirm" role="dialog" aria-modal="true" aria-labelledby="tray-favorite-confirm-title" style="margin-bottom: {submenuLift}px">
+      <div id="tray-favorite-confirm-title" class="tray-favorite-confirm-title">Remove favorite?</div>
+      <div class="tray-favorite-confirm-copy">
+        Remove {pendingFavoriteRemove.width}×{pendingFavoriteRemove.height} @ {pendingFavoriteRemove.hz} Hz?
+      </div>
+      <div class="tray-favorite-confirm-actions">
+        <button type="button" class="tray-favorite-confirm-btn" onclick={cancelFavoriteRemove}>Cancel</button>
+        <button type="button" class="tray-favorite-confirm-btn tray-favorite-confirm-danger" onclick={confirmFavoriteRemove}>Remove</button>
+      </div>
+    </div>
+  {/if}
 
   {#if openSubmenu === 'resolution' && display}
     <div class="tray-submenu tray-resolution-submenu" role="menu" tabindex="-1" style="margin-bottom: {submenuLift}px">

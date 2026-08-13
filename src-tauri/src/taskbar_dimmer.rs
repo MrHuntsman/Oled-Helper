@@ -729,10 +729,16 @@ mod platform {
         if guard.is_some() {
             return;
         }
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("taskbar-dimmer-elevation".into())
             .spawn(elevation_win_event_thread_loop)
-            .expect("taskbar dimmer elevation WinEvent thread");
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::error!("[taskbar-dimmer] could not start elevation WinEvent thread: {error}");
+                return;
+            }
+        };
         *guard = Some(handle);
     }
 
@@ -1262,10 +1268,16 @@ mod platform {
         }
         TICK_THREAD_SHUTDOWN.store(false, Ordering::Relaxed);
         TICK_INTERVAL_MS.store(POLL_INTERVAL_MS.load(Ordering::Relaxed), Ordering::Relaxed);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("taskbar-dimmer-tick".into())
             .spawn(tick_thread_loop)
-            .expect("taskbar dimmer tick thread");
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::error!("[taskbar-dimmer] could not start tick thread: {error}");
+                return;
+            }
+        };
         *guard = Some(handle);
     }
 
@@ -1307,7 +1319,7 @@ mod platform {
             };
             let (guard, wait_result) = TICK_WAKE_CONDVAR
                 .wait_timeout(guard, Duration::from_millis(wait_ms))
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             drop(guard);
             if TICK_THREAD_SHUTDOWN.load(Ordering::Relaxed) {
                 break;
@@ -1470,10 +1482,16 @@ mod platform {
         if guard.is_some() {
             return;
         }
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("taskbar-dimmer-mouse-hook".into())
             .spawn(mouse_hook_thread_loop)
-            .expect("taskbar dimmer mouse hook thread");
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::error!("[taskbar-dimmer] could not start mouse hook thread: {error}");
+                return;
+            }
+        };
         *guard = Some(handle);
     }
 
@@ -2244,7 +2262,7 @@ pub fn set_taskbar_dimmer(
     let raw = state
         .overlay
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .ok_or_else(|| "taskbar dimmer native overlay is not initialized".to_string())?;
     let fade_in_duration_ms = fade_in_duration_ms.clamp(0, 1000);
     let fade_out_duration_ms = fade_out_duration_ms.clamp(0, 1000);

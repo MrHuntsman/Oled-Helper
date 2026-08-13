@@ -34,6 +34,9 @@ const MANIFEST_URL: &str =
 // Used only for release notes/date in the update modal (best effort).
 const RELEASE_API_URL: &str =
     "https://api.github.com/repos/MrHuntsman/Oled-Helper-v2/releases/latest";
+// Sanity cap on the staged download. A corrupt/bad manifest must never be able
+// to point the updater at a multi-GB file and exhaust the disk next to the exe.
+const MAX_UPDATE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
 
 #[derive(Serialize, Clone)]
 pub struct UpdateInfo {
@@ -177,6 +180,12 @@ pub async fn download_update(
                 .into(),
         );
     }
+    // Only HTTPS is acceptable for the download itself. The URL is normally
+    // read back from the manifest, but the command is otherwise unconstrained,
+    // so enforce the scheme rather than trusting the caller.
+    if !url.trim().to_ascii_lowercase().starts_with("https://") {
+        return Err("update downloads must use HTTPS; the update was aborted.".into());
+    }
     let target = update_staging_path()?;
     let client = http_client()?;
     let response = client
@@ -191,6 +200,9 @@ pub async fn download_update(
         ));
     }
     let total = response.content_length().unwrap_or(0);
+    if total > MAX_UPDATE_SIZE {
+        return Err("the update is larger than the allowed size; the update was aborted.".into());
+    }
     let mut file = std::fs::File::create(&target).map_err(|error| {
         format!(
             "the app folder is not writable ({error}). Move OLED Helper to a writable folder to update it."
@@ -205,6 +217,10 @@ pub async fn download_update(
         file.write_all(&chunk)
             .map_err(|error| format!("could not write the update: {error}"))?;
         downloaded += chunk.len() as u64;
+        if downloaded > MAX_UPDATE_SIZE {
+            let _ = std::fs::remove_file(&target);
+            return Err("the update exceeded the allowed size; the update was aborted.".into());
+        }
         let _ = app.emit("update-progress", Progress { downloaded, total });
     }
     file.flush()

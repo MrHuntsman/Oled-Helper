@@ -317,6 +317,11 @@
 }
 
 .tray-favorite-confirm {
+  /* Wider than the default submenu (140–150px) so the remove copy doesn't
+     wrap awkwardly; still bounded well under the base menu's 270px. */
+  width: 200px;
+  min-width: 200px;
+  max-width: 200px;
   padding: 12px 12px 10px;
 }
 

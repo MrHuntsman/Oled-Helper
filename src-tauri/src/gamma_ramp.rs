@@ -1,7 +1,13 @@
 // gamma_ramp.rs ,  256-entry 16-bit gamma ramps using a Reinhard-based shadow-recovery curve.
 // Pure black (index 0) is always left untouched.
 
-use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC};
+use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+// Use the windows crate's typed bindings (gdi32!SetDeviceGammaRamp) rather than
+// a hand-rolled `#[link(name = "gdi32")]` extern block. The crate models the
+// ramp payload as an opaque `*const c_void`, so we keep our own `GammaRamp`
+// struct below; its layout (red/green/blue, 256 × u16 each) matches the Win32
+// GAMMA_RAMP memory layout.
+use windows::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -19,12 +25,6 @@ impl GammaRamp {
             blue: [0u16; 256],
         }
     }
-}
-
-#[link(name = "gdi32")]
-extern "system" {
-    pub fn SetDeviceGammaRamp(hdc: HDC, lpramp: *const GammaRamp) -> i32;
-    pub fn GetDeviceGammaRamp(hdc: HDC, lpramp: *mut GammaRamp) -> i32;
 }
 
 pub fn build_ramp(black_lift: i32) -> GammaRamp {
@@ -63,14 +63,20 @@ pub fn build_linear_ramp() -> GammaRamp {
     ramp
 }
 
+/// Applies a ramp to the PRIMARY display only (`GetDC(None)` targets the
+/// desktop DC of the primary monitor). The Black Crush profile keys in the
+/// frontend are scoped per-monitor, but the gamma write always lands on the
+/// primary; on multi-monitor setups a profile selected for a secondary monitor
+/// therefore cannot actually be applied there. Keep this in mind when
+/// extending per-monitor calibration.
 pub unsafe fn set_display_ramp(ramp: &GammaRamp) -> bool {
     let hdc = GetDC(None);
     if hdc.0.is_null() {
         return false;
     }
-    let ok = SetDeviceGammaRamp(hdc, ramp);
+    let ok = SetDeviceGammaRamp(hdc, ramp as *const GammaRamp as *const std::ffi::c_void);
     ReleaseDC(None, hdc);
-    ok != 0
+    ok.as_bool()
 }
 
 pub unsafe fn reset_display_ramp() {
@@ -86,9 +92,9 @@ pub unsafe fn get_display_ramp() -> Option<GammaRamp> {
         return None;
     }
     let mut ramp = GammaRamp::zeroed();
-    let ok = GetDeviceGammaRamp(hdc, &mut ramp);
+    let ok = GetDeviceGammaRamp(hdc, &mut ramp as *mut GammaRamp as *mut std::ffi::c_void);
     ReleaseDC(None, hdc);
-    if ok != 0 {
+    if ok.as_bool() {
         Some(ramp)
     } else {
         None

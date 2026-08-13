@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, loadConfig, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -1000,11 +1000,6 @@
 
   $effect(() => {
     document.documentElement.setAttribute('data-hdr', app.hdrStatus === 'hdr' ? 'true' : 'false');
-  });
-
-  // Load persisted config (black level) once on startup.
-  $effect(() => {
-    loadConfig();
   });
 
   // Event-driven HDR detection, matchMedia fires when Windows HDR is

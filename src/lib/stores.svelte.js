@@ -367,7 +367,9 @@ export function blackLevelDisplayForRefreshRate(hz) {
   const value = key && key === currentKey
     ? crush.adjustment
     : profileValue(key) ?? (hzKey(hz) && legacyBlackProfiles[hzKey(hz)]);
-  if (!value) return '';
+  // `null` (rather than '') so callers can distinguish "no profile" from a
+  // real formatted value without relying on string-vs-number falsiness.
+  if (!value) return null;
   return `${value > 0 ? '+' : ''}${(value / 10).toFixed(1)}`;
 }
 export function setHideCalibrationInterface(enabled) { crush.hideCalibrationInterface = enabled; saveConfig(); }
@@ -467,32 +469,44 @@ export async function loadConfig(prefetchedCfg = null) {
         }
       }
     }
-    try {
-      const status = await invoke('get_taskbar_dimmer_status');
-      if (status) taskbarDimmer.available = status.available !== false;
-    } catch { taskbarDimmer.available = false; }
-    if (!taskbarDimmer.available) {
-      // Transient false reading (tray restart, shell settling) ,  re-check with
-      // backoff instead of latching "unavailable" for the rest of the session.
-      clearTimeout(dimmerAvailabilityRetryTimer);
-      dimmerAvailabilityRetryTimer = null;
-      dimmerAvailabilityRetryEpoch++;
-      scheduleDimmerAvailabilityRecheck(5, dimmerAvailabilityRetryEpoch);
-    }
-    try {
-      await invoke('set_taskbar_dimmer', { enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, immediate: true });
-    } catch (e) {
-      // Transient failure (the shell can still be settling Shell_TrayWnd right
-      // after a tray restart). Do NOT overwrite the loaded toggle state with
-      // false ,  that silently erased the persisted ON state. The availability
-      // recheck re-applies the settings once the taskbar is reachable again.
-      console.warn('[taskbar-dimmer] initial apply failed, keeping loaded state', e);
-    }
   } catch (e) {
     console.warn('[config] load failed', e);
   } finally {
     configLoaded.v = true;
     applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
+  }
+  // Deferred and non-blocking: the dimmer availability snapshot and initial
+  // apply can be slow while the shell settles (right after a tray restart),
+  // so they must not delay the first paint. See initTaskbarDimmerRuntime.
+  initTaskbarDimmerRuntime();
+}
+
+// Taskbar dimmer availability snapshot + initial apply. Kept out of the
+// awaited loadConfig path on purpose: get_taskbar_dimmer_status and the first
+// set_taskbar_dimmer call can block briefly while Shell_TrayWnd is being
+// recreated (tray restart, resolution change), and delaying the main window's
+// first paint for that is a worse failure than a momentarily-stale dimmer tab.
+export async function initTaskbarDimmerRuntime() {
+  try {
+    const status = await invoke('get_taskbar_dimmer_status');
+    if (status) taskbarDimmer.available = status.available !== false;
+  } catch { taskbarDimmer.available = false; }
+  if (!taskbarDimmer.available) {
+    // Transient false reading (tray restart, shell settling) ,  re-check with
+    // backoff instead of latching "unavailable" for the rest of the session.
+    clearTimeout(dimmerAvailabilityRetryTimer);
+    dimmerAvailabilityRetryTimer = null;
+    dimmerAvailabilityRetryEpoch++;
+    scheduleDimmerAvailabilityRecheck(5, dimmerAvailabilityRetryEpoch);
+  }
+  try {
+    await invoke('set_taskbar_dimmer', { enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, immediate: true });
+  } catch (e) {
+    // Transient failure (the shell can still be settling Shell_TrayWnd right
+    // after a tray restart). Do NOT overwrite the loaded toggle state with
+    // false ,  that silently erased the persisted ON state. The availability
+    // recheck re-applies the settings once the taskbar is reachable again.
+    console.warn('[taskbar-dimmer] initial apply failed, keeping loaded state', e);
   }
 }
 
@@ -581,7 +595,11 @@ function flushTaskbarDimmerUpdate() {
     .catch((e) => {
       console.warn('[taskbar-dimmer] update failed', e);
       if (update.version === taskbarDimmerUpdateVersion) {
-        taskbarDimmer.enabled = false;
+        // Keep the user's requested state rather than forcing 'off'. A
+        // transient failure means the overlay wasn't reachable yet; the
+        // availability recheck (and the backend's taskbar-dimmer-available
+        // event) re-applies this same state once the overlay returns, so
+        // wiping `enabled` here would silently drop the persisted ON intent.
         emitTaskbarDimmerChanged();
       }
       // A failed persist=true update still represents the user's intent ,  queue
@@ -700,7 +718,6 @@ export function setDimmerVerboseLogging(enabled) {
 export function setContextMenuEnabled(enabled) {
   debugSettings.contextMenuEnabled = enabled;
 }
-export function accentColor() { return app.hdrStatus === 'hdr' ? '#FFCC00' : '#4CA6FF'; }
 export function pollHDRStatus() {
   try { app.hdrStatus = window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'sdr'; } catch { }
 }
@@ -842,7 +859,6 @@ export function pollDisplayInfo() {
   }).catch(() => scheduleDisplayInfoRetry());
 }
 export const envTick = $state({ n: 0 });
-export function bumpEnvTick() { envTick.n++; }
 
 // Cross-component dismiss tick for the right-click context menus. The status
 // bar's res/hz context menu handlers stopPropagation() the contextmenu event

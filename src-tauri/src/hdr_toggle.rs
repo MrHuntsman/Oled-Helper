@@ -374,10 +374,15 @@ fn query_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
     }
 }
 
-// Undocumented CCD device info type for SET SDR white level. The standard
-// windows-rs crate only exposes the GET variant; this SET constant (matching
-// the ledoge/set_maxtml reference implementation) is committed through
-// DisplayConfigSetDeviceInfo.
+// Undocumented CCD device info type for SET SDR white level. The public
+// windows-rs crate only exposes the GET variant (value 11 in the current SDK's
+// positive renumbering); the SET variant was never documented. Its value is
+// 0xFFFFFFEE (-18) in the preview-era negative numbering, matching the
+// ledoge/set_maxtml reference implementation, and Windows still honors it
+// alongside the positive GET value. set_sdr_white_level_ccd verifies every
+// write by reading back through the documented GET path, so a Windows change
+// to this internal type number is detected at runtime rather than silently
+// no-opping.
 const DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL_I: i32 = -18; // 0xFFFFFFEE
 
 // The SET form carries an extra `finalValue` byte beyond the GET struct
@@ -450,6 +455,19 @@ fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
         }
     }
     LAST_SDR_WRITE_AT.store(now_ms(), Ordering::Relaxed);
+    // The SET device-info type above is undocumented, so confirm it took effect
+    // by reading back through the documented GET path. A mismatch is the first
+    // signal that a Windows update changed the internal type number or that the
+    // driver quantized the value. Only a mismatch is logged to keep slider
+    // drags quiet; the Windows HDR tab's 500ms poll shows the same readback.
+    if let Ok(Some(readback)) = query_sdr_white_level() {
+        if (readback.nits - nits).abs() > 1.0 {
+            log::warn!(
+                "[hdr] SDR white level set to {nits:.0} nits but read back {:.1} nits — the SET may not have applied",
+                readback.nits
+            );
+        }
+    }
     Ok(SdrWhiteLevel { raw, nits })
 }
 

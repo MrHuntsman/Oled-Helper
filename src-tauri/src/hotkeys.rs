@@ -91,6 +91,18 @@ pub fn gamma_write_guard() -> std::sync::MutexGuard<'static, ()> {
 // unrecognised keys. The key names match exactly what the frontend capture UI
 // produces (see TabHotkeys.svelte) so a captured combo always round-trips.
 
+// Case-insensitive prefix strip for the modifier names ("Ctrl+", "ctrl+", ...).
+// The prefixes are ASCII, so slicing at their length is always on a char
+// boundary.
+fn strip_modifier<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let end = prefix.len();
+    if s.len() >= end && s[..end].eq_ignore_ascii_case(prefix) {
+        Some(&s[end..])
+    } else {
+        None
+    }
+}
+
 pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     if s.is_empty() || s.eq_ignore_ascii_case("none") {
         return None;
@@ -98,16 +110,16 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     let mut mods: u32 = 0;
     let mut key_part = s;
     loop {
-        if let Some(rest) = key_part.strip_prefix("Win+") {
+        if let Some(rest) = strip_modifier(key_part, "Win+") {
             mods |= MOD_WIN.0;
             key_part = rest;
-        } else if let Some(rest) = key_part.strip_prefix("Ctrl+") {
+        } else if let Some(rest) = strip_modifier(key_part, "Ctrl+") {
             mods |= MOD_CONTROL.0;
             key_part = rest;
-        } else if let Some(rest) = key_part.strip_prefix("Alt+") {
+        } else if let Some(rest) = strip_modifier(key_part, "Alt+") {
             mods |= MOD_ALT.0;
             key_part = rest;
-        } else if let Some(rest) = key_part.strip_prefix("Shift+") {
+        } else if let Some(rest) = strip_modifier(key_part, "Shift+") {
             mods |= MOD_SHIFT.0;
             key_part = rest;
         } else {
@@ -115,10 +127,13 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
         }
     }
 
+    // Match the key name case-insensitively (a hand-edited config may use
+    // "esc"/"pgup" instead of the canonical "Esc"/"PgUp"). The table is small,
+    // so a linear scan is both simple and fast.
     let vk = key_table()
-        .binary_search_by_key(&key_part, |&(name, _)| name)
-        .ok()
-        .map(|i| key_table()[i].1)?;
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key_part))
+        .map(|(_, vk)| *vk)?;
     Some((mods, vk))
 }
 
@@ -283,6 +298,13 @@ pub fn register_all() -> Result<(), String> {
             continue;
         };
         let Some((mods, vk)) = parse_hotkey(combo) else {
+            // "None"/empty is the unbound marker and is skipped silently; only a
+            // real, non-empty combo that fails to parse is surfaced as an error
+            // (e.g. a hand-edited config entry).
+            let trimmed = combo.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none") {
+                errors.push(format!("{action}: unrecognized key combination '{combo}'"));
+            }
             continue;
         };
         // "None" is stored as the unbound marker; parse_hotkey returns None for
@@ -626,13 +648,31 @@ mod tests {
         assert_eq!(parse_hotkey("Ctrl++"), None);
     }
     #[test]
-    fn key_table_is_sorted_for_binary_search() {
-        // parse_hotkey uses binary_search_by_key, which requires the table to
-        // be sorted ,  a regression here silently drops a key from the lookup.
-        let entries: Vec<(&str, u32)> = key_table().to_vec();
-        let mut sorted = entries.clone();
-        sorted.sort_by_key(|(name, _)| *name);
-        assert_eq!(entries, sorted, "KEY_TABLE must stay sorted");
-        assert!(!entries.is_empty());
+    fn key_table_has_unique_names() {
+        // parse_hotkey now matches case-insensitively via a linear scan, so a
+        // duplicate name (or two names that differ only by case) would be
+        // ambiguous and the first match would silently win.
+        let names: Vec<&str> = key_table().iter().map(|(name, _)| *name).collect();
+        let mut lowered: Vec<String> = names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let unique = lowered.len();
+        lowered.sort();
+        lowered.dedup();
+        assert_eq!(unique, lowered.len(), "key names must be unique (case-insensitively)");
+        assert!(!names.is_empty());
+    }
+    #[test]
+    fn parses_modifiers_case_insensitively() {
+        assert_eq!(
+            parse_hotkey("ctrl+alt+f9"),
+            Some((MOD_CONTROL.0 | MOD_ALT.0, 0x78))
+        );
+        assert_eq!(
+            parse_hotkey("ctrl+SHIFT+space"),
+            Some((MOD_CONTROL.0 | MOD_SHIFT.0, 0x20))
+        );
+        assert_eq!(parse_hotkey("CTRL+pgup"), Some((MOD_CONTROL.0, 0x21)));
     }
 }
