@@ -27,11 +27,11 @@ use windows::Win32::System::Registry::{
     REG_VALUE_TYPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    SendMessageTimeoutW, SystemParametersInfoW, FE_FONTSMOOTHINGCLEARTYPE,
+    PostMessageW, SystemParametersInfoW, FE_FONTSMOOTHINGCLEARTYPE,
     FE_FONTSMOOTHINGORIENTATIONBGR, FE_FONTSMOOTHINGORIENTATIONRGB, FE_FONTSMOOTHINGSTANDARD,
-    HWND_BROADCAST, SMTO_ABORTIFHUNG, SPI_SETFONTSMOOTHING, SPI_SETFONTSMOOTHINGCONTRAST,
+    HWND_BROADCAST, SPI_SETFONTSMOOTHING, SPI_SETFONTSMOOTHINGCONTRAST,
     SPI_SETFONTSMOOTHINGORIENTATION, SPI_SETFONTSMOOTHINGTYPE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, WM_FONTCHANGE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE, WM_FONTCHANGE,
     WM_SETTINGCHANGE,
 };
 
@@ -190,17 +190,20 @@ fn write_dword(subkey: &str, value: &str, data: u32) -> Result<(), String> {
 // Tells the shell and text-rendering subsystems to re-read the changed font
 // smoothing settings. SystemParametersInfo already broadcasts when given
 // SPIF_SENDCHANGE; this extra broadcast covers the registry-only writes.
+//
+// Posted asynchronously like broadcast_font_change: a synchronous broadcast
+// to every top-level window would block the UI thread on each contrast/gamma
+// slider tick, which is the whole reason those controls feel laggy.
+// Fire-and-forget is enough — apps pick the change up whenever they next run
+// their message loop.
 fn broadcast_settings_change() {
     unsafe {
         let msg = wide("Windows");
-        let _ = SendMessageTimeoutW(
-            HWND_BROADCAST,
+        let _ = PostMessageW(
+            Some(HWND_BROADCAST),
             WM_SETTINGCHANGE,
             WPARAM(0),
             LPARAM(msg.as_ptr() as isize),
-            SMTO_ABORTIFHUNG,
-            5000,
-            None,
         );
     }
 }
@@ -209,22 +212,34 @@ fn broadcast_settings_change() {
 // settings changed, so they flush their glyph caches. Sent alongside the
 // WM_SETTINGCHANGE broadcast on mode changes only — a full cache flush on
 // every gamma/contrast slider tick would be wasteful.
+//
+// Posted asynchronously (PostMessage) instead of sent synchronously: a
+// synchronous broadcast to every top-level window on the desktop blocks the
+// UI thread until each one answers, which is what makes mode switching feel
+// sluggish. The notification is fire-and-forget — other apps pick it up
+// whenever they next run their message loop — so the command returns as soon
+// as it is queued.
 fn broadcast_font_change() {
     unsafe {
-        let _ = SendMessageTimeoutW(
-            HWND_BROADCAST,
+        let _ = PostMessageW(
+            Some(HWND_BROADCAST),
             WM_FONTCHANGE,
             WPARAM(0),
             LPARAM(0),
-            SMTO_ABORTIFHUNG,
-            5000,
-            None,
         );
     }
 }
 
+// The mode-changing SPI calls persist with SPIF_UPDATEINIFILE but skip
+// SPIF_SENDCHANGE: that flag makes SystemParametersInfo synchronously
+// broadcast WM_SETTINGCHANGE to every top-level window, and a mode click
+// would fire three of those broadcasts back-to-back, which is the main
+// reason switching modes feels sluggish. The native preview repaints through
+// its own PREVIEW_UPDATE message, other renderers pick up the change via the
+// async WM_FONTCHANGE notification from apply_mode, and everything else in
+// the app re-reads these values at startup anyway.
 fn update_flags() -> SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS {
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(SPIF_UPDATEINIFILE.0 | SPIF_SENDCHANGE.0)
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(SPIF_UPDATEINIFILE.0)
 }
 
 fn set_smoothing_enabled(enabled: bool) -> Result<(), String> {
@@ -302,7 +317,9 @@ fn apply_directwrite(mode: &str) -> Result<(), String> {
     };
     write_dword(AVALON_SUBKEY, "PixelStructure", pixel_structure)?;
     write_dword(AVALON_SUBKEY, "ClearTypeLevel", cleartype_level)?;
-    broadcast_settings_change();
+    // No explicit broadcast here: apply_mode issues the async WM_FONTCHANGE
+    // notify for the whole desktop, and every SPI call in the mode path skips
+    // SPIF_SENDCHANGE so mode clicks never block on synchronous broadcasts.
     Ok(())
 }
 
@@ -504,60 +521,99 @@ mod native_preview {
                         .map(|value| value.is_some())
                         .unwrap_or(false);
                     if preview_ready {
-                        // Keep the exact same glyph sequence and horizontal
-                        // Show the first four sizes in two comparison columns:
-                        // actual size on the left and a 400% version on the
-                        // right. The rows share their baseline so the change
-                        // is easy to inspect without shifting between samples.
+                        // Two comparison columns: actual size on the left and a
+                        // 400% raster-zoomed version on the right. The left
+                        // column has four sentence rows at increasing sizes
+                        // (8, 10, 12, 15) followed by four digit rows
+                        // ("0123456789") at the same sizes; the right column
+                        // zooms the sentence rows 4x. The "400% zoom" caption
+                        // lives in the app HTML above the preview.
                         let text: Vec<u16> =
                             "The quick brown fox jumps over the lazy dog"
                                 .encode_utf16()
                                 .collect();
+                        let digits: Vec<u16> = "0123456789".encode_utf16().collect();
                         let row_sizes = [8i32, 10, 12, 15];
+                        let zoom_factor = 4i32;
                         let dpi = GetDpiForWindow(hwnd).max(96);
                         let top_padding = ((2u32 * dpi) / 96).max(1) as i32;
                         let horizontal_margin = ((10u32 * dpi) / 96).max(1) as i32;
                         let column_gap = ((12u32 * dpi) / 96).max(1) as i32;
+                        let row_gap = ((2u32 * dpi) / 96).max(1) as i32;
+                        let digits_gap = (((6u32) * dpi) / 96).max(1) as i32;
                         let split_x = client.left + (client.right - client.left) / 2;
-                        let mut row_top = client.top + top_padding;
+                        let content_top = client.top + top_padding;
                         let _ = SetBkMode(hdc, TRANSPARENT);
                         let _ = SetTextColor(hdc, COLORREF(0x00f0ecec));
 
+                        // Left column: lines stack at their own height plus a
+                        // small gap, top-aligned.
+                        let mut left_cursor = content_top;
+                        // Right column: zoomed rows, stacked with no gap.
+                        let mut right_top = content_top;
+
+                        unsafe fn draw_left_row(
+                            hdc: HDC,
+                            rect: &mut RECT,
+                            text: &[u16],
+                            size: i32,
+                            dpi: u32,
+                        ) {
+                            let font = font_for_size(size, dpi);
+                            let old_font = SelectObject(hdc, font.into());
+                            let mut buf = text.to_vec();
+                            let _ = DrawTextW(
+                                hdc,
+                                &mut buf,
+                                rect,
+                                DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_VCENTER,
+                            );
+                            let _ = SelectObject(hdc, old_font);
+                            let _ = DeleteObject(font.into());
+                        }
+
+                        // Left column: sentence rows at increasing sizes.
+                        for size in row_sizes {
+                            let base_height = (((size + 2) as u32 * dpi) / 96).max(1) as i32;
+                            let mut left_rect = RECT {
+                                left: client.left + horizontal_margin,
+                                top: left_cursor,
+                                right: split_x - column_gap,
+                                bottom: (left_cursor + base_height).min(client.bottom - 1),
+                            };
+                            draw_left_row(hdc, &mut left_rect, &text, size, dpi);
+                            left_cursor += base_height + row_gap;
+                        }
+
+                        // Left digit rows at the same increasing sizes,
+                        // separated from the sentences by a small gap. The
+                        // right column shows the sentence text only (not the
+                        // digits), zoomed 4x.
+                        left_cursor += digits_gap;
+                        for size in row_sizes {
+                            let base_height = (((size + 2) as u32 * dpi) / 96).max(1) as i32;
+                            let mut digits_left_rect = RECT {
+                                left: client.left + horizontal_margin,
+                                top: left_cursor,
+                                right: split_x - column_gap,
+                                bottom: (left_cursor + base_height).min(client.bottom - 1),
+                            };
+                            draw_left_row(hdc, &mut digits_left_rect, &digits, size, dpi);
+                            left_cursor += base_height + row_gap;
+                        }
+
+                        // Right column: the sentence rows at 4x zoom.
                         for size in row_sizes {
                             let base_height = (((size + 2) as u32 * dpi) / 96).max(1) as i32;
                             let zoom_height = base_height * 4;
-                            let left_top = row_top + (zoom_height - base_height) / 2;
-                            let mut left_rect = RECT {
-                                left: client.left + horizontal_margin,
-                                top: left_top,
-                                right: split_x - column_gap,
-                                bottom: (left_top + base_height).min(client.bottom - 1),
-                            };
                             let right_rect = RECT {
                                 left: split_x + column_gap,
-                                top: row_top,
+                                top: right_top,
                                 right: client.right - horizontal_margin,
-                                bottom: (row_top + zoom_height).min(client.bottom - 1),
+                                bottom: (right_top + zoom_height).min(client.bottom - 1),
                             };
-
-                            let left_font = font_for_size(size, dpi);
-                            let old_left_font = SelectObject(hdc, left_font.into());
-                            let mut left_text = text.clone();
-                            let _ = DrawTextW(
-                                hdc,
-                                &mut left_text,
-                                &mut left_rect,
-                                DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_VCENTER,
-                            );
-                            let _ = SelectObject(hdc, old_left_font);
-                            let _ = DeleteObject(left_font.into());
-
-                            draw_raster_zoom_row(hdc, right_rect, &text, size, dpi, 4);
-
-                            row_top += zoom_height;
-                            if row_top >= client.bottom {
-                                break;
-                            }
+                            draw_raster_zoom_row(hdc, right_rect, &text, size, dpi, zoom_factor);
+                            right_top += zoom_height;
                         }
                     }
                     let _ = EndPaint(hwnd, &paint);

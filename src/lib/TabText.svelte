@@ -6,7 +6,10 @@
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import tabTextIcon from './icons/tab_text.png?inline';
+  import TabTextIcon from './TabTextIcon.svelte';
+  import ModeBars from './ModeBars.svelte';
+
+  let { modalOpen = false } = $props();
 
   const MODES = [
     { id: 'off', label: 'Off' },
@@ -27,7 +30,6 @@
 
   let contrastDragging = $state(false);
   let contrastHovering = $state(false);
-  let contrastTimer = null;
 
   // Legacy refs retained while the native preview is being migrated; the
   // visible comparison samples are stable HTML text rather than canvases.
@@ -60,7 +62,6 @@
     try {
       await      invoke('text_rendering_set_mode', { mode });
       state.effective_mode = mode;
-      if (mode === 'off') clearTimeout(contrastTimer);
       await updateNativePreview();
     } catch (e) {
       error = String(e);
@@ -70,20 +71,19 @@
     }
   }
 
-  function scheduleContrast(value) {
+  // Applied immediately on every drag tick: the backend now only does a fast
+  // SPI write + registry write and posts the desktop notification
+  // asynchronously, so there is no need to debounce — the native preview
+  // follows the thumb live.
+  function applyContrast(value) {
     if (state.effective_mode === 'off') return;
     state.contrast = value;
-    clearTimeout(contrastTimer);
-    contrastTimer = setTimeout(() => {
-      contrastTimer = null;
-      if (state.effective_mode === 'off') return;
-      invoke('text_rendering_set_contrast', { contrast: value })
-        .then(updateNativePreview)
-        .catch((e) => {
-          error = String(e);
-          console.warn('[text] set_contrast failed', e);
-        });
-    }, 250);
+    invoke('text_rendering_set_contrast', { contrast: value })
+      .then(updateNativePreview)
+      .catch((e) => {
+        error = String(e);
+        console.warn('[text] set_contrast failed', e);
+      });
   }
 
   async function resetDefaults() {
@@ -116,6 +116,13 @@
     }
     nativePreviewBoundsSyncing = true;
     try {
+      if (modalOpen) {
+        if (nativePreviewVisible) {
+          nativePreviewVisible = false;
+          await invoke('text_preview_hide');
+        }
+        return;
+      }
       if (!nativePreviewHost) return;
       const rect = nativePreviewHost.getBoundingClientRect();
       const viewport = nativePreviewHost.closest('.content')?.getBoundingClientRect();
@@ -155,6 +162,15 @@
       }
     }
   }
+
+  $effect(() => {
+    if (modalOpen) {
+      nativePreviewVisible = false;
+      invoke('text_preview_hide').catch(() => {});
+    } else if (loaded) {
+      scheduleNativePreviewBounds();
+    }
+  });
 
   async function updateNativePreview() {
     try {
@@ -259,7 +275,7 @@
             gamma: state.gamma,
             contrast: state.contrast,
           });
-          scheduleNativePreviewBounds();
+          if (!modalOpen) scheduleNativePreviewBounds();
         } catch (e) {
           console.warn('[text] native preview unavailable', e);
         }
@@ -283,25 +299,44 @@
 </script>
 
 <div class="tab-body">
-  <div class="tab-heading">
-    <img class="tab-icon" src={tabTextIcon} alt="" />
-    <h2>Text</h2>
-    <span class="subtitle">ClearType &amp; font smoothing</span>
+  <div class="tab-heading tab-heading-2line">
+    <div class="tab-heading-toggle no-hover">
+      <TabTextIcon class="tab-icon" />
+      <div class="tab-heading-titles">
+        <div class="tab-heading-title-row">
+          <h2>Text rendering</h2>
+        </div>
+        <span class="subtitle">ClearType &amp; font smoothing</span>
+      </div>
+    </div>
     <div class="tab-heading-spacer"></div>
     <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore Windows defaults</button>
   </div>
   <div class="separator"></div>
 
-  <p class="text-render-intro">Fix color fringing and soft text by matching Windows' subpixel rendering to your panel. QD-OLED panels are usually sharpest with Grayscale.</p>
-
   <div class="dimmer-control">
     <div class="dimmer-control-heading">
-      <span class="settings-row-label">Text rendering mode</span>
+      <span class="hdr-control-title">
+        <span class="settings-row-label">Text rendering mode</span>
+        <span class="info-tip-wrap">
+          <button class="info-tip-btn" aria-label="About text rendering mode" tabindex="0">Info</button>
+          <span class="info-tip info-tip-right">
+            <span>Fix color fringing by changing Windows subpixel rendering.</span>
+          </span>
+        </span>
+      </span>
     </div>
     <div class="text-render-inline-modes" role="radiogroup" aria-label="Preview subpixel mode">
       {#each MODES as m (m.id)}
-        <button type="button" class="text-render-inline-mode" class:active={state.effective_mode === m.id} role="radio" aria-checked={state.effective_mode === m.id} onclick={() => applyMode(m.id)} disabled={busy}>{m.label}</button>
+        <button type="button" class="text-render-inline-mode" class:active={state.effective_mode === m.id} role="radio" aria-checked={state.effective_mode === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
+          {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
+          {m.label}
+        </button>
       {/each}
+    </div>
+    <div class="text-render-preview-caption-row">
+      <span class="text-render-preview-caption text-render-preview-caption-left">100% zoom</span>
+      <span class="text-render-preview-caption text-render-preview-caption-right">400% zoom</span>
     </div>
     <div class="text-render-native-preview-host" bind:this={nativePreviewHost} role="img" aria-label="Live native Windows text rendering preview">
       <span class="text-render-native-preview-fallback">The quick brown fox jumps over the lazy dog</span>
@@ -316,7 +351,7 @@
     <div class="slider-track-wrap dimmer-slider-track" role="presentation">
       <input type="range" min="1000" max="2200" step="100" value={state.contrast}
         style="--fill:{((state.contrast - 1000) / 1200) * 100}%"
-        oninput={(e) => scheduleContrast(Math.round(Number(e.currentTarget.value) / 100) * 100)}
+        oninput={(e) => applyContrast(Math.round(Number(e.currentTarget.value) / 100) * 100)}
         onpointerdown={() => contrastDragging = true}
         onpointerup={() => contrastDragging = false}
         onpointercancel={() => contrastDragging = false}

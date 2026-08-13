@@ -529,6 +529,20 @@ button {
   opacity: 1;
   transform: translateY(0) scale(1);
 }
+/* Right-side info tooltip (Text rendering tab): the native preview window
+   floats above the WebView DOM, so a tooltip that opens downward gets covered
+   where it overlaps the preview. Opening to the RIGHT of the button instead
+   keeps it on the heading line, clear of the preview area. */
+.info-tip.info-tip-right {
+  top: 50%;
+  left: calc(100% + 8px);
+  transform: translateY(-50%) translateX(-6px) scale(0.96);
+  transform-origin: left center;
+}
+.info-tip-wrap:hover .info-tip.info-tip-right,
+.info-tip-btn:focus-visible + .info-tip.info-tip-right {
+  transform: translateY(-50%) translateX(0) scale(1);
+}
 .info-tip-note {
   display: flex;
   align-items: flex-start;
@@ -3653,26 +3667,41 @@ button {
 .update-check-error { min-width: 0; overflow-wrap: anywhere; }
 
 /* ── Text tab (ClearType / subpixel tuning) ──────────────────────────── */
-.text-render-intro {
-  margin: 0 0 12px;
-  color: var(--text-weak);
-  font-size: 13px;
-  line-height: 1.45;
-}
 .text-render-note {
   margin: 6px 0 10px;
   color: var(--text-weak);
   font-size: 12px;
   line-height: 1.4;
 }
+.text-render-preview-caption-row {
+  display: flex;
+  margin: 6px 0 0;
+}
+/* Each caption centers over its own column: the preview splits at the
+   halfway point, so both halves get a centered label — "100% zoom" over the
+   native-size rows on the left, "400% zoom" over the zoomed rows on the
+   right. */
+.text-render-preview-caption-left,
+.text-render-preview-caption-right {
+  flex: 0 0 50%;
+  text-align: center;
+}
+.text-render-preview-caption {
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
 .text-render-native-preview-host {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 224px;
-  min-height: 224px;
-  margin: 8px 0;
+  /* Height matches the zoomed right column (4 rows at 4x: 40+48+56+64px)
+     plus the top padding, so there is no dead space at the bottom. */
+  height: 210px;
+  min-height: 210px;
+  margin: 4px 0 8px;
   border: 1px solid var(--divider);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.18);
@@ -3701,7 +3730,16 @@ button {
   color: var(--text-weak);
   font-size: 12px;
   font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
   transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.text-render-mode-bars {
+  width: 18px;
+  height: 14px;
+  flex-shrink: 0;
 }
 .text-render-inline-mode:hover:not(:disabled) {
   color: var(--text);

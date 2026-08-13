@@ -13,6 +13,7 @@
   import TabSettings from './lib/TabSettings.svelte';
   import TabAbout from './lib/TabAbout.svelte';
   import TabText from './lib/TabText.svelte';
+  import TabTextIcon from './lib/TabTextIcon.svelte';
 
   // Icons are inlined as data URIs (?inline) instead of /icons/*.png URLs so
   // they never depend on the dev server or asset protocol at runtime, a tray
@@ -26,7 +27,6 @@
   import tabHdrIcon from './lib/icons/tab_hdr.png?inline';
   import tabDebugIcon from './lib/icons/tab_debug.png?inline';
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
-  import tabTextIcon from './lib/icons/tab_text.png?inline';
   import { dropdownCloseEffect, ctxMenuCloseEffect } from './lib/dropdown.js';
   import { fmtNits } from './lib/calibration.js';
   import UpdateModal from './lib/UpdateModal.svelte';
@@ -1184,7 +1184,7 @@
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
-      <img class="nav-icon" src={tabTextIcon} alt="" /> Text
+      <TabTextIcon class="nav-icon" /> Text rendering
     </button>
 
     <div class="sidebar-spacer"></div>
@@ -1200,7 +1200,7 @@
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
       {:else if app.activeTab === 'text'}
-        <TabText />
+        <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} />
       {:else if app.activeTab === 'windows-hdr'}
         <TabWindowsHdr />
       {:else if app.activeTab === 'debug'}
