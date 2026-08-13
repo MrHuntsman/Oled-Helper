@@ -3,7 +3,7 @@ import './app.css'
 import App from './App.svelte'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { pushGpuLog, debugSettings, app, crush, taskbarDimmer, handleTaskbarDimmerAvailable, syncFavoritesFromBackend } from './lib/stores.svelte.js'
+import { pushGpuLog, debugSettings, app, crush, taskbarDimmer, handleTaskbarDimmerAvailable, syncFavoritesFromBackend, loadConfig, applyBlackLevelProfileForRefreshRate } from './lib/stores.svelte.js'
 
 // The Rust tauri-plugin-log Webview target is the canonical fan-out path:
 // every record is written to stdout/file and emitted as `log://log`. We do not
@@ -203,8 +203,40 @@ try {
   const target = document.getElementById('app');
   if (!target) throw new Error('#app not found');
 
-  mount(App, { target });
-  document.addEventListener('contextmenu', e => { if (!debugSettings.contextMenuEnabled) e.preventDefault(); });
+  // Load persisted config (black level, high-nits range, dimmer, etc.) AND
+  // seed the current display's monitor/mode identity BEFORE the first
+  // mount/render. Previously both ran from effects inside App.svelte that
+  // fire after the initial paint, so the Black Level slider (and other
+  // saved-per-display values) visibly rendered at their neutral default for
+  // a frame and then jumped to the saved value once the async invokes
+  // resolved. Awaiting both here means crush.adjustment already reflects the
+  // saved profile for the CURRENT monitor/resolution/refresh-rate the very
+  // first time Svelte renders, so there is nothing to jump from.
+  //
+  // get_display_info alone (not the full pollDisplayInfo helper) is enough:
+  // it only needs to seed app.displayInfo's identity fields so
+  // applyBlackLevelProfileForRefreshRate can resolve the right profile key.
+  // App.svelte's own onMount still calls pollDisplayInfo() afterward for the
+  // resolutions/refresh-rates lists and to keep polling wired up; that call
+  // is cheap and harmless once this identity is already seeded.
+  Promise.allSettled([
+    loadConfig(),
+    invoke('get_display_info').then((info) => {
+      if (!info) return;
+      app.displayInfo.width = info.width || 0;
+      app.displayInfo.height = info.height || 0;
+      app.displayInfo.deviceName = typeof info.device_name === 'string' ? info.device_name : '';
+      app.displayInfo.monitorId = typeof info.monitor_id === 'string' ? info.monitor_id : '';
+      app.displayInfo.refreshRateHz = info.refresh_hz || null;
+    }).catch(() => {}),
+  ]).then(() => {
+    // Both the config and the display identity are in, resolve the black
+    // level for the actual current mode before the first paint.
+    applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
+  }).catch((e) => console.error('[startup] preload failed', e)).finally(() => {
+    mount(App, { target });
+    document.addEventListener('contextmenu', e => { if (!debugSettings.contextMenuEnabled) e.preventDefault(); });
+  });
 } catch (e) {
   console.error('OLED Helper mount failed:', e);
   document.body.innerHTML = `<div style="color:#E05555;padding:20px;font:14px monospace;background:#0D0D0F;height:100vh;">
