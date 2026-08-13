@@ -43,10 +43,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const LABEL: &str = "tray-menu";
 static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
 static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
-// Set while a display-change rebuild is in flight so the rapid
-// WM_DISPLAYCHANGE + WM_SETTINGCHANGE pair (and any other burst) coalesces
-// into a single destroy/recreate instead of churning through two of them.
-static REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
 // The resolution submenu includes the same friendly/UW/native labels as the
 // main app, so reserve enough left-side space to keep those tags readable.
 // These are the rendered outer widths: the CSS declarations add 12px of
@@ -453,104 +449,6 @@ pub fn prewarm(app: &AppHandle) {
     {
         let _ = primary_monitor_scale(1.0);
     }
-}
-
-/// Called when the system reports a display configuration change (mode
-/// switch, topology change). The tray window is pre-warmed once at startup,
-/// so it keeps the DPI context it was born with; Windows only applies a
-/// hidden window's DPI transition when it is shown, which made the first
-/// open after a resolution change render stale-scale content (the two-step
-/// appearance: the WebView's inner height read 736px at the old scale before
-/// snapping to 460px) before the post-show re-anchor repositioned it.
-/// Recreating the window after the mode switch settles gives the next open a
-/// window born at the current monitor's DPI — the first frame is already at
-/// the final scale, so the menu appears in one step.
-///
-/// The rebuild runs on a background thread (the display-change notification
-/// arrives on the main thread) with a short settle so the new mode's monitor
-/// DPI has propagated before the comparison (mirroring flyout_window.rs's
-/// wait_for_display_geometry rationale: DEVMODE can report the mode active
-/// slightly before Windows updates the monitor geometry). Skipped while the
-/// popup is visible (the user is interacting), and skipped when the window's
-/// DPI context already matches the monitor (e.g. a settings broadcast with
-/// no scale change).
-pub fn handle_display_change(app: &AppHandle) {
-    // Coalesce the rapid event bursts (WM_DISPLAYCHANGE + WM_SETTINGCHANGE
-    // arrive ~80ms apart) into a single rebuild.
-    if REBUILD_PENDING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let app = app.clone();
-    std::thread::spawn(move || {
-        // The monitor's DPI can take a moment to propagate after a mode
-        // switch, so poll a couple of times instead of trusting a single
-        // reading — a slow settle must still trigger the rebuild, while an
-        // unrelated settings broadcast (no DPI change) never does.
-        for _ in 0..2 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            // Separate clone for the main-thread closure: run_on_main_thread
-            // borrows `app` (its receiver) while the closure needs to own one.
-            // The closure must return (), so a channel carries the verdict.
-            let (stale_tx, stale_rx) = std::sync::mpsc::channel();
-            let closure_app = app.clone();
-            if app
-                .run_on_main_thread(move || {
-                    let stale = match closure_app.get_webview_window(LABEL) {
-                        Some(window) if !window.is_visible().unwrap_or(false) => {
-                            // Only rebuild when the window's DPI context is
-                            // actually stale relative to the monitor — avoids
-                            // needless churn when an unrelated settings
-                            // broadcast fires with no scale change.
-                            #[cfg(target_os = "windows")]
-                            {
-                                let window_scale = window.scale_factor().unwrap_or(1.0);
-                                let monitor_scale = primary_monitor_scale(window_scale);
-                                (window_scale - monitor_scale).abs() >= 0.05
-                            }
-                            #[cfg(not(target_os = "windows"))]
-                            {
-                                true
-                            }
-                        }
-                        // No window, or the popup is visible (user is
-                        // interacting) — nothing to rebuild.
-                        _ => false,
-                    };
-                    let _ = stale_tx.send(stale);
-                })
-                .is_err()
-            {
-                break;
-            }
-            // Timeout guard (mirrors flyout_window.rs's recv_timeout): if the
-            // scheduled closure is dropped during shutdown it never sends, and
-            // a bare recv() would hang this thread forever.
-            let stale = stale_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap_or(false);
-            if !stale {
-                continue;
-            }
-            let closure_app = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                let Some(window) = closure_app.get_webview_window(LABEL) else {
-                    return;
-                };
-                if window.is_visible().unwrap_or(false) {
-                    return;
-                }
-                log::info!("[tray-menu] display change: rebuilding tray window at the new DPI");
-                SUBMENU_EXPANDED.store(false, Ordering::Release);
-                MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
-                let _ = window.destroy();
-                if let Err(e) = get_or_create_window(&closure_app) {
-                    log::warn!("[tray-menu] rebuild after display change failed: {e}");
-                }
-            });
-            break;
-        }
-        REBUILD_PENDING.store(false, Ordering::Release);
-    });
 }
 
 /// Show (or hide, if already visible) the custom tray menu, anchored flush

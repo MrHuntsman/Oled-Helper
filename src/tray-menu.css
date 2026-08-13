@@ -316,58 +316,105 @@
   background: color-mix(in srgb, var(--accent-hdr) 18%, transparent);
 }
 
-.tray-favorite-confirm {
-  /* Wider than the default submenu (140–150px) so the remove copy doesn't
-     wrap awkwardly; still bounded well under the base menu's 270px. */
-  width: 200px;
-  min-width: 200px;
-  max-width: 200px;
-  padding: 12px 12px 10px;
+/* Inline row confirm (option 2): replaces just the favorite row being
+   removed, in place, instead of opening a separate pane. Deliberately
+   reuses .tray-item's height/padding rhythm so the row doesn't jump when
+   swapping between its normal and confirming states. The whole row pops in
+   with a quick scale/fade so the swap reads as a deliberate state change
+   rather than an abrupt content jump. */
+.tray-favorite-inline-confirm {
+  cursor: default;
+  gap: 6px;
+  animation: tray-inline-confirm-in 140ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
 }
 
-.tray-favorite-confirm-title {
+@keyframes tray-inline-confirm-in {
+  from { opacity: 0; transform: scale(0.94); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.tray-favorite-inline-confirm-label {
   color: var(--text);
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 7px;
-}
-
-.tray-favorite-confirm-copy {
-  color: var(--text-weak);
   font-size: 12px;
-  line-height: 1.45;
-  white-space: normal;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.tray-favorite-confirm-actions {
+.tray-favorite-inline-confirm-actions {
+  flex: 0 0 auto;
   display: flex;
-  justify-content: flex-end;
-  gap: 7px;
-  margin-top: 12px;
+  align-items: center;
+  gap: 5px;
 }
 
-.tray-favorite-confirm-btn {
-  padding: 5px 10px;
-  border: 1px solid var(--divider);
-  border-radius: 5px;
+.tray-favorite-inline-confirm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
   background: transparent;
-  color: var(--text-weak);
-  font: inherit;
-  font-size: 11px;
   cursor: pointer;
+  /* Staggered pop-in so the two buttons feel like they're landing one after
+     the other rather than snapping in together with the row. */
+  opacity: 0;
+  animation: tray-inline-confirm-btn-in 160ms cubic-bezier(0.34, 1.56, 0.64, 1) 40ms forwards;
+  transition: background 0.12s, color 0.12s, transform 0.08s;
 }
 
-.tray-favorite-confirm-btn:hover,
-.tray-favorite-confirm-btn:focus-visible {
-  border-color: var(--accent);
-  color: var(--text);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+.tray-favorite-inline-confirm-no {
+  animation-delay: 80ms;
+}
+
+@keyframes tray-inline-confirm-btn-in {
+  from { opacity: 0; transform: scale(0.5); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.tray-favorite-inline-confirm-btn:active {
+  transform: scale(0.88);
+}
+
+.tray-favorite-inline-confirm-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.tray-favorite-inline-confirm-yes {
+  color: var(--accent);
+}
+
+.tray-favorite-inline-confirm-yes:hover,
+.tray-favorite-inline-confirm-yes:focus-visible {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
   outline: none;
 }
 
-.tray-favorite-confirm-danger {
-  color: var(--accent);
+.tray-favorite-inline-confirm-no {
+  color: var(--text-weak);
+}
+
+.tray-favorite-inline-confirm-no:hover,
+.tray-favorite-inline-confirm-no:focus-visible {
+  color: var(--text);
+  background: var(--hover);
+  outline: none;
+}
+
+/* Denser sizing to match the submenu's compact row rhythm when the same
+   inline confirm appears inside the Favorites submenu. */
+.tray-submenu .tray-favorite-inline-confirm-btn {
+  width: 22px;
+  height: 22px;
+}
+
+.tray-submenu .tray-favorite-inline-confirm-btn svg {
+  width: 13px;
+  height: 13px;
 }
 
 .tray-item-chevron {
@@ -638,8 +685,8 @@
 /* Keep the main card's comfortable spacing, but make submenu listings denser
    so more resolutions, rates, and favorites fit before scrolling. */
 .tray-submenu .tray-item {
-  gap: 6px;
-  padding: 4px 8px;
+  gap: 4px;
+  padding: 4px 5px;
   font-size: 12px;
   transition: background 0.08s, color 0.08s, transform 0.08s;
 }
@@ -656,7 +703,8 @@
 }
 
 .tray-submenu .tray-item-check {
-  width: 13px;
+  width: 10px;
+  margin-right: 1px;
 }
 
 /* Aspect-ratio group headers inside the resolution submenu, matching the
@@ -675,8 +723,8 @@
 }
 
 .tray-submenu .tray-favorite-star {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   margin-right: 0;
 }
 

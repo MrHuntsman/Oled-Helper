@@ -616,7 +616,7 @@
     // Without this first pass, the submenu is visible in the browser while
     // Windows still has only the collapsed base-menu region; a fast pointer
     // crossing can blur/hide the window before the exact measurement arrives.
-    const preBase = (openSubmenu !== null || pendingFavoriteRemove !== null)
+    const preBase = openSubmenu !== null
       ? menuRect(document.querySelector('.tray-menu'))
       : null;
     const preinstall = preBase
@@ -648,7 +648,7 @@
       await tick();
       const base = menuRect(document.querySelector('.tray-menu'));
       if (!base) return;
-      const expanded = openSubmenu !== null || pendingFavoriteRemove !== null;
+      const expanded = openSubmenu !== null;
       const submenuEl = expanded
         ? document.querySelector('.tray-submenu')
         : null;
@@ -697,7 +697,11 @@
 
   function requestFavoriteRemove(fav) {
     pendingFavoriteRemove = { width: fav.width, height: fav.height, hz: fav.hz };
-    closeSubmenu();
+    // Inline confirms replace the row in place, so only close a Resolution/
+    // Refresh Rate submenu (which has nothing to do with this favorite).
+    // Leave the Favorites submenu open so its own inline confirm row stays
+    // visible instead of the whole pane vanishing under the cursor.
+    if (openSubmenu !== 'favorites') closeSubmenu();
     syncHitRegion();
   }
 
@@ -882,7 +886,7 @@
 
 <div
   class="tray-menu-wrap"
-  class:tray-submenu-open={openSubmenu !== null || pendingFavoriteRemove !== null}
+  class:tray-submenu-open={openSubmenu !== null}
   role="menu"
   tabindex="-1"
   onmouseenter={cancelScheduledSubmenuClose}
@@ -963,6 +967,32 @@
     {:else}
       {#each favorites as fav (favoriteKey(fav))}
         {@const current = isCurrentFavorite(fav)}
+        {@const confirming = pendingFavoriteRemove !== null && favoriteKey(pendingFavoriteRemove) === favoriteKey(fav)}
+        {#if confirming}
+          <div class="tray-item tray-favorite-item tray-favorite-inline-confirm" role="group" aria-label={`Remove ${favoriteLabel(fav)} from favorites?`}>
+            <span class="tray-item-label tray-favorite-inline-confirm-label">Remove {favoriteLabel(fav)}?</span>
+            <div class="tray-favorite-inline-confirm-actions">
+              <button
+                type="button"
+                class="tray-favorite-inline-confirm-btn tray-favorite-inline-confirm-yes"
+                aria-label={`Confirm remove ${favoriteLabel(fav)}`}
+                title="Remove"
+                onclick={(event) => { event.stopPropagation(); confirmFavoriteRemove(); }}
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <button
+                type="button"
+                class="tray-favorite-inline-confirm-btn tray-favorite-inline-confirm-no"
+                aria-label={`Cancel remove ${favoriteLabel(fav)}`}
+                title="Cancel"
+                onclick={(event) => { event.stopPropagation(); cancelFavoriteRemove(); }}
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
+        {:else}
         <div
           class="tray-item tray-favorite-item"
           class:tray-favorite-current={current}
@@ -988,6 +1018,7 @@
             </svg>
           </button>
         </div>
+        {/if}
       {/each}
     {/if}
 
@@ -1090,19 +1121,6 @@
       <span class="tray-item-label">Quit</span>
     </div>
   </div>
-
-  {#if pendingFavoriteRemove}
-    <div class="tray-submenu tray-favorite-confirm" role="dialog" aria-modal="true" aria-labelledby="tray-favorite-confirm-title" style="margin-bottom: {submenuLift}px">
-      <div id="tray-favorite-confirm-title" class="tray-favorite-confirm-title">Remove favorite?</div>
-      <div class="tray-favorite-confirm-copy">
-        Remove {pendingFavoriteRemove.width}×{pendingFavoriteRemove.height} @ {pendingFavoriteRemove.hz} Hz?
-      </div>
-      <div class="tray-favorite-confirm-actions">
-        <button type="button" class="tray-favorite-confirm-btn" onclick={cancelFavoriteRemove}>Cancel</button>
-        <button type="button" class="tray-favorite-confirm-btn tray-favorite-confirm-danger" onclick={confirmFavoriteRemove}>Remove</button>
-      </div>
-    </div>
-  {/if}
 
   {#if openSubmenu === 'resolution' && display}
     <div class="tray-submenu tray-resolution-submenu" role="menu" tabindex="-1" style="margin-bottom: {submenuLift}px">
@@ -1216,6 +1234,32 @@
     <div class="tray-submenu tray-favorites-submenu" role="menu" tabindex="-1" style="margin-bottom: {submenuLift}px">
       {#each favorites as fav (favoriteKey(fav))}
         {@const current = isCurrentFavorite(fav)}
+        {@const confirming = pendingFavoriteRemove !== null && favoriteKey(pendingFavoriteRemove) === favoriteKey(fav)}
+        {#if confirming}
+          <div class="tray-item tray-favorite-item tray-favorite-inline-confirm" role="group" aria-label={`Remove ${favoriteLabel(fav)} from favorites?`}>
+            <span class="tray-item-label tray-favorite-inline-confirm-label">Remove {favoriteLabel(fav)}?</span>
+            <div class="tray-favorite-inline-confirm-actions">
+              <button
+                type="button"
+                class="tray-favorite-inline-confirm-btn tray-favorite-inline-confirm-yes"
+                aria-label={`Confirm remove ${favoriteLabel(fav)}`}
+                title="Remove"
+                onclick={(event) => { event.stopPropagation(); confirmFavoriteRemove(); }}
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <button
+                type="button"
+                class="tray-favorite-inline-confirm-btn tray-favorite-inline-confirm-no"
+                aria-label={`Cancel remove ${favoriteLabel(fav)}`}
+                title="Cancel"
+                onclick={(event) => { event.stopPropagation(); cancelFavoriteRemove(); }}
+              >
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
+        {:else}
         <div
           class="tray-item tray-favorite-item"
           class:tray-favorite-current={current}
@@ -1240,6 +1284,7 @@
             </svg>
           </button>
         </div>
+        {/if}
       {/each}
     </div>
   {/if}

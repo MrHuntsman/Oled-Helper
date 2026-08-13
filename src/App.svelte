@@ -1282,12 +1282,13 @@
             <button type="button" class="hz-menu-item res-item-main" class:active={current}
               role="option" aria-selected={current}
               onclick={() => pickResolution(resolution.width, resolution.height)}>
+              <span class="hz-check" aria-hidden="true">{current ? '✓' : ''}</span>
               {resolution.width}×{resolution.height}
               {#if displayMenuPrefs.showTags}
                 {#if ultrawide}<span class="ultrawide-tag"><span class="ultrawide-separator">·</span><svg class="ultrawide-icon" viewBox="0 0 32 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="30.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="16" y="10.8" text-anchor="middle" fill="currentColor" font-size="9" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}
-                {name ? ` · ${name}` : ''}
+                {#if name}<span class="res-item-tag"> · {name}</span>{/if}
               {/if}
-              {recommended ? ' (Native)' : ''}
+              {#if recommended}<span class="res-item-tag"> (Native)</span>{/if}
             </button>
             {#if hz > 0}
               <button
@@ -1308,6 +1309,7 @@
           <div class="hz-menu res-menu" bind:this={resMenuEl} role="listbox" aria-label="Resolution options" tabindex="-1" oncontextmenu={openResContextMenu}>
             {#if app.displayInfo.resolutions.length === 0}
               <div class="hz-menu-item active">
+                <span class="hz-check" aria-hidden="true">✓</span>
                 {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}
               </div>
             {:else if displayMenuPrefs.resolutionGroupBy === 'aspectRatio'}
@@ -1357,6 +1359,7 @@
               <button type="button" class="hz-menu-item" class:active={hz === app.displayInfo.refreshRateHz}
                 role="option" aria-selected={hz === app.displayInfo.refreshRateHz}
                 onclick={() => pickHz(hz)}>
+                <span class="hz-check" aria-hidden="true">{hz === app.displayInfo.refreshRateHz ? '✓' : ''}</span>
                 <span>{hz} Hz</span>
                 {#if blackLevelDisplayForRefreshRate(hz)}<span class="hz-profile-value">{blackLevelDisplayForRefreshRate(hz)}</span>{/if}
               </button>
