@@ -84,6 +84,10 @@ pub struct AppConfig {
     pub taskbar_dimmer_fade_out_duration_ms: u64,
     #[serde(default = "default_hover_detection")]
     pub taskbar_dimmer_hover_detection: String,
+    // Whether the one-time "still running in the tray" balloon has been shown
+    // already, so it only appears on the first close-to-tray ever.
+    #[serde(default)]
+    pub tray_notice_shown: bool,
     #[serde(default = "default_poll_interval")]
     pub taskbar_dimmer_poll_interval_ms: u64,
     #[serde(default = "default_resolution_sort")]
@@ -152,6 +156,7 @@ impl Default for AppConfig {
             taskbar_dimmer_fade_out_duration_ms: default_dimmer_ease_duration(),
             taskbar_dimmer_hover_detection: default_hover_detection(),
             taskbar_dimmer_poll_interval_ms: default_poll_interval(),
+            tray_notice_shown: false,
             display_menu_resolution_sort: default_resolution_sort(),
             display_menu_resolution_group_by: default_resolution_group_by(),
             display_menu_show_tags: true,

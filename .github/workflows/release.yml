@@ -1,7 +1,7 @@
 name: Release
 
 # Builds a portable OLED Helper exe and publishes a GitHub release with:
-#   - oled-helper.exe   the standalone portable app
+#   - OledHelper.exe    the standalone portable app
 #   - latest.json       the updater manifest (version, download url, sha256)
 # The in-app updater reads latest.json from the "latest" release, so every
 # published release must be a normal (non-draft, non-prerelease) release.
@@ -39,7 +39,7 @@ jobs:
 
       # `tauri build` runs the frontend build automatically (beforeBuildCommand
       # in tauri.conf.json) and, with bundle.active=false, produces only the
-      # standalone exe at src-tauri/target/release/oled-helper.exe.
+      # standalone exe at src-tauri/target/release/OledHelper.exe.
       - name: Build portable exe
         run: npm run tauri build
 
@@ -55,6 +55,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/release/oled-helper.exe
+            src-tauri/target/release/OledHelper.exe
             latest.json
           generate_release_notes: false

@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const REPO = 'MrHuntsman/Oled-Helper-v2';
-const EXE_RELATIVE_PATH = 'src-tauri/target/release/oled-helper.exe';
+const EXE_RELATIVE_PATH = 'src-tauri/target/release/OledHelper.exe';
 
 const conf = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
 const version = String(conf.version || '').trim();
@@ -32,7 +32,7 @@ const data = readFileSync(EXE_RELATIVE_PATH);
 const sha256 = createHash('sha256').update(data).digest('hex');
 const manifest = {
   version,
-  url: `https://github.com/${REPO}/releases/latest/download/oled-helper.exe`,
+  url: `https://github.com/${REPO}/releases/latest/download/OledHelper.exe`,
   sha256,
 };
 writeFileSync('latest.json', `${JSON.stringify(manifest, null, 2)}\n`);

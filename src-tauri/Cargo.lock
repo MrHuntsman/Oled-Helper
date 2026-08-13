@@ -3,6 +3,27 @@
 version = 3
 
 [[package]]
+name = "OledHelper"
+version = "0.1.5"
+dependencies = [
+ "bytemuck",
+ "fern",
+ "futures-util",
+ "log",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-log",
+ "tauri-plugin-positioner",
+ "tauri-plugin-single-instance",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2417,27 +2438,6 @@ dependencies = [
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-foundation",
-]
-
-[[package]]
-name = "oled-helper"
-version = "0.1.5"
-dependencies = [
- "bytemuck",
- "fern",
- "futures-util",
- "log",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-log",
- "tauri-plugin-positioner",
- "tauri-plugin-single-instance",
- "windows 0.62.2",
 ]
 
 [[package]]

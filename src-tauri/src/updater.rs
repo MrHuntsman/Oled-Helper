@@ -112,7 +112,7 @@ fn update_staging_path() -> Result<PathBuf, String> {
     let stem = exe
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("oled-helper");
+.unwrap_or("OledHelper");
     Ok(dir.join(format!("{stem}.new.exe")))
 }
 
@@ -316,7 +316,7 @@ pub fn handle_apply_update_mode() -> bool {
     let stem = target
         .file_stem()
         .and_then(|s| s.to_str())
-        .unwrap_or("oled-helper");
+.unwrap_or("OledHelper");
     let old_backup = target.with_file_name(format!("{stem}.old"));
 
     // 1. Move the old (exited) exe aside.

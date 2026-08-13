@@ -18,7 +18,7 @@ A Windows desktop utility for OLED display calibration and system tweaks, built 
 
 ## Download and update
 
-Grab the latest `oled-helper.exe` from the [Releases](https://github.com/MrHuntsman/Oled-Helper-v2/releases) page and run it from any writable folder. Nothing is installed and nothing touches the registry.
+Grab the latest `OledHelper.exe` from the [Releases](https://github.com/MrHuntsman/Oled-Helper-v2/releases) page and run it from any writable folder. Nothing is installed and nothing touches the registry.
 
 Updates are checked silently when the app starts or is restored from the tray. When a new version exists, the version number in the bottom-left status bar turns into a highlighted chip; clicking it opens the update window with the changelog and a one-click install that downloads, verifies, swaps the exe, and relaunches.
 
@@ -35,7 +35,7 @@ npx tauri dev
 npm run tauri build
 ```
 
-This produces a single standalone `oled-helper.exe` in `src-tauri/target/release/`. No installer is generated.
+This produces a single standalone `OledHelper.exe` in `src-tauri/target/release/`. No installer is generated.
 
 ## Releasing a new version
 

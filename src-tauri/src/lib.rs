@@ -5,6 +5,7 @@ mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod taskbar_dimmer;
+mod tray_balloon;
 // Kept (with dead_code allowed) because the native muda menu is retired but
 // may be reinstated as a fallback: see the DISABLED blocks in setup().
 #[allow(dead_code)]
@@ -467,6 +468,36 @@ fn request_shutdown_and_exit(app: &AppHandle) {
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     request_shutdown_and_exit(&app);
+}
+
+// One-time tray balloon on the first close-to-tray, so the user learns the
+// app is still running. Persisted in the config; the static guard also covers
+// rapid double-closes before the async config write has flushed.
+static TRAY_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
+fn show_tray_notice(app: &AppHandle) {
+    if TRAY_NOTICE_SHOWN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut config = config::load_config(app.clone());
+    if config.tray_notice_shown {
+        return;
+    }
+    config.tray_notice_shown = true;
+    let _ = config::save_config(app.clone(), config);
+    tray_balloon::show(
+        "OLED Helper",
+        "OLED Helper is still running in the system tray. Click the tray icon to reopen it.",
+    );
+}
+
+// Debug-tab helper: re-enable the one-time tray balloon after it has already
+// shown, by clearing both the in-process guard and the persisted flag.
+#[tauri::command]
+fn reset_tray_notice(app: AppHandle) -> Result<(), String> {
+    TRAY_NOTICE_SHOWN.store(false, Ordering::Relaxed);
+    let mut config = config::load_config(app.clone());
+    config.tray_notice_shown = false;
+    config::save_config(app, config)
 }
 
 // Set once at startup from --open-tab=<tab> (elevated RTX HDR restart) and
@@ -983,6 +1014,7 @@ pub fn run() {
             tray_menu_window::tray_menu_quit,
             tray_menu_window::tray_menu_set_expanded,
             quit_app,
+            reset_tray_notice,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1217,6 +1249,9 @@ pub fn run() {
                     // keeps the process alive so the tray icon can reopen it.
                     api.prevent_close();
                     if window.hide().is_ok() {
+                        // First close-to-tray ever: tell the user the app is
+                        // still running in the tray.
+                        show_tray_notice(window.app_handle());
                         // The process remains alive in the tray, but
                         // release the optional vendor-driver resources
                         // while idle. This is separate from final
