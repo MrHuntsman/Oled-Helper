@@ -149,6 +149,7 @@ button {
 .top-bar .version { font-size: 10px; color: var(--text-weak); }
 .top-bar .spacer { flex: 1; }
 .top-bar .top-btn-icon { width: 16px; height: 16px; opacity: 0.95; }
+.top-bar .top-exit-icon { flex-shrink: 0; opacity: 0.95; }
 .top-bar .top-btn {
   display: flex;
   align-items: center;

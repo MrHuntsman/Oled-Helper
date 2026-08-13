@@ -1077,6 +1077,18 @@
   $effect(() => {
     setDimmerSuspendedForFullscreen(crush.fullscreen === 'monitor');
   });
+
+  // Fully quits the app from the top-bar Exit button. Same graceful shutdown
+  // path as the tray's Quit (quit_app → request_shutdown_and_exit): the
+  // backend releases dimmer/hotkey/gamma resources and flushes the config
+  // before the process exits, closing the main window and tray together.
+  async function quitApp() {
+    try {
+      await invoke('quit_app');
+    } catch (e) {
+      console.warn('[app] quit failed', e);
+    }
+  }
 </script>
 
 <a href="#main-content" class="skip-to-content">Skip to main content</a>
@@ -1096,6 +1108,15 @@
     </button>
     <button class="top-btn" class:active={app.activeTab === 'about'} onclick={() => app.activeTab = 'about'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabAboutIcon} alt="" /> About</span>
+    </button>
+    <button class="top-btn top-exit-btn" title="Quit OLED Helper" aria-label="Exit OLED Helper" onclick={quitApp}>
+      <span class="top-btn-inner">
+        <svg class="top-exit-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M8 1.5v6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M4.7 3.7a6 6 0 1 0 6.6 0" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        Exit
+      </span>
     </button>
   </div>
 

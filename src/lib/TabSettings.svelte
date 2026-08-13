@@ -4,7 +4,7 @@
   import tabDebugIcon from './icons/tab_debug.png?inline';
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
-  import { traySettings, setTrayEnabled, configLoaded, app, restoreAllDefaults } from './stores.svelte.js';
+  import { app, restoreAllDefaults } from './stores.svelte.js';
 
   let startOnBoot = $state(false);
   let ready = $state(false);
@@ -37,10 +37,6 @@
     }
   }
 
-  async function toggleTray() {
-    await setTrayEnabled(!traySettings.enabled);
-  }
-
   async function restoreDefaults() {
     if (startOnBoot) {
       try {
@@ -50,7 +46,6 @@
         console.warn('[settings] restore defaults could not disable autostart', e);
       }
     }
-    await setTrayEnabled(true);
   }
 
   function openResetAllConfirm() {
@@ -133,7 +128,7 @@
     <img class="tab-icon" src={tabSystemIcon} alt="" />
     <h2>Settings</h2>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={restoreDefaults} title="Resets only the Start on Boot and System Tray options">↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={restoreDefaults} title="Resets the Start on Boot option">↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -145,18 +140,6 @@
     <div class="pill-wrap">
       {#if ready}
         <span class={`pill${startOnBoot ? '' : ' off'}`} aria-hidden="true"></span>
-      {/if}
-    </div>
-  </button>
-
-  <button class="settings-row" onclick={toggleTray}>
-    <div class="settings-row-text">
-      <span class="settings-row-label">System Tray</span>
-      <span class="settings-row-desc">Keep the app available in the system tray and close the window to the tray.</span>
-    </div>
-    <div class="pill-wrap">
-      {#if configLoaded.v}
-        <span class={`pill${traySettings.enabled ? '' : ' off'}`} aria-hidden="true"></span>
       {/if}
     </div>
   </button>

@@ -26,10 +26,6 @@ use tauri::{
     AppHandle, Emitter, Manager, State,
 };
 
-struct TrayState {
-    enabled: AtomicBool,
-}
-
 // Only consumed by the disabled native tray menu listener (see the DISABLED
 // block in setup), kept around in case that menu is reinstated.
 #[allow(dead_code)]
@@ -465,6 +461,14 @@ fn request_shutdown_and_exit(app: &AppHandle) {
     app.exit(0);
 }
 
+// Full app exit from the main window's Exit button. Shares the same graceful
+// shutdown path as the tray's Quit (tray_menu_quit), so dimmer/hotkey/gamma
+// resources are released and the config is flushed before the process ends.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    request_shutdown_and_exit(&app);
+}
+
 // Set once at startup from --open-tab=<tab> (elevated RTX HDR restart) and
 // consumed by take_startup_tab so the frontend reopens on the user's tab.
 static STARTUP_TAB: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
@@ -729,21 +733,6 @@ fn relaunch_elevated(
     Ok(())
 }
 
-#[tauri::command]
-fn set_tray_enabled(
-    app: tauri::AppHandle,
-    state: State<TrayState>,
-    enabled: bool,
-) -> Result<(), String> {
-    let tray = app
-        .tray_by_id("main-tray")
-        .ok_or_else(|| "system tray icon is not available".to_string())?;
-    tray.set_visible(enabled)
-        .map_err(|error| error.to_string())?;
-    state.enabled.store(enabled, Ordering::Relaxed);
-    Ok(())
-}
-
 // When this instance was spawned by a tray Restart, --restart-parent carries
 // the old process's PID. Wait for it to fully exit before creating the
 // WebView2 environment. A vanished parent is success; a live parent remains
@@ -940,9 +929,6 @@ pub fn run() {
             safety_thread: Mutex::new(None),
         })
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
-        .manage(TrayState {
-            enabled: AtomicBool::new(true),
-        })
         .invoke_handler(tauri::generate_handler![
             apply_gamma_ramp,
             log_frontend,
@@ -962,7 +948,6 @@ pub fn run() {
             confirm_display_mode_change,
             rollback_display_mode_change,
             get_display_target,
-            set_tray_enabled,
             config::load_config,
             config::save_config,
             config::reset_config,
@@ -997,6 +982,7 @@ pub fn run() {
             tray_menu_window::tray_menu_restart,
             tray_menu_window::tray_menu_quit,
             tray_menu_window::tray_menu_set_expanded,
+            quit_app,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -1070,9 +1056,6 @@ pub fn run() {
             log::info!("[tray] custom tray menu window ready");
 
             let saved_config = config::load_config(app.handle().clone());
-            app.state::<TrayState>()
-                .enabled
-                .store(saved_config.tray_enabled, Ordering::Relaxed);
 
             let tray_image = window_icon::crisp_tray_image()
                 .or_else(|| app.default_window_icon().cloned())
@@ -1112,10 +1095,6 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-
-            if let Some(tray) = app.tray_by_id("main-tray") {
-                tray.set_visible(saved_config.tray_enabled)?;
-            }
 
             // DISABLED: the older native muda tray menu is retired in favor of
             // the custom CSS popup (tray_menu_window). The menu-event handler
@@ -1233,29 +1212,25 @@ pub fn run() {
         .on_window_event(|window, event| {
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
-                    let tray_enabled = window
-                        .app_handle()
-                        .state::<TrayState>()
-                        .enabled
-                        .load(Ordering::Relaxed);
-                    if tray_enabled {
-                        api.prevent_close();
-                        if window.hide().is_ok() {
-                            // The process remains alive in the tray, but
-                            // release the optional vendor-driver resources
-                            // while idle. This is separate from final
-                            // shutdown so NVAPI can initialize lazily again
-                            // when the window is shown.
-                            vendor_info::release_for_tray();
-                            let _ = window.app_handle().emit("window-visibility", false);
-                        }
+                    // The window always closes to the tray; the top-bar Exit
+                    // button and the tray's Quit are the real exits. Hiding
+                    // keeps the process alive so the tray icon can reopen it.
+                    api.prevent_close();
+                    if window.hide().is_ok() {
+                        // The process remains alive in the tray, but
+                        // release the optional vendor-driver resources
+                        // while idle. This is separate from final
+                        // shutdown so NVAPI can initialize lazily again
+                        // when the window is shown.
+                        vendor_info::release_for_tray();
+                        let _ = window.app_handle().emit("window-visibility", false);
                     }
                 }
                 tauri::WindowEvent::Destroyed => {
-                    // Closing with the tray enabled only hides the window. When
-                    // the window is actually destroyed, request a synchronous
-                    // worker shutdown so the display ramp is reset before the
-                    // process exits.
+                    // Closing the main window hides it to the tray rather than
+                    // destroying it. When it is actually destroyed (real exit),
+                    // request a synchronous worker shutdown so the display
+                    // ramp is reset before the process exits.
                     taskbar_dimmer::shutdown();
                     hotkeys::shutdown();
                     shutdown_gamma_worker(window.app_handle());

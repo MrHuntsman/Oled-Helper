@@ -146,7 +146,6 @@ export const taskbarDimmer = $state({
   pollIntervalMs: 100,
 });
 
-export const traySettings = $state({ enabled: true });
 // Debug-tab logging switches, independent of each other:
 //   verbosePeriodic ,  vendor/EDID detailed diagnostics (set_detailed_logging)
 //   dimmerVerbose   ,  taskbar dimmer tick/winevent/fade verbose logs
@@ -441,7 +440,6 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
     if (cfg && typeof cfg.taskbar_dimmer_fade_out_duration_ms === 'number') taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_out_duration_ms)));
-    if (cfg && typeof cfg.tray_enabled === 'boolean') traySettings.enabled = cfg.tray_enabled;
     if (cfg && typeof cfg.taskbar_dimmer_hover_detection === 'string') {
       taskbarDimmer.hoverDetection = cfg.taskbar_dimmer_hover_detection;
       Object.assign(dimmerDetections, detectionDefaultsForMode(cfg.taskbar_dimmer_hover_detection));
@@ -529,7 +527,6 @@ export function saveConfig() {
     taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,
     taskbar_dimmer_hover_detection: taskbarDimmer.hoverDetection || 'event',
     taskbar_dimmer_poll_interval_ms: taskbarDimmer.pollIntervalMs,
-    tray_enabled: traySettings.enabled,
     display_menu_resolution_sort: displayMenuPrefs.resolutionSort,
     display_menu_resolution_group_by: displayMenuPrefs.resolutionGroupBy,
     display_menu_show_tags: displayMenuPrefs.showTags,
@@ -537,12 +534,6 @@ export function saveConfig() {
     hotkeys: { ...hotkeys },
     favorite_display_modes: displayFavorites.map((f) => ({ width: f.width, height: f.height, hz: f.hz })),
   } }).catch((e) => console.warn('[config] save failed', e));
-}
-export async function setTrayEnabled(enabled) {
-  const previous = traySettings.enabled;
-  traySettings.enabled = enabled;
-  try { await invoke('set_tray_enabled', { enabled }); saveConfig(); }
-  catch (e) { console.warn('[tray] update failed', e); traySettings.enabled = previous; }
 }
 
 let pendingTaskbarDimmerUpdate = null;
@@ -682,7 +673,6 @@ export async function restoreAllDefaults() {
   crush.fullscreen = 'normal';
   crush.blackStripGapEnabled = true;
   await resetHotkeys();
-  invoke('set_tray_enabled', { enabled: true }).catch((e) => console.warn('[restore-all] tray update failed', e));
   invoke('apply_gamma_ramp', { blackLift: 0 }).catch((e) => console.warn('[restore-all] gamma reset failed', e));
 }
 export function setDimmerSuspendedForFullscreen(suspended) { invoke('set_taskbar_dimmer_suspended', { suspended }).catch(() => {}); }

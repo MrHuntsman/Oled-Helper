@@ -82,8 +82,6 @@ pub struct AppConfig {
     pub taskbar_dimmer_fade_in_duration_ms: u64,
     #[serde(default = "default_dimmer_ease_duration")]
     pub taskbar_dimmer_fade_out_duration_ms: u64,
-    #[serde(default = "default_true")]
-    pub tray_enabled: bool,
     #[serde(default = "default_hover_detection")]
     pub taskbar_dimmer_hover_detection: String,
     #[serde(default = "default_poll_interval")]
@@ -154,7 +152,6 @@ impl Default for AppConfig {
             taskbar_dimmer_fade_out_duration_ms: default_dimmer_ease_duration(),
             taskbar_dimmer_hover_detection: default_hover_detection(),
             taskbar_dimmer_poll_interval_ms: default_poll_interval(),
-            tray_enabled: true,
             display_menu_resolution_sort: default_resolution_sort(),
             display_menu_resolution_group_by: default_resolution_group_by(),
             display_menu_show_tags: true,
