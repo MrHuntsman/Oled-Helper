@@ -25,7 +25,7 @@
   <p style="color: var(--text-weak);">OLED Helper is a Windows desktop utility for OLED display calibration and system control.</p>
   <p style="color: var(--text-weak); margin-top: 8px;">v{appVersion || '0.1.1'} - <a href="https://github.com/MrHuntsman/Oled-Helper-v2" tabindex="0" rel="noopener" style="color: var(--text-weak);" onclick={openGitHub}>View on GitHub</a></p>
 
-  <div class="update-check-row" class:has-update={updateState.status === 'available'}>
+  <div class="update-check-row" class:has-update={updateState.status === 'available'} class:has-error={updateState.status === 'error'}>
     {#if updateState.status === 'available'}
       <button
         type="button"
@@ -37,6 +37,14 @@
       <span>Checking for updates…</span>
     {:else if updateState.status === 'uptodate'}
       <span>You're up to date.</span>
+    {:else if updateState.status === 'error'}
+      <span class="update-check-error">Update check failed: {updateState.error || 'unknown error'}</span>
+      <button
+        type="button"
+        class="modal-btn"
+        onclick={() => checkForUpdates(true)}>
+        Retry
+      </button>
     {:else}
       <button
         type="button"

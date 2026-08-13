@@ -890,9 +890,9 @@ export function clearGpuLog() {
 //   'available'  a newer version exists (updateInfo filled)
 //   'uptodate'   checked, no newer version
 //   'error'      the check failed (offline, no endpoint, bad manifest)
-// All check failures are silent: a missing/blocked endpoint must never
-// disturb the app, it just stays 'idle' or flips to 'error' (unused in UI
-// except for hiding the indicator). The update itself is handled by the
+// Check failures don't disturb the rest of the app (no modal, no status-bar
+// indicator); they only set status 'error', which the About tab surfaces as
+// an inline message with a retry. The update itself is handled by the
 // backend (updater.rs): it streams the new exe next to the running one,
 // verifies the manifest sha256, then hands off to the staged exe which
 // swaps the files and relaunches the app.
@@ -928,6 +928,7 @@ export async function checkForUpdates(force = false) {
   if (!force && Date.now() - lastCheckedAt < UPDATE_COOLDOWN_MS) return;
   updateInFlight = true;
   if (updateState.status !== 'available') updateState.status = 'checking';
+  updateState.error = '';
   try {
     const update = await invoke('check_for_update');
     if (update) {
@@ -949,9 +950,10 @@ export async function checkForUpdates(force = false) {
     }
     lastCheckedAt = Date.now();
   } catch (e) {
-    // Never disturb the UI: offline or a blocked endpoint just leaves the
-    // indicator hidden.
-    updateState.status = 'idle';
+    // Surface the failure in the About tab's update row so the user knows the
+    // check could not complete (offline, blocked endpoint, bad manifest). The
+    // status bar stays silent; it only reacts to 'available'.
+    updateState.status = 'error';
     updateState.error = String(e);
   } finally {
     updateInFlight = false;

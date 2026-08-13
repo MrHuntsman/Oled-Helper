@@ -410,6 +410,21 @@ fn get_display_target() -> Option<display_info::DisplayTargetInfo> {
     display_info::display_target_info()
 }
 
+// Frontend self-heal for window visibility. The `window-visibility` event
+// mirrors show/hide driven from the tray, but a restore that happens outside
+// that path (e.g. clicking the taskbar button after minimize, or a missed
+// event) never emits it, so the frontend's mirror flag can go stale and leave
+// the active tab blank. Expose the real state so the frontend can reconcile
+// on window focus.
+#[tauri::command]
+fn is_main_window_visible(app: AppHandle) -> bool {
+    app.get_webview_window("main")
+        .map(|window| {
+            window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let is_minimized = window.is_minimized().unwrap_or(false);
@@ -463,7 +478,7 @@ fn request_shutdown_and_exit(app: &AppHandle) {
 }
 
 // Full app exit from the main window's Exit button. Shares the same graceful
-// shutdown path as the tray's Quit (tray_menu_quit), so dimmer/hotkey/gamma
+// shutdown path as the tray's Exit (tray_menu_quit), so dimmer/hotkey/gamma
 // resources are released and the config is flushed before the process ends.
 #[tauri::command]
 fn quit_app(app: AppHandle) {
@@ -979,6 +994,7 @@ pub fn run() {
             confirm_display_mode_change,
             rollback_display_mode_change,
             get_display_target,
+            is_main_window_visible,
             config::load_config,
             config::save_config,
             config::reset_config,
@@ -1245,7 +1261,7 @@ pub fn run() {
             match event {
                 tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
                     // The window always closes to the tray; the top-bar Exit
-                    // button and the tray's Quit are the real exits. Hiding
+                    // button and the tray's Exit are the real exits. Hiding
                     // keeps the process alive so the tray icon can reopen it.
                     api.prevent_close();
                     if window.hide().is_ok() {

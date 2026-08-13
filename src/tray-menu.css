@@ -185,6 +185,36 @@
   background: var(--hover);
 }
 
+.tray-item-icon {
+  flex: 0 0 auto;
+}
+
+/* Restart and Exit share one row: Restart on the left, Exit on the right.
+   Each half keeps the regular item height/padding, so the row reads as two
+   side-by-side actions. */
+.tray-restart-exit-row {
+  display: flex;
+  gap: 4px;
+}
+.tray-restart-exit-row > .tray-item {
+  flex: 1;
+  justify-content: center;
+}
+.tray-restart-exit-row > .tray-item > .tray-item-label {
+  flex: 0 0 auto;
+}
+
+/* The Exit row gets a muted red tint, matching the top bar's Exit button,
+   so it reads as a destructive action. The label and icon inherit
+   currentColor. */
+.tray-item.tray-exit-item {
+  color: #e87575;
+}
+.tray-item.tray-exit-item:hover {
+  background: color-mix(in srgb, #e87575 20%, transparent);
+  color: #f28a8a;
+}
+
 .tray-item.disabled {
   opacity: 0.45;
   cursor: default;

@@ -189,6 +189,16 @@ button {
   border-radius: 2px;
   background: var(--accent);
 }
+/* Exit gets a muted red tint so it reads as a destructive action without
+   dominating the top bar. The icon inherits currentColor, so it tints too. */
+.top-bar .top-exit-btn {
+  color: #e87575;
+  transition: background 0.08s, color 0.08s;
+}
+.top-bar .top-exit-btn:hover {
+  background: color-mix(in srgb, #e87575 20%, transparent);
+  color: #f28a8a;
+}
 
 /* ── Nav buttons ──────────────────────────────────────────────────── */
 .nav-btn {
@@ -3639,3 +3649,5 @@ button {
   color: var(--text-weak);
 }
 .update-check-row.has-update { color: var(--accent); }
+.update-check-row.has-error { color: #e06c6c; flex-wrap: wrap; }
+.update-check-error { min-width: 0; overflow-wrap: anywhere; }

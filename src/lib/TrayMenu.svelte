@@ -4,7 +4,7 @@
   // src-tauri/src/tray_menu_window.rs), anchored to the tray icon.
   //
   // Mirrors tray_menu.rs's native menu structure: Resolution, Refresh Rate,
-  // and Favorites submenus, then Restart/Quit. This window is a separate
+  // and Favorites submenus, then Restart/Exit. This window is a separate
   // WebView from the main app window, so it cannot reach into
   // stores.svelte.js's in-memory state — favorites are read/written directly
   // through load_config/save_config, the same way tray_menu.rs's native
@@ -1114,11 +1114,21 @@
 
     <div class="tray-sep"></div>
 
-    <div class="tray-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={restart} onkeydown={(e) => e.key === 'Enter' && restart()}>
-      <span class="tray-item-label">Restart</span>
-    </div>
-    <div class="tray-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={quit} onkeydown={(e) => e.key === 'Enter' && quit()}>
-      <span class="tray-item-label">Quit</span>
+    <div class="tray-restart-exit-row" role="group" aria-label="Restart or Exit">
+      <div class="tray-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={restart} onkeydown={(e) => e.key === 'Enter' && restart()}>
+        <svg class="tray-item-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M13.2 2.8v2.4h-2.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="tray-item-label">Restart</span>
+      </div>
+      <div class="tray-item tray-exit-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={quit} onkeydown={(e) => e.key === 'Enter' && quit()}>
+        <svg class="tray-item-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path d="M8 1.5v6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          <path d="M4.7 3.7a6 6 0 1 0 6.6 0" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+        <span class="tray-item-label">Exit</span>
+      </div>
     </div>
   </div>
 

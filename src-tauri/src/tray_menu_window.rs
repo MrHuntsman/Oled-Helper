@@ -58,7 +58,7 @@ const FULL_HEIGHT: f64 = 460.0;
 // CSS width 270px + padding/borders.
 const BASE_WIDTH: f64 = 284.0;
 // Estimate for the collapsed base menu: Resolution / Refresh Rate /
-// Favorites / separator / Restart / Quit (6 rows + 1 separator). Only used
+// Favorites / separator / Restart / Exit (6 rows + 1 separator). Only used
 // as the initial native hit-region before the first real Svelte layout
 // measurement replaces it via tray_menu_set_expanded (see below), so an
 // approximate value is fine — it only has to be roughly right for the very

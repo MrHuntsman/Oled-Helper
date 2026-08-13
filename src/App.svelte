@@ -948,23 +948,47 @@
       hdrLayerRetryCount = 0;
       hdrLayerInitStarted = false;
     }).then((stop) => { unlistenDisplayChanged = stop; }).catch(() => {});
-    listen('window-visibility', (event) => {
-      const visible = event.payload !== false;
+    // Central handler for the window's shown/hidden state. Rust's
+    // window-visibility event is the fast path for tray show/hide, but a
+    // restore that happens outside that path (taskbar click after minimize,
+    // or a dropped event) never emits it, so `windowVisible` — the flag that
+    // gates the active tab's markup — can go stale and leave the tab area
+    // blank. Routing the state change through here (and re-checking the real
+    // state on window focus below) makes the flag self-heal.
+    function applyWindowVisible(visible) {
+      const wasVisible = windowVisible;
       windowVisible = visible;
-      if (visible) {
-        // Re-query display info when the window is shown again (e.g. after
-        // sleep/resume while hidden in the tray). The cached mode can be
-        // stale or empty from a transitional query during wake; this makes
-        // it self-heal without a periodic poll.
-        pollDisplayInfo();
-        refreshSdrWhiteLevel();
-        hdrLayerRetryCount = 0;
-        hdrLayerInitStarted = false;
-        // Silent update check whenever the app is restored from the tray
-        // (cooldown throttles it). Never disturbs the UI on failure.
-        checkForUpdates();
-      }
+      if (!visible || wasVisible) return;
+      // The strip selection is session-only: always land back on the Black
+      // strip when the window is restored, so a leftover Brightness pick
+      // never greets the user after returning from the tray.
+      crush.stripType = 'black';
+      // Re-query display info when the window is shown again (e.g. after
+      // sleep/resume while hidden in the tray). The cached mode can be
+      // stale or empty from a transitional query during wake; this makes
+      // it self-heal without a periodic poll.
+      pollDisplayInfo();
+      refreshSdrWhiteLevel();
+      hdrLayerRetryCount = 0;
+      hdrLayerInitStarted = false;
+      // Silent update check whenever the app is restored from the tray
+      // (cooldown throttles it). Never disturbs the UI on failure.
+      checkForUpdates();
+    }
+    listen('window-visibility', (event) => {
+      applyWindowVisible(event.payload !== false);
     }).then((stop) => { unlisten = stop; }).catch(() => {});
+    // Self-heal: a restore that doesn't go through show_main_window (e.g.
+    // clicking the taskbar button after minimizing) fires window focus but no
+    // window-visibility event, which would leave windowVisible false and the
+    // active tab blank. Re-read the real visibility from Rust on focus so the
+    // flag always converges to the actual state.
+    function reconcileWindowVisible() {
+      invoke('is_main_window_visible')
+        .then((visible) => { applyWindowVisible(!!visible); })
+        .catch(() => {});
+    }
+    window.addEventListener('focus', reconcileWindowVisible);
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
     listen('hotkey-pressed', (event) => handleHotkeyAction(event.payload)).then((stop) => { unlistenHotkeyPressed = stop; }).catch(() => {});
     // A resolution or refresh rate picked from the tray menu. Runs the same
@@ -995,6 +1019,7 @@
       unlistenHotkeyPressed?.();
       unlistenTrayMode?.();
       unlistenFlyoutCompleted?.();
+      window.removeEventListener('focus', reconcileWindowVisible);
     };
   });
 
@@ -1079,7 +1104,7 @@
   });
 
   // Fully quits the app from the top-bar Exit button. Same graceful shutdown
-  // path as the tray's Quit (quit_app → request_shutdown_and_exit): the
+  // path as the tray's Exit (quit_app → request_shutdown_and_exit): the
   // backend releases dimmer/hotkey/gamma resources and flushes the config
   // before the process exits, closing the main window and tray together.
   async function quitApp() {
@@ -1089,6 +1114,29 @@
       console.warn('[app] quit failed', e);
     }
   }
+
+  // Confirm before quitting: the Exit button is a destructive, session-ending
+  // action (the app fully stops, including the tray icon), so a stray click
+  // should not silently end it. Mirrors the favorite-remove confirmation.
+  let exitConfirmOpen = $state(false);
+  let exitConfirmCancelEl = $state(null);
+  function askQuit() { exitConfirmOpen = true; }
+  function cancelQuit() { exitConfirmOpen = false; }
+  function confirmQuit() {
+    exitConfirmOpen = false;
+    void quitApp();
+  }
+  function onExitConfirmKeydown(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelQuit();
+    }
+  }
+  // Focus the safe action (Cancel) when the dialog opens, so Enter and
+  // Escape both take the safe path (Enter activates the focused button).
+  $effect(() => {
+    if (exitConfirmOpen) exitConfirmCancelEl?.focus();
+  });
 </script>
 
 <a href="#main-content" class="skip-to-content">Skip to main content</a>
@@ -1109,7 +1157,7 @@
     <button class="top-btn" class:active={app.activeTab === 'about'} onclick={() => app.activeTab = 'about'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabAboutIcon} alt="" /> About</span>
     </button>
-    <button class="top-btn top-exit-btn" title="Quit OLED Helper" aria-label="Exit OLED Helper" onclick={quitApp}>
+    <button class="top-btn top-exit-btn" title="Exit OLED Helper" aria-label="Exit OLED Helper" onclick={askQuit}>
       <span class="top-btn-inner">
         <svg class="top-exit-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <path d="M8 1.5v6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
@@ -1427,6 +1475,21 @@
         <div class="modal-actions">
           <button bind:this={favoriteConfirmCancelEl} class="modal-btn modal-btn-cancel" onclick={cancelRemoveFavorite}>Cancel</button>
           <button class="modal-btn" onclick={confirmRemoveFavorite}>Remove</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if exitConfirmOpen}
+    <div class="modal-backdrop" role="presentation" onpointerdown={(e) => { if (e.target === e.currentTarget) cancelQuit(); }}>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="exit-confirm-title" aria-describedby="exit-confirm-desc" tabindex="-1" onkeydown={onExitConfirmKeydown}>
+        <h2 id="exit-confirm-title" class="modal-title">Exit OLED Helper?</h2>
+        <p id="exit-confirm-desc" class="modal-desc">
+          The app will close completely and stop running in the system tray.
+        </p>
+        <div class="modal-actions">
+          <button bind:this={exitConfirmCancelEl} class="modal-btn modal-btn-cancel" onclick={cancelQuit}>Cancel</button>
+          <button class="modal-btn modal-btn-danger" onclick={confirmQuit}>Exit</button>
         </div>
       </div>
     </div>

@@ -235,7 +235,7 @@ fn build_menu_with_overrides(
             .map_err(|e| e.to_string())?,
     );
     menu = menu.item(
-        &MenuItemBuilder::with_id("tray:quit", "Quit")
+        &MenuItemBuilder::with_id("tray:quit", "Exit")
             .build(app)
             .map_err(|e| e.to_string())?,
     );
