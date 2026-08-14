@@ -32,6 +32,14 @@
 
   let contrastDragging = $state(false);
   let contrastHovering = $state(false);
+  // Coalescing for the system-wide contrast write: dragging fires an oninput
+  // per frame, and each write is an SPI call + registry write + WM_SETTINGCHANGE
+  // broadcast to every top-level window. The preview follows live via
+  // text_preview_update (a cheap repaint); the real write is flushed at most
+  // once per CONTRAST_APPLY_MS with the latest value.
+  const CONTRAST_APPLY_MS = 80;
+  let contrastApplyTimer = null;
+  let contrastPending = null;
 
   // Explorer hook state from the backend's explorer_hook_status command
   // (polled while mounted): active = DLL loaded in the running explorer.exe,
@@ -72,6 +80,13 @@
   const PREVIEW_HOLD_MS = 350;
   let previewHoldUntil = 0;
   let previewHoldRetryTimer = null;
+  // True while a restore/maximize animation is in progress. Manual resizes
+  // must keep the preview following live, so the hold is only extended while
+  // this is set (the animation resizes the window through its path). It is
+  // armed wherever the hold is armed by a restore indicator and cleared by
+  // window-restore-settled (which always fires, via the pixel-watch or its
+  // 1.2s timeout fallback).
+  let restoreInProgress = false;
   // Timestamp of the last `window-restore-settled` event (0 = none yet). The
   // backend's visual settle detector emits it the moment the restore
   // animation finishes, which lets the preview appear exactly when the
@@ -93,8 +108,10 @@
     // hold can arm again if needed.
     restoreSettledAt = 0;
     if (app.windowRestoreAnimated) {
+      restoreInProgress = true;
       previewHoldUntil = Math.max(previewHoldUntil, stamp + PREVIEW_HOLD_MS);
     } else {
+      restoreInProgress = false;
       previewHoldUntil = 0;
     }
     scheduleNativePreviewBounds();
@@ -180,21 +197,35 @@
     }
   }
 
-  // Applied immediately on every drag tick: the backend now only does a fast
-  // SPI write + registry write and posts the desktop notification
-  // asynchronously, so there is no need to debounce — the native preview
-  // follows the thumb live. Contrast is a ClearType-only setting: grayscale
-  // and off text has no color fringing to intensify, so the control is
-  // disabled (and ignored) outside RGB/BGR.
+  // Contrast is a ClearType-only setting: grayscale and off text has no color
+  // fringing to intensify, so the control is disabled (and ignored) outside
+  // RGB/BGR.
   function applyContrast(value) {
     if (state.effective_mode !== 'rgb' && state.effective_mode !== 'bgr') return;
     state.contrast = value;
-    invoke('text_rendering_set_contrast', { contrast: value })
-      .then(updateNativePreview)
-      .catch((e) => {
-        error = String(e);
-        console.warn('[text] set_contrast failed', e);
-      });
+    // Preview follows the thumb every tick — this is a cheap repaint of the
+    // native window, not a system settings change.
+    invoke('text_preview_update', {
+      mode: state.effective_mode,
+      gamma: state.gamma,
+      contrast: value,
+    }).catch((e) => console.warn('[text] native preview update failed', e));
+    // Coalesce the real write: at most one in flight per CONTRAST_APPLY_MS,
+    // always carrying the latest value so the final thumb position lands.
+    contrastPending = value;
+    if (contrastApplyTimer === null) {
+      contrastApplyTimer = setTimeout(() => {
+        contrastApplyTimer = null;
+        const pending = contrastPending;
+        contrastPending = null;
+        if (pending !== null) {
+          invoke('text_rendering_set_contrast', { contrast: pending }).catch((e) => {
+            error = String(e);
+            console.warn('[text] set_contrast failed', e);
+          });
+        }
+      }, CONTRAST_APPLY_MS);
+    }
   }
 
   async function resetDefaults() {
@@ -234,11 +265,12 @@
     scheduleNativePreviewBounds();
   }
 
-  // Called on window resize. Restore/maximize animations and manual resizes
-  // all resize the window; hold the preview until the resize settles so it
-  // never appears over (or jumps through) the transition.
+  // Called on window resize. Only a restore/maximize animation needs the
+  // preview held back; a manual resize must keep it following live, so never
+  // start a hold here — just extend one already in progress (the animation
+  // resizes the window through its path).
   function onWindowResized() {
-    previewHoldUntil = Date.now() + PREVIEW_HOLD_MS;
+    if (restoreInProgress) previewHoldUntil = Date.now() + PREVIEW_HOLD_MS;
     scheduleNativePreviewBounds();
   }
 
@@ -456,6 +488,7 @@
         // fresh window-restore-settled event clears the hold shortly after.
         if (animated) {
           restoreSettledAt = 0;
+          restoreInProgress = true;
           previewHoldUntil = Math.max(previewHoldUntil, Date.now() + PREVIEW_HOLD_MS);
         }
         recreateNativePreview();
@@ -468,6 +501,7 @@
     let unlistenRestoreSettled = null;
     listen('window-restore-settled', () => {
       restoreSettledAt = Date.now();
+      restoreInProgress = false;
       previewHoldUntil = 0;
       scheduleNativePreviewBounds();
     }).then((stop) => { unlistenRestoreSettled = stop; }).catch(() => {});
@@ -487,6 +521,7 @@
         // the real animated-vs-instant state.)
         if (Date.now() - (app.windowShownAt || 0) > 100) {
           restoreSettledAt = 0;
+          restoreInProgress = true;
           previewHoldUntil = Math.max(previewHoldUntil, Date.now() + PREVIEW_HOLD_MS);
         }
         recreateNativePreview();
@@ -526,6 +561,8 @@
 
     return () => {
       disposed = true;
+      if (contrastApplyTimer) clearTimeout(contrastApplyTimer);
+      contrastApplyTimer = null;
       clearInterval(hookStatusPoll);
       if (nativePreviewSyncRaf) cancelAnimationFrame(nativePreviewSyncRaf);
       if (previewHoldRetryTimer) clearTimeout(previewHoldRetryTimer);
@@ -629,24 +666,24 @@
         <span class="settings-row-label">Windows Explorer</span>
       </span>
     </div>
-    <p class="text-render-explorer-desc">Windows Explorer ignores grayscale and always renders its text with ClearType (RGB by default).<br>This fix injects a hook into explorer.exe and forces grayscale rendering.</p>
+    <p class="text-render-explorer-desc">Windows Explorer ignores grayscale and always renders its text with ClearType RGB.<br>This fix injects a hook into explorer.exe and forces grayscale rendering on Windows Explorer.</p>
     <p class="text-render-explorer-warning">⚠ It could trigger a false positive in your antivirus.</p>
     <div class="text-render-explorer-actions">
       <label class="text-render-explorer-toggle">
         <input type="checkbox" checked={textSettings.explorerHookEnabled} onchange={onToggleExplorerHook} />
         <span class="text-render-explorer-toggle-label">Fix Windows Explorer</span>
       </label>
-      <button type="button" class="restart-explorer-btn" class:applied={hookStatus.applied} onclick={onRestartExplorer} disabled={busy || restarting || !hookStatus.active || hookStatus.applied}>
-        {#if restarting}
-          Restarting…
-        {:else if hookStatus.applied}
-          Fix applied <span class="restart-explorer-check">✓</span>
-        {:else if hookStatus.active}
-          Apply and restart Explorer
-        {:else}
-          Fix not applied to Explorer
-        {/if}
-      </button>
+      {#if restarting || (hookStatus.active && !hookStatus.applied)}
+        <button type="button" class="restart-explorer-btn" onclick={onRestartExplorer} disabled={busy || restarting}>
+          {#if restarting}
+            Restarting…
+          {:else}
+            Apply and restart Explorer
+          {/if}
+        </button>
+      {:else if hookStatus.applied}
+        <span class="restart-explorer-status">Fix applied <span class="restart-explorer-check">✓</span></span>
+      {/if}
     </div>
   </div>
 

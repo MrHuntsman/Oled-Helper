@@ -686,13 +686,6 @@ button {
   min-width: 34px;
   text-align: left;
 }
-/* In SDR the High Nits strip shows a fixed RGB ramp, so the nits range is
-   not applicable, grey the row out (still configurable once in HDR). */
-.nits-range-control.sdr-disabled {
-  opacity: 0.45;
-  pointer-events: none;
-}
-
 /* Hover tooltip on the High Nits grid, follows the cursor and shows the
    value of the square underneath. pointer-events: none so it never steals
    clicks/wheel from the strip, and fixed positioning keeps it glued to the
@@ -3775,16 +3768,18 @@ button {
   opacity: 0.55;
   cursor: default;
 }
-/* Applied state: a status badge rather than an action — muted grey, with
-   the green checkmark on the right as the positive confirmation. The button
-   is inert (disabled), so keep it full-opacity to stay readable. */
-.restart-explorer-btn.applied {
-  border-color: var(--divider);
+/* Applied state: a static status row instead of a button — muted grey text
+   with the green checkmark on the right as the positive confirmation. */
+.restart-explorer-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
   color: var(--text-weak);
-  opacity: 1;
-  cursor: default;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
-.restart-explorer-btn.applied .restart-explorer-check {
+.restart-explorer-status .restart-explorer-check {
   color: #4CD964;
 }
 /* The preview (caption row + native sample) lives in its own bordered panel,

@@ -226,8 +226,8 @@ export const STRIPS = [
   },
   {
     id: 'highNits',
-    label: 'Brightness',
-    title: 'Brightness grid strip ,  ascending nits cells to judge peak output',
+    label: 'White',
+    title: 'White grid strip ,  ascending nits cells to judge peak output',
   },
 ];
 

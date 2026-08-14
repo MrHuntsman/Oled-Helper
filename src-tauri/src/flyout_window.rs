@@ -436,6 +436,11 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     } else {
         log::warn!("[flyout] could not resolve app_local_data_dir; flyout will share the main window's WebView2 environment");
     }
+    // This window has its own WebView2 environment (own data_directory), so
+    // it can take its own browser args. Cap the HTTP cache like the main
+    // window so the per-window profile folders stay bounded (~64 MB instead
+    // of growing to a few hundred MB of cache each).
+    builder = builder.additional_browser_args("--disk-cache-size=67108864");
     let window = builder
         .build()
         .map_err(|error| format!("could not create flyout window: {error}"))?;

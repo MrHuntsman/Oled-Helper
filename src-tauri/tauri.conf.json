@@ -20,7 +20,7 @@
         "minHeight": 400,
         "resizable": true,
         "fullscreen": false,
-        "additionalBrowserArgs": "--enable-hdr --enable-unsafe-webgpu"
+        "additionalBrowserArgs": "--enable-hdr --enable-unsafe-webgpu --disk-cache-size=67108864"
       }
     ],
     "security": {

@@ -586,8 +586,16 @@ mod native_preview {
                         let _ = SetTextColor(hdc, COLORREF(0x00ffffff));
 
                         // Left column: lines stack at their own height plus a
-                        // small gap, top-aligned.
-                        let mut left_cursor = content_top;
+                        // small gap, vertically centered in the space below the
+                        // top padding so it balances against the taller
+                        // right column.
+                        let left_height: i32 = row_sizes
+                            .iter()
+                            .map(|&size| (((size as u32 * 3 / 2) * dpi) / 96).max(1) as i32)
+                            .sum::<i32>()
+                            + row_gap * (row_sizes.len() as i32 - 1);
+                        let left_area = (client.bottom - client.top - top_padding).max(0);
+                        let mut left_cursor = content_top + (left_area - left_height).max(0) / 2;
                         // Right column: zoomed rows, stacked with no gap.
                         let mut right_top = content_top;
 

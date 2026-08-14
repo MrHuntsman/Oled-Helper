@@ -399,6 +399,11 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     if let Some(dir) = data_dir {
         builder = builder.data_directory(dir);
     }
+    // This window has its own WebView2 environment (own data_directory), so
+    // it can take its own browser args. Cap the HTTP cache like the main
+    // window so the per-window profile folders stay bounded (~64 MB instead
+    // of growing to a few hundred MB of cache each).
+    builder = builder.additional_browser_args("--disk-cache-size=67108864");
     let window = builder
         .build()
         .map_err(|e| format!("could not create tray menu window: {e}"))?;

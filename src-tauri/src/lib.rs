@@ -159,7 +159,12 @@ mod display_change_events {
     }
 
     fn notify_display_changed(app: &AppHandle, source: &str) {
-        log::debug!("[display] change notification ({source})");
+        // Fires for EVERY system-wide WM_SETTINGCHANGE broadcast (any app on
+        // the system changing any setting), so it is noise at Debug: log it
+        // only when detailed logging is enabled.
+        if crate::detailed_logging_enabled() {
+            log::debug!("[display] change notification ({source})");
+        }
         // The CCD SDR white level write broadcasts a settings-change message
         // on some systems. Reacting to the app's own write as if it were a
         // display topology change would re-enumerate the display config
@@ -1140,17 +1145,22 @@ pub fn run() {
             // and the console bridge in main.js for how JS-side output gets in.
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
-                    .level(log::LevelFilter::Trace)
-                    // tao's event-loop runner emits DEBUG lifecycle
-                    // diagnostics ("NewEvents emitted without explicit
-                    // RedrawEventsCleared" on every window focus/redraw when
-                    // clicking the app) that are noise, not problems. Cap the
-                    // whole tao module at Info so they are suppressed in every
-                    // destination (stdout, file, Debug tab, DevTools) while
-                    // real tao warnings/errors still pass through.
-                    .level_for("tao", log::LevelFilter::Info)
+                    // The app's own modules keep full Trace (the Debug tab
+                    // and file log stay detailed), but everything else —
+                    // reqwest, hyper, tao's event-loop diagnostics, and the
+                    // rest of the dependency tree — is capped at Info so
+                    // library internals can't flood the log with per-request
+                    // noise. That flood was filling files to the rotation cap
+                    // in minutes during dev ("just a few lines" repeated
+                    // thousands of times).
+                    .level(log::LevelFilter::Info)
+                    .level_for("app_lib", log::LevelFilter::Trace)
                     .max_file_size(5_000_000)
-                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                    // Keep the newest 5 rotated archives; the plugin prunes
+                    // older ones on startup and rotation, so the logs folder
+                    // stays bounded instead of accumulating every 5 MB file
+                    // forever (KeepAll left ~160 MB of backlog).
+                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                     // The same logger record is fanned out to terminal, file,
                     // and the frontend event consumed by main.js. Keeping one
                     // logger target set prevents the three views from drifting.
@@ -1171,6 +1181,36 @@ pub fn run() {
             // here (rather than lazily on first show()) so its WebView2
             // controller exists well before any display-mode change can race
             // its creation ,  see flyout_window::prewarm for why.
+            // Load the persisted config before the flyout/tray webviews are
+            // pre-warmed: their first status reads (taskbar dimmer, etc.)
+            // must see the saved values, not the state defaults.
+            let saved_config = config::load_config(app.handle().clone());
+
+            // Seed the taskbar dimmer state from the persisted config. The
+            // main window's frontend applies these to the overlay shortly
+            // after launch, but the pre-warmed tray menu reads status before
+            // that — without the seed it paints the default opacity (95%) on
+            // the first open and then jumps to the real value.
+            {
+                let dimmer_state = app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
+                *dimmer_state
+                    .enabled
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_enabled;
+                *dimmer_state
+                    .opacity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_opacity.clamp(0.0, 1.0);
+                *dimmer_state
+                    .fade_in_duration_ms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_fade_in_duration_ms;
+                *dimmer_state
+                    .fade_out_duration_ms
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_fade_out_duration_ms;
+            }
+
             flyout_window::prewarm(app.handle());
             log::info!("[tray] mode flyout window ready");
 
@@ -1179,8 +1219,6 @@ pub fn run() {
             // WebView2 controller should exist before the first click.
             tray_menu_window::prewarm(app.handle());
             log::info!("[tray] custom tray menu window ready");
-
-            let saved_config = config::load_config(app.handle().clone());
 
             let tray_image = window_icon::crisp_tray_image()
                 .or_else(|| app.default_window_icon().cloned())

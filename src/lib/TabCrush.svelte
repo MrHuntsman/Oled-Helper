@@ -42,7 +42,7 @@
 
   // Keep the original Crush canvas configuration. The extended tone-mapping
   // experiment changed the browser's HDR presentation path and caused the
-  // Brightness strip's previously calibrated values to clip at the wrong
+  // White strip's previously calibrated values to clip at the wrong
   // luminance. The Windows HDR comparison owns its separate HDR experiment.
   function configureContext(format, colorSpace) {
     ctx.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT, colorSpace });
@@ -69,7 +69,7 @@
   function stripTitle() {
     const isHdr = app.hdrStatus === 'hdr';
     if (crush.stripType === 'highNits') {
-      return isHdr ? 'HDR Brightness' : 'SDR Brightness';
+      return isHdr ? 'HDR White' : 'SDR White';
     }
     return isHdr ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)';
   }
@@ -1100,7 +1100,7 @@
 
   {#snippet calibrationTip()}
     {#if crush.stripType === 'highNits'}
-      <span>Find the max nits value you can still distinguish.</span>
+      <span>Find the max brightness value you can still distinguish.</span>
     {:else}
       <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
       <span class="info-tip-note">
@@ -1152,7 +1152,7 @@
     {:else}
       <p class="strip-heading">
         <!-- Title + Info group sizes to its content so the Info button always
-             sits right next to the title text; the Black/Brightness switch is
+             sits right next to the title text; the Black/White switch is
              anchored to the heading's right edge (margin-left:auto) and never
              moves when the title length changes. -->
         <span class="strip-heading-title">
@@ -1248,10 +1248,9 @@
       <!-- is derived silently as (max − min) / 20 (setHighNitsMax in        -->
       <!-- stores.svelte.js), not shown as its own control. The slider only -->
       <!-- rests on HIGH_NITS_MAX_STOPS. In SDR the strip shows a fixed RGB  -->
-      <!-- ramp, so the nits range doesn't apply, greyed out (still         -->
-      <!-- configurable once in HDR).                                       -->
-      <div class="nits-range-control" class:sdr-disabled={app.hdrStatus !== 'hdr' || forceSdrRender} title={app.hdrStatus === 'hdr' && !forceSdrRender ? 'Nits range shown on the strip' : 'Nits range only applies in HDR'}>
-        <!-- SDR: the ramp is a fixed RGB range, so disable the control -->
+      <!-- ramp, so the nits range doesn't apply and the slider is hidden.  -->
+      {#if app.hdrStatus === 'hdr' && !forceSdrRender}
+      <div class="nits-range-control">
         <div class="nits-slider-group" onwheel={handleNitsWheel}>
           <span class="nits-range-label">Max</span>
           <div class="slider-track-wrap zoom-track-compact">
@@ -1269,6 +1268,7 @@
           <span class="nits-slider-val">{highNitsMaxValue()}</span>
         </div>
       </div>
+      {/if}
     {:else}
       <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCounts[crush.stripType] = value)}>
         <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />

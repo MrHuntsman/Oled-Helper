@@ -22,11 +22,10 @@ use windows::core::{BOOL, GUID};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconGetRect, Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
-    NOTIFYICONIDENTIFIER, NIF_INFO, NIIF_INFO, NIIF_USER, NIM_MODIFY,
+    NOTIFYICONIDENTIFIER, NIF_INFO, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER, NIM_MODIFY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, EnumWindows, GetSystemMetrics, GetWindowThreadProcessId, HICON, SM_CXSMICON,
-    SM_CYSMICON,
+    DestroyIcon, EnumWindows, GetWindowThreadProcessId, HICON,
 };
 
 // Keep the balloon's icon handle alive long enough for the shell to render it,
@@ -100,12 +99,24 @@ unsafe fn show_on_real_icon(title: &str, message: &str) -> Result<(), String> {
 
     // App icon in the balloon body is a nice-to-have; a missing icon must not
     // suppress the notification, so fall back to the plain info style.
+    //
+    // The shell validates the balloon icon size against the flag it is paired
+    // with (tested empirically): a small icon without NIIF_LARGE_ICON must be
+    // SM_CXSMICON-sized (16px at 100% DPI), and anything larger is rejected
+    // with ERROR_INCORRECT_SIZE (1462). With NIIF_LARGE_ICON, larger sources
+    // are accepted — 32/64/256 all work. So use the large-icon balloon with
+    // the biggest ICO frame (256×256): the shell downscales it to the
+    // balloon's large-icon slot, which stays crisp at any display DPI. The
+    // old small-icon balloon handed the shell a 16px source that it upscaled
+    // into that slot — that is what looked blurry.
     let icon = crate::window_icon::materialize_icon_file().and_then(|icon_path| {
-        let cx = GetSystemMetrics(SM_CXSMICON);
-        let cy = GetSystemMetrics(SM_CYSMICON);
-        crate::window_icon::load_icon(&icon_path, cx, cy)
+        crate::window_icon::load_icon(&icon_path, 256, 256)
     });
-    let dw_info_flags = if icon.is_some() { NIIF_USER } else { NIIF_INFO };
+    let dw_info_flags = if icon.is_some() {
+        NIIF_USER | NIIF_LARGE_ICON
+    } else {
+        NIIF_INFO
+    };
     let h_balloon_icon = icon.unwrap_or(HICON(std::ptr::null_mut()));
 
     let title_u16 = to_wide(title);
