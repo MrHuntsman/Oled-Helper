@@ -16,19 +16,23 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 use windows::core::{s, w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HMODULE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HMODULE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    REG_VALUE_TYPE,
+};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, VirtualAllocEx, VirtualFreeEx, FILE_MAP_ALL_ACCESS,
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
     CreateRemoteThread, GetExitCodeThread, OpenProcess, WaitForSingleObject, PROCESS_ALL_ACCESS,
-    PROCESS_SYNCHRONIZE,
 };
 
 type LoadLibraryWFn = unsafe extern "system" fn(PCWSTR) -> HMODULE;
@@ -40,6 +44,23 @@ static STATE_VIEW: OnceLock<usize> = OnceLock::new();
 static LAST_INJECTED_PID: AtomicU32 = AtomicU32::new(0);
 // Whether the feature is active (Grayscale/Off vs RGB/BGR).
 static ENABLED: AtomicBool = AtomicBool::new(false);
+// Master toggle from the Text tab (persisted in config): off means Explorer
+// is never touched and the DLL is not injected. Defaults to off; the
+// frontend syncs the stored value on load.
+static TOGGLE: AtomicBool = AtomicBool::new(false);
+// Last mode-state from the Text tab (0/1/2), gated by TOGGLE in apply_state.
+static LAST_STATE: AtomicU32 = AtomicU32::new(0);
+// True once Explorer has been restarted while the hook was active, so the
+// Text tab can show "✓ Fix applied": a freshly restarted explorer.exe is
+// guaranteed to render everything through the hook. Any mode/toggle change
+// resets it (the running Explorer needs another restart to fully apply).
+static RESTARTED_WHILE_ACTIVE: AtomicBool = AtomicBool::new(false);
+// True when the hook was already loaded in the running explorer.exe before
+// this app session's first injection (the DLL never unloads, so it survives
+// app restarts). Lets status.applied stay true across app restarts without
+// persisting a config flag: if the marker PID matches the current explorer
+// PID at the moment of our first injection, the fix predates this session.
+static HOOK_PREDATES_SESSION: AtomicBool = AtomicBool::new(false);
 // Watchdog lifecycle: started once, stopped on app shutdown.
 static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -48,6 +69,78 @@ static INJECT_LOCK: Mutex<()> = Mutex::new(());
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// Read the LoadedPid marker the app writes after each successful injection
+// (see write_hook_marker). Lets the app tell, on startup, whether the
+// running explorer already has the hook from a previous session.
+fn read_hook_marker_pid() -> Option<u32> {
+    // SAFETY: standard HKCU registry read of a DWORD marker.
+    unsafe {
+        let subkey = wide(r"Software\OledHelper\ExplorerHook");
+        let mut key = HKEY::default();
+        let open = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            KEY_QUERY_VALUE,
+            &mut key,
+        );
+        if open.is_err() || key.is_invalid() {
+            return None;
+        }
+        let mut data: u32 = 0;
+        let mut size: u32 = 4;
+        let mut value_type = REG_VALUE_TYPE::default();
+        let query = RegQueryValueExW(
+            key,
+            PCWSTR(wide("LoadedPid").as_ptr()),
+            None,
+            Some(&mut value_type),
+            Some(&mut data as *mut u32 as *mut u8),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(key);
+        if query.is_err() || value_type != REG_DWORD {
+            return None;
+        }
+        Some(data)
+    }
+}
+
+// Record which explorer.exe generation the hook was injected into. The DLL
+// never unloads, so the marker survives app restarts and lets the next app
+// session tell that the running explorer already has the hook from a
+// previous session (marker PID == current explorer PID before this
+// session's first injection).
+fn write_hook_marker(pid: u32) {
+    // SAFETY: standard HKCU registry write of a DWORD marker.
+    unsafe {
+        let subkey = wide(r"Software\OledHelper\ExplorerHook");
+        let mut key = HKEY::default();
+        let created = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        );
+        if created.is_err() || key.is_invalid() {
+            return;
+        }
+        let _ = RegSetValueExW(
+            key,
+            PCWSTR(wide("LoadedPid").as_ptr()),
+            None,
+            REG_DWORD,
+            Some(&pid.to_le_bytes()),
+        );
+        let _ = RegCloseKey(key);
+    }
 }
 
 fn ensure_state_mapped() -> Result<*mut u32, String> {
@@ -236,13 +329,29 @@ fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
     }
 }
 
+// Recompute the effective state from the master toggle and the last mode,
+// write it to the shared memory, and keep the watchdog/injection running only
+// while the feature is genuinely active.
+fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
+    let last = LAST_STATE.load(Ordering::Acquire);
+    let enabled = TOGGLE.load(Ordering::Acquire) && last != 0;
+    ENABLED.store(enabled, Ordering::Release);
+    // When disabled, write passthrough so an already-injected Explorer stops
+    // rewriting fonts immediately (no restart needed for that).
+    write_state(if enabled { last } else { 0 })?;
+    if enabled {
+        ensure_watchdog_running(app.clone());
+        ensure_injected(app)?;
+    }
+    Ok(())
+}
+
 /// Follow the Text rendering tab's mode in Explorer:
 ///   grayscale → force grayscale (ANTIALIASED_QUALITY)
 ///   off       → force no antialiasing, crisp (NONANTIALIASED_QUALITY)
 ///   rgb/bgr   → pass through (Explorer keeps its ClearType + the system
 ///               orientation the app already sets)
-/// Writes the shared mode, starts the restart watchdog, and injects (or
-/// re-injects) the hook DLL into explorer.exe.
+/// Stores the mode and applies it through the master toggle.
 #[tauri::command]
 pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
     let state = match mode.as_str() {
@@ -250,10 +359,104 @@ pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(),
         "off" => 2,
         _ => 0,
     };
-    ENABLED.store(state != 0, Ordering::Release);
-    write_state(state)?;
-    ensure_watchdog_running(app.clone());
-    ensure_injected(&app)
+    if LAST_STATE.load(Ordering::Acquire) != state {
+        // The config changed: the running Explorer must be restarted again
+        // before the new mode is fully applied everywhere.
+        RESTARTED_WHILE_ACTIVE.store(false, Ordering::Release);
+        HOOK_PREDATES_SESSION.store(false, Ordering::Release);
+    }
+    LAST_STATE.store(state, Ordering::Release);
+    apply_state(&app)
+}
+
+/// Master toggle for the Explorer hook (Text tab). Off stops the injection
+/// and writes passthrough so Explorer's text returns to system ClearType;
+/// on re-enables the mode mapping.
+#[tauri::command]
+pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if TOGGLE.load(Ordering::Acquire) != enabled {
+        RESTARTED_WHILE_ACTIVE.store(false, Ordering::Release);
+        HOOK_PREDATES_SESSION.store(false, Ordering::Release);
+    }
+    TOGGLE.store(enabled, Ordering::Release);
+    apply_state(&app)
+}
+
+/// Report whether the hook is currently loaded in the running explorer.exe,
+/// so the Text tab can reflect it on the Restart Explorer button: restarting
+/// only applies the mode to already-open windows when the DLL is in there.
+#[derive(serde::Serialize)]
+pub struct ExplorerHookStatus {
+    enabled: bool,
+    active: bool,
+    applied: bool,
+    pid: u32,
+}
+
+#[tauri::command]
+pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
+    let enabled = TOGGLE.load(Ordering::Acquire);
+    let pid = LAST_INJECTED_PID.load(Ordering::Acquire);
+    let active = enabled && pid != 0 && find_explorer_pid() == Some(pid);
+    let applied = active
+        && (RESTARTED_WHILE_ACTIVE.load(Ordering::Acquire)
+            || HOOK_PREDATES_SESSION.load(Ordering::Acquire));
+    Ok(ExplorerHookStatus {
+        enabled,
+        active,
+        applied,
+        pid,
+    })
+}
+
+/// Restart explorer.exe so font changes apply to already-open windows
+/// immediately (fonts already rasterized stay cached until the process
+/// restarts). The watchdog re-injects the hook afterwards if the feature is
+/// active. Closes all open File Explorer windows.
+#[tauri::command]
+pub fn restart_explorer() -> Result<(), String> {
+    // taskkill /f does NOT trigger Winlogon's shell auto-restart (only a
+    // graceful termination does), so the shell must be started manually —
+    // otherwise the desktop stays dead. But spawning the replacement while
+    // the old process is still winding down is what makes the taskbar take
+    // 10+ seconds (two explorer instances fight over the taskbar), so wait
+    // for the killed generation to actually disappear first.
+    let old_pid = find_explorer_pid();
+    let kill = std::process::Command::new("taskkill")
+        .args(["/f", "/im", "explorer.exe"])
+        .status();
+    match kill {
+        Ok(status) if status.success() => {}
+        Ok(_) => log::warn!("[explorer-hook] taskkill reported a non-zero exit"),
+        Err(e) => log::warn!("[explorer-hook] taskkill failed: {e}"),
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match find_explorer_pid() {
+            // Old process fully gone — safe to start the fresh shell.
+            None => break,
+            // A different generation already appeared on its own (Winlogon
+            // auto-restart on some systems) — use it, no manual spawn.
+            Some(pid) if old_pid.is_some_and(|old| pid != old) => {
+                RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
+                return Ok(());
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Old explorer is gone — start the shell fresh.
+    std::process::Command::new("explorer.exe")
+        .spawn()
+        .map_err(|e| format!("could not restart explorer.exe: {e}"))?;
+    // Explorer is coming up. The watchdog re-injects the hook into the fresh
+    // process (its 1s poll); once status.active flips, the fix is fully
+    // applied — every window in the new explorer renders through the hook.
+    RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// Inject the hook DLL into the current explorer.exe if this process
@@ -268,9 +471,20 @@ fn ensure_injected(app: &tauri::AppHandle) -> Result<(), String> {
     if LAST_INJECTED_PID.load(Ordering::Acquire) == pid {
         return Ok(());
     }
+    // Before this app session's first injection, check whether the running
+    // explorer already has the hook from a previous session (the DLL never
+    // unloads from explorer). A matching marker means the fix predates this
+    // app session, so status.applied stays true across app restarts.
+    if LAST_INJECTED_PID.load(Ordering::Acquire) == 0 {
+        HOOK_PREDATES_SESSION.store(
+            read_hook_marker_pid() == Some(pid),
+            Ordering::Release,
+        );
+    }
     let dll = ensure_hook_dll(app)?;
     inject(pid, &dll)?;
     LAST_INJECTED_PID.store(pid, Ordering::Release);
+    write_hook_marker(pid);
     log::info!("[explorer-hook] injected explorer_hook.dll into explorer.exe (pid {pid})");
     Ok(())
 }
@@ -296,37 +510,30 @@ fn watchdog_loop(app: tauri::AppHandle) {
         if SHUTDOWN.load(Ordering::Acquire) {
             return;
         }
-        let Some(pid) = find_explorer_pid() else {
-            // Explorer isn't running (mid-logoff etc.). Back off and retry.
-            sleep_or_shutdown(2);
-            continue;
-        };
-        // Hold a SYNCHRONIZE handle and block until Explorer exits, ticking
-        // once per second so shutdown is still observed without a signal.
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok() };
-        match handle {
-            Some(h) => {
-                loop {
-                    if SHUTDOWN.load(Ordering::Acquire) {
-                        let _ = unsafe { CloseHandle(h) };
-                        return;
-                    }
-                    let wait = unsafe { WaitForSingleObject(h, 1000) };
-                    if wait != WAIT_TIMEOUT {
-                        break; // explorer exited
-                    }
-                }
-                let _ = unsafe { CloseHandle(h) };
-            }
-            None => {
-                sleep_or_shutdown(2);
-                continue;
-            }
-        }
-        // Explorer restarted: re-inject if the feature is still enabled.
+        // Re-inject whenever the running explorer.exe generation differs from
+        // the one we last injected. Polling once per second is cheap (one
+        // process snapshot) and immune to the transition race: the old
+        // wait-on-handle design called ensure_injected exactly once when the
+        // old process died — but at that moment the fresh explorer.exe often
+        // did not exist yet, so injection was deferred and the watchdog then
+        // blocked on the new process without ever re-injecting. That is why
+        // the fix sometimes never applied after a restart.
         if ENABLED.load(Ordering::Acquire) {
-            let _ = ensure_injected(&app);
+            let Some(pid) = find_explorer_pid() else {
+                // Explorer isn't running (mid-logoff etc.). Back off.
+                sleep_or_shutdown(1);
+                continue;
+            };
+            if LAST_INJECTED_PID.load(Ordering::Acquire) != pid {
+                // New explorer generation (or first injection): try to inject
+                // now, retrying on the next tick if explorer is still
+                // initializing and the remote thread failed.
+                if let Err(e) = ensure_injected(&app) {
+                    log::warn!("[explorer-hook] re-injection failed, will retry: {e}");
+                }
+            }
         }
+        sleep_or_shutdown(1);
     }
 }
 

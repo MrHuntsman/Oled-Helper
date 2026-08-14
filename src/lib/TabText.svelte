@@ -9,9 +9,9 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
-  import { app } from './stores.svelte.js';
+  import { app, textSettings, saveConfig } from './stores.svelte.js';
 
-  let { modalOpen = false } = $props();
+  let { modalOpen = false, menuOpen = false } = $props();
 
   const MODES = [
     { id: 'off', label: 'Off' },
@@ -32,6 +32,24 @@
 
   let contrastDragging = $state(false);
   let contrastHovering = $state(false);
+
+  // Explorer hook state from the backend's explorer_hook_status command
+  // (polled while mounted): active = DLL loaded in the running explorer.exe,
+  // applied = active AND Explorer was restarted with the fix active, so every
+  // window in the current process renders through the hook.
+  let hookStatus = $state({ enabled: false, active: false, applied: false });
+  let restarting = $state(false);
+  // opts may be null: the backend commands resolve to null (unit), so
+  // `.then(refreshHookStatus)` passes null — never destructure it directly.
+  async function refreshHookStatus(opts) {
+    const clearRestarting = opts?.clearRestarting === true;
+    try {
+      hookStatus = await invoke('explorer_hook_status');
+      if (clearRestarting && hookStatus.active) restarting = false;
+    } catch (e) {
+      console.warn('[text] explorer hook status failed', e);
+    }
+  }
 
   // Legacy refs retained while the native preview is being migrated; the
   // visible comparison samples are stable HTML text rather than canvases.
@@ -82,10 +100,17 @@
     scheduleNativePreviewBounds();
   });
 
+  // Sync the persisted master toggle into the backend hook module so it
+  // gates injection (Explorer untouched when off).
+  function syncExplorerToggle() {
+    invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled }).catch(() => {});
+  }
+
   async function refreshState() {
     try {
       const s = await invoke('text_rendering_get_state');
       state = { ...state, ...s };
+      syncExplorerToggle();
       syncExplorerHook(state.effective_mode);
     } catch (e) {
       error = String(e);
@@ -100,7 +125,42 @@
   // hook DLL (see src-tauri/src/explorer_hook.rs): grayscale → force
   // grayscale, off → force non-antialiased (crisp), rgb/bgr → pass through.
   function syncExplorerHook(mode) {
-    invoke('explorer_hook_set_mode', { mode }).catch((e) => console.warn('[text] explorer hook failed', e));
+    invoke('explorer_hook_set_mode', { mode })
+      .then(refreshHookStatus)
+      .catch((e) => console.warn('[text] explorer hook failed', e));
+  }
+
+  // Master toggle: on → inject the hook and follow the mode; off → stop
+  // injecting and write passthrough so Explorer returns to system ClearType.
+  function onToggleExplorerHook() {
+    textSettings.explorerHookEnabled = !textSettings.explorerHookEnabled;
+    saveConfig();
+    invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled })
+      .then(refreshHookStatus)
+      .catch((e) => console.warn('[text] explorer hook toggle failed', e));
+  }
+
+  // Restart Explorer so the change applies to already-open windows
+  // immediately (rasterized fonts stay cached until the process restarts).
+  // The button shows "Restarting…" until the fresh explorer.exe is up and
+  // the watchdog has re-injected the hook.
+  function onRestartExplorer() {
+    if (busy || restarting || !hookStatus.active || hookStatus.applied) return;
+    restarting = true;
+    invoke('restart_explorer')
+      .then(() => {
+        // Explorer takes ~1s to respawn; refresh once settled so the button
+        // flips to "✓ Fix applied" when the hook is back.
+        setTimeout(() => refreshHookStatus({ clearRestarting: true }), 1500);
+      })
+      .catch((e) => {
+        restarting = false;
+        error = String(e);
+      });
+    // Safety net: never leave the button stuck on "Restarting…". The
+    // backend may wait several seconds for Winlogon to bring Explorer back,
+    // so give it room (10s) before force-clearing.
+    setTimeout(() => { restarting = false; }, 10000);
   }
 
   async function applyMode(mode) {
@@ -142,6 +202,12 @@
     error = '';
     try {
       await invoke('text_rendering_reset');
+      // Restore the Explorer hook toggle to its (off) default too.
+      if (textSettings.explorerHookEnabled) {
+        textSettings.explorerHookEnabled = false;
+        saveConfig();
+        syncExplorerToggle();
+      }
       await refreshState();
       await updateNativePreview();
     } catch (e) {
@@ -183,7 +249,12 @@
     }
     nativePreviewBoundsSyncing = true;
     try {
-      if (modalOpen) {
+      // Hide while a modal or a bottom-panel dropdown/context menu is open:
+      // the preview is a separate popup HWND floating above the WebView, so
+      // HTML menus that open over it would be drawn underneath (cut off).
+      // With the preview hidden the menu renders fully; it reappears when
+      // the menu closes.
+      if (modalOpen || menuOpen) {
         if (nativePreviewVisible) {
           nativePreviewVisible = false;
           await invoke('text_preview_hide');
@@ -242,7 +313,7 @@
   }
 
   $effect(() => {
-    if (modalOpen) {
+    if (modalOpen || menuOpen) {
       nativePreviewVisible = false;
       invoke('text_preview_hide').catch(() => {});
     } else if (loaded) {
@@ -353,7 +424,7 @@
         contrast: state.contrast,
       })
         .then(() => {
-          if (!modalOpen) scheduleNativePreviewBounds();
+          if (!modalOpen && !menuOpen) scheduleNativePreviewBounds();
         })
         .catch((e) => console.warn('[text] native preview recreate failed', e));
     };
@@ -447,8 +518,15 @@
     window.addEventListener('resize', onWindowResized);
     scrollParents.forEach((parent) => parent.addEventListener('scroll', onLayoutChange, { passive: true }));
 
+    // Poll the hook status while mounted so the Restart Explorer button
+    // reflects reality (toggle, mode changes, Explorer restarting, watchdog
+    // re-injection) without wiring every event path.
+    refreshHookStatus();
+    const hookStatusPoll = setInterval(refreshHookStatus, 2000);
+
     return () => {
       disposed = true;
+      clearInterval(hookStatusPoll);
       if (nativePreviewSyncRaf) cancelAnimationFrame(nativePreviewSyncRaf);
       if (previewHoldRetryTimer) clearTimeout(previewHoldRetryTimer);
       previewHoldRetryTimer = null;
@@ -481,7 +559,7 @@
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore Windows defaults</button>
+    <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -492,54 +570,84 @@
         <span class="info-tip-wrap">
           <button class="info-tip-btn" aria-label="About text rendering mode" tabindex="0">Info</button>
           <span class="info-tip info-tip-right">
-            <span>Fix color fringing by changing Windows subpixel rendering.</span>
+            <span>
+              Sets the subpixel mode for GDI and DirectWrite text pipelines.<br>
+              <br>
+              Apps that cache their fonts like Chromium need a restart.
+            </span>
           </span>
         </span>
       </span>
     </div>
-    <div class="text-render-inline-modes" role="radiogroup" aria-label="Preview subpixel mode">
-      {#each MODES as m (m.id)}
-        <button type="button" class="text-render-inline-mode" class:active={state.effective_mode === m.id} role="radio" aria-checked={state.effective_mode === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
-          {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
-          {m.label}
-        </button>
-      {/each}
+    <div class="text-render-modes-row">
+      <div class="text-render-inline-modes" role="radiogroup" aria-label="Preview subpixel mode">
+        {#each MODES as m (m.id)}
+          <button type="button" class="text-render-inline-mode" class:active={state.effective_mode === m.id} role="radio" aria-checked={state.effective_mode === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
+            {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
+            {m.label}
+            {#if m.id === 'grayscale'}<span class="text-render-recommended-badge">Recommended</span>{/if}
+          </button>
+        {/each}
+      </div>
+      {#if state.effective_mode === 'rgb' || state.effective_mode === 'bgr'}
+        <div class="text-render-mini-contrast">
+          <span class="text-render-mini-contrast-label">Contrast</span>
+          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+            <input type="range" class="slider-sm" min="1000" max="2200" step="100" value={state.contrast}
+              style="--fill:{((state.contrast - 1000) / 1200) * 100}%"
+              oninput={(e) => applyContrast(Math.round(Number(e.currentTarget.value) / 100) * 100)}
+              onpointerdown={() => contrastDragging = true}
+              onpointerup={() => contrastDragging = false}
+              onpointercancel={() => contrastDragging = false}
+              onpointerenter={() => contrastHovering = true}
+              onpointerleave={() => contrastHovering = false} />
+            <div class="slider-tooltip" class:visible={contrastDragging || contrastHovering} style="left:calc(9px + ({((state.contrast - 1000) / 1200)} * (100% - 18px)))">{state.contrast}</div>
+          </div>
+          <span class="slider-val">{state.contrast}</span>
+        </div>
+      {/if}
     </div>
+  </div>
+
+  <div class="text-render-preview-panel">
     <div class="text-render-preview-caption-row">
       <span class="text-render-preview-caption text-render-preview-caption-left">100% zoom</span>
       <span class="text-render-preview-caption text-render-preview-caption-right">400% zoom</span>
     </div>
     <div class="text-render-native-preview-host" bind:this={nativePreviewHost} role="img" aria-label="Live native Windows text rendering preview">
-      <span class="text-render-native-preview-fallback">The quick brown fox jumps over the lazy dog</span>
+      <span class="text-render-native-preview-fallback">
+        {menuOpen || modalOpen
+          ? 'The live text preview is hidden while a menu is open.'
+          : 'Loading live text preview…'}
+      </span>
     </div>
   </div>
 
   <div class="dimmer-control">
-    <div class="dimmer-control-heading text-render-slider-heading">
-      <span class="settings-row-label">
-        Text contrast
-        <span class="info-tip-wrap">
-          <button class="info-tip-btn" aria-label="About text contrast" tabindex="0">Info</button>
-          <span class="info-tip info-tip-right">
-            <span>Contrast only affects ClearType (RGB/BGR) text and controls the intensity of the color fringing. Grayscale and Off doesn't have text fringing.</span>
-          </span>
-        </span>
+    <div class="dimmer-control-heading">
+      <span class="hdr-control-title">
+        <span class="settings-row-label">Windows Explorer</span>
       </span>
-      <span class="slider-val">{state.contrast}</span>
     </div>
-    <div class="slider-track-wrap dimmer-slider-track" role="presentation">
-      <input type="range" min="1000" max="2200" step="100" value={state.contrast}
-        style="--fill:{((state.contrast - 1000) / 1200) * 100}%"
-        oninput={(e) => applyContrast(Math.round(Number(e.currentTarget.value) / 100) * 100)}
-        onpointerdown={() => contrastDragging = true}
-        onpointerup={() => contrastDragging = false}
-        onpointercancel={() => contrastDragging = false}
-        onpointerenter={() => contrastHovering = true}
-        onpointerleave={() => contrastHovering = false}
-        disabled={busy || (state.effective_mode !== 'rgb' && state.effective_mode !== 'bgr')} />
-      <div class="slider-tooltip" class:visible={contrastDragging || contrastHovering} style="left:calc(9px + ({((state.contrast - 1000) / 1200)} * (100% - 18px)))">{state.contrast}</div>
+    <p class="text-render-explorer-desc">Windows Explorer ignores grayscale and always renders its text with ClearType (RGB by default).<br>This fix injects a hook into explorer.exe and forces grayscale rendering.</p>
+    <p class="text-render-explorer-warning">⚠ It could trigger a false positive in your antivirus.</p>
+    <div class="text-render-explorer-actions">
+      <label class="text-render-explorer-toggle">
+        <input type="checkbox" checked={textSettings.explorerHookEnabled} onchange={onToggleExplorerHook} />
+        <span class="text-render-explorer-toggle-label">Fix Windows Explorer</span>
+      </label>
+      <button type="button" class="restart-explorer-btn" class:applied={hookStatus.applied} onclick={onRestartExplorer} disabled={busy || restarting || !hookStatus.active || hookStatus.applied}>
+        {#if restarting}
+          Restarting…
+        {:else if hookStatus.applied}
+          Fix applied <span class="restart-explorer-check">✓</span>
+        {:else if hookStatus.active}
+          Apply and restart Explorer
+        {:else}
+          Fix not applied to Explorer
+        {/if}
+      </button>
     </div>
-    <div class="dimmer-scale"><span>Darker</span><span>Lighter</span></div>
   </div>
 
   <div class="separator"></div>

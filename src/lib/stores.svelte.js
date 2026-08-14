@@ -161,6 +161,11 @@ export const taskbarDimmer = $state({
   pollIntervalMs: 100,
 });
 
+// Text rendering tab settings persisted in config. The Explorer hook toggle
+// decides whether the injected DLL fixes Explorer's text (Grayscale/Off
+// modes) or leaves it at system ClearType.
+export const textSettings = $state({ explorerHookEnabled: false });
+
 // Debug-tab logging switches, independent of each other:
 //   verbosePeriodic ,  vendor/EDID detailed diagnostics (set_detailed_logging)
 //   dimmerVerbose   ,  taskbar dimmer tick/winevent/fade verbose logs
@@ -452,6 +457,7 @@ export async function loadConfig(prefetchedCfg = null) {
     }
     clampHighNitsRange();
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
+    if (cfg && typeof cfg.explorer_hook_enabled === 'boolean') textSettings.explorerHookEnabled = cfg.explorer_hook_enabled;
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
     if (cfg && typeof cfg.taskbar_dimmer_fade_out_duration_ms === 'number') taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_out_duration_ms)));
@@ -537,6 +543,7 @@ export function saveConfig() {
     high_nits_max: crush.highNitsMax,
     high_nits_step: crush.highNitsStep,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
+    explorer_hook_enabled: textSettings.explorerHookEnabled,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
     taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
     taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,

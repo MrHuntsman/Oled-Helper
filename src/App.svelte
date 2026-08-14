@@ -1194,11 +1194,11 @@
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
-      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
-    </button>
     <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
       <TabTextIcon class="nav-icon" /> Text rendering
+    </button>
+    <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
+      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
 
     <div class="sidebar-spacer"></div>
@@ -1214,7 +1214,7 @@
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
       {:else if app.activeTab === 'text'}
-        <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} />
+        <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} menuOpen={resMenuOpen || hzMenuOpen || favoritesMenuOpen || resCtxMenu.open || hzCtxMenu.open} />
       {:else if app.activeTab === 'windows-hdr'}
         <TabWindowsHdr />
       {:else if app.activeTab === 'debug'}

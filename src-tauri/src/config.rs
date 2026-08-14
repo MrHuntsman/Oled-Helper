@@ -48,6 +48,11 @@ pub struct AppConfig {
     // Small gap between cells on the Black strip (right-click menu toggle).
     #[serde(default = "default_true")]
     pub black_strip_gap_enabled: bool,
+    // Whether the injected Explorer font hook is active (Text rendering tab
+    // toggle). Off by default: Explorer's text is left at system ClearType
+    // and the hook DLL is not injected unless the user enables it.
+    #[serde(default)]
+    pub explorer_hook_enabled: bool,
     // High Nits strip range: the grid is a fixed 3×7 (21 cells) with no
     // zoom; the user picks Min and Max directly (independently of each
     // other) and Step (nits between neighboring cells) is derived on the
@@ -147,6 +152,7 @@ impl Default for AppConfig {
             black_enabled: true,
             hide_calibration_interface: false,
             black_strip_gap_enabled: true,
+            explorer_hook_enabled: false,
             high_nits_min: default_high_nits_min(),
             high_nits_max: None,
             high_nits_step: default_high_nits_step(),

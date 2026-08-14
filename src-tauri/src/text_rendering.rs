@@ -565,23 +565,21 @@ mod native_preview {
                         // Two comparison columns: actual size on the left and a
                         // 400% raster-zoomed version on the right. The left
                         // column has four sentence rows at increasing sizes
-                        // (8, 10, 12, 15) followed by four digit rows
-                        // ("0123456789") at the same sizes; the right column
-                        // zooms the sentence rows 4x. The "400% zoom" caption
-                        // lives in the app HTML above the preview.
+                        // (8, 10, 12, 15); the right column zooms the last two
+                        // sizes (12, 15) 4x. The "400% zoom" caption lives in
+                        // the app HTML above the preview.
                         let text: Vec<u16> =
                             "The quick brown fox jumps over the lazy dog"
                                 .encode_utf16()
                                 .collect();
-                        let digits: Vec<u16> = "0123456789".encode_utf16().collect();
                         let row_sizes = [8i32, 10, 12, 15];
+                        let right_sizes = [12i32, 15];
                         let zoom_factor = 4i32;
                         let dpi = GetDpiForWindow(hwnd).max(96);
                         let top_padding = ((2u32 * dpi) / 96).max(1) as i32;
                         let horizontal_margin = ((10u32 * dpi) / 96).max(1) as i32;
                         let column_gap = ((12u32 * dpi) / 96).max(1) as i32;
                         let row_gap = ((6u32 * dpi) / 96).max(1) as i32;
-                        let digits_gap = (((6u32) * dpi) / 96).max(1) as i32;
                         let split_x = client.left + (client.right - client.left) / 2;
                         let content_top = client.top + top_padding;
                         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -628,25 +626,8 @@ mod native_preview {
                             left_cursor += base_height + row_gap;
                         }
 
-                        // Left digit rows at the same increasing sizes,
-                        // separated from the sentences by a small gap. The
-                        // right column shows the sentence text only (not the
-                        // digits), zoomed 4x.
-                        left_cursor += digits_gap;
-                        for size in row_sizes {
-                            let base_height = (((size as u32 * 3 / 2) * dpi) / 96).max(1) as i32;
-                            let mut digits_left_rect = RECT {
-                                left: client.left + horizontal_margin,
-                                top: left_cursor,
-                                right: split_x - column_gap,
-                                bottom: (left_cursor + base_height).min(client.bottom - 1),
-                            };
-                            draw_left_row(hdc, &mut digits_left_rect, &digits, size, dpi);
-                            left_cursor += base_height + row_gap;
-                        }
-
-                        // Right column: the sentence rows at 4x zoom.
-                        for size in row_sizes {
+                        // Right column: the last two sentence sizes at 4x zoom.
+                        for size in right_sizes {
                             let base_height = (((size + 2) as u32 * dpi) / 96).max(1) as i32;
                             let zoom_height = base_height * 4;
                             let right_rect = RECT {
