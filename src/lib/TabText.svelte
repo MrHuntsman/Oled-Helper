@@ -97,11 +97,10 @@
 
   // Mirror the mode into Explorer. The shell hard-codes ClearType and ignores
   // the registry, so Grayscale/Off only reach Explorer through the injected
-  // hook DLL (see src-tauri/src/explorer_hook.rs).
+  // hook DLL (see src-tauri/src/explorer_hook.rs): grayscale → force
+  // grayscale, off → force non-antialiased (crisp), rgb/bgr → pass through.
   function syncExplorerHook(mode) {
-    invoke('explorer_hook_set_force_grayscale', {
-      enabled: mode === 'grayscale' || mode === 'off',
-    }).catch((e) => console.warn('[text] explorer hook failed', e));
+    invoke('explorer_hook_set_mode', { mode }).catch((e) => console.warn('[text] explorer hook failed', e));
   }
 
   async function applyMode(mode) {
@@ -124,9 +123,11 @@
   // Applied immediately on every drag tick: the backend now only does a fast
   // SPI write + registry write and posts the desktop notification
   // asynchronously, so there is no need to debounce — the native preview
-  // follows the thumb live.
+  // follows the thumb live. Contrast is a ClearType-only setting: grayscale
+  // and off text has no color fringing to intensify, so the control is
+  // disabled (and ignored) outside RGB/BGR.
   function applyContrast(value) {
-    if (state.effective_mode === 'off') return;
+    if (state.effective_mode !== 'rgb' && state.effective_mode !== 'bgr') return;
     state.contrast = value;
     invoke('text_rendering_set_contrast', { contrast: value })
       .then(updateNativePreview)
@@ -515,7 +516,15 @@
 
   <div class="dimmer-control">
     <div class="dimmer-control-heading text-render-slider-heading">
-      <span class="settings-row-label">Text contrast</span>
+      <span class="settings-row-label">
+        Text contrast
+        <span class="info-tip-wrap">
+          <button class="info-tip-btn" aria-label="About text contrast" tabindex="0">Info</button>
+          <span class="info-tip info-tip-right">
+            <span>Contrast only affects ClearType (RGB/BGR) text and controls the intensity of the color fringing. Grayscale and Off doesn't have text fringing.</span>
+          </span>
+        </span>
+      </span>
       <span class="slider-val">{state.contrast}</span>
     </div>
     <div class="slider-track-wrap dimmer-slider-track" role="presentation">
@@ -527,7 +536,7 @@
         onpointercancel={() => contrastDragging = false}
         onpointerenter={() => contrastHovering = true}
         onpointerleave={() => contrastHovering = false}
-        disabled={busy || state.effective_mode === 'off'} />
+        disabled={busy || (state.effective_mode !== 'rgb' && state.effective_mode !== 'bgr')} />
       <div class="slider-tooltip" class:visible={contrastDragging || contrastHovering} style="left:calc(9px + ({((state.contrast - 1000) / 1200)} * (100% - 18px)))">{state.contrast}</div>
     </div>
     <div class="dimmer-scale"><span>Darker</span><span>Lighter</span></div>

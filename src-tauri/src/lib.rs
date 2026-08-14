@@ -1089,7 +1089,7 @@ pub fn run() {
             text_rendering::text_preview_set_bounds,
             text_rendering::text_preview_hide,
             text_rendering::text_preview_destroy,
-            explorer_hook::explorer_hook_set_force_grayscale,
+            explorer_hook::explorer_hook_set_mode,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,

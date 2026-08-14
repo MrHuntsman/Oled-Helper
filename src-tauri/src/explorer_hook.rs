@@ -1,9 +1,11 @@
 // explorer_hook.rs — inject explorer_hook.dll into explorer.exe and control
-// its grayscale-forcing flag. The Windows shell hard-codes ClearType and
+// its font-antialiasing override. The Windows shell hard-codes ClearType and
 // ignores the per-user font-smoothing registry values, so the only way to
 // change Explorer's text is to inject a DLL that hooks CreateFontIndirectW
-// (see explorer-hook/). The DLL reads a session-local shared-memory flag that
-// this module writes: 0 = pass through, 1 = force ANTIALIASED_QUALITY.
+// (see explorer-hook/). The DLL reads a session-local shared-memory mode
+// that this module writes: 0 = pass through, 1 = force grayscale
+// (ANTIALIASED_QUALITY), 2 = force no antialiasing / crisp
+// (NONANTIALIASED_QUALITY).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,11 +82,11 @@ fn ensure_state_mapped() -> Result<*mut u32, String> {
     }
 }
 
-fn write_state(enabled: bool) -> Result<(), String> {
+fn write_state(mode: u32) -> Result<(), String> {
     let ptr = ensure_state_mapped()?;
     // SAFETY: ptr is the mapped view, valid for the process lifetime.
     unsafe {
-        *ptr = if enabled { 1 } else { 0 };
+        *ptr = mode;
     }
     Ok(())
 }
@@ -234,14 +236,22 @@ fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
     }
 }
 
-/// Follow the Text rendering tab's mode: force grayscale in Explorer while the
-/// app is in Grayscale or Off, and leave Explorer's ClearType alone in
-/// RGB/BGR. Writes the shared flag, starts the restart watchdog, and injects
-/// (or re-injects) the hook DLL into explorer.exe.
+/// Follow the Text rendering tab's mode in Explorer:
+///   grayscale → force grayscale (ANTIALIASED_QUALITY)
+///   off       → force no antialiasing, crisp (NONANTIALIASED_QUALITY)
+///   rgb/bgr   → pass through (Explorer keeps its ClearType + the system
+///               orientation the app already sets)
+/// Writes the shared mode, starts the restart watchdog, and injects (or
+/// re-injects) the hook DLL into explorer.exe.
 #[tauri::command]
-pub fn explorer_hook_set_force_grayscale(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    ENABLED.store(enabled, Ordering::Release);
-    write_state(enabled)?;
+pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
+    let state = match mode.as_str() {
+        "grayscale" => 1,
+        "off" => 2,
+        _ => 0,
+    };
+    ENABLED.store(state != 0, Ordering::Release);
+    write_state(state)?;
     ensure_watchdog_running(app.clone());
     ensure_injected(&app)
 }
