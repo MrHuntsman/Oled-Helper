@@ -355,11 +355,20 @@
         rtxHdrPositionController?.stop();
       }
     }
+    // The window losing focus (minimize, backgrounded, hidden to tray)
+    // must close the menu too — it would otherwise still be open, stale,
+    // when the user returns to the window.
+    function onBlur() {
+      rtxHdrMenuOpen = false;
+      rtxHdrPositionController?.stop();
+    }
     window.addEventListener('pointerdown', onDown);
     window.addEventListener('keydown', onKey);
+    window.addEventListener('blur', onBlur);
     return () => {
       window.removeEventListener('pointerdown', onDown);
       window.removeEventListener('keydown', onKey);
+      window.removeEventListener('blur', onBlur);
       rtxHdrPositionController?.stop();
       rtxHdrPositionController = null;
     };

@@ -555,6 +555,17 @@
     clearTimeout(favoritesHoverTimer);
     favoritesMenuOpen = false;
   }
+  // Close every open dropdown/context menu in one go. Called when the window
+  // hides to the tray or loses focus (minimize, backgrounded): a dropdown
+  // left open would otherwise still be open — stale and floating over the
+  // restored window — when the user comes back.
+  function closeAllMenus() {
+    resMenuOpen = false;
+    hzMenuOpen = false;
+    favoritesMenuOpen = false;
+    if (resCtxMenu.open) closeResContextMenu();
+    if (hzCtxMenu.open) closeHzContextMenu();
+  }
   // Hover-open for the favorites menu: a short delay so a quick pass over the
   // star in the status bar does not flash the menu, and a grace period on
   // leave so moving the pointer from the icon into the menu itself (or across
@@ -960,7 +971,13 @@
     function applyWindowVisible(visible, animated = false) {
       const wasVisible = windowVisible;
       windowVisible = visible;
-      if (!visible || wasVisible) return;
+      if (!visible) {
+        // Window hid to the tray (or a self-heal read found it hidden):
+        // close any open dropdown so it never greets the user on restore.
+        closeAllMenus();
+        return;
+      }
+      if (wasVisible) return;
       // Stamp the restore moment. The Text tab's native preview reads this
       // on mount and holds itself hidden until the window's restore
       // animation has had time to finish, so the text sample never appears
@@ -1005,6 +1022,16 @@
         .catch(() => {});
     }
     window.addEventListener('focus', reconcileWindowVisible);
+    // A dropdown left open when the window is minimized or backgrounded
+    // (another app focused) would still be open — and stale — when the user
+    // comes back. The window-visibility event covers the close-to-tray path
+    // (applyWindowVisible above); blur and visibilitychange cover minimize
+    // and backgrounding, where no Rust event is emitted.
+    window.addEventListener('blur', closeAllMenus);
+    function onDocumentVisibilityChange() {
+      if (document.visibilityState === 'hidden') closeAllMenus();
+    }
+    document.addEventListener('visibilitychange', onDocumentVisibilityChange);
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
     listen('hotkey-pressed', (event) => handleHotkeyAction(event.payload)).then((stop) => { unlistenHotkeyPressed = stop; }).catch(() => {});
     // A resolution or refresh rate picked from the tray menu. Runs the same
@@ -1036,6 +1063,8 @@
       unlistenTrayMode?.();
       unlistenFlyoutCompleted?.();
       window.removeEventListener('focus', reconcileWindowVisible);
+      window.removeEventListener('blur', closeAllMenus);
+      document.removeEventListener('visibilitychange', onDocumentVisibilityChange);
     };
   });
 

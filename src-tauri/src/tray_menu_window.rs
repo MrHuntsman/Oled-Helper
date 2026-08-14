@@ -65,8 +65,9 @@ const BASE_WIDTH: f64 = 284.0;
 // first frame after the window is created.
 // Includes the title/monitor/current-mode header, the three compact quick
 // control rows, separators, plus the largest inline favorites layout (up to
-// three favorites) before exact DOM measurement.
-const BASE_HEIGHT_ESTIMATE: f64 = 425.0;
+// three favorites) before exact DOM measurement. Kept in step with the
+// compact row padding in tray-menu.css.
+const BASE_HEIGHT_ESTIMATE: f64 = 400.0;
 // The window is built once at this full footprint (base menu + resolution
 // submenu both visible) and never resized while shown; CSS/Svelte alone
 // show or hide the submenu pane inside that fixed canvas. An earlier

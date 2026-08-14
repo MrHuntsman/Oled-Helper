@@ -181,7 +181,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 7px 10px;
+  padding: 4px 10px;
   border-radius: 6px;
   cursor: pointer;
   white-space: nowrap;
@@ -231,7 +231,7 @@
    button on the left instead of sharing the row's width. */
 .tray-restart-exit-row > .tray-item.tray-restart-item {
   flex: 0 0 auto;
-  padding: 7px 12px;
+  padding: 4px 12px;
 }
 .tray-restart-exit-row > .tray-item > .tray-item-label {
   flex: 0 0 auto;
@@ -491,7 +491,7 @@
    inline confirm appears inside the Favorites submenu. */
 .tray-submenu .tray-favorite-inline-confirm-btn {
   width: 22px;
-  height: 22px;
+  height: 20px;
 }
 
 .tray-submenu .tray-favorite-inline-confirm-btn svg {
@@ -516,7 +516,7 @@
 
 .tray-sep {
   height: 1px;
-  margin: 6px 4px;
+  margin: 4px 4px;
   background: var(--divider);
 }
 
@@ -524,14 +524,10 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 34px;
-  padding: 5px 10px;
+  min-height: 30px;
+  padding: 4px 10px;
   border-radius: 6px;
   transition: background 0.08s;
-}
-
-.tray-dimmer-row:hover {
-  background: color-mix(in srgb, var(--accent) 7%, var(--hover));
 }
 
 .tray-dimmer-row.unavailable {
@@ -634,6 +630,50 @@
   text-align: right;
 }
 
+/* SDR→HDR inverse tone mapping mode row: a short label plus the mode
+   choices (Off / Auto HDR / RTX HDR) inline as a segmented control, sitting
+   above the Restart/Exit row. */
+.tray-hdr-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 4px 10px;
+  border-radius: 6px;
+}
+.tray-hdr-mode-options {
+  display: flex;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+.tray-hdr-mode-opt {
+  flex: 1;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-weak);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.tray-hdr-mode-opt:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+.tray-hdr-mode-opt.active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.tray-hdr-mode-opt:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Black Level and SDR Content Brightness share one compact control group
    directly below the Taskbar Dimmer row. There are deliberately no dividers
    between these three related controls. */
@@ -641,14 +681,10 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 34px;
-  padding: 5px 10px;
+  min-height: 30px;
+  padding: 4px 10px;
   border-radius: 6px;
   transition: background 0.08s;
-}
-
-.tray-quick-row:hover {
-  background: color-mix(in srgb, var(--accent) 7%, var(--hover));
 }
 
 .tray-quick-row.unavailable {
@@ -771,15 +807,25 @@
   border: 1px solid var(--divider);
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  padding: 6px;
+  /* Same container padding and 2px inter-item gap as the main app's
+     dropdowns (.hz-menu), so the tray submenus share their spacing too. */
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
-/* Keep the main card's comfortable spacing, but make submenu listings denser
-   so more resolutions, rates, and favorites fit before scrolling. */
+/* Use the exact same row sizing as the main app's dropdown items
+   (.hz-menu-item: height 32px + flex-basis 20px, 11px font) so the tray
+   submenus render at the same pitch as the app dropdowns, whatever the
+   browser's flexbox resolution does with that pair. */
 .tray-submenu .tray-item {
   gap: 4px;
-  padding: 4px 5px;
-  font-size: 12px;
+  height: 32px;
+  flex: 0 0 20px;
+  box-sizing: border-box;
+  padding: 0 5px;
+  font-size: 11px;
   transition: background 0.08s, color 0.08s, transform 0.08s;
 }
 
@@ -810,9 +856,7 @@
   padding: 6px 10px 3px;
 }
 
-.tray-submenu-group-label:not(:first-child) {
-  margin-top: 4px;
-}
+
 
 .tray-submenu .tray-favorite-star {
   width: 18px;
@@ -846,10 +890,22 @@
 }
 
 .tray-refresh-submenu {
-  /* Match the main app's dropdown sizing: rows expand to fit their content
-     (Hz + Black Level) up to the same 320px ceiling, with the Black Level
-     value pushed to the right edge. */
-  min-width: 140px;
+  /* The refresh rows are short ("120 Hz" + optional black level), so this
+     pane sizes to its content instead of the 140px min-width the
+     resolution/favorites panes use, which left empty space on the right. */
+  min-width: 0;
   width: max-content;
-  max-width: 320px;
+  max-width: none;
+}
+/* The base .tray-item-label uses flex: 1, which makes it grow to fill the
+   row and shove the black-level value ("(-0.1)") to the far right. In the
+   refresh submenu the value belongs right next to the Hz label, so the
+   label must stop growing (and the row packs from the left instead of
+   space-between). This also lets the submenu shrink to its true content
+   width. */
+.tray-refresh-submenu .tray-item {
+  justify-content: flex-start;
+}
+.tray-refresh-submenu .tray-item-label {
+  flex: 0 1 auto;
 }

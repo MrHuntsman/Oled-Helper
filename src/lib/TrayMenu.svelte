@@ -31,6 +31,13 @@
   // read through the same matchMedia probe the main app uses. Drives the
   // header's SDR/HDR switch and hides the SDR Content Brightness row in SDR.
   let trayHdrStatus = $state('unknown');
+  // SDR→HDR inverse tone mapping mode, mirroring the main app's Windows HDR
+  // tab: 'off' | 'auto' | 'rtx' | null (null = not loaded yet). The RTX
+  // option only exists on NVIDIA GPUs, like the main tab.
+  let trayHdrMode = $state(null);
+  let trayHdrModeBusy = $state(false);
+  let trayHdrModeError = $state('');
+  let trayHdrIsNvidia = $state(false);
 
   // Mirror the main app's accent switch: app.css flips --accent to the gold
   // HDR tone via `:root[data-hdr="true"]`, so the tray sliders/toggles follow
@@ -215,6 +222,55 @@
     quickInteractionVersion++;
     trayBlack.adjustment = Math.max(-150, Math.min(150, Math.round(Number(event.currentTarget.value))));
     queueBlackLevelApply();
+  }
+
+  // Read the current SDR→HDR mode the same way the main app's Windows HDR
+  // tab derives it: Auto HDR state from the registry, RTX HDR state from the
+  // NVIDIA driver (only when the primary GPU is NVIDIA). Both read commands
+  // are registered for this window's IPC.
+  async function loadHdrEnhancementMode() {
+    try {
+      const vendorInfo = await invoke('refresh_vendor_display_info');
+      trayHdrIsNvidia = vendorInfo?.vendor === 'nvidia';
+      const autoEnabled = !!await invoke('get_auto_hdr_enabled');
+      let rtxEnabled = false;
+      if (trayHdrIsNvidia) {
+        const rtxSettings = await invoke('get_rtx_hdr_settings_state').catch(() => null);
+        rtxEnabled = !!rtxSettings?.enabled;
+      }
+      trayHdrMode = autoEnabled ? 'auto' : rtxEnabled ? 'rtx' : 'off';
+      trayHdrModeError = '';
+    } catch (e) {
+      console.error('tray-menu: failed to load HDR mode', e);
+    }
+  }
+
+  // Apply an SDR→HDR mode from the tray. Same single backend command as the
+  // main app's selector; RTX writes that need elevation relaunch the app
+  // elevated (the elevated child performs the full transition).
+  async function selectTrayHdrMode(mode) {
+    if (trayHdrModeBusy || mode === trayHdrMode) return;
+    if (mode === 'rtx' && !trayHdrIsNvidia) return;
+    trayHdrModeBusy = true;
+    trayHdrModeError = '';
+    try {
+      await invoke('set_hdr_enhancement_mode', { mode });
+      await loadHdrEnhancementMode();
+    } catch (e) {
+      trayHdrModeError = String(e);
+      if (trayHdrModeError.startsWith('ADMIN_REQUIRED:')) {
+        // Elevated relaunch applies the pending mode itself; there is no
+        // main-window tab to reopen on from the tray.
+        invoke('relaunch_elevated', {
+          rtxHdrFlags: null,
+          rtxHdrEnabled: null,
+          hdrMode: mode,
+          tab: null,
+        }).catch(() => {});
+      }
+    } finally {
+      trayHdrModeBusy = false;
+    }
   }
 
   async function loadSdrContentBrightness() {
@@ -814,6 +870,7 @@
     loadDisplayInfo();
     loadFavorites();
     loadTaskbarDimmer();
+    loadHdrEnhancementMode();
     loadSdrContentBrightness();
     pollTrayHdrStatus();
     getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
@@ -824,6 +881,7 @@
       loadDisplayInfo();
       loadFavorites();
       loadTaskbarDimmer();
+      loadHdrEnhancementMode();
       loadSdrContentBrightness();
       pollTrayHdrStatus();
     });
@@ -1127,6 +1185,20 @@
         </div>
       </div>
     {/if}
+
+    <div class="tray-sep"></div>
+
+    <div class="tray-hdr-mode-row" role="group" aria-label="SDR to HDR mode" onmouseenter={closeSubmenu}>
+      <div class="tray-hdr-mode-options">
+        {#each (trayHdrIsNvidia ? ['off', 'auto', 'rtx'] : ['off', 'auto']) as mode (mode)}
+          <button type="button" class="tray-hdr-mode-opt" class:active={trayHdrMode === mode}
+            disabled={trayHdrModeBusy || trayHdrMode === null}
+            aria-pressed={trayHdrMode === mode}
+            title={trayHdrModeError || undefined}
+            onclick={() => selectTrayHdrMode(mode)}>{mode === 'off' ? 'Off' : mode === 'auto' ? 'Auto HDR' : 'RTX HDR'}</button>
+        {/each}
+      </div>
+    </div>
 
     <div class="tray-sep"></div>
 
