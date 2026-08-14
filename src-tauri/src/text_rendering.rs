@@ -303,6 +303,7 @@ fn set_contrast(contrast: u32) -> Result<(), String> {
     // consistent lightness control across both rendering paths.
     write_dword(AVALON_SUBKEY, "GammaLevel", contrast)?;
     broadcast_settings_change();
+    log_smoothing_state(&format!("contrast set to {contrast}"));
     Ok(())
 }
 
@@ -351,6 +352,7 @@ fn apply_mode(mode: &str) -> Result<(), String> {
     // below still lets GDI apps and other DirectWrite apps pick the change up
     // immediately.
     broadcast_font_change();
+    log_smoothing_state(&format!("mode '{mode}' applied"));
     Ok(())
 }
 
@@ -369,6 +371,45 @@ fn derive_effective_mode(smoothing_enabled: bool, smoothing_type: u32, orientati
         }
         _ => "off".to_string(),
     }
+}
+
+// Read back the full GDI + DirectWrite smoothing state from the registry and
+// log it. This is how we verify writes actually landed and let users compare
+// what the app sets against what Explorer (a known ClearType holdout) visibly
+// honors — the registry values update, but Explorer's text may not.
+fn log_smoothing_state(context: &str) {
+    let smoothing_enabled = read_string(DESKTOP_SUBKEY, "FontSmoothing")
+        .ok()
+        .flatten()
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
+    let smoothing_type = read_dword(DESKTOP_SUBKEY, "FontSmoothingType")
+        .ok()
+        .flatten()
+        .unwrap_or(2);
+    let orientation = read_dword(DESKTOP_SUBKEY, "FontSmoothingOrientation")
+        .ok()
+        .flatten()
+        .unwrap_or(1);
+    let gdi_gamma = read_dword(DESKTOP_SUBKEY, "FontSmoothingGamma")
+        .ok()
+        .flatten()
+        .unwrap_or(DEFAULT_GAMMA);
+    let pixel_structure = read_dword(AVALON_SUBKEY, "PixelStructure")
+        .ok()
+        .flatten()
+        .unwrap_or(1);
+    let cleartype_level = read_dword(AVALON_SUBKEY, "ClearTypeLevel")
+        .ok()
+        .flatten()
+        .unwrap_or(100);
+    let dw_gamma = read_dword(AVALON_SUBKEY, "GammaLevel")
+        .ok()
+        .flatten()
+        .unwrap_or(1900);
+    log::info!(
+        "[text-rendering] {context}: GDI smoothing={smoothing_enabled} type={smoothing_type} orientation={orientation} gamma={gdi_gamma} | DirectWrite pixel_structure={pixel_structure} cleartype_level={cleartype_level} gamma_level={dw_gamma}"
+    );
 }
 
 // A small native child window used by the Text tab as a live, real-Windows
@@ -875,7 +916,7 @@ pub fn text_rendering_get_state() -> Result<TextRenderingState, String> {
     let gamma = read_dword(DESKTOP_SUBKEY, "FontSmoothingGamma")
         .unwrap_or(None)
         .unwrap_or(DEFAULT_GAMMA);
-    let contrast = read_dword(DESKTOP_SUBKEY, "FontSmoothingContrast")
+    let contrast = read_dword(DESKTOP_SUBKEY, "FontSmoothingGamma")
         .unwrap_or(None)
         .unwrap_or(DEFAULT_CONTRAST);
     let cleartype_level = read_dword(AVALON_SUBKEY, "ClearTypeLevel")
@@ -909,6 +950,7 @@ pub fn text_rendering_set_gamma(gamma: u32) -> Result<(), String> {
     }
     write_dword(DESKTOP_SUBKEY, "FontSmoothingGamma", gamma)?;
     broadcast_settings_change();
+    log_smoothing_state(&format!("gamma set to {gamma}"));
     Ok(())
 }
 
@@ -929,6 +971,7 @@ pub fn text_rendering_set_cleartype_level(level: u32) -> Result<(), String> {
         return Err(format!("cleartype level out of range: {level}"));
     }
     write_dword(AVALON_SUBKEY, "ClearTypeLevel", level)?;
+    log_smoothing_state(&format!("cleartype level set to {level}"));
     Ok(())
 }
 

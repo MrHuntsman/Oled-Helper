@@ -1,5 +1,6 @@
 mod config;
 mod display_info;
+mod explorer_hook;
 mod flyout_window;
 mod gamma_ramp;
 mod hdr_toggle;
@@ -475,6 +476,7 @@ fn request_shutdown_and_exit(app: &AppHandle) {
     taskbar_dimmer::shutdown();
     hotkeys::shutdown();
     shutdown_gamma_worker(app);
+    explorer_hook::shutdown();
     app.exit(0);
 }
 
@@ -1037,6 +1039,7 @@ pub fn run() {
             text_rendering::text_preview_update,
             text_rendering::text_preview_set_bounds,
             text_rendering::text_preview_hide,
+            explorer_hook::explorer_hook_set_force_grayscale,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,
@@ -1046,6 +1049,7 @@ pub fn run() {
             tray_menu_window::tray_menu_set_resolution,
             tray_menu_window::tray_menu_set_refresh_rate,
             tray_menu_window::tray_menu_hide,
+            tray_menu_window::tray_menu_open_main,
             tray_menu_window::tray_menu_restart,
             tray_menu_window::tray_menu_quit,
             tray_menu_window::tray_menu_set_expanded,

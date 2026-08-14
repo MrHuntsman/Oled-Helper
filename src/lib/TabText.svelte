@@ -47,12 +47,22 @@
     try {
       const s = await invoke('text_rendering_get_state');
       state = { ...state, ...s };
+      syncExplorerHook(state.effective_mode);
     } catch (e) {
       error = String(e);
       console.warn('[text] get_state failed', e);
     } finally {
       loaded = true;
     }
+  }
+
+  // Mirror the mode into Explorer. The shell hard-codes ClearType and ignores
+  // the registry, so Grayscale/Off only reach Explorer through the injected
+  // hook DLL (see src-tauri/src/explorer_hook.rs).
+  function syncExplorerHook(mode) {
+    invoke('explorer_hook_set_force_grayscale', {
+      enabled: mode === 'grayscale' || mode === 'off',
+    }).catch((e) => console.warn('[text] explorer hook failed', e));
   }
 
   async function applyMode(mode) {
@@ -62,6 +72,7 @@
     try {
       await      invoke('text_rendering_set_mode', { mode });
       state.effective_mode = mode;
+      syncExplorerHook(mode);
       await updateNativePreview();
     } catch (e) {
       error = String(e);

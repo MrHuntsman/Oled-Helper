@@ -82,6 +82,7 @@
   width: 22px;
   height: 22px;
   border-radius: 6px;
+  cursor: pointer;
 }
 
 .tray-menu-header-copy {
@@ -134,6 +135,12 @@
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.14s ease;
+}
+.tray-menu-header-title:hover,
+.tray-menu-header-title:focus-visible {
+  color: #fff;
 }
 
 .tray-menu-header-version {
@@ -219,6 +226,12 @@
 .tray-restart-exit-row > .tray-item {
   flex: 1;
   justify-content: center;
+}
+/* The Restart action is icon-only, so it collapses to a compact square
+   button on the left instead of sharing the row's width. */
+.tray-restart-exit-row > .tray-item.tray-restart-item {
+  flex: 0 0 auto;
+  padding: 7px 12px;
 }
 .tray-restart-exit-row > .tray-item > .tray-item-label {
   flex: 0 0 auto;

@@ -801,6 +801,10 @@
     await invoke('tray_menu_restart');
   }
 
+  async function openMain() {
+    await invoke('tray_menu_open_main');
+  }
+
   async function quit() {
     await invoke('tray_menu_quit');
   }
@@ -894,10 +898,28 @@
 >
   <div class="tray-menu">
     <div class="tray-menu-header">
-      <img class="tray-menu-header-icon" src={appIcon} alt="" aria-hidden="true" />
+      <img
+        class="tray-menu-header-icon"
+        src={appIcon}
+        alt=""
+        role="button"
+        tabindex="0"
+        aria-label="Open OLED Helper"
+        title="Open OLED Helper"
+        onclick={openMain}
+        onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && openMain()}
+      />
       <div class="tray-menu-header-copy">
         <div class="tray-menu-header-title-row">
-          <div class="tray-menu-header-title">OLED HELPER</div>
+          <div
+            class="tray-menu-header-title"
+            role="button"
+            tabindex="0"
+            aria-label="Open OLED Helper"
+            title="Open OLED Helper"
+            onclick={openMain}
+            onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && openMain()}
+          >OLED HELPER</div>
           <button
             type="button"
             class="hdr-switch"
@@ -1109,12 +1131,11 @@
     <div class="tray-sep"></div>
 
     <div class="tray-restart-exit-row" role="group" aria-label="Restart or Exit">
-      <div class="tray-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={restart} onkeydown={(e) => e.key === 'Enter' && restart()}>
+      <div class="tray-item tray-restart-item" role="menuitem" tabindex="0" aria-label="Restart" title="Restart" onmouseenter={closeSubmenu} onclick={restart} onkeydown={(e) => e.key === 'Enter' && restart()}>
         <svg class="tray-item-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <path d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
           <path d="M13.2 2.8v2.4h-2.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
-        <span class="tray-item-label">Restart</span>
       </div>
       <div class="tray-item tray-exit-item" role="menuitem" tabindex="0" onmouseenter={closeSubmenu} onclick={quit} onkeydown={(e) => e.key === 'Enter' && quit()}>
         <svg class="tray-item-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">

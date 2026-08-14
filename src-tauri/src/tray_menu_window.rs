@@ -608,6 +608,22 @@ pub fn tray_menu_restart(app: AppHandle) {
     crate::request_restart(&app, None);
 }
 
+/// Open (not toggle) the main app window from the tray menu header. Mirrors
+/// the single-instance handler: unminimize + show + focus, then emit the
+/// same window-visibility event so the frontend reconciles its tab state.
+#[tauri::command]
+pub fn tray_menu_open_main(app: AppHandle) {
+    hide(&app);
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = app.emit("window-visibility", true);
+    }
+}
+
 #[tauri::command]
 pub fn tray_menu_quit(app: AppHandle) {
     hide(&app);
