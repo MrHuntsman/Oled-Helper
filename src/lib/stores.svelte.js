@@ -5,6 +5,21 @@ import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, H
 
 export const app = $state({
   activeTab: 'crush',
+  // Timestamp (Date.now) of the last time the main window became visible
+  // again (tray show or taskbar restore). The Text tab's native preview
+  // reads it on mount so it can hold itself hidden until the window's
+  // restore animation finishes, instead of appearing over the transition.
+  // 0 = never restored (fresh launch), which means no hold.
+  windowRestoredAt: 0,
+  // Whether that last restore was from MINIMIZED (the Windows restore
+  // animation plays) rather than from hidden (instant, e.g. close-to-tray).
+  // The Text tab only waits out the animation in the animated case.
+  windowRestoreAnimated: false,
+  // Timestamp of the last backend-driven show (window-visibility event). The
+  // Text tab uses it to tell a backend show (the animated flag decides)
+  // from a taskbar restore (no event fires; a taskbar restore is always a
+  // minimized restore, so it always animates).
+  windowShownAt: 0,
   hdrStatus: 'unknown',
   hdrLuminance: null,
   // Windows SDR white level in nits (80–480), read live for System Info and

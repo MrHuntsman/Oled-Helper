@@ -957,10 +957,19 @@
     // gates the active tab's markup — can go stale and leave the tab area
     // blank. Routing the state change through here (and re-checking the real
     // state on window focus below) makes the flag self-heal.
-    function applyWindowVisible(visible) {
+    function applyWindowVisible(visible, animated = false) {
       const wasVisible = windowVisible;
       windowVisible = visible;
       if (!visible || wasVisible) return;
+      // Stamp the restore moment. The Text tab's native preview reads this
+      // on mount and holds itself hidden until the window's restore
+      // animation has had time to finish, so the text sample never appears
+      // over the transition. The hold only applies when the restore actually
+      // animates (the window was minimized), not for an instant close-to-tray
+      // show.
+      app.windowRestoredAt = Date.now();
+      app.windowRestoreAnimated = !!animated;
+      app.windowShownAt = Date.now();
       // The strip selection is session-only: always land back on the Black
       // strip when the window is restored, so a leftover Brightness pick
       // never greets the user after returning from the tray.
@@ -978,7 +987,12 @@
       checkForUpdates();
     }
     listen('window-visibility', (event) => {
-      applyWindowVisible(event.payload !== false);
+      const payload = event.payload;
+      const object = payload !== null && typeof payload === 'object';
+      applyWindowVisible(
+        object ? payload.visible !== false : payload !== false,
+        object ? payload.animated === true : false,
+      );
     }).then((stop) => { unlisten = stop; }).catch(() => {});
     // Self-heal: a restore that doesn't go through show_main_window (e.g.
     // clicking the taskbar button after minimizing) fires window focus but no

@@ -615,12 +615,18 @@ pub fn tray_menu_restart(app: AppHandle) {
 pub fn tray_menu_open_main(app: AppHandle) {
     hide(&app);
     if let Some(window) = app.get_webview_window("main") {
-        if window.is_minimized().unwrap_or(false) {
+        let was_minimized = window.is_minimized().unwrap_or(false);
+        if was_minimized {
             let _ = window.unminimize();
         }
         let _ = window.show();
         let _ = window.set_focus();
-        let _ = app.emit("window-visibility", true);
+        // animated = the window was minimized, so the restore replays the
+        // Windows restore animation (see show_main_window).
+        let _ = app.emit(
+            "window-visibility",
+            serde_json::json!({ "visible": true, "animated": was_minimized }),
+        );
     }
 }
 

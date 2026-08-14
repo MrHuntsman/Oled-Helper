@@ -68,11 +68,17 @@ mod display_change_events {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_NCDESTROY, WM_SETTINGCHANGE, WM_TIMER,
+        SIZE_MINIMIZED, SIZE_RESTORED, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_NCDESTROY,
+        WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
     };
 
     const SUBCLASS_ID: usize = 0x4F4C_4449; // "OLDI"
     static APP: OnceLock<AppHandle> = OnceLock::new();
+    // True while the main window is minimized (between SIZE_MINIMIZED and the
+    // next SIZE_RESTORED). SIZE_RESTORED also fires for ordinary resizes, so
+    // this flag is what lets us tell a genuine restore-from-minimized apart
+    // from a plain resize — only the former replays the restore animation.
+    static WAS_MINIMIZED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
@@ -110,6 +116,38 @@ mod display_change_events {
             WM_SETTINGCHANGE => {
                 if let Some(app) = APP.get() {
                     notify_display_changed(app, "WM_SETTINGCHANGE");
+                }
+            }
+            // Minimize/restore tracking for the Text tab's native preview. On
+            // minimize, destroy the preview window: it is an owned popup and
+            // Windows would otherwise re-show it mid restore-animation, making
+            // the text sample appear before the animation finishes. With the
+            // HWND gone there is nothing to auto-show; the frontend recreates
+            // it once the window is back and settled. On restore from
+            // minimized, emit the same window-visibility event the tray paths
+            // use (animated = true) so the frontend's animated-flag is correct
+            // even when the restore came from the taskbar (which fires no
+            // event of its own) instead of the tray icon.
+            WM_SIZE => {
+                if wparam.0 == SIZE_MINIMIZED as usize {
+                    WAS_MINIMIZED.store(true, Ordering::SeqCst);
+                    if let Some(app) = APP.get() {
+                        let _ = crate::text_rendering::destroy_text_preview(app);
+                    }
+                } else if wparam.0 == SIZE_RESTORED as usize
+                    && WAS_MINIMIZED.swap(false, Ordering::SeqCst)
+                {
+                    if let Some(app) = APP.get() {
+                        let _ = app.emit(
+                            "window-visibility",
+                            serde_json::json!({ "visible": true, "animated": true }),
+                        );
+                        // Watch the window's pixels until the restore
+                        // animation visually settles, then tell the frontend
+                        // exactly when it ends (window-restore-settled) so the
+                        // Text tab's preview doesn't need a fixed delay.
+                        crate::text_rendering::start_restore_settle_watch(app, hwnd.0 as isize);
+                    }
                 }
             }
             WM_NCDESTROY => {
@@ -437,7 +475,10 @@ fn show_main_window(app: &AppHandle) {
         // runs. Visibility and minimized state are the reliable toggle inputs.
         if is_visible && !is_minimized {
             if window.minimize().is_ok() {
-                let _ = app.emit("window-visibility", false);
+                let _ = app.emit(
+                    "window-visibility",
+                    serde_json::json!({ "visible": false, "animated": false }),
+                );
             }
             return;
         }
@@ -447,7 +488,15 @@ fn show_main_window(app: &AppHandle) {
         }
         if window.show().is_ok() {
             let _ = window.set_focus();
-            let _ = app.emit("window-visibility", true);
+            // animated = the window was minimized, so restoring replays the
+            // Windows restore animation; a merely-hidden window (close-to-tray)
+            // appears instantly. The frontend uses this to decide whether the
+            // Text tab's native preview must wait out the animation before
+            // showing.
+            let _ = app.emit(
+                "window-visibility",
+                serde_json::json!({ "visible": true, "animated": is_minimized }),
+            );
         }
     }
 }
@@ -1039,6 +1088,7 @@ pub fn run() {
             text_rendering::text_preview_update,
             text_rendering::text_preview_set_bounds,
             text_rendering::text_preview_hide,
+            text_rendering::text_preview_destroy,
             explorer_hook::explorer_hook_set_force_grayscale,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
@@ -1298,7 +1348,10 @@ pub fn run() {
                         // shutdown so NVAPI can initialize lazily again
                         // when the window is shown.
                         vendor_info::release_for_tray();
-                        let _ = window.app_handle().emit("window-visibility", false);
+                        let _ = window.app_handle().emit(
+                            "window-visibility",
+                            serde_json::json!({ "visible": false, "animated": false }),
+                        );
                     }
                 }
                 tauri::WindowEvent::Destroyed => {

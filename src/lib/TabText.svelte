@@ -5,9 +5,11 @@
   // and persist in the Windows registry itself, so no app config is involved.
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
+  import { app } from './stores.svelte.js';
 
   let { modalOpen = false } = $props();
 
@@ -42,6 +44,43 @@
   let nativePreviewSyncRaf = 0;
   let nativePreviewBoundsSyncing = false;
   let nativePreviewBoundsPending = false;
+
+  // The main window minimizes to the tray, so restoring replays the Windows
+  // restore (maximize) animation. Hold the native preview hidden until that
+  // animation has had time to finish so the text sample doesn't appear over
+  // the transition. The hold is armed from the backend's window-visibility
+  // events (animated restores) and extended by window resize events while it
+  // is active.
+  const PREVIEW_HOLD_MS = 350;
+  let previewHoldUntil = 0;
+  let previewHoldRetryTimer = null;
+  // Timestamp of the last `window-restore-settled` event (0 = none yet). The
+  // backend's visual settle detector emits it the moment the restore
+  // animation finishes, which lets the preview appear exactly when the
+  // animation ends instead of after a fixed delay. The fixed hold below stays
+  // as a fallback in case the event is lost.
+  let restoreSettledAt = 0;
+
+  // Backend-driven show events (tray icon / tray menu, or the WM_SIZE
+  // SIZE_RESTORED emit in lib.rs) stamp app.windowRestoredAt together with
+  // whether the restore animates. Arm or clear the preview hold to match: an
+  // animated restore (the window was minimized) must wait out the animation,
+  // an instant show (close-to-tray) must not be delayed. Only fresh stamps
+  // are honored, so switching back to this tab later never replays a hold
+  // from an old restore.
+  $effect(() => {
+    const stamp = app.windowRestoredAt;
+    if (!stamp || Date.now() - stamp > 2000) return;
+    // A new restore is starting — forget a settle from a previous one so the
+    // hold can arm again if needed.
+    restoreSettledAt = 0;
+    if (app.windowRestoreAnimated) {
+      previewHoldUntil = Math.max(previewHoldUntil, stamp + PREVIEW_HOLD_MS);
+    } else {
+      previewHoldUntil = 0;
+    }
+    scheduleNativePreviewBounds();
+  });
 
   async function refreshState() {
     try {
@@ -120,6 +159,22 @@
     });
   }
 
+  // Called on window move. Never starts a hold here: dragging the window must
+  // keep the preview following live. Only extend a hold already in progress
+  // (a restore animation moves the window through its path).
+  function onWindowMoved() {
+    if (Date.now() < previewHoldUntil) previewHoldUntil = Date.now() + PREVIEW_HOLD_MS;
+    scheduleNativePreviewBounds();
+  }
+
+  // Called on window resize. Restore/maximize animations and manual resizes
+  // all resize the window; hold the preview until the resize settles so it
+  // never appears over (or jumps through) the transition.
+  function onWindowResized() {
+    previewHoldUntil = Date.now() + PREVIEW_HOLD_MS;
+    scheduleNativePreviewBounds();
+  }
+
   async function syncNativePreviewBounds() {
     if (nativePreviewBoundsSyncing) {
       nativePreviewBoundsPending = true;
@@ -132,6 +187,17 @@
           nativePreviewVisible = false;
           await invoke('text_preview_hide');
         }
+        return;
+      }
+      // Wait out the window's restore/maximize animation before showing the
+      // preview. Re-check once the hold expires so the sample appears right
+      // after the transition instead of waiting for the next layout event.
+      if (Date.now() < previewHoldUntil) {
+        clearTimeout(previewHoldRetryTimer);
+        previewHoldRetryTimer = setTimeout(() => {
+          previewHoldRetryTimer = null;
+          scheduleNativePreviewBounds();
+        }, previewHoldUntil - Date.now());
         return;
       }
       if (!nativePreviewHost) return;
@@ -272,7 +338,91 @@
     ].filter((element, index, elements) => element && elements.indexOf(element) === index);
     const onLayoutChange = () => scheduleNativePreviewBounds();
 
-    getCurrentWindow().onMoved(onLayoutChange).then((unlisten) => {
+    // Destroy-and-recreate lifecycle for the native preview. Hiding it (via
+    // ShowWindow) is not enough: the preview is an owned popup and Windows
+    // re-shows owned windows that were visible when their owner restores from
+    // minimized — mid restore-animation, bypassing set_bounds. So on any
+    // visibility loss the preview is destroyed entirely (there is then no
+    // HWND Windows could auto-show), and recreated once the window is visible
+    // again, after the restore animation has settled.
+    const recreateNativePreview = () => {
+      invoke('text_preview_show', {
+        mode: state.effective_mode,
+        gamma: state.gamma,
+        contrast: state.contrast,
+      })
+        .then(() => {
+          if (!modalOpen) scheduleNativePreviewBounds();
+        })
+        .catch((e) => console.warn('[text] native preview recreate failed', e));
+    };
+
+    // Backend-driven show/hide events (tray icon, tray menu, or the WM_SIZE
+    // SIZE_RESTORED emit in lib.rs for taskbar restores). This is the primary
+    // recreate trigger for a taskbar restore: document.visibilitychange does
+    // NOT fire when a WebView2 host window is minimized/restored via the
+    // taskbar (only for close-to-tray hides), so without this event the
+    // mounted tab would never learn the window came back — the preview stays
+    // destroyed until the user switches tabs (remount).
+    let unlistenWindowVisibility = null;
+    listen('window-visibility', (event) => {
+      const payload = event.payload;
+      const object = payload !== null && typeof payload === 'object';
+      const visible = object ? payload.visible !== false : payload !== false;
+      const animated = object ? payload.animated === true : false;
+      if (!visible) {
+        // Backend-driven hide (tray toggle minimize / close-to-tray). The tab
+        // unmounts right after, but destroy immediately so no owned popup
+        // survives even if the unmount is delayed.
+        nativePreviewVisible = false;
+        invoke('text_preview_destroy').catch(() => {});
+      } else {
+        // A show while this tab is still mounted means the window was
+        // restored without unmounting us — the taskbar-restore-after-minimize
+        // case. The restore animates (the backend only emits animated=true
+        // for a genuine minimize→restore), so arm the hold and recreate. A
+        // fresh window-restore-settled event clears the hold shortly after.
+        if (animated) {
+          restoreSettledAt = 0;
+          previewHoldUntil = Math.max(previewHoldUntil, Date.now() + PREVIEW_HOLD_MS);
+        }
+        recreateNativePreview();
+      }
+    }).then((stop) => { unlistenWindowVisibility = stop; }).catch(() => {});
+
+    // The backend's visual settle detector: the restore animation has
+    // finished (or the timeout fallback fired). Stop waiting — show the
+    // preview now, at the exact moment the animation ended.
+    let unlistenRestoreSettled = null;
+    listen('window-restore-settled', () => {
+      restoreSettledAt = Date.now();
+      previewHoldUntil = 0;
+      scheduleNativePreviewBounds();
+    }).then((stop) => { unlistenRestoreSettled = stop; }).catch(() => {});
+
+    // Fallback destroy/recreate via document visibility. Unreliable for
+    // taskbar minimize/restore in WebView2 (see above), but it does fire for
+    // close-to-tray hides and costs nothing to keep.
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        nativePreviewVisible = false;
+        invoke('text_preview_destroy').catch(() => {});
+      } else if (document.visibilityState === 'visible') {
+        // A taskbar restore never fires window-visibility, so reaching this
+        // handler with the tab still mounted means the window was minimized
+        // and the restore animates — arm the hold here. (For backend-driven
+        // shows the windowRestoredAt effect above overrides the hold to match
+        // the real animated-vs-instant state.)
+        if (Date.now() - (app.windowShownAt || 0) > 100) {
+          restoreSettledAt = 0;
+          previewHoldUntil = Math.max(previewHoldUntil, Date.now() + PREVIEW_HOLD_MS);
+        }
+        recreateNativePreview();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    getCurrentWindow().onMoved(onWindowMoved).then((unlisten) => {
       if (disposed) unlisten();
       else unlistenWindowMoved = unlisten;
     }).catch(() => {});
@@ -293,18 +443,27 @@
       });
     nativePreviewResizeObserver = new ResizeObserver(onLayoutChange);
     if (nativePreviewHost) nativePreviewResizeObserver.observe(nativePreviewHost);
-    window.addEventListener('resize', onLayoutChange);
+    window.addEventListener('resize', onWindowResized);
     scrollParents.forEach((parent) => parent.addEventListener('scroll', onLayoutChange, { passive: true }));
 
     return () => {
       disposed = true;
       if (nativePreviewSyncRaf) cancelAnimationFrame(nativePreviewSyncRaf);
+      if (previewHoldRetryTimer) clearTimeout(previewHoldRetryTimer);
+      previewHoldRetryTimer = null;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       nativePreviewResizeObserver?.disconnect();
       nativePreviewResizeObserver = null;
-      window.removeEventListener('resize', onLayoutChange);
+      window.removeEventListener('resize', onWindowResized);
       scrollParents.forEach((parent) => parent.removeEventListener('scroll', onLayoutChange));
       unlistenWindowMoved?.();
-      invoke('text_preview_hide').catch(() => {});
+      unlistenWindowVisibility?.();
+      unlistenRestoreSettled?.();
+      // The tab unmounts when the window hides (close-to-tray, tray minimize)
+      // or when the user switches tabs. Destroy the preview so no owned popup
+      // survives to be auto-shown over the next restore animation; it is
+      // recreated on the next mount.
+      invoke('text_preview_destroy').catch(() => {});
     };
   });
 </script>

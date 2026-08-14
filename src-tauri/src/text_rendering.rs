@@ -431,8 +431,8 @@ mod native_preview {
         DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
     };    use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassW, SetWindowPos, ShowWindow, WNDCLASSW,
-        HWND_TOP, SW_HIDE, SWP_NOCOPYBITS, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_APP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos, ShowWindow,
+        WNDCLASSW, HWND_TOP, SW_HIDE, SWP_NOCOPYBITS, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_APP,
         WM_ERASEBKGND, GetClientRect, WM_NCHITTEST, WM_PAINT, WM_SIZE, WS_EX_NOACTIVATE,
 
         WS_EX_TOOLWINDOW, WS_POPUP,
@@ -827,6 +827,32 @@ mod native_preview {
         }
         Ok(())
     }
+
+    // Destroy the preview window entirely (not just hide it). Used when the
+    // main window minimizes: the preview is an owned popup, and Windows
+    // automatically re-shows owned windows that were visible when their owner
+    // is restored — mid restore-animation, bypassing set_bounds. With the
+    // HWND gone there is nothing for Windows to re-show, so the text sample
+    // can never appear over the transition. The frontend recreates it (via
+    // text_preview_show) once the window is back and settled.
+    pub fn destroy(_app: &AppHandle) -> Result<(), String> {
+        // Capture the HWND before clearing the state, then destroy it.
+        let hwnd = state()
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().map(|value| HWND(value.hwnd as *mut std::ffi::c_void)));
+        // Clear the state so a later show() creates a fresh window and any
+        // in-flight set_bounds/update calls become no-ops.
+        if let Ok(mut current) = state().lock() {
+            *current = None;
+        }
+        if let Some(hwnd) = hwnd {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -894,6 +920,188 @@ pub fn text_preview_hide(app: tauri::AppHandle) -> Result<(), String> {
     {
         let _ = app;
         Ok(())
+    }
+}
+
+// Backend-facing destroy entry point, used by the main-window subclass when
+// the window minimizes (see display_change_events in lib.rs) as well as the
+// frontend. Idempotent: destroying an already-destroyed (or never-created)
+// preview is a no-op.
+pub(crate) fn destroy_text_preview(app: &tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        native_preview::destroy(app)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub fn text_preview_destroy(app: tauri::AppHandle) -> Result<(), String> {
+    destroy_text_preview(&app)
+}
+
+// ── Restore-animation settle detection ──────────────────────────────────
+// Windows exposes no API signal for when the DWM minimize→restore animation
+// ends: the window rect is at its final position immediately (the animation
+// is a DWM-side transform), the window is uncloaked at animation start, and
+// no message storm marks the end. The only exact signal is the visual one —
+// the window's pixels change every frame while the animation plays and stop
+// when it completes. So after a genuine restore-from-minimized, capture the
+// window's region at ~30 fps, hash it, and emit `window-restore-settled` the
+// moment it stops changing (or after a hard timeout as a safety net). The
+// Text tab uses that event to show its native preview exactly when the
+// animation ends instead of waiting a fixed number of milliseconds.
+mod restore_settle {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tauri::{AppHandle, Emitter};
+
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    const POLL_MS: u64 = 25;
+    // ~1.2 s of polling: a restore animation lasts a few hundred ms at most,
+    // so this is a generous cap before the fallback emit fires.
+    const MAX_FRAMES: u32 = 48;
+    // Two consecutive identical captures (~50 ms of stillness) means the
+    // animation has finished.
+    const STABLE_FRAMES: u32 = 2;
+
+    // Downscaled capture of the window's screen region. Returns a cheap hash
+    // of the pixels; None if the capture failed (window destroyed etc.).
+    fn capture_hash(hwnd: isize) -> Option<u64> {
+        unsafe {
+            use windows::Win32::Foundation::{HWND, RECT};
+            use windows::Win32::Graphics::Gdi::{
+                BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+                GetDIBits, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+                DIB_RGB_COLORS, SRCCOPY,
+            };
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            if w <= 0 || h <= 0 {
+                return None;
+            }
+            const CAP_W: i32 = 48;
+            const CAP_H: i32 = 36;
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return None;
+            }
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, CAP_W, CAP_H);
+            let old = SelectObject(mem, bmp.into());
+            let _ = BitBlt(
+                mem,
+                0,
+                0,
+                CAP_W,
+                CAP_H,
+                Some(screen),
+                rect.left,
+                rect.top,
+                SRCCOPY,
+            );
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: CAP_W,
+                    biHeight: -CAP_H,
+                    biPlanes: 1,
+                    biBitCount: 24,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; (CAP_W * CAP_H * 4) as usize];
+            let got = GetDIBits(
+                mem,
+                bmp,
+                0,
+                CAP_H as u32,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            let _ = SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            let _ = ReleaseDC(None, screen);
+            if got == 0 {
+                return None;
+            }
+            let mut hash: u64 = 1469598103934665603;
+            let mut i = 0;
+            while i < buf.len() {
+                hash = hash.wrapping_mul(1099511628211).wrapping_add(buf[i] as u64);
+                i += 4;
+            }
+            Some(hash)
+        }
+    }
+
+    fn emit_settled(app: &AppHandle) {
+        let _ = app.emit("window-restore-settled", ());
+    }
+
+    // Called from the main-window subclass on a genuine minimize→restore.
+    // Spawns a short-lived watcher that emits `window-restore-settled` once
+    // the window's visual stops changing (or after the timeout). A generation
+    // counter makes a superseded watcher (a newer restore started) exit
+    // silently instead of emitting a stale event.
+    pub fn start(app: &AppHandle, hwnd: isize) {
+        let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let mut previous: Option<u64> = None;
+            let mut stable = 0u32;
+            for _ in 0..MAX_FRAMES {
+                if GENERATION.load(Ordering::SeqCst) != generation {
+                    return; // superseded by a newer restore
+                }
+                match capture_hash(hwnd) {
+                    Some(hash) => {
+                        if previous == Some(hash) {
+                            stable += 1;
+                        } else {
+                            stable = 0;
+                        }
+                        previous = Some(hash);
+                        if stable >= STABLE_FRAMES {
+                            emit_settled(&app);
+                            return;
+                        }
+                    }
+                    None => {
+                        // Capture failed; keep polling — the timeout below is
+                        // the safety net.
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+            }
+            // Timeout: never settled (e.g. something else was animating over
+            // the window). Emit anyway so the preview is never stuck hidden.
+            emit_settled(&app);
+        });
+    }
+}
+
+pub(crate) fn start_restore_settle_watch(app: &tauri::AppHandle, hwnd: isize) {
+    #[cfg(target_os = "windows")]
+    {
+        restore_settle::start(app, hwnd);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, hwnd);
     }
 }
 
