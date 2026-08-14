@@ -458,7 +458,7 @@ mod native_preview {
         let font = font_for_size(size, dpi);
         let old_font = SelectObject(source_dc, font.into());
         let _ = SetBkMode(source_dc, TRANSPARENT);
-        let _ = SetTextColor(source_dc, COLORREF(0x00f0ecec));
+        let _ = SetTextColor(source_dc, COLORREF(0x00ffffff));
         let mut source_text = text.to_vec();
         let _ = DrawTextW(
             source_dc,
@@ -539,12 +539,12 @@ mod native_preview {
                         let top_padding = ((2u32 * dpi) / 96).max(1) as i32;
                         let horizontal_margin = ((10u32 * dpi) / 96).max(1) as i32;
                         let column_gap = ((12u32 * dpi) / 96).max(1) as i32;
-                        let row_gap = ((2u32 * dpi) / 96).max(1) as i32;
+                        let row_gap = ((6u32 * dpi) / 96).max(1) as i32;
                         let digits_gap = (((6u32) * dpi) / 96).max(1) as i32;
                         let split_x = client.left + (client.right - client.left) / 2;
                         let content_top = client.top + top_padding;
                         let _ = SetBkMode(hdc, TRANSPARENT);
-                        let _ = SetTextColor(hdc, COLORREF(0x00f0ecec));
+                        let _ = SetTextColor(hdc, COLORREF(0x00ffffff));
 
                         // Left column: lines stack at their own height plus a
                         // small gap, top-aligned.
@@ -574,7 +574,9 @@ mod native_preview {
 
                         // Left column: sentence rows at increasing sizes.
                         for size in row_sizes {
-                            let base_height = (((size + 2) as u32 * dpi) / 96).max(1) as i32;
+                            // Taller line box (1.5x the em) so descenders
+                            // like 'g'/'j'/'p' aren't clipped at the bottom.
+                            let base_height = (((size as u32 * 3 / 2) * dpi) / 96).max(1) as i32;
                             let mut left_rect = RECT {
                                 left: client.left + horizontal_margin,
                                 top: left_cursor,
@@ -591,7 +593,7 @@ mod native_preview {
                         // digits), zoomed 4x.
                         left_cursor += digits_gap;
                         for size in row_sizes {
-                            let base_height = (((size + 2) as u32 * dpi) / 96).max(1) as i32;
+                            let base_height = (((size as u32 * 3 / 2) * dpi) / 96).max(1) as i32;
                             let mut digits_left_rect = RECT {
                                 left: client.left + horizontal_margin,
                                 top: left_cursor,
@@ -916,6 +918,18 @@ pub fn text_rendering_set_contrast(contrast: u32) -> Result<(), String> {
         return Err(format!("contrast out of range: {contrast}"));
     }
     set_contrast(contrast)
+}
+
+// DirectWrite/WPF-only: controls the color intensity of subpixel antialiasing
+// (0 = grayscale edges, 100 = full color). GDI ignores it, so the native
+// preview does not change; DirectWrite apps read it at startup.
+#[tauri::command]
+pub fn text_rendering_set_cleartype_level(level: u32) -> Result<(), String> {
+    if level > 100 {
+        return Err(format!("cleartype level out of range: {level}"));
+    }
+    write_dword(AVALON_SUBKEY, "ClearTypeLevel", level)?;
+    Ok(())
 }
 
 #[tauri::command]

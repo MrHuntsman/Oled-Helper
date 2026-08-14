@@ -1030,6 +1030,7 @@ pub fn run() {
             text_rendering::text_rendering_set_mode,
             text_rendering::text_rendering_set_gamma,
             text_rendering::text_rendering_set_contrast,
+            text_rendering::text_rendering_set_cleartype_level,
             text_rendering::text_rendering_reset,
             text_rendering::text_rendering_restart_app,
             text_rendering::text_preview_show,
