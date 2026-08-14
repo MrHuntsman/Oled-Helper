@@ -1,18 +1,15 @@
 # OLED Helper 2
 
-A Windows desktop utility for OLED display calibration and system tweaks, built with Tauri (Rust) and Svelte 5. It ships as a single portable exe, needs no installer, and updates itself in place.
+A Windows desktop utility for OLED display calibration and system tweaks, built with Tauri (Rust) and Svelte 5. Portable version with auto-update.
 
 ## Features
 
-- **Black Crush Tweak**: Fix near-black levels while preserving pure black, with HDR/SDR calibration strips (Black and White) and per-refresh-rate profiles.
-- **Taskbar Dimmer**: Dim the taskbar to prevent OLED burn-in, with configurable opacity, fades, and hover detection. Also adjustable from the tray menu.
-- **Text rendering**: Fix color fringing and soft text on QD-OLED and other panels by setting the subpixel mode (Off / Grayscale / RGB / BGR) for both GDI and DirectWrite pipelines, with contrast and ClearType level controls. Includes a live native preview (100% and 400% zoom) that refreshes the moment a setting changes.
-- **Windows Explorer fix**: Explorer hard-codes ClearType, so grayscale rendering never reaches the shell. A small hook injected into explorer.exe forces your selected mode there too; apply and restart Explorer with one click, and a watchdog keeps the fix applied across Explorer and app restarts.
-- **Windows HDR**: Control Windows Auto HDR, RTX HDR, HDR on/off, and SDR white level.
+- **Black Crush Tweak**: Tweak black levels while preserving pure black, with HDR/SDR calibration strips (Black and White) and per-refresh-rate profiles. Includes real HDR calibration strips.
+- **Taskbar Dimmer**: Dim the taskbar to prevent OLED burn-in, with configurable opacity and hover animation.
+- **Text rendering**: Mitigate text color fringing by setting the subpixel mode (Off / Grayscale / RGB / BGR) for both GDI and DirectWrite pipelines. Includes Windows Explorer fix and a live preview.
+- **Windows HDR**: Controls for Windows SDR white level, Auto HDR, RTX HDR.
 - **Hotkeys**: Global shortcuts, including a hold-to-compare calibration view.
 - **Custom tray menu**: Resolution and refresh-rate switching, favorites, black level and taskbar dimmer quick controls, plus restart/exit right from the tray icon.
-- **Display tools**: Resolution and refresh-rate switching with auto rollback, plus detailed system info.
-- **Auto-update**: Silent checks at startup and on demand from the About tab, with one-click in-app updates.
 
 ## Requirements
 
