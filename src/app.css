@@ -2104,10 +2104,16 @@ button {
   border-radius: 4px;
   background: color-mix(in srgb, var(--accent) 22%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  transition: transform 0.16s ease;
+  /* Anchor each state to an edge instead of translating the highlight by
+     its own width. The explicit right inset keeps SDR from touching or
+     spilling over the toggle border. */
+  transition: left 0.16s ease, right 0.16s ease;
   pointer-events: none;
 }
-.strip-calibration-toggle.sdr::before { transform: translateX(100%); }
+.strip-calibration-toggle.sdr::before {
+  left: auto;
+  right: 2px;
+}
 .strip-calibration-toggle:hover {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--divider));
 }
