@@ -27,10 +27,22 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, FILE_MAP_READ};
+use windows::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE};
 use windows::Win32::System::SystemServices::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH,
 };
+
+// Shared memory layout (12 bytes): the app writes the mode at offset 0; the
+// DLL writes its own state back at offsets 4 and 8 so the app can verify the
+// hook is really installed in the CURRENT explorer.exe instead of trusting
+// its own injection bookkeeping.
+const STATE_MODE: usize = 0;
+const STATE_STATUS: usize = 4;
+const STATE_PID: usize = 8;
+const STATE_SIZE: usize = 12;
+// Status bits written by the DLL at attach.
+const STATUS_HOOK_W_INSTALLED: u32 = 1;
+const STATUS_HOOK_EX_INSTALLED: u32 = 2;
 
 type CreateFontIndirectWFn = unsafe extern "system" fn(*const LOGFONTW) -> HFONT;
 type CreateFontIndirectExWFn = unsafe extern "system" fn(*const ENUMLOGFONTEXDVW) -> HFONT;
@@ -110,7 +122,29 @@ fn rewritten_quality(mode: u32, quality: FONT_QUALITY) -> Option<FONT_QUALITY> {
 fn state_mode() -> u32 {
     // SAFETY: STATE is written once in map_state; the mapped view stays valid
     // for the lifetime of the process.
-    unsafe { STATE.get().map(|addr| *( *addr as *const u32)).unwrap_or(0) }
+    unsafe {
+        STATE.get()
+            .map(|addr| *((addr + STATE_MODE) as *const u32))
+            .unwrap_or(0)
+    }
+}
+
+// Write this process's PID and hook status back into the shared memory so the
+// app can verify the hook is really live in the CURRENT explorer.exe
+// generation instead of trusting its own injection bookkeeping. Called from
+// DllMain at attach, so by the time LoadLibraryW returns in the injector the
+// report is already visible.
+fn report_state(status: u32) {
+    let Some(addr) = STATE.get() else {
+        return;
+    };
+    // SAFETY: the mapped view is valid for the process lifetime; both fields
+    // are plain u32s at fixed offsets we own.
+    unsafe {
+        let pid = std::process::id();
+        std::ptr::write_volatile((addr + STATE_PID) as *mut u32, pid);
+        std::ptr::write_volatile((addr + STATE_STATUS) as *mut u32, status);
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -126,10 +160,11 @@ fn map_state() {
     // SAFETY: called once at DLL_PROCESS_ATTACH.
     unsafe {
         let name = wide(r"Local\OledHelperExplorerHookState");
-        let Ok(mapping) = OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())) else {
+        let Ok(mapping) = OpenFileMappingW(FILE_MAP_READ.0 | FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr()))
+        else {
             return;
         };
-        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 4);
+        let view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, STATE_SIZE as usize);
         if !view.Value.is_null() {
             let _ = STATE.set(view.Value as usize);
         }
@@ -156,17 +191,26 @@ fn find_create_font_indirect_ex_w() -> Option<CreateFontIndirectExWFn> {
 }
 
 fn install_detour() {
-    install_font_detour();
-    install_font_ex_detour();
+    let mut status = 0;
+    if install_font_detour() {
+        status |= STATUS_HOOK_W_INSTALLED;
+    }
+    if install_font_ex_detour() {
+        status |= STATUS_HOOK_EX_INSTALLED;
+    }
+    // Report what actually got installed so the app can tell "hooked" from
+    // "DLL loaded but detour failed" — the status write happens while
+    // LoadLibraryW is still inside DllMain, so inject() sees it on return.
+    report_state(status);
 }
 
-fn install_font_detour() {
+fn install_font_detour() -> bool {
     if DETOUR.get().is_some() {
-        return;
+        return true;
     }
     let Some(original) = find_create_font_indirect_w() else {
         debug("[explorer-hook] CreateFontIndirectW not found; no hook installed");
-        return;
+        return false;
     };
     // SAFETY: the detour is created once, enabled, and kept alive in DETOUR
     // for the lifetime of the process.
@@ -175,13 +219,15 @@ fn install_font_detour() {
             Ok(detour) => {
                 if let Err(e) = detour.enable() {
                     debug(&format!("[explorer-hook] detour enable failed: {e}"));
-                    return;
+                    return false;
                 }
                 let _ = DETOUR.set(detour);
                 debug("[explorer-hook] CreateFontIndirectW detour installed");
+                true
             }
             Err(e) => {
                 debug(&format!("[explorer-hook] detour setup failed: {e}"));
+                false
             }
         }
     }
@@ -189,13 +235,13 @@ fn install_font_detour() {
 
 // CreateFontIndirectExW is optional — if gdi32 ever lacks the export, skip it
 // rather than failing the whole hook.
-fn install_font_ex_detour() {
+fn install_font_ex_detour() -> bool {
     if DETOUR_EX.get().is_some() {
-        return;
+        return true;
     }
     let Some(original) = find_create_font_indirect_ex_w() else {
         debug("[explorer-hook] CreateFontIndirectExW not found; skipping");
-        return;
+        return false;
     };
     // SAFETY: the detour is created once, enabled, and kept alive in DETOUR_EX
     // for the lifetime of the process.
@@ -204,13 +250,15 @@ fn install_font_ex_detour() {
             Ok(detour) => {
                 if let Err(e) = detour.enable() {
                     debug(&format!("[explorer-hook] Ex detour enable failed: {e}"));
-                    return;
+                    return false;
                 }
                 let _ = DETOUR_EX.set(detour);
                 debug("[explorer-hook] CreateFontIndirectExW detour installed");
+                true
             }
             Err(e) => {
                 debug(&format!("[explorer-hook] Ex detour setup failed: {e}"));
+                false
             }
         }
     }

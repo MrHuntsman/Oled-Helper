@@ -219,10 +219,16 @@
         const pending = contrastPending;
         contrastPending = null;
         if (pending !== null) {
-          invoke('text_rendering_set_contrast', { contrast: pending }).catch((e) => {
-            error = String(e);
-            console.warn('[text] set_contrast failed', e);
-          });
+          invoke('text_rendering_set_contrast', { contrast: pending })
+            // The preview is a real GDI window: it renders with the system's
+            // currently applied settings, so it only shows the new value
+            // AFTER the write lands. Repaint it post-write or the preview
+            // stays one step behind (drag and keyboard behave differently).
+            .then(() => updateNativePreview())
+            .catch((e) => {
+              error = String(e);
+              console.warn('[text] set_contrast failed', e);
+            });
         }
       }, CONTRAST_APPLY_MS);
     }

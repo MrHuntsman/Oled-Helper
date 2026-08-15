@@ -486,7 +486,7 @@ mod native_preview {
         let source_dc = CreateCompatibleDC(Some(hdc));
         let source_bitmap = CreateCompatibleBitmap(hdc, source_width, source_height);
         let old_bitmap = SelectObject(source_dc, source_bitmap.into());
-        let background = CreateSolidBrush(COLORREF(0x001b1717));
+        let background = CreateSolidBrush(COLORREF(0x00181414));
         let source_rect = RECT {
             left: 0,
             top: 0,
@@ -550,9 +550,10 @@ mod native_preview {
                     let mut client = RECT::default();
                     let _ = GetClientRect(hwnd, &mut client);
 
-                    // Match the Text tab's dark panel while keeping this HWND
-                    // opaque, so the WebView underneath cannot bleed through.
-                    let background = CreateSolidBrush(COLORREF(0x001b1717));
+                    // Match the Text tab's panel background (rgba(0,0,0,0.12)
+                    // over --panel) while keeping this HWND opaque, so the
+                    // WebView underneath cannot bleed through.
+                    let background = CreateSolidBrush(COLORREF(0x00181414));
                     let _ = FillRect(hdc, &client, background);
                     let _ = DeleteObject(background.into());
 
@@ -1113,7 +1114,7 @@ pub fn text_rendering_get_state() -> Result<TextRenderingState, String> {
     let gamma = read_dword(DESKTOP_SUBKEY, "FontSmoothingGamma")
         .unwrap_or(None)
         .unwrap_or(DEFAULT_GAMMA);
-    let contrast = read_dword(DESKTOP_SUBKEY, "FontSmoothingGamma")
+    let contrast = read_dword(DESKTOP_SUBKEY, "FontSmoothingContrast")
         .unwrap_or(None)
         .unwrap_or(DEFAULT_CONTRAST);
     let cleartype_level = read_dword(AVALON_SUBKEY, "ClearTypeLevel")

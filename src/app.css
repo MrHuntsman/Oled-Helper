@@ -3816,13 +3816,14 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Height matches the zoomed right column (last 2 sizes at 4x: 56+68px)
-     plus the top padding, so there is no dead space at the bottom. */
+  /* Same as the surrounding panel (rgba(0,0,0,0.12) over --panel); the
+     native HWND paints this exact color so the preview blends into the
+     panel with no visible seam. */
   height: 126px;
   min-height: 126px;
   margin: 4px 0 8px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, 0.18);
+  background: rgba(0, 0, 0, 0.12);
   overflow: hidden;
 }
 .text-render-native-preview-fallback {

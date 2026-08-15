@@ -35,8 +35,20 @@ use windows::Win32::System::Threading::{
 type LoadLibraryWFn = unsafe extern "system" fn(PCWSTR) -> HMODULE;
 type ThreadProc = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
 
-// The mapped view of the shared flag (created once, leaked for app lifetime).
+// The mapped view of the shared state (created once, leaked for app
+// lifetime). Layout: u32 mode (app->explorer) + u32 status + u32 pid
+// (explorer->app, written by the DLL at attach so the app can VERIFY the
+// hook is really installed in the current explorer.exe instead of trusting
+// its own injection bookkeeping — LoadLibraryW returning non-null only
+// proves the module mapped, not that the detour installed).
 static STATE_VIEW: OnceLock<usize> = OnceLock::new();
+const STATE_SIZE: usize = 12;
+const STATE_STATUS_OFFSET: usize = 4;
+const STATE_PID_OFFSET: usize = 8;
+// The primary CreateFontIndirectW detour is what makes the fix real; the
+// Ex variant is optional (see explorer-hook), so the app only requires this
+// one for a hook to count as active.
+const STATUS_HOOK_W_INSTALLED: u32 = 1;
 // Last explorer PID we injected into, so we only re-inject after a restart.
 static LAST_INJECTED_PID: AtomicU32 = AtomicU32::new(0);
 // Whether the feature is active (Grayscale/Off vs RGB/BGR).
@@ -81,11 +93,11 @@ fn ensure_state_mapped() -> Result<*mut u32, String> {
             None,
             PAGE_READWRITE,
             0,
-            4,
+            STATE_SIZE as u32,
             PCWSTR(name.as_ptr()),
         )
         .map_err(|e| format!("CreateFileMappingW failed: {e}"))?;
-        let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 4);
+        let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, STATE_SIZE);
         if view.Value.is_null() {
             let _ = CloseHandle(mapping);
             return Err("MapViewOfFile failed".to_string());
@@ -106,6 +118,24 @@ fn write_state(mode: u32) -> Result<(), String> {
         *ptr = mode;
     }
     Ok(())
+}
+
+// Read the DLL's own report (pid + status) back from the shared memory. The
+// pid lets us tie the report to the CURRENT explorer.exe generation: a stale
+// report from a previous generation is ignored by pid mismatch. Returns
+// (0, 0) when nothing is mapped yet.
+fn read_hook_report() -> (u32, u32) {
+    let Ok(ptr) = ensure_state_mapped() else {
+        return (0, 0);
+    };
+    // SAFETY: ptr is the mapped view, valid for the process lifetime; both
+    // fields are plain u32s at fixed offsets we own.
+    unsafe {
+        let base = ptr as *const u8;
+        let status = std::ptr::read_volatile(base.add(STATE_STATUS_OFFSET) as *const u32);
+        let pid = std::ptr::read_volatile(base.add(STATE_PID_OFFSET) as *const u32);
+        (pid, status)
+    }
 }
 
 fn find_explorer_pid() -> Option<u32> {
@@ -324,9 +354,16 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
     apply_state(&app)
 }
 
-/// Report whether the hook is currently loaded in the running explorer.exe,
+/// Report whether the hook is currently VERIFIED in the running explorer.exe,
 /// so the Text tab can reflect it on the Restart Explorer button: restarting
 /// only applies the mode to already-open windows when the DLL is in there.
+///
+/// active is not inferred from injection bookkeeping — the DLL itself writes
+/// its pid and status into the shared memory at attach, and we only count it
+/// when the report comes from the CURRENT explorer.exe generation AND the
+/// detour actually installed. That closes the gap where LoadLibraryW
+/// returned non-null (module mapped) but install_detour silently failed, so
+/// the app used to claim "Fix applied" while Explorer's text was untouched.
 #[derive(serde::Serialize)]
 pub struct ExplorerHookStatus {
     enabled: bool,
@@ -338,14 +375,18 @@ pub struct ExplorerHookStatus {
 #[tauri::command]
 pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
     let enabled = TOGGLE.load(Ordering::Acquire);
-    let pid = LAST_INJECTED_PID.load(Ordering::Acquire);
-    let active = enabled && pid != 0 && find_explorer_pid() == Some(pid);
+    let current = find_explorer_pid().unwrap_or(0);
+    let (reported_pid, status) = read_hook_report();
+    let active = enabled
+        && current != 0
+        && reported_pid == current
+        && status & STATUS_HOOK_W_INSTALLED != 0;
     let applied = active && RESTARTED_WHILE_ACTIVE.load(Ordering::Acquire);
     Ok(ExplorerHookStatus {
         enabled,
         active,
         applied,
-        pid,
+        pid: current,
     })
 }
 
@@ -377,10 +418,7 @@ pub fn restart_explorer() -> Result<(), String> {
             None => break,
             // A different generation already appeared on its own (Winlogon
             // auto-restart on some systems) — use it, no manual spawn.
-            Some(pid) if old_pid.is_some_and(|old| pid != old) => {
-                RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
-                return Ok(());
-            }
+            Some(pid) if old_pid.is_some_and(|old| pid != old) => return Ok(()),
             _ => {}
         }
         if std::time::Instant::now() >= deadline {
@@ -393,9 +431,10 @@ pub fn restart_explorer() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("could not restart explorer.exe: {e}"))?;
     // Explorer is coming up. The watchdog re-injects the hook into the fresh
-    // process (its 1s poll); once status.active flips, the fix is fully
-    // applied — every window in the new explorer renders through the hook.
-    RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
+    // process (its 1s poll) and marks it applied only after verifying the DLL
+    // reports itself hooked in that new generation (see ensure_injected).
+    // Nothing is set optimistically here: claiming "Fix applied" before the
+    // verification is exactly how the status used to lie.
     Ok(())
 }
 
@@ -414,14 +453,30 @@ fn ensure_injected(app: &tauri::AppHandle) -> Result<(), String> {
     let dll = ensure_hook_dll(app)?;
     inject(pid, &dll)?;
     LAST_INJECTED_PID.store(pid, Ordering::Release);
-    // The hook is now loaded in this explorer generation (a fresh process,
-    // since LAST_INJECTED_PID differed): every font it renders from here on
-    // goes through the override, which is exactly what "applied" means. This
-    // is what lets an external Explorer restart (watchdog re-injection) or
-    // an app restart onto a fresh Explorer show "✓ Fix applied" instead of
-    // nagging for another restart.
-    RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
-    log::info!("[explorer-hook] injected explorer_hook.dll into explorer.exe (pid {pid})");
+    // Verify the DLL actually reports itself hooked in this generation before
+    // claiming "applied": LoadLibraryW returning non-null only proves the
+    // module mapped — install_detour can still fail silently inside DllMain.
+    // The report is written while LoadLibraryW is still inside DllMain, so it
+    // is already visible here. A fresh explorer generation (pid differs) that
+    // verifies is exactly what "applied" means — every font it renders from
+    // here on goes through the override. That is what lets an external
+    // Explorer restart (watchdog re-injection) or an app restart onto a fresh
+    // Explorer show "✓ Fix applied" instead of nagging for another restart.
+    let (reported_pid, status) = read_hook_report();
+    if reported_pid == pid && status & STATUS_HOOK_W_INSTALLED != 0 {
+        RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
+        log::info!("[explorer-hook] injected + verified explorer_hook.dll in explorer.exe (pid {pid})");
+    } else {
+        // The DLL is in the process but the detour did not install (or the
+        // report raced the attach). The pid is recorded so the watchdog does
+        // not spam re-injection into the same process — LoadLibraryW on an
+        // already-loaded DLL would not re-run DllMain anyway. The status
+        // reads active=false until explorer is restarted (the restart button),
+        // which loads the DLL into a fresh process and retries the detour.
+        log::warn!(
+            "[explorer-hook] injected into explorer.exe (pid {pid}) but hook not verified (reported_pid={reported_pid}, status={status:#x})"
+        );
+    }
     Ok(())
 }
 
