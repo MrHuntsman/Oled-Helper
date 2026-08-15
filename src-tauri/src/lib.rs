@@ -1097,7 +1097,6 @@ pub fn run() {
             explorer_hook::explorer_hook_set_mode,
             explorer_hook::explorer_hook_set_enabled,
             explorer_hook::explorer_hook_status,
-            explorer_hook::restart_explorer,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,
             flyout_window::flyout_layout_ready,

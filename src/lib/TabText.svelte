@@ -42,18 +42,15 @@
   let contrastPending = null;
 
   // Explorer hook state from the backend's explorer_hook_status command
-  // (polled while mounted): active = DLL loaded in the running explorer.exe,
-  // applied = active AND Explorer was restarted with the fix active, so every
-  // window in the current process renders through the hook.
+  // (polled while mounted): active = DLL verified in the running explorer.exe;
+  // applied = active AND the current explorer.exe generation was injected and
+  // verified, so every window in it renders through the hook. Fonts are
+  // rasterized at window creation, so a mode change only reaches already-open
+  // windows after they are closed or Explorer restarts.
   let hookStatus = $state({ enabled: false, active: false, applied: false });
-  let restarting = $state(false);
-  // opts may be null: the backend commands resolve to null (unit), so
-  // `.then(refreshHookStatus)` passes null — never destructure it directly.
-  async function refreshHookStatus(opts) {
-    const clearRestarting = opts?.clearRestarting === true;
+  async function refreshHookStatus() {
     try {
       hookStatus = await invoke('explorer_hook_status');
-      if (clearRestarting && hookStatus.active) restarting = false;
     } catch (e) {
       console.warn('[text] explorer hook status failed', e);
     }
@@ -155,29 +152,6 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled })
       .then(refreshHookStatus)
       .catch((e) => console.warn('[text] explorer hook toggle failed', e));
-  }
-
-  // Restart Explorer so the change applies to already-open windows
-  // immediately (rasterized fonts stay cached until the process restarts).
-  // The button shows "Restarting…" until the fresh explorer.exe is up and
-  // the watchdog has re-injected the hook.
-  function onRestartExplorer() {
-    if (busy || restarting || !hookStatus.active || hookStatus.applied) return;
-    restarting = true;
-    invoke('restart_explorer')
-      .then(() => {
-        // Explorer takes ~1s to respawn; refresh once settled so the button
-        // flips to "✓ Fix applied" when the hook is back.
-        setTimeout(() => refreshHookStatus({ clearRestarting: true }), 1500);
-      })
-      .catch((e) => {
-        restarting = false;
-        error = String(e);
-      });
-    // Safety net: never leave the button stuck on "Restarting…". The
-    // backend may wait several seconds for Winlogon to bring Explorer back,
-    // so give it room (10s) before force-clearing.
-    setTimeout(() => { restarting = false; }, 10000);
   }
 
   async function applyMode(mode) {
@@ -559,8 +533,8 @@
     window.addEventListener('resize', onWindowResized);
     scrollParents.forEach((parent) => parent.addEventListener('scroll', onLayoutChange, { passive: true }));
 
-    // Poll the hook status while mounted so the Restart Explorer button
-    // reflects reality (toggle, mode changes, Explorer restarting, watchdog
+    // Poll the hook status while mounted so the Explorer status reflects
+    // reality (toggle, mode changes, Explorer restarts, watchdog
     // re-injection) without wiring every event path.
     refreshHookStatus();
     const hookStatusPoll = setInterval(refreshHookStatus, 2000);
@@ -679,16 +653,10 @@
         <input type="checkbox" checked={textSettings.explorerHookEnabled} onchange={onToggleExplorerHook} />
         <span class="text-render-explorer-toggle-label">Fix Windows Explorer</span>
       </label>
-      {#if restarting || (hookStatus.active && !hookStatus.applied)}
-        <button type="button" class="restart-explorer-btn" onclick={onRestartExplorer} disabled={busy || restarting}>
-          {#if restarting}
-            Restarting…
-          {:else}
-            Apply and restart Explorer
-          {/if}
-        </button>
-      {:else if hookStatus.applied}
+      {#if hookStatus.active && hookStatus.applied}
         <span class="restart-explorer-status">Fix applied <span class="restart-explorer-check">✓</span></span>
+      {:else if hookStatus.active}
+        <span class="restart-explorer-hint">Applies to new Explorer windows. Already opened windows will need a restart.</span>
       {/if}
     </div>
   </div>

@@ -31,6 +31,10 @@
   // written by App.svelte's poll timer, and writing to it here caused an
   // infinite render ↔ fallback ↔ poll loop (Svelte's max update depth error).
   let forceSdrRender = $state(false);
+  // In HDR, allow the user to inspect the SDR calibration values without
+  // changing the display's HDR state. This is session-only and automatically
+  // becomes irrelevant when the app is in SDR.
+  let useSdrCalibration = $state(false);
 
   function runtimeLabel() {
     if (window.chrome?.webview) {
@@ -66,8 +70,12 @@
   // Heading title + square label helpers, driven by the active strip. The
   // High Nits strip shows a windowed nits ladder (HDR) or bright RGB range
   // (SDR); the black strip keeps the existing PQ/RGB code labels.
+  function calibrationIsHdr() {
+    return app.hdrStatus === 'hdr' && !forceSdrRender && !useSdrCalibration;
+  }
+
   function stripTitle() {
-    const isHdr = app.hdrStatus === 'hdr';
+    const isHdr = calibrationIsHdr();
     if (crush.stripType === 'highNits') {
       return isHdr ? 'HDR White' : 'SDR White';
     }
@@ -75,7 +83,7 @@
   }
 
   function stripLabels() {
-    const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
+    const isHdr = calibrationIsHdr();
     const sq = activeSquareCount();
     if (crush.stripType === 'highNits') {
       // Fixed 3×7 grid (21 cells) in normal mode, no zoom; in fullscreen the
@@ -434,7 +442,7 @@
       if (w < 1 || h < 1) return;
       if (w !== canvas.width || h !== canvas.height) { canvas.width = w; canvas.height = h; }
       const sq = activeSquareCount();
-      const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
+      const isHdr = calibrationIsHdr();
       const highNits = crush.stripType === 'highNits';
       // High Nits: render the aspect-fit grid values (21 cells in normal
       // mode, up to 40 in fullscreen, one value per slot, no empty cells),
@@ -483,7 +491,7 @@
     if (canvas && !initStarted) initGPU();
   });
   $effect(() => {
-    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void app.sdrWhiteBaseNits; void canvas;
+    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void useSdrCalibration; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void app.sdrWhiteBaseNits; void canvas;
     // untrack the geometry write: stripGeom is a $state read by the template
     // and by render() (high-nits grid). Writing it from inside this effect.
     // whose render() call reads it, would re-schedule the effect on every
@@ -930,7 +938,7 @@
   // HDR value comes from the actual grid codes (region-stepped), so it stays
   // in sync with the cell's label.
   function hoverLabel() {
-    const isHdr = app.hdrStatus === 'hdr' && !forceSdrRender;
+    const isHdr = calibrationIsHdr();
     if (isHdr) return { code: String(highNitsGridCodes(crush.highNitsMax, stripGeom.cells)[hoverCell]), unit: 'nits' };
     return { code: String(highNitsSdrCodes(stripGeom.cells)[hoverCell]), unit: 'RGB' };
   }
@@ -1105,7 +1113,7 @@
       <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
       <span class="info-tip-note">
         <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2V11.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="4.9" r="0.9" fill="currentColor"/></svg>
-        <span><span class="info-tip-strong">{app.hdrStatus === 'hdr' ? '64' : '0'}</span> column is pure black.</span>
+        <span><span class="info-tip-strong">{calibrationIsHdr() ? '64' : '0'}</span> column is pure black.</span>
       </span>
     {/if}
     <div class="fs-hint-sep"></div>
@@ -1162,6 +1170,15 @@
             <span class="info-tip">{@render calibrationTip()}</span>
           </span>
         </span>
+        {#if app.hdrStatus === 'hdr' && !forceSdrRender}
+          <button type="button" class="strip-calibration-toggle" class:sdr={!calibrationIsHdr()}
+            aria-label="Calibration values" aria-pressed={!calibrationIsHdr()}
+            title="Switch between HDR and SDR calibration values"
+            onclick={() => useSdrCalibration = !useSdrCalibration}>
+            <span class:active={calibrationIsHdr()}>HDR</span>
+            <span class:active={!calibrationIsHdr()}>SDR</span>
+          </button>
+        {/if}
         <span class="strip-switch" role="group" aria-label="Calibration strip">
           {#each STRIPS as strip}
             <button type="button" class="strip-switch-btn" class:active={crush.stripType === strip.id}
@@ -1249,7 +1266,7 @@
       <!-- stores.svelte.js), not shown as its own control. The slider only -->
       <!-- rests on HIGH_NITS_MAX_STOPS. In SDR the strip shows a fixed RGB  -->
       <!-- ramp, so the nits range doesn't apply and the slider is hidden.  -->
-      {#if app.hdrStatus === 'hdr' && !forceSdrRender}
+      {#if calibrationIsHdr()}
       <div class="nits-range-control">
         <div class="nits-slider-group" onwheel={handleNitsWheel}>
           <span class="nits-range-label">Max</span>

@@ -355,8 +355,7 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
 }
 
 /// Report whether the hook is currently VERIFIED in the running explorer.exe,
-/// so the Text tab can reflect it on the Restart Explorer button: restarting
-/// only applies the mode to already-open windows when the DLL is in there.
+/// so the Text tab can reflect it.
 ///
 /// active is not inferred from injection bookkeeping — the DLL itself writes
 /// its pid and status into the shared memory at attach, and we only count it
@@ -364,6 +363,13 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
 /// detour actually installed. That closes the gap where LoadLibraryW
 /// returned non-null (module mapped) but install_detour silently failed, so
 /// the app used to claim "Fix applied" while Explorer's text was untouched.
+///
+/// applied additionally requires that the current mode is actually VISIBLE:
+/// fonts are rasterized at window creation, so a mode change only reaches
+/// already-open windows after Explorer restarts. It is set when a fresh
+/// explorer.exe generation is injected and verified (watchdog re-injection
+/// after an external restart, or an app restart onto a fresh Explorer); any
+/// mode/toggle change resets it until then.
 #[derive(serde::Serialize)]
 pub struct ExplorerHookStatus {
     enabled: bool,
@@ -381,6 +387,11 @@ pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
         && current != 0
         && reported_pid == current
         && status & STATUS_HOOK_W_INSTALLED != 0;
+    // A mode change only reaches already-open windows after Explorer
+    // restarts; fonts are rasterized at window creation. applied therefore
+    // means a fresh explorer.exe generation was injected and verified — the
+    // frontend shows a warning that the change applies to newly opened
+    // windows when it is not yet true.
     let applied = active && RESTARTED_WHILE_ACTIVE.load(Ordering::Acquire);
     Ok(ExplorerHookStatus {
         enabled,
@@ -388,54 +399,6 @@ pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
         applied,
         pid: current,
     })
-}
-
-/// Restart explorer.exe so font changes apply to already-open windows
-/// immediately (fonts already rasterized stay cached until the process
-/// restarts). The watchdog re-injects the hook afterwards if the feature is
-/// active. Closes all open File Explorer windows.
-#[tauri::command]
-pub fn restart_explorer() -> Result<(), String> {
-    // taskkill /f does NOT trigger Winlogon's shell auto-restart (only a
-    // graceful termination does), so the shell must be started manually —
-    // otherwise the desktop stays dead. But spawning the replacement while
-    // the old process is still winding down is what makes the taskbar take
-    // 10+ seconds (two explorer instances fight over the taskbar), so wait
-    // for the killed generation to actually disappear first.
-    let old_pid = find_explorer_pid();
-    let kill = std::process::Command::new("taskkill")
-        .args(["/f", "/im", "explorer.exe"])
-        .status();
-    match kill {
-        Ok(status) if status.success() => {}
-        Ok(_) => log::warn!("[explorer-hook] taskkill reported a non-zero exit"),
-        Err(e) => log::warn!("[explorer-hook] taskkill failed: {e}"),
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match find_explorer_pid() {
-            // Old process fully gone — safe to start the fresh shell.
-            None => break,
-            // A different generation already appeared on its own (Winlogon
-            // auto-restart on some systems) — use it, no manual spawn.
-            Some(pid) if old_pid.is_some_and(|old| pid != old) => return Ok(()),
-            _ => {}
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    // Old explorer is gone — start the shell fresh.
-    std::process::Command::new("explorer.exe")
-        .spawn()
-        .map_err(|e| format!("could not restart explorer.exe: {e}"))?;
-    // Explorer is coming up. The watchdog re-injects the hook into the fresh
-    // process (its 1s poll) and marks it applied only after verifying the DLL
-    // reports itself hooked in that new generation (see ensure_injected).
-    // Nothing is set optimistically here: claiming "Fix applied" before the
-    // verification is exactly how the status used to lie.
-    Ok(())
 }
 
 /// Inject the hook DLL into the current explorer.exe if this process
