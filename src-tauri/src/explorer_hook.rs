@@ -1,46 +1,42 @@
-// explorer_hook.rs — inject explorer_hook.dll into explorer.exe and control
+// explorer_hook.rs — load explorer_hook.dll into explorer.exe and control
 // its font-antialiasing override. The Windows shell hard-codes ClearType and
 // ignores the per-user font-smoothing registry values, so the only way to
-// change Explorer's text is to inject a DLL that hooks CreateFontIndirectW
-// (see explorer-hook/). The DLL reads a session-local shared-memory mode
-// that this module writes: 0 = pass through, 1 = force grayscale
-// (ANTIALIASED_QUALITY), 2 = force no antialiasing / crisp
+// change Explorer's text is to load a DLL that hooks CreateFontIndirectW (see
+// explorer-hook/). The DLL is loaded through a thread-specific
+// SetWindowsHookExW CALLWNDPROC hook on Explorer's UI thread — the documented
+// OS mechanism — instead of CreateRemoteThread injection, so Windows Defender
+// does not flag the app the way it did the injection path. The DLL reads a
+// session-local shared-memory mode that this module writes: 0 = pass through,
+// 1 = force grayscale (ANTIALIASED_QUALITY), 2 = force no antialiasing / crisp
 // (NONANTIALIASED_QUALITY).
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 use windows::core::{s, w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HMODULE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
-use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::Foundation::{CloseHandle, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, VirtualAllocEx, VirtualFreeEx, FILE_MAP_ALL_ACCESS,
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+    CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
-use windows::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, OpenProcess, TerminateThread, WaitForSingleObject,
-    PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
-    PROCESS_VM_WRITE,
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GetWindowThreadProcessId, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+    WH_CALLWNDPROC,
 };
 
-type LoadLibraryWFn = unsafe extern "system" fn(PCWSTR) -> HMODULE;
-type ThreadProc = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 // The mapped view of the shared state (created once, leaked for app
 // lifetime). Layout: u32 mode (app->explorer) + u32 status + u32 pid
 // (explorer->app, written by the DLL at attach so the app can VERIFY the
 // hook is really installed in the current explorer.exe instead of trusting
-// its own injection bookkeeping — LoadLibraryW returning non-null only
-// proves the module mapped, not that the detour installed).
+// its own bookkeeping — the DLL loading only proves the module mapped, not
+// that the detour installed).
 static STATE_VIEW: OnceLock<usize> = OnceLock::new();
 const STATE_SIZE: usize = 12;
 const STATE_STATUS_OFFSET: usize = 4;
@@ -49,31 +45,34 @@ const STATE_PID_OFFSET: usize = 8;
 // Ex variant is optional (see explorer-hook), so the app only requires this
 // one for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
-// Last explorer PID we injected into, so we only re-inject after a restart.
-static LAST_INJECTED_PID: AtomicU32 = AtomicU32::new(0);
+// The installed CALLWNDPROC hook (HHOOK value as isize, 0 = none) plus the
+// explorer generation it targets. The pid+thread let us detect an Explorer
+// restart: a fresh shell gets a new thread id, so we re-install the hook.
+static HOOK_VALUE: AtomicUsize = AtomicUsize::new(0);
+static HOOKED_PID: AtomicU32 = AtomicU32::new(0);
+static HOOKED_TID: AtomicU32 = AtomicU32::new(0);
+// Last explorer pid whose hook report verified, so a pid change (Explorer
+// restart) can flip the applied flag.
+static VERIFIED_PID: AtomicU32 = AtomicU32::new(0);
 // Whether the feature is active (Grayscale/Off vs RGB/BGR).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 // Master toggle from the Text tab (persisted in config): off means Explorer
-// is never touched and the DLL is not injected. Defaults to off; the
+// is never touched and the DLL is not loaded. Defaults to off; the
 // frontend syncs the stored value on load.
 static TOGGLE: AtomicBool = AtomicBool::new(false);
 // Last mode-state from the Text tab (0/1/2), gated by TOGGLE in apply_state.
 static LAST_STATE: AtomicU32 = AtomicU32::new(0);
-// True once the hook is loaded in the current explorer.exe generation, so
-// the Text tab can show "✓ Fix applied". Set when Explorer is restarted
-// while the hook is active (the in-app restart) and whenever the hook is
-// injected into a new explorer generation — an external restart while the
-// app is running (watchdog re-injection) or an app restart that finds a
-// fresh Explorer. A generation the hook was injected into renders every
-// font through the override, which is exactly what "applied" means. Any
-// mode/toggle change resets it (the running Explorer needs another restart
-// to fully apply to already-open windows).
+// True once the hook is verified in a NEW explorer.exe generation while the
+// feature was already active, so the Text tab can show "✓ Fix applied". Fonts
+// are rasterized at window creation, so a mode change only fully applies after
+// Explorer restarts (or to newly opened windows). Any mode/toggle change
+// resets it.
 static RESTARTED_WHILE_ACTIVE: AtomicBool = AtomicBool::new(false);
 // Watchdog lifecycle: started once, stopped on app shutdown.
 static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-// Serializes injection so the watchdog and the command handler don't race.
-static INJECT_LOCK: Mutex<()> = Mutex::new(());
+// Serializes hook install so the watchdog and the command handler don't race.
+static HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -138,47 +137,38 @@ fn read_hook_report() -> (u32, u32) {
     }
 }
 
-fn find_explorer_pid() -> Option<u32> {
-    // SAFETY: ToolHelp snapshot; the handle is closed before returning.
+// The main Explorer shell: its taskbar window gives us both the pid (for
+// status verification) and the owning UI thread (the hook target). This keeps
+// the hook pointed at the same single shell process the old injection used,
+// and avoids loading the DLL into every GUI process on the system.
+fn explorer_target() -> Option<(u32, u32)> {
+    // SAFETY: FindWindowW/GetWindowThreadProcessId are well-formed calls.
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-        let mut found = None;
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if name.eq_ignore_ascii_case("explorer.exe") {
-                    found = Some(entry.th32ProcessID);
-                    break;
-                }
-                if Process32NextW(snapshot, &mut entry).is_err() {
-                    break;
-                }
-            }
+        let hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
+        if hwnd.0.is_null() {
+            return None;
         }
-        let _ = CloseHandle(snapshot);
-        found
+        let mut pid = 0u32;
+        let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if tid == 0 {
+            return None;
+        }
+        Some((pid, tid))
     }
 }
 
 // The hook DLL is compiled into the exe as a byte blob by build.rs (see
 // build_explorer_hook in build.rs), so the app stays a single portable exe. At
 // runtime the bytes are written to the config dir and that on-disk path is
-// what LoadLibraryW in explorer.exe opens.
+// what both the app's LoadLibraryW and the hook loader in explorer.exe open.
 static EMBEDDED_HOOK_DLL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/explorer_hook.dll"));
 
-// Write the embedded DLL into the config dir (next to config.json) so
-// explorer.exe can LoadLibraryW it. A short SHA-256 prefix of the embedded
-// bytes is baked into the filename, so a newer app build writes a fresh file
-// instead of trying to overwrite a DLL an older explorer.exe may still have
-// mapped (Windows locks loaded DLL files).
+// Write the embedded DLL into the config dir (next to config.json) so it can
+// be loaded by a full path. A short SHA-256 prefix of the embedded bytes is
+// baked into the filename, so a newer app build writes a fresh file instead of
+// trying to overwrite a DLL an older explorer.exe may still have mapped
+// (Windows locks loaded DLL files).
 fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -211,111 +201,72 @@ fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
-    // SAFETY: standard LoadLibraryW remote-thread injection. All handles and
-    // the remote allocation are released on every path.
-    unsafe {
-        // Least privilege: only the rights the injection actually needs. A
-        // PROCESS_ALL_ACCESS handle to a shell process is exactly the kind of
-        // thing antivirus heuristics flag.
-        let process = OpenProcess(
-            PROCESS_CREATE_THREAD
-                | PROCESS_QUERY_INFORMATION
-                | PROCESS_VM_OPERATION
-                | PROCESS_VM_WRITE
-                | PROCESS_VM_READ,
-            false,
-            pid,
+// Load the DLL into this process (so SetWindowsHookExW can resolve its hook
+// procedure), then install a thread-specific CALLWNDPROC hook on Explorer's UI
+// thread. Windows itself maps the DLL into explorer.exe as a result — the
+// documented hook mechanism — which is why this does not trip the injection
+// signatures that Windows Defender flags.
+fn install_hook(app: &tauri::AppHandle, pid: u32, tid: u32) -> Result<(), String> {
+    let dll = ensure_hook_dll(app)?;
+    let wide_path = wide(&dll.to_string_lossy());
+    // SAFETY: LoadLibraryW on the full path of our own embedded DLL. The
+    // module is kept loaded for the process lifetime (same leak-for-lifetime
+    // pattern as the shared-memory mapping) so the hook's module reference
+    // stays valid.
+    let module = unsafe { LoadLibraryW(PCWSTR(wide_path.as_ptr())) }
+        .map_err(|e| format!("could not load the explorer hook DLL: {e}"))?;
+
+    let proc: HookProcFn = unsafe {
+        let addr = GetProcAddress(module, s!("hook_callback"))
+            .ok_or("hook_callback export not found in the explorer hook DLL")?;
+        std::mem::transmute(addr)
+    };
+
+    // SAFETY: installs a thread-specific CALLWNDPROC hook on Explorer's UI
+    // thread. Because the hook procedure lives in the DLL and the thread is in
+    // another process, Windows maps the DLL into explorer.exe for us.
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_CALLWNDPROC,
+            Some(proc),
+            Some(HINSTANCE(module.0)),
+            tid,
         )
-        .map_err(|e| format!("OpenProcess(explorer.exe) failed: {e}"))?;
-
-        let wide_path: Vec<u16> = dll_path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let byte_len = wide_path.len() * 2;
-
-        let remote = VirtualAllocEx(process, None, byte_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote.is_null() {
-            let _ = CloseHandle(process);
-            return Err("VirtualAllocEx failed".to_string());
-        }
-
-        if let Err(e) = WriteProcessMemory(
-            process,
-            remote.cast(),
-            wide_path.as_ptr().cast(),
-            byte_len,
-            None,
-        ) {
-            let _ = VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-            let _ = CloseHandle(process);
-            return Err(format!("WriteProcessMemory failed: {e}"));
-        }
-
-        let kernel32 = GetModuleHandleW(w!("kernel32.dll"))
-            .map_err(|e| format!("GetModuleHandleW(kernel32.dll) failed: {e}"))?;
-        let loadlib: LoadLibraryWFn = std::mem::transmute(
-            GetProcAddress(kernel32, s!("LoadLibraryW")).ok_or("LoadLibraryW not found")?,
-        );
-
-        let thread = CreateRemoteThread(
-            process,
-            None,
-            0,
-            Some(std::mem::transmute::<LoadLibraryWFn, ThreadProc>(loadlib)),
-            Some(remote.cast()),
-            0,
-            None,
-        )
-        .map_err(|e| {
-            let _ = VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-            let _ = CloseHandle(process);
-            format!("CreateRemoteThread failed: {e}")
-        })?;
-
-        // Bound the wait: if LoadLibraryW ever wedges in explorer.exe, fail
-        // cleanly instead of blocking the command thread forever. On timeout
-        // the loader thread is terminated and everything is released.
-        if WaitForSingleObject(thread, 10_000) == WAIT_TIMEOUT {
-            let _ = TerminateThread(thread, 1);
-            let _ = CloseHandle(thread);
-            let _ = VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-            let _ = CloseHandle(process);
-            return Err("LoadLibraryW in explorer.exe timed out".to_string());
-        }
-        let mut exit_code = 0u32;
-        let _ = GetExitCodeThread(thread, &mut exit_code);
-        let _ = CloseHandle(thread);
-        let _ = VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-        let _ = CloseHandle(process);
-
-        if exit_code == 0 {
-            Err(
-                "LoadLibraryW in explorer.exe returned null — the DLL failed to load \
-                 (check it matches the process architecture)."
-                    .to_string(),
-            )
-        } else {
-            Ok(())
-        }
     }
+    .map_err(|e| format!("SetWindowsHookExW failed: {e}"))?;
+
+    HOOK_VALUE.store(hook.0 as usize, Ordering::Release);
+    HOOKED_PID.store(pid, Ordering::Release);
+    HOOKED_TID.store(tid, Ordering::Release);
+    log::info!("[explorer-hook] installed CALLWNDPROC hook on explorer.exe (pid {pid}, thread {tid})");
+    Ok(())
+}
+
+fn uninstall_hook() {
+    let value = HOOK_VALUE.swap(0, Ordering::AcqRel);
+    if value != 0 {
+        // SAFETY: value is a live HHOOK we installed and never otherwise free.
+        let _ = unsafe { UnhookWindowsHookEx(HHOOK(value as *mut core::ffi::c_void)) };
+    }
+    HOOKED_PID.store(0, Ordering::Release);
+    HOOKED_TID.store(0, Ordering::Release);
 }
 
 // Recompute the effective state from the master toggle and the last mode,
-// write it to the shared memory, and keep the watchdog/injection running only
-// while the feature is genuinely active.
+// write it to the shared memory, and keep the hook/watchdog running only while
+// the feature is genuinely active.
 fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
     let last = LAST_STATE.load(Ordering::Acquire);
     let enabled = TOGGLE.load(Ordering::Acquire) && last != 0;
     ENABLED.store(enabled, Ordering::Release);
-    // When disabled, write passthrough so an already-injected Explorer stops
+    // When disabled, write passthrough so an already-loaded Explorer stops
     // rewriting fonts immediately (no restart needed for that).
     write_state(if enabled { last } else { 0 })?;
     if enabled {
         ensure_watchdog_running(app.clone());
-        ensure_injected(app)?;
+        ensure_hooked(app)?;
+    } else {
+        uninstall_hook();
     }
     Ok(())
 }
@@ -342,9 +293,9 @@ pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(),
     apply_state(&app)
 }
 
-/// Master toggle for the Explorer hook (Text tab). Off stops the injection
-/// and writes passthrough so Explorer's text returns to system ClearType;
-/// on re-enables the mode mapping.
+/// Master toggle for the Explorer hook (Text tab). Off stops the hook and
+/// writes passthrough so Explorer's text returns to system ClearType; on
+/// re-enables the mode mapping.
 #[tauri::command]
 pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     if TOGGLE.load(Ordering::Acquire) != enabled {
@@ -357,19 +308,19 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
 /// Report whether the hook is currently VERIFIED in the running explorer.exe,
 /// so the Text tab can reflect it.
 ///
-/// active is not inferred from injection bookkeeping — the DLL itself writes
-/// its pid and status into the shared memory at attach, and we only count it
-/// when the report comes from the CURRENT explorer.exe generation AND the
-/// detour actually installed. That closes the gap where LoadLibraryW
-/// returned non-null (module mapped) but install_detour silently failed, so
-/// the app used to claim "Fix applied" while Explorer's text was untouched.
+/// active is not inferred from app bookkeeping — the DLL itself writes its pid
+/// and status into the shared memory at attach, and we only count it when the
+/// report comes from the CURRENT explorer.exe generation AND the detour
+/// actually installed. That closes the gap where the DLL mapped but
+/// install_detour silently failed, so the app used to claim "Fix applied"
+/// while Explorer's text was untouched.
 ///
 /// applied additionally requires that the current mode is actually VISIBLE:
 /// fonts are rasterized at window creation, so a mode change only reaches
 /// already-open windows after Explorer restarts. It is set when a fresh
-/// explorer.exe generation is injected and verified (watchdog re-injection
-/// after an external restart, or an app restart onto a fresh Explorer); any
-/// mode/toggle change resets it until then.
+/// explorer.exe generation is verified hooked (the watchdog detects the
+/// restart and re-installs the hook on the new thread); any mode/toggle change
+/// resets it until then.
 #[derive(serde::Serialize)]
 pub struct ExplorerHookStatus {
     enabled: bool,
@@ -381,17 +332,12 @@ pub struct ExplorerHookStatus {
 #[tauri::command]
 pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
     let enabled = TOGGLE.load(Ordering::Acquire);
-    let current = find_explorer_pid().unwrap_or(0);
+    let current = explorer_target().map(|(pid, _)| pid).unwrap_or(0);
     let (reported_pid, status) = read_hook_report();
     let active = enabled
         && current != 0
         && reported_pid == current
         && status & STATUS_HOOK_W_INSTALLED != 0;
-    // A mode change only reaches already-open windows after Explorer
-    // restarts; fonts are rasterized at window creation. applied therefore
-    // means a fresh explorer.exe generation was injected and verified — the
-    // frontend shows a warning that the change applies to newly opened
-    // windows when it is not yet true.
     let applied = active && RESTARTED_WHILE_ACTIVE.load(Ordering::Acquire);
     Ok(ExplorerHookStatus {
         enabled,
@@ -401,51 +347,54 @@ pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
     })
 }
 
-/// Inject the hook DLL into the current explorer.exe if this process
-/// generation hasn't been injected yet. Serialized so the watchdog and the
-/// mode-change handler cannot race.
-fn ensure_injected(app: &tauri::AppHandle) -> Result<(), String> {
-    let _guard = INJECT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(pid) = find_explorer_pid() else {
-        log::warn!("[explorer-hook] explorer.exe not running; injection deferred");
+// Confirm the DLL actually reports itself hooked in this explorer generation.
+// The DLL loads into explorer asynchronously after the hook is installed (on
+// its next processed message), so this runs from the watchdog rather than
+// synchronously inside install_hook. A pid change while VERIFIED_PID is
+// already set means Explorer restarted, which is exactly what "applied" means.
+fn verify_report(pid: u32) {
+    let (reported_pid, status) = read_hook_report();
+    if reported_pid != pid || status & STATUS_HOOK_W_INSTALLED == 0 {
+        return;
+    }
+    let prev = VERIFIED_PID.swap(pid, Ordering::AcqRel);
+    if prev == pid {
+        return;
+    }
+    if prev != 0 {
+        RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
+        log::info!("[explorer-hook] verified hook in restarted explorer.exe (pid {pid})");
+    } else {
+        log::info!("[explorer-hook] verified hook in explorer.exe (pid {pid})");
+    }
+}
+
+/// Install the CALLWNDPROC hook on the current explorer.exe if this shell
+/// generation isn't already hooked. Serialized so the watchdog and the mode-
+/// change handler cannot race.
+fn ensure_hooked(app: &tauri::AppHandle) -> Result<(), String> {
+    let _guard = HOOK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some((pid, tid)) = explorer_target() else {
+        log::warn!("[explorer-hook] explorer shell window not found; hook deferred");
         return Ok(());
     };
-    if LAST_INJECTED_PID.load(Ordering::Acquire) == pid {
+    if HOOK_VALUE.load(Ordering::Acquire) != 0
+        && HOOKED_PID.load(Ordering::Acquire) == pid
+        && HOOKED_TID.load(Ordering::Acquire) == tid
+    {
+        // Already hooked on this shell generation.
         return Ok(());
     }
-    let dll = ensure_hook_dll(app)?;
-    inject(pid, &dll)?;
-    LAST_INJECTED_PID.store(pid, Ordering::Release);
-    // Verify the DLL actually reports itself hooked in this generation before
-    // claiming "applied": LoadLibraryW returning non-null only proves the
-    // module mapped — install_detour can still fail silently inside DllMain.
-    // The report is written while LoadLibraryW is still inside DllMain, so it
-    // is already visible here. A fresh explorer generation (pid differs) that
-    // verifies is exactly what "applied" means — every font it renders from
-    // here on goes through the override. That is what lets an external
-    // Explorer restart (watchdog re-injection) or an app restart onto a fresh
-    // Explorer show "✓ Fix applied" instead of nagging for another restart.
-    let (reported_pid, status) = read_hook_report();
-    if reported_pid == pid && status & STATUS_HOOK_W_INSTALLED != 0 {
-        RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
-        log::info!("[explorer-hook] injected + verified explorer_hook.dll in explorer.exe (pid {pid})");
-    } else {
-        // The DLL is in the process but the detour did not install (or the
-        // report raced the attach). The pid is recorded so the watchdog does
-        // not spam re-injection into the same process — LoadLibraryW on an
-        // already-loaded DLL would not re-run DllMain anyway. The status
-        // reads active=false until explorer is restarted (the restart button),
-        // which loads the DLL into a fresh process and retries the detour.
-        log::warn!(
-            "[explorer-hook] injected into explorer.exe (pid {pid}) but hook not verified (reported_pid={reported_pid}, status={status:#x})"
-        );
-    }
+    // A hook on a stale thread (previous shell generation) is dead: drop it
+    // before installing the new one.
+    uninstall_hook();
+    install_hook(app, pid, tid)?;
     Ok(())
 }
 
-/// Start the restart watchdog exactly once. It waits event-driven on
-/// explorer.exe's process handle (no polling) and re-injects when Explorer
-/// restarts while the feature is enabled.
+/// Start the watchdog exactly once. It waits event-driven on the hook state
+/// (one poll per second) and re-installs the hook when Explorer restarts while
+/// the feature is enabled.
 fn ensure_watchdog_running(app: tauri::AppHandle) {
     if WATCHDOG_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -464,26 +413,26 @@ fn watchdog_loop(app: tauri::AppHandle) {
         if SHUTDOWN.load(Ordering::Acquire) {
             return;
         }
-        // Re-inject whenever the running explorer.exe generation differs from
-        // the one we last injected. Polling once per second is cheap (one
-        // process snapshot) and immune to the transition race: the old
-        // wait-on-handle design called ensure_injected exactly once when the
-        // old process died — but at that moment the fresh explorer.exe often
-        // did not exist yet, so injection was deferred and the watchdog then
-        // blocked on the new process without ever re-injecting. That is why
-        // the fix sometimes never applied after a restart.
+        // Re-install whenever the running explorer generation differs from the
+        // one the hook targets (Explorer restart) and verify the DLL's report
+        // so the applied flag tracks reality. Polling once per second is cheap
+        // (one FindWindowW) and immune to the transition race where the fresh
+        // explorer.exe shell window does not exist yet.
         if ENABLED.load(Ordering::Acquire) {
-            let Some(pid) = find_explorer_pid() else {
-                // Explorer isn't running (mid-logoff etc.). Back off.
-                sleep_or_shutdown(1);
-                continue;
-            };
-            if LAST_INJECTED_PID.load(Ordering::Acquire) != pid {
-                // New explorer generation (or first injection): try to inject
-                // now, retrying on the next tick if explorer is still
-                // initializing and the remote thread failed.
-                if let Err(e) = ensure_injected(&app) {
-                    log::warn!("[explorer-hook] re-injection failed, will retry: {e}");
+            match explorer_target() {
+                Some((pid, tid)) => {
+                    let hooked = HOOK_VALUE.load(Ordering::Acquire) != 0
+                        && HOOKED_PID.load(Ordering::Acquire) == pid
+                        && HOOKED_TID.load(Ordering::Acquire) == tid;
+                    if !hooked {
+                        if let Err(e) = ensure_hooked(&app) {
+                            log::warn!("[explorer-hook] hook install failed, will retry: {e}");
+                        }
+                    }
+                    verify_report(pid);
+                }
+                None => {
+                    // Explorer isn't running (mid-logoff etc.). Back off.
                 }
             }
         }
@@ -501,8 +450,8 @@ fn sleep_or_shutdown(seconds: u64) {
     }
 }
 
-/// Signal the watchdog to stop during app shutdown.
+/// Signal the watchdog to stop and drop the hook during app shutdown.
 pub(crate) fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
+    uninstall_hook();
 }
-

@@ -1,5 +1,6 @@
-//! explorer-hook.dll — injected into explorer.exe to override its font
-//! antialiasing. The Windows shell hard-codes ClearType and ignores the
+//! explorer-hook.dll — loaded into explorer.exe via SetWindowsHookExW to
+//! override its font antialiasing. The Windows shell hard-codes ClearType and
+//! ignores the
 //! per-user font-smoothing registry values, so the only way to change its
 //! text is to hook its font creation and rewrite the quality flag.
 //!
@@ -20,13 +21,16 @@ use std::sync::OnceLock;
 
 use retour::GenericDetour;
 use windows::core::{s, w, BOOL, PCWSTR};
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, CLEARTYPE_NATURAL_QUALITY, CLEARTYPE_QUALITY, ENUMLOGFONTEXDVW, FONT_QUALITY,
     HFONT, LOGFONTW, NONANTIALIASED_QUALITY,
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleW, GetProcAddress,
+};
+use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 use windows::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE};
 use windows::Win32::System::SystemServices::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH,
@@ -35,7 +39,7 @@ use windows::Win32::System::SystemServices::{
 // Shared memory layout (12 bytes): the app writes the mode at offset 0; the
 // DLL writes its own state back at offsets 4 and 8 so the app can verify the
 // hook is really installed in the CURRENT explorer.exe instead of trusting
-// its own injection bookkeeping.
+// that the module merely loaded.
 const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
@@ -131,9 +135,9 @@ fn state_mode() -> u32 {
 
 // Write this process's PID and hook status back into the shared memory so the
 // app can verify the hook is really live in the CURRENT explorer.exe
-// generation instead of trusting its own injection bookkeeping. Called from
-// DllMain at attach, so by the time LoadLibraryW returns in the injector the
-// report is already visible.
+// generation instead of trusting that the module merely loaded. Called from
+// DllMain at attach, so once the DLL is loaded in explorer the report is
+// already visible.
 fn report_state(status: u32) {
     let Some(addr) = STATE.get() else {
         return;
@@ -149,6 +153,27 @@ fn report_state(status: u32) {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// The DLL is loaded into more than just explorer.exe: the app also LoadLibraryWs
+// it to resolve the hook procedure before calling SetWindowsHookExW. Only
+// explorer.exe needs the font detour, so everything is gated on the host
+// process being the shell.
+fn is_explorer() -> bool {
+    // GetModuleFileNameW(None, ...) returns the image path of the process the
+    // DLL is loaded in, which is exactly what we need to distinguish the shell
+    // from every other host.
+    unsafe {
+        let mut buf = [0u16; 260];
+        let len = GetModuleFileNameW(None, &mut buf);
+        if len == 0 || len as usize >= buf.len() {
+            return false;
+        }
+        let name = String::from_utf16_lossy(&buf[..len as usize]);
+        name.rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|base| base.eq_ignore_ascii_case("explorer.exe"))
+    }
 }
 
 fn debug(msg: &str) {
@@ -200,7 +225,7 @@ fn install_detour() {
     }
     // Report what actually got installed so the app can tell "hooked" from
     // "DLL loaded but detour failed" — the status write happens while
-    // LoadLibraryW is still inside DllMain, so inject() sees it on return.
+    // LoadLibraryW is still inside DllMain.
     report_state(status);
 }
 
@@ -264,6 +289,20 @@ fn install_font_ex_detour() -> bool {
     }
 }
 
+// Exported so the app can hand it to SetWindowsHookExW. The hook only exists
+// to make Windows load this DLL into explorer.exe through the documented hook
+// mechanism (no CreateRemoteThread / VirtualAllocEx), which is why it does not
+// trip the injection signatures that trip Windows Defender. The real work
+// happens in DllMain; every callback is forwarded straight through.
+#[no_mangle]
+pub unsafe extern "system" fn hook_callback(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(
     _hinst: windows::Win32::Foundation::HINSTANCE,
@@ -272,8 +311,10 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
-            map_state();
-            install_detour();
+            if is_explorer() {
+                map_state();
+                install_detour();
+            }
             BOOL(1)
         }
         DLL_PROCESS_DETACH | DLL_THREAD_ATTACH | DLL_THREAD_DETACH => BOOL(1),

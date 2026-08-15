@@ -162,7 +162,7 @@ export const taskbarDimmer = $state({
 });
 
 // Text rendering tab settings persisted in config. The Explorer hook toggle
-// decides whether the injected DLL fixes Explorer's text (Grayscale/Off
+// decides whether the hook DLL fixes Explorer's text (Grayscale/Off
 // modes) or leaves it at system ClearType.
 export const textSettings = $state({ explorerHookEnabled: false });
 

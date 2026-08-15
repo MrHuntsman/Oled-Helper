@@ -3813,24 +3813,9 @@ button {
   align-items: center;
   gap: 6px;
 }
-/* Applied state: a static status row — muted grey text with the green
-   checkmark on the right as the positive confirmation. */
-.restart-explorer-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-weak);
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-.restart-explorer-status .restart-explorer-check {
-  color: #4CD964;
-}
-/* Shown when the hook is active but not yet applied: fonts are rasterized
-   at window creation, so the change only reaches newly opened windows (or
-   windows opened after Explorer restarts). Wraps to its own line under the
-   toggle row. */
+/* Shown while the hook is active: fonts are rasterized at window creation,
+   so the change only reaches newly opened windows (or windows opened after
+   Explorer restarts). Wraps to its own line under the toggle row. */
 .restart-explorer-hint {
   flex-basis: 100%;
   font-size: 12px;

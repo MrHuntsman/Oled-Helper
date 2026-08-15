@@ -43,7 +43,7 @@
 
   // Explorer hook state from the backend's explorer_hook_status command
   // (polled while mounted): active = DLL verified in the running explorer.exe;
-  // applied = active AND the current explorer.exe generation was injected and
+  // applied = active AND the current explorer.exe generation was hooked and
   // verified, so every window in it renders through the hook. Fonts are
   // rasterized at window creation, so a mode change only reaches already-open
   // windows after they are closed or Explorer restarts.
@@ -115,7 +115,7 @@
   });
 
   // Sync the persisted master toggle into the backend hook module so it
-  // gates injection (Explorer untouched when off).
+  // gates the hook (Explorer untouched when off).
   function syncExplorerToggle() {
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled }).catch(() => {});
   }
@@ -135,8 +135,8 @@
   }
 
   // Mirror the mode into Explorer. The shell hard-codes ClearType and ignores
-  // the registry, so Grayscale/Off only reach Explorer through the injected
-  // hook DLL (see src-tauri/src/explorer_hook.rs): grayscale → force
+  // the registry, so Grayscale/Off only reach Explorer through the hook DLL
+  // (see src-tauri/src/explorer_hook.rs): grayscale → force
   // grayscale, off → force non-antialiased (crisp), rgb/bgr → pass through.
   function syncExplorerHook(mode) {
     invoke('explorer_hook_set_mode', { mode })
@@ -144,8 +144,8 @@
       .catch((e) => console.warn('[text] explorer hook failed', e));
   }
 
-  // Master toggle: on → inject the hook and follow the mode; off → stop
-  // injecting and write passthrough so Explorer returns to system ClearType.
+  // Master toggle: on → load the hook and follow the mode; off → stop the
+  // hook and write passthrough so Explorer returns to system ClearType.
   function onToggleExplorerHook() {
     textSettings.explorerHookEnabled = !textSettings.explorerHookEnabled;
     saveConfig();
@@ -535,7 +535,7 @@
 
     // Poll the hook status while mounted so the Explorer status reflects
     // reality (toggle, mode changes, Explorer restarts, watchdog
-    // re-injection) without wiring every event path.
+    // re-hook) without wiring every event path.
     refreshHookStatus();
     const hookStatusPoll = setInterval(refreshHookStatus, 2000);
 
@@ -646,17 +646,15 @@
         <span class="settings-row-label">Windows Explorer</span>
       </span>
     </div>
-    <p class="text-render-explorer-desc">Windows Explorer ignores grayscale and always renders its text with ClearType RGB.<br>This fix injects a hook into explorer.exe and forces grayscale rendering on Windows Explorer.</p>
+    <p class="text-render-explorer-desc">Windows Explorer ignores grayscale and always renders its text with ClearType RGB.<br>This fix loads a hook into Windows Explorer and forces grayscale rendering.</p>
     <p class="text-render-explorer-warning">⚠ It could trigger a false positive in your antivirus.</p>
     <div class="text-render-explorer-actions">
       <label class="text-render-explorer-toggle">
         <input type="checkbox" checked={textSettings.explorerHookEnabled} onchange={onToggleExplorerHook} />
         <span class="text-render-explorer-toggle-label">Fix Windows Explorer</span>
       </label>
-      {#if hookStatus.active && hookStatus.applied}
-        <span class="restart-explorer-status">Fix applied <span class="restart-explorer-check">✓</span></span>
-      {:else if hookStatus.active}
-        <span class="restart-explorer-hint">Applies to new Explorer windows. Already opened windows will need a restart.</span>
+      {#if hookStatus.active}
+        <span class="restart-explorer-hint">Note: Current open windows will need a restart.</span>
       {/if}
     </div>
   </div>
