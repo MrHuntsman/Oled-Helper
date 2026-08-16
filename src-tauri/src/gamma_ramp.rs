@@ -1,7 +1,8 @@
 // gamma_ramp.rs ,  256-entry 16-bit gamma ramps using a Reinhard-based shadow-recovery curve.
 // Pure black (index 0) is always left untouched.
 
-use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+use windows::core::PCWSTR;
+use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC, GetDC, ReleaseDC};
 // Use the windows crate's typed bindings (gdi32!SetDeviceGammaRamp) rather than
 // a hand-rolled `#[link(name = "gdi32")]` extern block. The crate models the
 // ramp payload as an opaque `*const c_void`, so we keep our own `GammaRamp`
@@ -77,6 +78,31 @@ pub unsafe fn set_display_ramp(ramp: &GammaRamp) -> bool {
     let ok = SetDeviceGammaRamp(hdc, ramp as *const GammaRamp as *const std::ffi::c_void);
     ReleaseDC(None, hdc);
     ok.as_bool()
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Applies a ramp to a specific display device (e.g. r"\\.\DISPLAY1").
+/// `GetDC(None)` always targets the primary monitor, so per-monitor
+/// calibration must CreateDCW on the device name instead — this is what lets
+/// Black Crush land on secondary displays.
+pub unsafe fn set_monitor_ramp(device_name: &str, ramp: &GammaRamp) -> bool {
+    let device = wide(device_name);
+    let hdc = CreateDCW(PCWSTR::null(), PCWSTR(device.as_ptr()), PCWSTR::null(), None);
+    if hdc.0.is_null() {
+        return false;
+    }
+    let ok = SetDeviceGammaRamp(hdc, ramp as *const GammaRamp as *const std::ffi::c_void);
+    let _ = DeleteDC(hdc);
+    ok.as_bool()
+}
+
+/// Restores a specific display device to the linear (OS default) ramp.
+pub unsafe fn reset_monitor_ramp(device_name: &str) {
+    let ramp = build_linear_ramp();
+    set_monitor_ramp(device_name, &ramp);
 }
 
 pub unsafe fn reset_display_ramp() {

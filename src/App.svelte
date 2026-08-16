@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -693,7 +693,7 @@
   let hotkeySaveTimer = null;
 
   function applyGammaForHotkey() {
-    invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch((e) => console.warn('[hotkey] gamma apply failed', e));
+    applyGamma(blackLift()).catch((e) => console.warn('[hotkey] gamma apply failed', e));
   }
 
   // SDR Content Brightness is a Windows setting, not an OLED Helper setting.
@@ -934,6 +934,9 @@
     // Seed the SDR white level used by the Brightness strip compensation
     // (Chromium maps the HDR calibration canvas relative to this value).
     refreshSdrWhiteLevel();
+    // Load the monitor list for the top-bar per-monitor selector; a saved
+    // selection is restored in loadConfig.
+    loadMonitors().catch(() => {});
     // Read the runtime version for the status bar (keeps it in sync with
     // the version the updater compares against).
     getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
@@ -950,6 +953,9 @@
     // refresh below handles that case without touching mode lists or EDID.
     listen('display-changed', () => {
       scheduleDisplayInfoRefresh();
+      // Hotplug/mode changes can add or remove monitors; keep the selector
+      // list in sync so a stale entry is never shown.
+      loadMonitors().catch(() => {});
       // A mode change can briefly make the full display query incomplete, and
       // that query rebuilds displayInfo. Re-check the lightweight GPU payload
       // after the driver has settled so NVIDIA-only controls do not depend on
@@ -1212,6 +1218,22 @@
       </div>
     </div>
     <div class="spacer"></div>
+    <label class="top-monitor-select">
+      <span class="top-monitor-label">Monitor</span>
+      <select
+        class="top-monitor-select-control"
+        value={activeMonitor.mon ? activeMonitor.mon.sig : ''}
+        onchange={(e) => {
+          const sig = e.currentTarget.value;
+          if (sig) setActiveMonitor(monitors.find((m) => m.sig === sig) || null);
+        }}
+        aria-label="Active monitor for per-monitor settings"
+      >
+        {#each monitors as mon (mon.sig)}
+          <option value={mon.sig}>{mon.friendly_name || `Monitor ${monitors.indexOf(mon) + 1}`}{mon.primary ? ' · Primary' : ''} · {mon.width}×{mon.height}</option>
+        {/each}
+      </select>
+    </label>
     <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabSystemIcon} alt="" /> Settings</span>
     </button>

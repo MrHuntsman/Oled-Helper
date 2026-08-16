@@ -61,6 +61,11 @@ pub struct AppConfig {
     pub per_monitor_enabled: bool,
     #[serde(default)]
     pub per_monitor_modes: HashMap<String, String>,
+    // The monitor selected in the app's per-monitor selector: its stable
+    // signature, or empty for Global. Restored so the selector keeps its
+    // position across restarts.
+    #[serde(default)]
+    pub active_monitor_sig: String,
     // Power tab screen protector: seconds of idle before the display fades
     // and stays dimmed until input (10–180 seconds). Enabled separately via
     // the Screen Dimmer title-section toggle.
@@ -199,6 +204,7 @@ impl Default for AppConfig {
             explorer_hook_enabled: false,
             per_monitor_enabled: false,
             per_monitor_modes: HashMap::new(),
+            active_monitor_sig: String::new(),
             screen_protector_seconds: default_screen_protector_seconds(),
             screen_protector_enabled: false,
             screen_protector_opacity: default_screen_protector_opacity(),

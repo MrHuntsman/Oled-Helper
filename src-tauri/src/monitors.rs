@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use windows::core::BOOL;
+use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
     DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
@@ -24,9 +24,10 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{LPARAM, RECT, WIN32_ERROR};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetDC, GetDeviceCaps, GetMonitorInfoW, HDC, HORZRES, HORZSIZE,
-    LOGPIXELSX, LOGPIXELSY, MONITORINFO, ReleaseDC, VERTRES, VERTSIZE, HMONITOR,
-    GET_DEVICE_CAPS_INDEX,
+    EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDeviceCaps,
+    GetMonitorInfoW, HDC, HORZRES, HORZSIZE, LOGPIXELSX, LOGPIXELSY, MONITORINFO, ReleaseDC,
+    VERTRES, VERTSIZE, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+    ENUM_CURRENT_SETTINGS, HMONITOR, GET_DEVICE_CAPS_INDEX,
 };
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
@@ -51,6 +52,12 @@ pub struct AppMonitor {
     /// CCD/EDID friendly name (e.g. "LG OLED C4"); empty when CCD is
     /// unavailable.
     pub friendly_name: String,
+    /// GDI display device name (e.g. r"\\.\DISPLAY1") — what CreateDCW needs
+    /// for per-monitor gamma. Empty when the device could not be matched.
+    pub device_name: String,
+    /// EDID device ID (e.g. r"MONITOR\LGD05XX\{...}") — the frontend's
+    /// per-monitor profile keys use this. Empty when unavailable.
+    pub monitor_id: String,
 }
 
 impl AppMonitor {
@@ -96,6 +103,8 @@ unsafe extern "system" fn monitor_enum_proc(
         primary,
         rect: *rect,
         friendly_name: String::new(),
+        device_name: String::new(),
+        monitor_id: String::new(),
     });
     BOOL(1)
 }
@@ -131,7 +140,99 @@ pub fn all_monitors() -> Vec<AppMonitor> {
             m.friendly_name = name.clone();
         }
     }
+    let devices = display_devices_by_position();
+    for m in &mut list {
+        if let Some((name, id)) = devices.get(&(m.rect.left, m.rect.top)) {
+            m.device_name = name.clone();
+            m.monitor_id = id.clone();
+        }
+    }
     list
+}
+
+/// The connected monitors for the frontend monitor selector. `sig` is the
+/// stable key per-monitor settings are persisted against; `monitor_id` is the
+/// EDID device id the Black Crush profile keys use.
+#[derive(serde::Serialize)]
+pub struct ListedMonitor {
+    pub sig: String,
+    pub friendly_name: String,
+    pub primary: bool,
+    pub width: u32,
+    pub height: u32,
+    pub monitor_id: String,
+    pub device_name: String,
+}
+
+#[tauri::command]
+pub fn list_monitors() -> Vec<ListedMonitor> {
+    all_monitors()
+        .into_iter()
+        .map(|m| ListedMonitor {
+            sig: m.sig(),
+            friendly_name: m.friendly_name,
+            primary: m.primary,
+            width: m.width,
+            height: m.height,
+            monitor_id: m.monitor_id,
+            device_name: m.device_name,
+        })
+        .collect()
+}
+
+/// Maps each connected monitor's stable signature to its GDI display device
+/// name (r"\\.\DISPLAY1"), for per-monitor gamma writes. Monitors whose
+/// device could not be matched are omitted.
+pub fn monitor_device_names() -> HashMap<String, String> {
+    all_monitors()
+        .into_iter()
+        .filter(|m| !m.device_name.is_empty())
+        .map(|m| (m.sig(), m.device_name))
+        .collect()
+}
+
+// GDI display devices (device name + EDID id) keyed by the device's
+// current-mode desktop position, so they can be joined to the monitor rects:
+// the position from EnumDisplaySettingsW is the same virtual-desktop space as
+// the EnumDisplayMonitors rect, so (left, top) pins each monitor to its device.
+fn display_devices_by_position() -> HashMap<(i32, i32), (String, String)> {
+    let mut map = HashMap::new();
+    // SAFETY: EnumDisplayDevicesW(NULL) enumerates the display devices; only
+    // attached devices (those on the desktop) get their current-mode position.
+    unsafe {
+        let mut index = 0u32;
+        loop {
+            let mut dev = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut dev, 0).as_bool() {
+                break;
+            }
+            index += 1;
+            if (dev.StateFlags.0 & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP.0) == 0 {
+                continue;
+            }
+            let name = trim_utf16(&dev.DeviceName);
+            let mut dm = DEVMODEW::default();
+            let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            if !EnumDisplaySettingsW(PCWSTR(name_wide.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm)
+                .as_bool()
+            {
+                continue;
+            }
+            // DEVMODEW models the union-typed fields through Anonymous1/2;
+            // dmPosition lives in the second anonymous member.
+            let pos = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
+            map.insert((pos.x, pos.y), (name, trim_utf16(&dev.DeviceID)));
+        }
+    }
+    map
+}
+
+fn trim_utf16(raw: &[u16]) -> String {
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end]).trim().to_string()
 }
 
 /// Friendly name of the primary monitor (CCD/EDID, e.g. "LG OLED C4"), when

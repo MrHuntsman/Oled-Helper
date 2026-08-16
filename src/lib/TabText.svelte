@@ -7,7 +7,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
-  import { textSettings, saveConfig } from './stores.svelte.js';
+  import { textSettings, saveConfig, activeMonitor, syncTextPerMonitor } from './stores.svelte.js';
 
   let { modalOpen = false, menuOpen = false } = $props();
 
@@ -90,6 +90,7 @@
       syncExplorerToggle();
       scheduleKnobSync();
       syncExplorerHook(state.effective_mode);
+      syncTextPerMonitor();
     } catch (e) {
       error = String(e);
       console.warn('[text] get_state failed', e);
@@ -104,41 +105,35 @@
       .catch((e) => console.warn('[text] explorer hook failed', e));
   }
 
-  // ── Per-monitor rendering (M3) ────────────────────────────────────────
-  // The connected monitors, from the backend's monitor-table enumeration.
-  let monitors = $state([]);
+  // ── Per-monitor text modes (M3) ───────────────────────────────────────
+  // Every monitor carries its own profile; the top-bar selector (stores
+  // activeMonitor) picks which one the mode control edits. A monitor without
+  // an explicit mode uses 'default' — the system text setting (the hook's
+  // fallback slot, synced from text_rendering_get_state). The hook's
+  // per-monitor flag is derived in stores from whether any assignment exists.
 
-  // Push the per-monitor toggle and all assignments to the backend so the
-  // hook's shared-memory table reflects the current config.
-  function syncPerMonitor() {
-    invoke('explorer_hook_set_per_monitor', { enabled: textSettings.perMonitorEnabled }).catch(() => {});
-    for (const [sig, mode] of Object.entries(textSettings.perMonitorModes)) {
-      invoke('explorer_hook_set_monitor_mode', { sig, mode }).catch(() => {});
-    }
+  // The mode the radios should show as active: the selected monitor's assigned
+  // mode, or 'default' when it follows the system text setting.
+  function shownMode() {
+    if (activeMonitor.mon) return textSettings.perMonitorModes[activeMonitor.mon.sig] || 'default';
+    return state.effective_mode;
   }
 
-  function refreshMonitors() {
-    invoke('explorer_hook_monitors')
-      .then((list) => { monitors = list || []; })
-      .catch((e) => console.warn('[text] monitor list failed', e));
-  }
-
-  function onTogglePerMonitor() {
-    textSettings.perMonitorEnabled = !textSettings.perMonitorEnabled;
-    saveConfig();
-    syncPerMonitor();
-    if (textSettings.perMonitorEnabled) refreshMonitors();
-  }
-
-  function onMonitorModeChange(sig, mode) {
-    if (mode === 'global') delete textSettings.perMonitorModes[sig];
+  // Assign (or clear, via 'default') the selected monitor's mode override.
+  function applyMonitorMode(mode) {
+    const sig = activeMonitor.mon.sig;
+    if (mode === 'default') delete textSettings.perMonitorModes[sig];
     else textSettings.perMonitorModes[sig] = mode;
     saveConfig();
-    invoke('explorer_hook_set_monitor_mode', { sig, mode }).catch(() => {});
+    syncTextPerMonitor();
+    schedulePreviewRender();
   }
 
-  function perMonitorModeFor(sig) {
-    return textSettings.perMonitorModes[sig] || 'global';
+  // The mode the preview rasterizes with: the selected monitor's override,
+  // or the system default.
+  function previewMode() {
+    if (activeMonitor.mon) return textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode;
+    return state.effective_mode;
   }
 
   function onToggleExplorerHook() {
@@ -151,6 +146,12 @@
 
   async function applyMode(mode) {
     if (busy) return;
+    // A monitor selected in the top bar means the mode edit targets that
+    // monitor's profile; 'default' clears it back to the system setting.
+    if (activeMonitor.mon) {
+      applyMonitorMode(mode);
+      return;
+    }
     busy = true;
     error = '';
     try {
@@ -183,6 +184,10 @@
         saveConfig();
         syncExplorerToggle();
       }
+      // Restore defaults also clears any per-monitor mode overrides.
+      textSettings.perMonitorModes = {};
+      saveConfig();
+      syncTextPerMonitor();
       await refreshState();
       await renderPreview();
     } catch (e) {
@@ -230,7 +235,7 @@
     const cssWidth = canvas.clientWidth;
     if (cssWidth <= 0) return;
 
-    const mode = state.effective_mode;
+    const mode = previewMode();
     const zoom = previewZoom / 100;
     const key = `${mode}|${textSettings.lcdFilterStrength}|${textSettings.crosstalk}|${textSettings.boldness}|${dpr}`;
     const gen = ++previewGen;
@@ -355,8 +360,9 @@
       await renderPreview();
     });
 
-    refreshMonitors();
-    syncPerMonitor();
+    // Ensure the hook's per-monitor table matches the top-bar selector
+    // (the flag is derived from the selected monitor).
+    syncTextPerMonitor();
     refreshHookStatus();
     const hookStatusPoll = setInterval(refreshHookStatus, 2000);
 
@@ -405,8 +411,13 @@
     </div>
     <div class="text-render-modes-row">
       <div class="text-render-inline-modes" role="radiogroup" aria-label="Preview subpixel mode">
+        {#if activeMonitor.mon}
+          <button type="button" class="text-render-inline-mode" class:active={shownMode() === 'default'} role="radio" aria-checked={shownMode() === 'default'} onclick={() => applyMode('default')} disabled={busy}>
+            Default
+          </button>
+        {/if}
         {#each MODES as m (m.id)}
-          <button type="button" class="text-render-inline-mode" class:active={state.effective_mode === m.id} role="radio" aria-checked={state.effective_mode === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
+          <button type="button" class="text-render-inline-mode" class:active={shownMode() === m.id} role="radio" aria-checked={shownMode() === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
             {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
             {m.label}
             {#if m.id === 'grayscale'}<span class="text-render-recommended-badge">Recommended</span>{/if}
@@ -431,53 +442,6 @@
         </div>
       {/if}
     </div>
-  </div>
-
-  <div class="dimmer-control">
-    <div class="dimmer-control-heading">
-      <span class="hdr-control-title">
-        <span class="settings-row-label">Per-monitor rendering</span>
-        <span class="info-tip-wrap">
-          <button class="info-tip-btn" aria-label="About per-monitor rendering" tabindex="0">Info</button>
-          <span class="info-tip info-tip-right">
-            <span>
-              Use a different text rendering mode on each monitor — for example
-              RWBG on your WOLED and RGB on an LCD.<br>
-              <br>
-              Assignments are matched to the monitor's resolution, physical
-              size and DPI; a monitor that can't be identified falls back to
-              the global mode.
-            </span>
-          </span>
-        </span>
-      </span>
-    </div>
-    <p class="text-render-explorer-desc">Different monitors often have different subpixel layouts. When this is on, each draw is attributed to its monitor and rendered with that monitor's mode.</p>
-    <div class="text-render-explorer-actions">
-      <label class="text-render-explorer-toggle">
-        <input type="checkbox" checked={textSettings.perMonitorEnabled} onchange={onTogglePerMonitor} />
-        <span class="text-render-explorer-toggle-label">Use per-monitor modes</span>
-      </label>
-    </div>
-    {#if textSettings.perMonitorEnabled}
-      <div class="text-render-per-monitor-list">
-        {#each monitors as mon (mon.sig)}
-          <div class="text-render-per-monitor-row">
-            <span class="text-render-per-monitor-name">{mon.friendly_name || `Monitor ${mon.index + 1}`}{mon.primary ? ' · Primary' : ''}</span>
-            <span class="text-render-per-monitor-res">{mon.width}×{mon.height}</span>
-            <select class="text-render-per-monitor-select" value={perMonitorModeFor(mon.sig)} onchange={(e) => onMonitorModeChange(mon.sig, e.currentTarget.value)} aria-label="Mode for monitor {mon.index + 1}">
-              <option value="global">Global</option>
-              {#each MODES as m (m.id)}
-                <option value={m.id}>{m.label}</option>
-              {/each}
-            </select>
-          </div>
-        {/each}
-        {#if monitors.length === 0}
-          <p class="text-render-per-monitor-empty">No monitors detected.</p>
-        {/if}
-      </div>
-    {/if}
   </div>
 
   <div class="text-render-preview-panel">

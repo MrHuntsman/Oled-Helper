@@ -19,6 +19,7 @@ mod updater;
 mod vendor_info;
 mod window_icon;
 
+use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 use std::sync::{
@@ -214,6 +215,11 @@ struct GammaShutdown {
 
 struct GammaState {
     desired: Arc<AtomicI32>,
+    // Per-monitor black-lift values keyed by the monitor's stable signature
+    // (see monitors::AppMonitor::sig). The safety thread re-applies these to
+    // their own devices alongside the global value, and shutdown resets every
+    // affected monitor. Zero entries are removed (linear = OS default).
+    per_monitor: Arc<Mutex<HashMap<String, i32>>>,
     shutdown: Arc<GammaShutdown>,
     safety_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -229,11 +235,60 @@ impl Drop for GammaState {
         }
         unsafe {
             gamma_ramp::reset_display_ramp();
+            reset_per_monitor_ramps(&self.per_monitor);
         }
     }
 }
 
-fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
+// Restores every monitor that has a per-monitor lift entry to the linear ramp.
+fn reset_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
+    let Ok(map) = per_monitor.lock() else {
+        return;
+    };
+    if map.is_empty() {
+        return;
+    }
+    let devices = crate::monitors::monitor_device_names();
+    for sig in map.keys() {
+        if let Some(device) = devices.get(sig) {
+            unsafe {
+                gamma_ramp::reset_monitor_ramp(device);
+            }
+        }
+    }
+}
+
+// Re-applies every non-zero per-monitor lift to its own device. Called from
+// the safety loop so external resets are corrected on secondary displays too.
+fn reapply_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
+    let lifts: Vec<(String, i32)> = {
+        let Ok(map) = per_monitor.lock() else {
+            return;
+        };
+        map.iter()
+            .filter(|(_, &v)| v != 0)
+            .map(|(sig, &v)| (sig.clone(), v))
+            .collect()
+    };
+    if lifts.is_empty() {
+        return;
+    }
+    let devices = crate::monitors::monitor_device_names();
+    for (sig, lift) in lifts {
+        if let Some(device) = devices.get(&sig) {
+            let ramp = gamma_ramp::build_ramp(lift);
+            unsafe {
+                gamma_ramp::set_monitor_ramp(device, &ramp);
+            }
+        }
+    }
+}
+
+fn gamma_safety_loop(
+    desired: Arc<AtomicI32>,
+    per_monitor: Arc<Mutex<HashMap<String, i32>>>,
+    shutdown: Arc<GammaShutdown>,
+) {
     loop {
         let guard = shutdown
             .lock
@@ -259,14 +314,18 @@ fn gamma_safety_loop(desired: Arc<AtomicI32>, shutdown: Arc<GammaShutdown>) {
             crate::hotkeys::recover_hold_restore();
             continue;
         }
-        let value = desired.load(Ordering::Relaxed);
-        // When black lift is zero the system ramp is linear (OS default) ,
-        // nothing to restore. Skip both the reference-mode check and the GDI
-        // call to keep the thread truly idle while black crush is disabled.
-        if value == 0 {
+        if crate::vendor_info::nvidia_reference_mode_enabled() {
             continue;
         }
-        if crate::vendor_info::nvidia_reference_mode_enabled() {
+        // Per-monitor entries re-apply regardless of the global value (a
+        // secondary monitor's lift must survive even when the primary is at
+        // zero); the helper skips zero entries and empty maps cheaply.
+        reapply_per_monitor_ramps(&per_monitor);
+        let value = desired.load(Ordering::Relaxed);
+        // When black lift is zero the system ramp is linear (OS default) ,
+        // nothing to restore. Skip the GDI call to keep the thread truly
+        // idle while black crush is disabled.
+        if value == 0 {
             continue;
         }
         let ramp = gamma_ramp::build_ramp(value);
@@ -386,6 +445,42 @@ fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), Str
     }
     state.desired.store(black_lift, Ordering::Relaxed);
     crate::hotkeys::update_hold_restore_locked(black_lift);
+    Ok(())
+}
+
+// Same as apply_gamma_ramp but targets a specific monitor (by stable
+// signature) instead of the primary. Used by per-monitor Black Crush when the
+// frontend has a monitor selected; the primary monitor goes through the global
+// path above. A zero lift removes the entry (linear ramp, no safety re-apply).
+#[tauri::command]
+fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i32) -> Result<(), String> {
+    let black_lift = black_lift.clamp(-150, 150);
+    if crate::vendor_info::nvidia_reference_mode_enabled() {
+        return Err("NVIDIA Override to reference mode is enabled; disable it in your NVIDIA driver settings under System → Displays to use Black Crush Tweak".into());
+    }
+    let _gamma_guard = crate::hotkeys::gamma_write_guard();
+    if !crate::hotkeys::is_hold_compare_active() {
+        let device = crate::monitors::monitor_device_names()
+            .get(&sig)
+            .cloned()
+            .ok_or_else(|| format!("no display device for monitor {sig}"))?;
+        let ramp = gamma_ramp::build_ramp(black_lift);
+        let applied = unsafe { gamma_ramp::set_monitor_ramp(&device, &ramp) };
+        if !applied {
+            return Err("SetDeviceGammaRamp failed".into());
+        }
+    }
+    {
+        let mut map = state
+            .per_monitor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if black_lift == 0 {
+            map.remove(&sig);
+        } else {
+            map.insert(sig, black_lift);
+        }
+    }
     Ok(())
 }
 
@@ -519,6 +614,7 @@ pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
     }
     unsafe {
         gamma_ramp::reset_display_ramp();
+        reset_per_monitor_ramps(&state.per_monitor);
     }
     // app.exit(0) bypasses Rust Drop, so explicitly close the process-lifetime
     // NVAPI DRS session/context before Tauri terminates. Flush afterward so
@@ -1036,6 +1132,7 @@ pub fn run() {
     builder
         .manage(GammaState {
             desired: gamma_desired,
+            per_monitor: Arc::new(Mutex::new(HashMap::new())),
             shutdown: Arc::new(GammaShutdown {
                 requested: AtomicBool::new(false),
                 wake: Condvar::new(),
@@ -1046,6 +1143,8 @@ pub fn run() {
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
         .invoke_handler(tauri::generate_handler![
             apply_gamma_ramp,
+            apply_gamma_ramp_for,
+            monitors::list_monitors,
             log_frontend,
             get_display_info,
             refresh_vendor_display_info,
@@ -1141,10 +1240,11 @@ pub fn run() {
             {
                 let state = app.state::<GammaState>();
                 let desired = state.desired.clone();
+                let per_monitor = state.per_monitor.clone();
                 let shutdown = state.shutdown.clone();
                 let handle = std::thread::Builder::new()
                     .name("gamma-safety".into())
-                    .spawn(move || gamma_safety_loop(desired, shutdown))
+                    .spawn(move || gamma_safety_loop(desired, per_monitor, shutdown))
                     .map_err(|error| format!("could not start gamma safety thread: {error}"))?;
                 state
                     .safety_thread

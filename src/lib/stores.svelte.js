@@ -83,6 +83,64 @@ export const crush = $state({
   blackStripGapEnabled: true,
 });
 
+// ── Per-monitor selector (M3) ────────────────────────────────────────────
+// The monitor chosen in the top bar — every connected monitor is listed
+// (defaults to the primary), and each tab reads/writes the selected monitor's
+// profiles. Null only before the monitor list has loaded.
+// Svelte 5: exported $state bindings cannot be reassigned, so the selection
+// lives as a property of a never-reassigned object (the codebase pattern).
+export const monitors = $state([]);
+export const activeMonitor = $state({ mon: null });
+
+export async function loadMonitors() {
+  try {
+    const list = await invoke('list_monitors');
+    monitors.splice(0, monitors.length, ...(list || []));
+    // A selected monitor that disappeared (unplug/reconnect) falls back to
+    // the primary rather than pointing at a stale signature.
+    if (activeMonitor.mon && !monitors.some((m) => m.sig === activeMonitor.mon.sig)) {
+      activeMonitor.mon = monitors.find((m) => m.primary) || monitors[0] || null;
+    }
+  } catch (e) {
+    console.warn('[monitors] list failed', e);
+  }
+}
+
+export function setActiveMonitor(mon) {
+  activeMonitor.mon = mon || null;
+  saveConfig();
+  // Keep the hook's per-monitor table in sync from any tab.
+  syncTextPerMonitor();
+}
+
+// Push the per-monitor text flag + all assignments to the hook so its
+// shared-memory table matches the profiles. The flag is derived from the
+// profiles themselves: per-monitor resolution only runs once any monitor has
+// an explicit mode assignment (before that, every monitor uses the system
+// default and the hook stays on the cheap lazy path). Assignments are keyed
+// by the monitor's stable signature.
+export function syncTextPerMonitor() {
+  const enabled = Object.keys(textSettings.perMonitorModes).length > 0;
+  invoke('explorer_hook_set_per_monitor', { enabled }).catch(() => {});
+  for (const [sig, mode] of Object.entries(textSettings.perMonitorModes)) {
+    invoke('explorer_hook_set_monitor_mode', { sig, mode }).catch(() => {});
+  }
+}
+
+export function activeMonitorSig() {
+  return activeMonitor.mon ? activeMonitor.mon.sig : '';
+}
+
+// Route a black-lift apply to the selected monitor's device; before the
+// selector has a monitor (or with none connected), fall back to the primary.
+// One decision point for every caller.
+export function applyGamma(blackLiftValue) {
+  if (activeMonitor.mon) {
+    return invoke('apply_gamma_ramp_for', { sig: activeMonitor.mon.sig, blackLift: blackLiftValue });
+  }
+  return invoke('apply_gamma_ramp', { blackLift: blackLiftValue });
+}
+
 export function activeSquareCount() {
   return crush.squareCounts[crush.stripType] ?? 12;
 }
@@ -173,10 +231,10 @@ export const textSettings = $state({
   lcdFilterStrength: 0,
   crosstalk: 0,
   boldness: 0,
-  // Per-monitor rendering (M3): master flag plus per-monitor mode
-  // assignments keyed by the monitor's stable signature ("WxH|phys|dpi") →
-  // mode id ("rgb", "rwbg", ...). Absent = use the global mode.
-  perMonitorEnabled: false,
+  // Per-monitor mode assignments keyed by the monitor's stable signature
+  // ("WxH|phys|dpi") → mode id ("rgb", "rwbg", ...). Absent = the system
+  // default ("Default" in the UI). Whether per-monitor resolution is active
+  // is derived from whether any assignment exists — no stored flag.
   perMonitorModes: {},
 });
 
@@ -376,6 +434,21 @@ export function adjustmentDisplay() {
   return `${crush.adjustment > 0 ? '+' : ''}${(crush.adjustment / 10).toFixed(1)}`;
 }
 export function blackLift() { return crush.blackEnabled ? crush.adjustment : 0; }
+// Display identity the Black Crush profiles are keyed against: the selected
+// monitor's EDID id (identical to app.displayInfo's for the primary, so
+// existing primary profile keys stay compatible), falling back to the current
+// display before the selector has a monitor.
+function crushInfo() {
+  if (activeMonitor.mon) {
+    return {
+      monitorId: activeMonitor.mon.monitor_id || '',
+      deviceName: activeMonitor.mon.device_name || '',
+      width: activeMonitor.mon.width,
+      height: activeMonitor.mon.height,
+    };
+  }
+  return app.displayInfo;
+}
 function hzKey(hz) {
   const value = Number(hz);
   return Number.isFinite(value) && value > 0 ? String(Math.round(value)) : null;
@@ -384,7 +457,7 @@ function displayIdentity(info = app.displayInfo) {
   const identity = String(info.monitorId || info.deviceName || '').trim();
   return identity || 'unknown-display';
 }
-function profileKey(hz, info = app.displayInfo) {
+function profileKey(hz, info = crushInfo()) {
   const hzPart = hzKey(hz);
   if (!hzPart || !info.width || !info.height) return null;
   // Monitor identity + active mode makes profiles independent across both
@@ -430,7 +503,7 @@ export function applyBlackLevelProfileForRefreshRate(hz) {
   const existing = profileValue(key);
   if (existing !== null) {
       crush.adjustment = existing;
-    invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch((e) => console.warn('[profile] gamma apply failed', e));
+    applyGamma(blackLift()).catch((e) => console.warn('[profile] gamma apply failed', e));
     return;
   }
   const legacyKey = hzKey(hz);
@@ -441,9 +514,9 @@ export function applyBlackLevelProfileForRefreshRate(hz) {
   legacyBlackLift = null;
   crush.adjustment = fallback;
   // Profile application is owned here rather than by TabCrush, so a display
-  // change while another tab is open still updates the primary display's gamma
-  // immediately. The backend safely targets Windows' current primary display.
-  invoke('apply_gamma_ramp', { blackLift: blackLift() }).catch((e) => console.warn('[profile] gamma apply failed', e));
+  // change while another tab is open still updates the gamma immediately.
+  // applyGamma routes to the selected monitor or the primary display.
+  applyGamma(blackLift()).catch((e) => console.warn('[profile] gamma apply failed', e));
 }
 
 export function currentBlackLevelProfileKey() {
@@ -487,8 +560,19 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.lcd_filter_strength === 'number') textSettings.lcdFilterStrength = Math.max(0, Math.min(100, Math.round(cfg.lcd_filter_strength)));
     if (cfg && typeof cfg.crosstalk === 'number') textSettings.crosstalk = Math.max(0, Math.min(100, Math.round(cfg.crosstalk)));
     if (cfg && typeof cfg.boldness === 'number') textSettings.boldness = Math.max(0, Math.min(100, Math.round(cfg.boldness)));
-    if (cfg && typeof cfg.per_monitor_enabled === 'boolean') textSettings.perMonitorEnabled = cfg.per_monitor_enabled;
     if (cfg && typeof cfg.per_monitor_modes === 'object' && cfg.per_monitor_modes) textSettings.perMonitorModes = { ...cfg.per_monitor_modes };
+    // Restore the per-monitor selector after the monitor list loads.
+    // Default the selector to the primary monitor; a saved selection wins
+    // when it still exists.
+    loadMonitors().then(() => {
+      const saved = typeof cfg.active_monitor_sig === 'string' ? cfg.active_monitor_sig : '';
+      const match = (saved && monitors.find((m) => m.sig === saved))
+        || monitors.find((m) => m.primary)
+        || monitors[0]
+        || null;
+      activeMonitor.mon = match;
+      syncTextPerMonitor();
+    }).catch(() => { syncTextPerMonitor(); });
     if (cfg && typeof cfg.screen_protector_enabled === 'boolean') {
       screenDimmer.enabled = cfg.screen_protector_enabled;
     }
@@ -602,8 +686,8 @@ export function saveConfig() {
     lcd_filter_strength: textSettings.lcdFilterStrength,
     crosstalk: textSettings.crosstalk,
     boldness: textSettings.boldness,
-    per_monitor_enabled: textSettings.perMonitorEnabled,
     per_monitor_modes: { ...textSettings.perMonitorModes },
+    active_monitor_sig: activeMonitor.mon ? activeMonitor.mon.sig : '',
     screen_protector_enabled: screenDimmer.enabled,
     screen_protector_seconds: screenDimmer.seconds,
     screen_protector_opacity: screenDimmer.opacity,
@@ -762,6 +846,10 @@ export async function restoreAllDefaults() {
   crush.fullscreen = 'normal';
   crush.blackStripGapEnabled = true;
   await resetHotkeys();
+  // Restore defaults resets gamma on every monitor, not just the selected one.
+  for (const m of monitors) {
+    invoke('apply_gamma_ramp_for', { sig: m.sig, blackLift: 0 }).catch(() => {});
+  }
   invoke('apply_gamma_ramp', { blackLift: 0 }).catch((e) => console.warn('[restore-all] gamma reset failed', e));
 }
 export function setDimmerSuspendedForFullscreen(suspended) { invoke('set_taskbar_dimmer_suspended', { suspended }).catch(() => {}); }

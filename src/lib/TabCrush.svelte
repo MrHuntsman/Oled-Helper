@@ -2,7 +2,7 @@
   // Inlined data URIs, see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
-  import { app, crush, adjustmentDisplay, blackLift, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, applyGamma, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax } from './stores.svelte.js';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
   // duplicated in either destination.
@@ -550,7 +550,7 @@
     // Skip redundant sends so a drag doesn't spam the IPC channel.
     if (value === gammaRampLastValue) return;
     gammaRampLastValue = value;
-    invoke('apply_gamma_ramp', { blackLift: value })
+    applyGamma(value)
       .catch((error) => console.warn(`[gamma] send value=${value} failed: ${String(error)}`));
   }
 
