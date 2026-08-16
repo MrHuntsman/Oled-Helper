@@ -1,32 +1,36 @@
-// explorer_hook.rs — load explorer_hook.dll into explorer.exe and control
-// its font-antialiasing override. The Windows shell hard-codes ClearType and
-// ignores the per-user font-smoothing registry values, so the only way to
-// change Explorer's text is to load a DLL that hooks CreateFontIndirectW (see
-// explorer-hook/). The DLL is loaded through a thread-specific
-// SetWindowsHookExW CALLWNDPROC hook on Explorer's UI thread — the documented
-// OS mechanism — instead of CreateRemoteThread injection, so Windows Defender
-// does not flag the app the way it did the injection path. The DLL reads a
-// session-local shared-memory mode that this module writes: 0 = pass through,
-// 1 = force grayscale (ANTIALIASED_QUALITY), 2 = force no antialiasing / crisp
-// (NONANTIALIASED_QUALITY).
+// explorer_hook.rs — load explorer_hook.dll into the shell and the classic
+// Control Panel host processes via a single global WH_CBT hook, and control
+// their font-antialiasing override. The Windows shell (and several system
+// consoles) hard-code ClearType and ignore the per-user font-smoothing
+// registry values, so the only way to change their text is to load a DLL that
+// hooks CreateFontIndirectW (see explorer-hook/). The DLL is loaded through a
+// global SetWindowsHookExW WH_CBT hook — the documented OS mechanism — instead
+// of CreateRemoteThread injection, so Windows Defender does not flag the app
+// the way it did the injection path. WH_CBT fires on window creation, before
+// fonts are rasterized, so the fix reaches fast-starting applets (Device
+// Manager, classic Control Panel, etc.) that a per-process watchdog would
+// miss. The DLL reads a session-local shared-memory mode that this module
+// writes: 0 = pass through, 1 = force grayscale (ANTIALIASED_QUALITY), 2 =
+// force no antialiasing / crisp (NONANTIALIASED_QUALITY).
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 use windows::core::{s, w, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM,
+};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-    WH_CALLWNDPROC,
+    FindWindowW, GetWindowThreadProcessId, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, WH_CBT,
 };
 
 type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
@@ -45,12 +49,12 @@ const STATE_PID_OFFSET: usize = 8;
 // Ex variant is optional (see explorer-hook), so the app only requires this
 // one for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
-// The installed CALLWNDPROC hook (HHOOK value as isize, 0 = none) plus the
-// explorer generation it targets. The pid+thread let us detect an Explorer
-// restart: a fresh shell gets a new thread id, so we re-install the hook.
-static HOOK_VALUE: AtomicUsize = AtomicUsize::new(0);
-static HOOKED_PID: AtomicU32 = AtomicU32::new(0);
-static HOOKED_TID: AtomicU32 = AtomicU32::new(0);
+// The single global WH_CBT hook handle (0 = not installed yet). A global hook
+// (thread id 0) makes Windows map the DLL into every GUI process on the
+// desktop, including ones that start later, so no per-process discovery or
+// re-install is needed — the DLL's own is_target() gate limits the detour to
+// the shell/Control Panel hosts.
+static GLOBAL_HOOK: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 // Last explorer pid whose hook report verified, so a pid change (Explorer
 // restart) can flip the applied flag.
 static VERIFIED_PID: AtomicU32 = AtomicU32::new(0);
@@ -137,10 +141,9 @@ fn read_hook_report() -> (u32, u32) {
     }
 }
 
-// The main Explorer shell: its taskbar window gives us both the pid (for
-// status verification) and the owning UI thread (the hook target). This keeps
-// the hook pointed at the same single shell process the old injection used,
-// and avoids loading the DLL into every GUI process on the system.
+// The main Explorer shell: its taskbar window gives us the pid used for status
+// verification. Explorer is the primary target whose report we trust, since
+// the shared memory has a single report slot that only Explorer writes.
 fn explorer_target() -> Option<(u32, u32)> {
     // SAFETY: FindWindowW/GetWindowThreadProcessId are well-formed calls.
     unsafe {
@@ -155,6 +158,10 @@ fn explorer_target() -> Option<(u32, u32)> {
         }
         Some((pid, tid))
     }
+}
+
+fn global_hook() -> &'static Mutex<Option<usize>> {
+    GLOBAL_HOOK.get_or_init(|| Mutex::new(None))
 }
 
 // The hook DLL is compiled into the exe as a byte blob by build.rs (see
@@ -202,11 +209,12 @@ fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 // Load the DLL into this process (so SetWindowsHookExW can resolve its hook
-// procedure), then install a thread-specific CALLWNDPROC hook on Explorer's UI
-// thread. Windows itself maps the DLL into explorer.exe as a result — the
-// documented hook mechanism — which is why this does not trip the injection
-// signatures that Windows Defender flags.
-fn install_hook(app: &tauri::AppHandle, pid: u32, tid: u32) -> Result<(), String> {
+// procedure), then install a single GLOBAL WH_CBT hook (thread id 0). Windows
+// itself maps the DLL into every GUI process on the desktop — both currently
+// running and any that start later — which is why this does not trip the
+// injection signatures that Windows Defender flags and why no per-process
+// watchdog discovery is needed.
+fn install_hook(app: &tauri::AppHandle) -> Result<(), String> {
     let dll = ensure_hook_dll(app)?;
     let wide_path = wide(&dll.to_string_lossy());
     // SAFETY: LoadLibraryW on the full path of our own embedded DLL. The
@@ -222,34 +230,31 @@ fn install_hook(app: &tauri::AppHandle, pid: u32, tid: u32) -> Result<(), String
         std::mem::transmute(addr)
     };
 
-    // SAFETY: installs a thread-specific CALLWNDPROC hook on Explorer's UI
-    // thread. Because the hook procedure lives in the DLL and the thread is in
-    // another process, Windows maps the DLL into explorer.exe for us.
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_CALLWNDPROC,
-            Some(proc),
-            Some(HINSTANCE(module.0)),
-            tid,
-        )
-    }
-    .map_err(|e| format!("SetWindowsHookExW failed: {e}"))?;
+    // SAFETY: installs a global WH_CBT hook. Thread id 0 associates it with
+    // all threads on the desktop; because the hook procedure lives in the DLL,
+    // Windows maps the DLL into each GUI process for us. WH_CBT fires on
+    // window creation, before fonts rasterize, so fast-starting applets get
+    // the detour in time.
+    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(proc), Some(HINSTANCE(module.0)), 0) }
+        .map_err(|e| format!("SetWindowsHookExW failed: {e}"))?;
 
-    HOOK_VALUE.store(hook.0 as usize, Ordering::Release);
-    HOOKED_PID.store(pid, Ordering::Release);
-    HOOKED_TID.store(tid, Ordering::Release);
-    log::info!("[explorer-hook] installed CALLWNDPROC hook on explorer.exe (pid {pid}, thread {tid})");
+    let mut slot = global_hook().lock().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(hook.0 as usize);
+    log::info!("[explorer-hook] installed global WH_CBT hook");
     Ok(())
 }
 
-fn uninstall_hook() {
-    let value = HOOK_VALUE.swap(0, Ordering::AcqRel);
-    if value != 0 {
-        // SAFETY: value is a live HHOOK we installed and never otherwise free.
-        let _ = unsafe { UnhookWindowsHookEx(HHOOK(value as *mut core::ffi::c_void)) };
+fn uninstall_all_hooks() {
+    let Some(cell) = GLOBAL_HOOK.get() else {
+        return;
+    };
+    let mut slot = cell.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(hook) = slot.take() {
+        // SAFETY: each value is a live HHOOK we installed and never otherwise
+        // free.
+        let _ = unsafe { UnhookWindowsHookEx(HHOOK(hook as *mut core::ffi::c_void)) };
+        log::info!("[explorer-hook] removed global WH_CBT hook");
     }
-    HOOKED_PID.store(0, Ordering::Release);
-    HOOKED_TID.store(0, Ordering::Release);
 }
 
 // Recompute the effective state from the master toggle and the last mode,
@@ -266,7 +271,7 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
         ensure_watchdog_running(app.clone());
         ensure_hooked(app)?;
     } else {
-        uninstall_hook();
+        uninstall_all_hooks();
     }
     Ok(())
 }
@@ -319,8 +324,7 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
 /// fonts are rasterized at window creation, so a mode change only reaches
 /// already-open windows after Explorer restarts. It is set when a fresh
 /// explorer.exe generation is verified hooked (the watchdog detects the
-/// restart and re-installs the hook on the new thread); any mode/toggle change
-/// resets it until then.
+/// restart via a pid change); any mode/toggle change resets it until then.
 #[derive(serde::Serialize)]
 pub struct ExplorerHookStatus {
     enabled: bool,
@@ -349,8 +353,8 @@ pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
 
 // Confirm the DLL actually reports itself hooked in this explorer generation.
 // The DLL loads into explorer asynchronously after the hook is installed (on
-// its next processed message), so this runs from the watchdog rather than
-// synchronously inside install_hook. A pid change while VERIFIED_PID is
+// its next window-creation callback), so this runs from the watchdog rather
+// than synchronously inside install_hook. A pid change while VERIFIED_PID is
 // already set means Explorer restarted, which is exactly what "applied" means.
 fn verify_report(pid: u32) {
     let (reported_pid, status) = read_hook_report();
@@ -369,32 +373,24 @@ fn verify_report(pid: u32) {
     }
 }
 
-/// Install the CALLWNDPROC hook on the current explorer.exe if this shell
-/// generation isn't already hooked. Serialized so the watchdog and the mode-
-/// change handler cannot race.
+/// Install the global WH_CBT hook if it isn't already installed. Serialized so
+/// the watchdog and the mode-change handler cannot race. A global hook reaches
+/// every GUI process automatically (including ones started later), so there is
+/// no per-process install work — this only ensures the single hook exists.
 fn ensure_hooked(app: &tauri::AppHandle) -> Result<(), String> {
     let _guard = HOOK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some((pid, tid)) = explorer_target() else {
-        log::warn!("[explorer-hook] explorer shell window not found; hook deferred");
-        return Ok(());
-    };
-    if HOOK_VALUE.load(Ordering::Acquire) != 0
-        && HOOKED_PID.load(Ordering::Acquire) == pid
-        && HOOKED_TID.load(Ordering::Acquire) == tid
-    {
-        // Already hooked on this shell generation.
+    let installed = global_hook()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some();
+    if installed {
         return Ok(());
     }
-    // A hook on a stale thread (previous shell generation) is dead: drop it
-    // before installing the new one.
-    uninstall_hook();
-    install_hook(app, pid, tid)?;
-    Ok(())
+    install_hook(app)
 }
 
-/// Start the watchdog exactly once. It waits event-driven on the hook state
-/// (one poll per second) and re-installs the hook when Explorer restarts while
-/// the feature is enabled.
+/// Start the watchdog exactly once. It verifies the Explorer report (so the
+/// applied flag tracks reality) and re-installs the hook if it was ever lost.
 fn ensure_watchdog_running(app: tauri::AppHandle) {
     if WATCHDOG_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -413,27 +409,16 @@ fn watchdog_loop(app: tauri::AppHandle) {
         if SHUTDOWN.load(Ordering::Acquire) {
             return;
         }
-        // Re-install whenever the running explorer generation differs from the
-        // one the hook targets (Explorer restart) and verify the DLL's report
-        // so the applied flag tracks reality. Polling once per second is cheap
-        // (one FindWindowW) and immune to the transition race where the fresh
-        // explorer.exe shell window does not exist yet.
         if ENABLED.load(Ordering::Acquire) {
-            match explorer_target() {
-                Some((pid, tid)) => {
-                    let hooked = HOOK_VALUE.load(Ordering::Acquire) != 0
-                        && HOOKED_PID.load(Ordering::Acquire) == pid
-                        && HOOKED_TID.load(Ordering::Acquire) == tid;
-                    if !hooked {
-                        if let Err(e) = ensure_hooked(&app) {
-                            log::warn!("[explorer-hook] hook install failed, will retry: {e}");
-                        }
-                    }
-                    verify_report(pid);
-                }
-                None => {
-                    // Explorer isn't running (mid-logoff etc.). Back off.
-                }
+            if let Err(e) = ensure_hooked(&app) {
+                log::warn!("[explorer-hook] hook install failed, will retry: {e}");
+            }
+            // Verify the primary target (Explorer) for the applied flag. Only
+            // Explorer writes its report back into shared memory, so this
+            // stays unambiguous even with the global hook reaching many
+            // processes.
+            if let Some((pid, _)) = explorer_target() {
+                verify_report(pid);
             }
         }
         sleep_or_shutdown(1);
@@ -453,5 +438,5 @@ fn sleep_or_shutdown(seconds: u64) {
 /// Signal the watchdog to stop and drop the hook during app shutdown.
 pub(crate) fn shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
-    uninstall_hook();
+    uninstall_all_hooks();
 }

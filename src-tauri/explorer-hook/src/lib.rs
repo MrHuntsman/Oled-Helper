@@ -1,8 +1,8 @@
-//! explorer-hook.dll — loaded into explorer.exe via SetWindowsHookExW to
-//! override its font antialiasing. The Windows shell hard-codes ClearType and
-//! ignores the
-//! per-user font-smoothing registry values, so the only way to change its
-//! text is to hook its font creation and rewrite the quality flag.
+//! explorer-hook.dll — loaded into the shell and the classic Control Panel
+//! host processes via SetWindowsHookExW to override their font antialiasing.
+//! The Windows shell (and several system consoles) hard-code ClearType and
+//! ignore the per-user font-smoothing registry values, so the only way to
+//! change their text is to hook font creation and rewrite the quality flag.
 //!
 //! The app (OLED Helper) controls this via a session-local shared-memory
 //! mode: 0 = pass through untouched, 1 = force grayscale
@@ -87,6 +87,9 @@ static ORIGINAL_EX: OnceLock<CreateFontIndirectExWFn> = OnceLock::new();
 // so the next hook callback retries (the callback fires on every message, so
 // a transient failure self-heals).
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+// Cached in DllMain so the hook callback doesn't re-query the process image
+// path on every window-creation event.
+static IS_TARGET: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn hook_create_font_indirect_w(lplf: *const LOGFONTW) -> HFONT {
     match DETOUR.get() {
@@ -189,23 +192,50 @@ fn wide(s: &str) -> Vec<u16> {
 
 // The DLL is loaded into more than just explorer.exe: the app also
 // LoadLibraryWs it to resolve the hook procedure before calling
-// SetWindowsHookExW. Only explorer.exe needs the font detour, so everything
-// is gated on the host process being the shell.
-fn is_explorer() -> bool {
+// SetWindowsHookExW. Only the targeted shell/Control Panel processes need the
+// font detour, so everything is gated on the host process being one of them.
+fn process_name() -> Option<String> {
     // GetModuleFileNameW(None, ...) returns the image path of the process the
-    // DLL is loaded in, which is exactly what we need to distinguish the shell
-    // from every other host.
+    // DLL is loaded in, which is exactly what we need to distinguish the
+    // targeted hosts from every other process.
     unsafe {
         let mut buf = [0u16; 260];
         let len = GetModuleFileNameW(None, &mut buf);
         if len == 0 || len as usize >= buf.len() {
-            return false;
+            return None;
         }
-        let name = String::from_utf16_lossy(&buf[..len as usize]);
-        name.rsplit(['\\', '/'])
-            .next()
-            .is_some_and(|base| base.eq_ignore_ascii_case("explorer.exe"))
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
     }
+}
+
+fn process_base_name() -> String {
+    process_name()
+        .map(|name| {
+            name.rsplit(['\\', '/'])
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+// The primary host: only Explorer writes its status report back into the
+// shared memory (single slot), so the app verifies the primary target from it.
+fn is_explorer() -> bool {
+    process_base_name().eq_ignore_ascii_case("explorer.exe")
+}
+
+// Everything the app wants the font detour in: Explorer plus the classic
+// Control Panel host processes and the MMC admin consoles. SystemProperties is
+// a family of executables, so it is matched by prefix.
+fn is_target() -> bool {
+    let name = process_base_name();
+    let lower = name.to_ascii_lowercase();
+    lower == "explorer.exe"
+        || lower == "control.exe"
+        || lower == "rundll32.exe"
+        || lower == "mmc.exe"
+        || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
 }
 
 fn debug(msg: &str) {
@@ -319,7 +349,11 @@ fn install_detour() -> bool {
     }
     // Resume all suspended threads before touching shared memory.
     drop(suspended);
-    report_state(status);
+    // Only Explorer reports its pid+status back (the shared memory has a single
+    // slot); every target still installs the detour and reads the mode.
+    if is_explorer() {
+        report_state(status);
+    }
     status & STATUS_HOOK_W_INSTALLED != 0
 }
 
@@ -420,10 +454,14 @@ pub unsafe extern "system" fn hook_callback(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if !INSTALL_ATTEMPTED.swap(true, Ordering::SeqCst) {
-        // Runs on the hooked UI thread; fires on the first processed message
+    // Only target processes install the detour; every other host just forwards.
+    // With a global WH_CBT hook this fires on window creation, before the
+    // window's fonts are rasterized, so the fix reaches fast-starting applets.
+    if IS_TARGET.load(Ordering::Acquire) && !INSTALL_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        // Runs on the hooked thread; fires on the first processed callback
         // after the DLL is loaded. On failure, reset so the next callback
-        // retries — the callback fires on every message, so this self-heals.
+        // retries — the callback fires on every window creation, so this
+        // self-heals.
         if !install_detour() {
             INSTALL_ATTEMPTED.store(false, Ordering::SeqCst);
         }
@@ -439,17 +477,19 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
-            // Keep DllMain minimal: just map the shared state. The detour
-            // install is deferred to the first hook callback so no heavy
-            // work (VirtualAlloc, disassembly, patching) runs under the
-            // loader lock.
-            if is_explorer() {
+            // Keep DllMain minimal: cache the target decision once, then map
+            // the shared state. The detour install is deferred to the first
+            // hook callback so no heavy work (VirtualAlloc, disassembly,
+            // patching) runs under the loader lock.
+            let target = is_target();
+            IS_TARGET.store(target, Ordering::Release);
+            if target {
                 map_state();
             }
             BOOL(1)
         }
         DLL_PROCESS_DETACH => {
-            if is_explorer() {
+            if IS_TARGET.load(Ordering::Acquire) {
                 disable_detours();
             }
             BOOL(1)
