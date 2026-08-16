@@ -41,6 +41,13 @@ const AVALON_SUBKEY: &str = r"Software\Microsoft\Avalon.Graphics\DISPLAY1";
 const DEFAULT_GAMMA: u32 = 1400;
 const DEFAULT_CONTRAST: u32 = 1400;
 
+// TEMPORARY: disables the registry/SystemParametersInfo ClearType path (the
+// "old method") while the swash rasterizer hook (explorer-hook) is validated.
+// When off, a mode change only drives the hook and writes nothing to the
+// system, so Explorer's text is provably rendered by the hook alone. Set to
+// true to restore the registry-based behavior.
+static REGISTRY_METHOD_ENABLED: bool = false;
+
 #[derive(serde::Serialize, Clone)]
 pub struct TextRenderingState {
     pub smoothing_enabled: bool,
@@ -1138,11 +1145,17 @@ pub fn text_rendering_get_state() -> Result<TextRenderingState, String> {
 
 #[tauri::command]
 pub fn text_rendering_set_mode(mode: String) -> Result<(), String> {
+    if !REGISTRY_METHOD_ENABLED {
+        return Ok(());
+    }
     apply_mode(&mode)
 }
 
 #[tauri::command]
 pub fn text_rendering_set_gamma(gamma: u32) -> Result<(), String> {
+    if !REGISTRY_METHOD_ENABLED {
+        return Ok(());
+    }
     if !(1000..=2200).contains(&gamma) {
         return Err(format!("gamma out of range: {gamma}"));
     }
@@ -1154,6 +1167,9 @@ pub fn text_rendering_set_gamma(gamma: u32) -> Result<(), String> {
 
 #[tauri::command]
 pub fn text_rendering_set_contrast(contrast: u32) -> Result<(), String> {
+    if !REGISTRY_METHOD_ENABLED {
+        return Ok(());
+    }
     if !(1000..=2200).contains(&contrast) {
         return Err(format!("contrast out of range: {contrast}"));
     }
@@ -1165,6 +1181,9 @@ pub fn text_rendering_set_contrast(contrast: u32) -> Result<(), String> {
 // preview does not change; DirectWrite apps read it at startup.
 #[tauri::command]
 pub fn text_rendering_set_cleartype_level(level: u32) -> Result<(), String> {
+    if !REGISTRY_METHOD_ENABLED {
+        return Ok(());
+    }
     if level > 100 {
         return Err(format!("cleartype level out of range: {level}"));
     }
@@ -1175,6 +1194,9 @@ pub fn text_rendering_set_cleartype_level(level: u32) -> Result<(), String> {
 
 #[tauri::command]
 pub fn text_rendering_reset() -> Result<(), String> {
+    if !REGISTRY_METHOD_ENABLED {
+        return Ok(());
+    }
     apply_mode("rgb")?;
     write_dword(DESKTOP_SUBKEY, "FontSmoothingGamma", DEFAULT_GAMMA)?;
     set_contrast(DEFAULT_CONTRAST)?;

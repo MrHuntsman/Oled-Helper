@@ -9,12 +9,14 @@ description = "Injected into explorer.exe to force grayscale font antialiasing"
 crate-type = ["cdylib"]
 
 [dependencies]
-retour = "0.3"
+iced-x86 = "1"
+swash = "0.2"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_System_Diagnostics_Debug",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Kernel",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Registry",

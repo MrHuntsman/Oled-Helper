@@ -3,15 +3,16 @@
 // their font-antialiasing override. The Windows shell (and several system
 // consoles) hard-code ClearType and ignore the per-user font-smoothing
 // registry values, so the only way to change their text is to load a DLL that
-// hooks CreateFontIndirectW (see explorer-hook/). The DLL is loaded through a
+// hooks ExtTextOutW and re-rasterizes each draw with swash (see explorer-hook/).
+// The DLL is loaded through a
 // global SetWindowsHookExW WH_CBT hook — the documented OS mechanism — instead
 // of CreateRemoteThread injection, so Windows Defender does not flag the app
 // the way it did the injection path. WH_CBT fires on window creation, before
 // fonts are rasterized, so the fix reaches fast-starting applets (Device
 // Manager, classic Control Panel, etc.) that a per-process watchdog would
 // miss. The DLL reads a session-local shared-memory mode that this module
-// writes: 0 = pass through, 1 = force grayscale (ANTIALIASED_QUALITY), 2 =
-// force no antialiasing / crisp (NONANTIALIASED_QUALITY).
+// writes: 0 = pass through, 1 = force grayscale, 2 = force crisp. Because the
+// hook sits on the draw path, a mode change applies on the next repaint (live).
 
 use std::fs;
 use std::path::PathBuf;
@@ -45,9 +46,8 @@ static STATE_VIEW: OnceLock<usize> = OnceLock::new();
 const STATE_SIZE: usize = 12;
 const STATE_STATUS_OFFSET: usize = 4;
 const STATE_PID_OFFSET: usize = 8;
-// The primary CreateFontIndirectW detour is what makes the fix real; the
-// Ex variant is optional (see explorer-hook), so the app only requires this
-// one for a hook to count as active.
+// The ExtTextOutW detour is what makes the fix real; the app requires this
+// status bit for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
 // The single global WH_CBT hook handle (0 = not installed yet). A global hook
 // (thread id 0) makes Windows map the DLL into every GUI process on the

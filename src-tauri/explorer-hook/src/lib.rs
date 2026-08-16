@@ -1,54 +1,55 @@
-//! explorer-hook.dll — loaded into the shell and the classic Control Panel
-//! host processes via SetWindowsHookExW to override their font antialiasing.
-//! The Windows shell (and several system consoles) hard-code ClearType and
-//! ignore the per-user font-smoothing registry values, so the only way to
-//! change their text is to hook font creation and rewrite the quality flag.
+//! explorer-hook.dll — inject a GDI text-rendering replacement into the shell
+//! and the classic Control Panel hosts via a global WH_CBT hook.
 //!
-//! The app (OLED Helper) controls this via a session-local shared-memory
-//! mode: 0 = pass through untouched, 1 = force grayscale
-//! (ANTIALIASED_QUALITY), 2 = force no antialiasing / crisp
-//! (NONANTIALIASED_QUALITY). Only explicit ClearType requests are rewritten
-//! — fonts that already asked for grayscale or non-antialiased rendering
-//! pass through untouched, and in crisp mode explicit grayscale requests are
-//! converted too (smoothing off means no smoothing at all). Both
-//! CreateFontIndirectW and CreateFontIndirectExW are hooked. Fonts that ask
-//! for DEFAULT_QUALITY are intentionally left alone: they follow the system
-//! smoothing state, which the app already sets per mode. The mode is
-//! re-read on every font creation call, so the app can flip it live without
-//! unloading the DLL.
+//! Instead of rewriting the font-quality flag at CreateFontIndirectW (which
+//! only affected fonts created after a window was built), we hook the text
+//! OUTPUT path (ExtTextOutW) and rasterize each draw with `swash` — a pure-Rust
+//! glyph rasterizer — so a mode change is picked up on the very next repaint
+//! (live). Mode 0 forwards straight to GDI (RGB/BGR keep Windows ClearType);
+//! modes 1/2 resolve the selected font, rasterize the run with swash, and
+//! alpha-blend the coverage into the HDC using the current text color.
 //!
 //! Crash safety (explorer.exe restarts itself if we crash it):
 //! 1. The inline patch is applied while every OTHER thread of the process is
 //!    suspended, so no thread can execute the function entry while the jump
-//!    bytes are half-written (a plain copy_from_slice over the entry is not
-//!    atomic and explorer creates fonts from many threads at once). Same for
-//!    restoring the original bytes on DLL_PROCESS_DETACH — re-enabling after
-//!    a toggle-off must find a pristine function, not a double patch.
+//!    bytes are half-written (ExtTextOutW runs on many threads at once).
 //! 2. The detour is installed lazily from the first hook callback, NOT in
-//!    DllMain — keeping DllMain free of VirtualAlloc / disassembly work that
-//!    runs under the loader lock.
-//! 3. The hook functions never return a NULL HFONT: before the detour is
-//!    stored they call the original function pointer directly, so a font
-//!    creation can never fail spuriously during the install window.
+//!    DllMain, keeping the loader lock free of patching work.
+//! 3. The hook never returns failure spuriously: before the detour is stored
+//!    it calls the original pointer directly, and any rasterization error
+//!    falls back to GDI untouched.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+mod detour;
+mod font;
+mod render;
 
-use retour::GenericDetour;
+use std::cell::Cell;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+use detour::Detour;
 use windows::core::{s, w, BOOL, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    ANTIALIASED_QUALITY, CLEARTYPE_NATURAL_QUALITY, CLEARTYPE_QUALITY, ENUMLOGFONTEXDVW, FONT_QUALITY,
-    HFONT, LOGFONTW, NONANTIALIASED_QUALITY,
+    AlphaBlend, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetCurrentObject,
+    GetObjectW, GetTextAlign, GetTextColor, HDC, LOGFONTW, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, ETO_OPTIONS,
+    ETO_GLYPH_INDEX, ETO_PDY, OBJ_FONT, TA_BASELINE, TA_BOTTOM, TA_CENTER, TA_RIGHT,
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
 use windows::Win32::System::LibraryLoader::{
-    GetModuleFileNameW, GetModuleHandleW, GetProcAddress,
+    GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LoadLibraryW,
 };
-use windows::Win32::System::Memory::{MapViewOfFile, OpenFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE};
+use windows::Win32::System::Memory::{
+    MapViewOfFile, OpenFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE,
+};
 use windows::Win32::System::SystemServices::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, DLL_THREAD_ATTACH, DLL_THREAD_DETACH,
 };
@@ -65,98 +66,68 @@ const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
 const STATE_SIZE: usize = 12;
-// Status bits written by the DLL once the detour is actually installed.
-const STATUS_HOOK_W_INSTALLED: u32 = 1;
-const STATUS_HOOK_EX_INSTALLED: u32 = 2;
+// Status bit written by the DLL once the ExtTextOutW detour is installed.
+const STATUS_HOOK_INSTALLED: u32 = 1;
 
-type CreateFontIndirectWFn = unsafe extern "system" fn(*const LOGFONTW) -> HFONT;
-type CreateFontIndirectExWFn = unsafe extern "system" fn(*const ENUMLOGFONTEXDVW) -> HFONT;
+#[allow(improper_ctypes_definitions)]
+type ExtTextOutWFn = unsafe extern "system" fn(
+    HDC,
+    i32,
+    i32,
+    ETO_OPTIONS,
+    *const RECT,
+    PCWSTR,
+    u32,
+    *const i32,
+) -> BOOL;
 
 // Shared mode (0 = passthrough, 1 = grayscale, 2 = crisp) + the installed
-// detours. Both are set once and live for the process lifetime. STATE stores
+// detour. Both are set once and live for the process lifetime. STATE stores
 // the mapped view's raw pointer as a usize (raw pointers are not Send/Sync,
-// so we carry the address in an integer type instead). ORIGINAL_* keep the
-// pristine entry points so the hooks can fall back to a direct call before
-// the detour is stored (never return NULL HFONT).
+// so we carry the address in an integer type instead). ORIGINAL keeps the
+// pristine entry point so the hook can fall back to a direct call before the
+// detour is stored.
 static STATE: OnceLock<usize> = OnceLock::new();
-static DETOUR: OnceLock<GenericDetour<CreateFontIndirectWFn>> = OnceLock::new();
-static DETOUR_EX: OnceLock<GenericDetour<CreateFontIndirectExWFn>> = OnceLock::new();
-static ORIGINAL_W: OnceLock<CreateFontIndirectWFn> = OnceLock::new();
-static ORIGINAL_EX: OnceLock<CreateFontIndirectExWFn> = OnceLock::new();
+static DETOUR: OnceLock<Detour> = OnceLock::new();
+static ORIGINAL: OnceLock<ExtTextOutWFn> = OnceLock::new();
 // True once the deferred detour install has been attempted; reset on failure
-// so the next hook callback retries (the callback fires on every message, so
-// a transient failure self-heals).
+// so the next hook callback retries (the callback fires on every window
+// creation, so a transient failure self-heals).
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 // Cached in DllMain so the hook callback doesn't re-query the process image
 // path on every window-creation event.
 static IS_TARGET: AtomicBool = AtomicBool::new(false);
 
-unsafe extern "system" fn hook_create_font_indirect_w(lplf: *const LOGFONTW) -> HFONT {
-    match DETOUR.get() {
-        Some(detour) => {
-            if lplf.is_null() {
-                return detour.call(lplf);
-            }
-            let mode = state_mode();
-            let mut lf = *lplf;
-            if let Some(quality) = rewritten_quality(mode, lf.lfQuality) {
-                lf.lfQuality = quality;
-            }
-            detour.call(&lf)
-        }
-        // Detour not stored yet (install window): call the real function
-        // directly instead of failing the font creation.
-        None => ORIGINAL_W.get().map(|orig| orig(lplf)).unwrap_or_default(),
-    }
+// ── File logging (%TEMP%\OledHelperHook.log) ───────────────────────────
+// The hook runs inside explorer.exe and friends, where OutputDebugStringW is
+// invisible to the app. An append-only file survives a process crash (the OS
+// flushes the handle on exit), so the last line before a crash is the clue.
+static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static LOG_START: OnceLock<Instant> = OnceLock::new();
+static PROC_NAME: OnceLock<String> = OnceLock::new();
+static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn proc_name() -> &'static str {
+    PROC_NAME.get_or_init(process_base_name).as_str()
 }
 
-// CreateFontIndirectExW takes an ENUMLOGFONTEXDVW whose first member is the
-// LOGFONT, so the requested quality sits at the same offset as in
-// CreateFontIndirectW. A few shell font paths use this variant, so without
-// this detour they would keep ClearType fringing.
-unsafe extern "system" fn hook_create_font_indirect_ex_w(lplf: *const ENUMLOGFONTEXDVW) -> HFONT {
-    match DETOUR_EX.get() {
-        Some(detour) => {
-            if lplf.is_null() {
-                return detour.call(lplf);
-            }
-            let mode = state_mode();
-            let quality = (*(lplf as *const LOGFONTW)).lfQuality;
-            let Some(rewritten) = rewritten_quality(mode, quality) else {
-                return detour.call(lplf);
-            };
-            // Copy the (large) struct so the caller's is never mutated, flip
-            // the embedded quality, and call the original with the copy.
-            let mut copy = *lplf;
-            copy.elfEnumLogfontEx.elfLogFont.lfQuality = rewritten;
-            detour.call(&copy)
+fn log(msg: &str) {
+    let cell = LOG_FILE.get_or_init(|| {
+        let path = std::env::temp_dir().join("OledHelperHook.log");
+        let file = OpenOptions::new().create(true).append(true).open(path).ok();
+        Mutex::new(file)
+    });
+    let ts = LOG_START.get_or_init(Instant::now).elapsed().as_millis();
+    if let Ok(mut guard) = cell.lock() {
+        if let Some(f) = guard.as_mut() {
+            let _ = writeln!(
+                f,
+                "[{ts:>8}ms][{} pid={}] {msg}",
+                proc_name(),
+                std::process::id()
+            );
+            let _ = f.flush();
         }
-        None => ORIGINAL_EX.get().map(|orig| orig(lplf)).unwrap_or_default(),
-    }
-}
-
-// Map a requested quality to the forced one for the current mode, or None to
-// pass through. Only explicit ClearType requests are rewritten (plus
-// explicit grayscale in crisp mode). Fonts that asked for DEFAULT_QUALITY or
-// non-antialiased rendering keep their intent — DEFAULT_QUALITY fonts follow
-// the system smoothing state, which the app already sets per mode.
-fn rewritten_quality(mode: u32, quality: FONT_QUALITY) -> Option<FONT_QUALITY> {
-    if mode == 0 {
-        return None;
-    }
-    let is_cleartype =
-        quality == CLEARTYPE_QUALITY || u32::from(quality.0) == CLEARTYPE_NATURAL_QUALITY;
-    // Crisp mode also converts explicit grayscale requests — smoothing off
-    // means no smoothing at all — but leaves non-antialiased fonts alone.
-    let needs_rewrite = is_cleartype || (mode == 2 && quality == ANTIALIASED_QUALITY);
-    if needs_rewrite {
-        Some(if mode == 2 {
-            NONANTIALIASED_QUALITY
-        } else {
-            ANTIALIASED_QUALITY
-        })
-    } else {
-        None
     }
 }
 
@@ -170,9 +141,6 @@ fn state_mode() -> u32 {
     }
 }
 
-// Write this process's PID and hook status back into the shared memory so the
-// app can verify the hook is really live in the CURRENT explorer.exe
-// generation instead of trusting that the module merely loaded.
 fn report_state(status: u32) {
     let Some(addr) = STATE.get() else {
         return;
@@ -190,14 +158,16 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-// The DLL is loaded into more than just explorer.exe: the app also
-// LoadLibraryWs it to resolve the hook procedure before calling
-// SetWindowsHookExW. Only the targeted shell/Control Panel processes need the
-// font detour, so everything is gated on the host process being one of them.
+fn debug(msg: &str) {
+    let w = wide(msg);
+    unsafe { OutputDebugStringW(PCWSTR(w.as_ptr())) };
+    log(msg);
+}
+
+// The DLL is loaded into more than just explorer.exe (the app LoadLibraryWs it
+// to resolve the hook proc, and the global hook maps it into every GUI
+// process). Only the targeted shell/Control Panel hosts need the detour.
 fn process_name() -> Option<String> {
-    // GetModuleFileNameW(None, ...) returns the image path of the process the
-    // DLL is loaded in, which is exactly what we need to distinguish the
-    // targeted hosts from every other process.
     unsafe {
         let mut buf = [0u16; 260];
         let len = GetModuleFileNameW(None, &mut buf);
@@ -209,28 +179,24 @@ fn process_name() -> Option<String> {
 }
 
 fn process_base_name() -> String {
-    process_name()
-        .map(|name| {
-            name.rsplit(['\\', '/'])
-                .next()
-                .unwrap_or("")
-                .to_string()
-        })
+    let Some(name) = process_name() else {
+        return String::new();
+    };
+    Path::new(&name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-// The primary host: only Explorer writes its status report back into the
-// shared memory (single slot), so the app verifies the primary target from it.
 fn is_explorer() -> bool {
     process_base_name().eq_ignore_ascii_case("explorer.exe")
 }
 
-// Everything the app wants the font detour in: Explorer plus the classic
-// Control Panel host processes and the MMC admin consoles. SystemProperties is
-// a family of executables, so it is matched by prefix.
+// Everything the app wants the detour in: Explorer plus the classic Control
+// Panel host processes and the MMC admin consoles. SystemProperties is a
+// family of executables, matched by prefix.
 fn is_target() -> bool {
-    let name = process_base_name();
-    let lower = name.to_ascii_lowercase();
+    let lower = process_base_name().to_ascii_lowercase();
     lower == "explorer.exe"
         || lower == "control.exe"
         || lower == "rundll32.exe"
@@ -238,20 +204,16 @@ fn is_target() -> bool {
         || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
 }
 
-fn debug(msg: &str) {
-    let w = wide(msg);
-    unsafe { OutputDebugStringW(PCWSTR(w.as_ptr())) };
-}
-
 fn map_state() {
-    // SAFETY: called once at DLL_PROCESS_ATTACH.
     unsafe {
         let name = wide(r"Local\OledHelperExplorerHookState");
-        let Ok(mapping) = OpenFileMappingW(FILE_MAP_READ.0 | FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr()))
+        let Ok(mapping) =
+            OpenFileMappingW(FILE_MAP_READ.0 | FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr()))
         else {
             return;
         };
-        let view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, STATE_SIZE as usize);
+        let view =
+            MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, STATE_SIZE as usize);
         if !view.Value.is_null() {
             let _ = STATE.set(view.Value as usize);
         }
@@ -259,16 +221,388 @@ fn map_state() {
     }
 }
 
-// ── Safe patching ──────────────────────────────────────────────────────
+// ── Text color helpers ─────────────────────────────────────────────────
+
+// COLORREF is 0x00BBGGRR: low byte = red, then green, then blue.
+fn text_color_rgb(hdc: HDC) -> (u8, u8, u8) {
+    let raw = unsafe { GetTextColor(hdc) }.0;
+    let r = (raw & 0xFF) as u8;
+    let g = ((raw >> 8) & 0xFF) as u8;
+    let b = ((raw >> 16) & 0xFF) as u8;
+    (r, g, b)
+}
+
+// ── Blit ──────────────────────────────────────────────────────────────
+
+// Compute the tight bounding box of a rasterized run in run-local coordinates
+// (origin = left edge + baseline). Returns (left, top, width, height).
+fn run_bounds(run: &render::RasterizedText) -> Option<(i32, i32, i32, i32)> {
+    if run.glyphs.is_empty() {
+        return None;
+    }
+    let mut min_left = i32::MAX;
+    let mut min_top = i32::MAX;
+    let mut max_right = i32::MIN;
+    let mut max_bottom = i32::MIN;
+    for g in &run.glyphs {
+        let left = g.x.floor() as i32 + g.bitmap_left;
+        // `bitmap_top` is measured UPWARD from the baseline (swash's y-up
+        // Origin::BottomLeft), but the DIB is top-down, so it must be negated
+        // to keep every glyph on the same baseline.
+        let top = g.y.floor() as i32 - g.bitmap_top;
+        let right = left + g.width as i32;
+        let bottom = top + g.height as i32;
+        min_left = min_left.min(left);
+        min_top = min_top.min(top);
+        max_right = max_right.max(right);
+        max_bottom = max_bottom.max(bottom);
+    }
+    Some((min_left, min_top, (max_right - min_left).max(1), (max_bottom - min_top).max(1)))
+}
+
+// Alpha-blend the rasterized run into the HDC at the text reference point,
+// honoring the HDC's text alignment. Transparent background only (opaque /
+// ETO_OPAQUE handled in a later pass).
+unsafe fn blit_run(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    run: &render::RasterizedText,
+    color: (u8, u8, u8),
+) -> bool {
+    let Some((min_left, min_top, w, h)) = run_bounds(run) else {
+        return true; // empty run, nothing to draw
+    };
+    // A malformed glyph position must never produce a giant allocation.
+    if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+        return false;
+    }
+
+    // Build a 32bpp premultiplied BGRA DIB section.
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // negative = top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let hbitmap = match CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(hb) => hb,
+        Err(_) => return false,
+    };
+    if hbitmap.is_invalid() || bits.is_null() {
+        if !hbitmap.is_invalid() {
+            let _ = DeleteObject(hbitmap.into());
+        }
+        return false;
+    }
+
+    // Composite each glyph's coverage into the DIB as premultiplied BGRA.
+    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+    buf.fill(0);
+    for g in &run.glyphs {
+        let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
+        let dst_top = g.y.floor() as i32 - g.bitmap_top - min_top;
+        for row in 0..g.height as usize {
+            for col in 0..g.width as usize {
+                let c = g.coverage[row * g.width as usize + col];
+                if c == 0 {
+                    continue;
+                }
+                let dx = dst_left as usize + col;
+                let dy = dst_top as usize + row;
+                if dx >= w as usize || dy >= h as usize {
+                    continue;
+                }
+                let i = (dy * w as usize + dx) * 4;
+                buf[i] = (color.2 as u32 * c as u32 / 255) as u8; // B
+                buf[i + 1] = (color.1 as u32 * c as u32 / 255) as u8; // G
+                buf[i + 2] = (color.0 as u32 * c as u32 / 255) as u8; // R
+                buf[i + 3] = c; // A
+            }
+        }
+    }
+
+    let memdc = CreateCompatibleDC(Some(hdc));
+    let old = SelectObject(memdc, hbitmap.into());
+
+    // Translate the reference point to the run origin using text alignment.
+    let align = GetTextAlign(hdc);
+    let origin_x = match align.0 & 0x6 {
+        v if v == TA_RIGHT.0 => x - run.advance as i32,
+        v if v == TA_CENTER.0 => x - (run.advance / 2.0) as i32,
+        _ => x,
+    };
+    // GDI positions text by the font's alignment box (tmAscent/tmDescent),
+    // not the tight ink bounds, so the baseline is placed from the font
+    // metrics rather than the glyphs' ink extents.
+    let origin_y = match align.0 & 0x18 {
+        v if v == TA_BASELINE.0 => y,
+        v if v == TA_BOTTOM.0 => y - (run.descent as i32),
+        _ => y + (run.ascent as i32),
+    };
+
+    let dest_x = origin_x + min_left;
+    let dest_y = origin_y + min_top;
+
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let ok = AlphaBlend(hdc, dest_x, dest_y, w, h, memdc, 0, 0, w, h, blend);
+
+    let _ = SelectObject(memdc, old);
+    let _ = DeleteObject(hbitmap.into());
+    let _ = DeleteDC(memdc);
+    ok.as_bool()
+}
+
+// ── Detour ────────────────────────────────────────────────────────────
+
+// Try to render this ExtTextOutW call with swash. Returns true when the call
+// was fully handled; false means the caller should fall back to GDI.
+//
+// lprect/dx are plain raw pointers (null = the Option's None) rather than
+// `Option<*const _>`: the compiler was miscompiling the niche-Option form in
+// calls by dereferencing the pointer as if it were a by-reference 16-byte
+// struct, which crashes on null. Raw pointers have a single unambiguous ABI.
+unsafe extern "system" fn try_render_swash(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    options: ETO_OPTIONS,
+    _lprect: *const RECT,
+    string: PCWSTR,
+    count: u32,
+    dx: *const i32,
+) -> bool {
+    let mode = state_mode();
+    let render_mode = match mode {
+        1 => render::RenderMode::Grayscale,
+        2 => render::RenderMode::Crisp,
+        _ => return false,
+    };
+    // Only count attempts that actually reach the swash path (mode 1/2), so
+    // passthrough (mode 0) draws don't flood the log.
+    let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+    let verbose = n < 100 || n % 10000 == 0;
+    let fallback = |reason: &str| {
+        if verbose {
+            log(&format!("render #{n}: fallback ({reason})"));
+        }
+        false
+    };
+    if verbose {
+        log(&format!("render #{n}: attempt mode={mode} count={count}"));
+    }
+
+    // Bound the text so a pathological call cannot drive unbounded work.
+    if count == 0 || count > 4096 {
+        return fallback("count out of range");
+    }
+    // ETO_GLYPH_INDEX: the string is an array of glyph indices, not UTF-16.
+    if options.0 & ETO_GLYPH_INDEX.0 != 0 {
+        return try_render_glyph_indices(hdc, x, y, string, count, dx, render_mode);
+    }
+    if options.0 & ETO_PDY.0 != 0 {
+        return fallback(&format!("ETO_PDY (options={:#x})", options.0));
+    }
+    // `dx` sets the distance to the NEXT character cell, so for a single
+    // glyph it has no effect on where that glyph lands. Render single-glyph
+    // draws through swash so one-off characters (ellipsis and friends) get
+    // grayscale instead of ClearType. Multi-glyph custom spacing still falls
+    // back for now.
+    if !dx.is_null() && count > 1 {
+        return fallback("dx spacing");
+    }
+
+    let Some((font_data, px)) = resolve_hdc_font(hdc) else {
+        return fallback("font not resolved");
+    };
+
+    let text = String::from_utf16_lossy(std::slice::from_raw_parts(string.as_ptr(), count as usize));
+    let Some(run) = render::rasterize(&font_data, 0, px, &text, render_mode) else {
+        return fallback("rasterize failed");
+    };
+
+    if verbose {
+        log(&format!(
+            "render #{n}: px={px} glyphs={} -> blit",
+            run.glyphs.len()
+        ));
+    }
+    let color = text_color_rgb(hdc);
+    blit_run(hdc, x, y, &run, color)
+}
+
+// Resolve the font selected into the HDC to (file bytes, pixel size). Shared
+// by the character and glyph-index paths.
+unsafe fn resolve_hdc_font(hdc: HDC) -> Option<(std::sync::Arc<[u8]>, f32)> {
+    let hgdi = GetCurrentObject(hdc, OBJ_FONT);
+    if hgdi.is_invalid() {
+        return None;
+    }
+    let mut logfont = LOGFONTW::default();
+    let got = GetObjectW(
+        hgdi,
+        std::mem::size_of::<LOGFONTW>() as i32,
+        Some(&mut logfont as *mut LOGFONTW as *mut core::ffi::c_void),
+    );
+    if got == 0 {
+        return None;
+    }
+    let face: Vec<u16> = logfont
+        .lfFaceName
+        .iter()
+        .take_while(|&&c| c != 0)
+        .copied()
+        .collect();
+    let face = String::from_utf16_lossy(&face);
+    if face.is_empty() {
+        return None;
+    }
+    let font_data = font::cached_font(&face, logfont.lfWeight, logfont.lfItalic != 0)?;
+    // Pixel size from lfHeight (negative = character height, the common case).
+    let px = logfont.lfHeight.unsigned_abs().max(1) as f32;
+    if px > 512.0 {
+        return None;
+    }
+    Some((font_data, px))
+}
+
+// Handle ETO_GLYPH_INDEX: the string is an array of `count` u16 glyph indices
+// (already shaped by GDI), optionally with a `dx` array of per-glyph advances
+// in logical units (MM_TEXT => pixels). Rasterize each glyph by ID and blit.
+unsafe fn try_render_glyph_indices(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    string: PCWSTR,
+    count: u32,
+    dx: *const i32,
+    mode: render::RenderMode,
+) -> bool {
+    let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+    let verbose = n < 100 || n % 10000 == 0;
+    if verbose {
+        log(&format!("render #{n}: glyph-index count={count}"));
+    }
+
+    let Some((font_data, px)) = resolve_hdc_font(hdc) else {
+        if verbose {
+            log(&format!("render #{n}: glyph-index fallback (font not resolved)"));
+        }
+        return false;
+    };
+
+    let glyph_ids = std::slice::from_raw_parts(string.as_ptr() as *const u16, count as usize);
+    let advances: Vec<f32> = if dx.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(dx, count as usize)
+            .iter()
+            .map(|&a| a as f32)
+            .collect()
+    };
+
+    let Some(run) = render::rasterize_glyphs(&font_data, 0, px, glyph_ids, &advances, mode) else {
+        if verbose {
+            log(&format!("render #{n}: glyph-index fallback (rasterize failed)"));
+        }
+        return false;
+    };
+
+    if verbose {
+        log(&format!(
+            "render #{n}: glyph-index px={px} glyphs={} -> blit",
+            run.glyphs.len()
+        ));
+    }
+    let color = text_color_rgb(hdc);
+    blit_run(hdc, x, y, &run, color)
+}
+
+// Re-entrancy guard: gdi32!ExtTextOutW calls back into itself internally, so
+// while we're already inside the hook (on this thread) the original's nested
+// call must pass straight through instead of recursing forever.
+thread_local! {
+    static IN_EXT_TEXT_OUT: Cell<bool> = const { Cell::new(false) };
+}
+
+// Invoke the original ExtTextOutW (through the trampoline, since the entry is
+// patched). Shared by the fallback and re-entrant paths.
+unsafe extern "system" fn call_original_ext_text_out(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    options: ETO_OPTIONS,
+    lprect: *const RECT,
+    string: PCWSTR,
+    count: u32,
+    dx: *const i32,
+) -> BOOL {
+    match DETOUR.get() {
+        Some(detour) => {
+            let orig: ExtTextOutWFn = std::mem::transmute(detour.trampoline());
+            orig(hdc, x, y, options, lprect, string, count, dx)
+        }
+        None => ORIGINAL
+            .get()
+            .map(|orig| orig(hdc, x, y, options, lprect, string, count, dx))
+            .unwrap_or(BOOL(0)),
+    }
+}
+
+#[allow(improper_ctypes_definitions)]
+unsafe extern "system" fn hook_ext_text_out_w(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    options: ETO_OPTIONS,
+    lprect: *const RECT,
+    string: PCWSTR,
+    count: u32,
+    dx: *const i32,
+) -> BOOL {
+    // Re-entrant call from the original ExtTextOutW: pass straight through so
+    // its nested call can complete instead of recursing forever.
+    if IN_EXT_TEXT_OUT.with(|f| f.get()) {
+        return call_original_ext_text_out(hdc, x, y, options, lprect, string, count, dx);
+    }
+    IN_EXT_TEXT_OUT.with(|f| f.set(true));
+
+    // A panic in the swash path must never take down the shell: catch it and
+    // fall back to GDI untouched.
+    let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        try_render_swash(hdc, x, y, options, lprect, string, count, dx)
+    }));
+    let result = match rendered {
+        Ok(true) => BOOL(1),
+        Ok(false) => call_original_ext_text_out(hdc, x, y, options, lprect, string, count, dx),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            log(&format!("PANIC in swash path (falling back to GDI): {msg}"));
+            call_original_ext_text_out(hdc, x, y, options, lprect, string, count, dx)
+        }
+    };
+    IN_EXT_TEXT_OUT.with(|f| f.set(false));
+    result
+}
+
+// ── Safe patching ─────────────────────────────────────────────────────
 // The inline patch (retour) overwrites the function entry with a multi-byte
-// jump that is NOT written atomically. CreateFontIndirectW is a hot function
-// called from many explorer threads at once, so a thread executing the entry
-// mid-write would run a half-written instruction and crash the shell (which
-// Windows then auto-restarts). Suspending every other thread of the process
-// while the bytes are written closes that window — the same technique
-// MinHook uses. Best effort: threads we fail to open/suspend are left alone
-// (rare; a tiny race window is far better than a crash, and the hook's
-// direct-call fallback keeps font creation safe in between).
+// jump that is NOT written atomically. ExtTextOutW is a hot function called
+// from many threads at once, so a thread executing the entry mid-write would
+// run a half-written instruction and crash the shell (which Windows then
+// auto-restarts). Suspending every other thread while the bytes are written
+// closes that window (the same technique MinHook uses).
 
 struct SuspendedThread(HANDLE);
 
@@ -286,8 +620,6 @@ fn suspend_other_threads() -> Vec<SuspendedThread> {
     let pid = std::process::id();
     let current = unsafe { GetCurrentThreadId() };
     let mut suspended = Vec::new();
-    // SAFETY: CreateToolhelp32Snapshot with TH32CS_SNAPTHREAD + Thread32
-    // enumeration are well-formed calls; the snapshot handle is closed below.
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
             return suspended;
@@ -297,9 +629,9 @@ fn suspend_other_threads() -> Vec<SuspendedThread> {
         if Thread32First(snapshot, &mut entry).is_ok() {
             loop {
                 if entry.th32OwnerProcessID == pid && entry.th32ThreadID != current {
-                    if let Ok(handle) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
-                        // SuspendThread returns (u32)-1 when the thread is
-                        // already suspended or dying; skip those, keep the rest.
+                    if let Ok(handle) =
+                        OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
+                    {
                         if SuspendThread(handle) != u32::MAX {
                             suspended.push(SuspendedThread(handle));
                         } else {
@@ -317,156 +649,201 @@ fn suspend_other_threads() -> Vec<SuspendedThread> {
     suspended
 }
 
-fn find_create_font_indirect_w() -> Option<CreateFontIndirectWFn> {
-    // SAFETY: reads export tables; both calls are well-formed.
+fn find_ext_text_out_w() -> Option<ExtTextOutWFn> {
     unsafe {
         let module = GetModuleHandleW(w!("gdi32.dll")).ok()?;
-        let proc = GetProcAddress(module, s!("CreateFontIndirectW"))?;
+        let proc = GetProcAddress(module, s!("ExtTextOutW"))?;
         Some(std::mem::transmute(proc))
     }
 }
 
-fn find_create_font_indirect_ex_w() -> Option<CreateFontIndirectExWFn> {
-    // SAFETY: reads export tables; both calls are well-formed.
-    unsafe {
-        let module = GetModuleHandleW(w!("gdi32.dll")).ok()?;
-        let proc = GetProcAddress(module, s!("CreateFontIndirectExW"))?;
-        Some(std::mem::transmute(proc))
-    }
-}
-
-// Install both detours with every other thread of the process suspended, then
-// report what actually got installed so the app can tell "hooked" from "DLL
-// loaded but detour failed". Returns whether the primary (W) detour is live.
+// Install the ExtTextOutW detour, then report the status so the app can tell
+// "hooked" from "DLL loaded but detour failed".
 fn install_detour() -> bool {
-    let suspended = suspend_other_threads();
-    let mut status = 0;
-    if install_font_detour() {
-        status |= STATUS_HOOK_W_INSTALLED;
-    }
-    if install_font_ex_detour() {
-        status |= STATUS_HOOK_EX_INSTALLED;
-    }
-    // Resume all suspended threads before touching shared memory.
-    drop(suspended);
-    // Only Explorer reports its pid+status back (the shared memory has a single
-    // slot); every target still installs the detour and reads the mode.
-    if is_explorer() {
-        report_state(status);
-    }
-    status & STATUS_HOOK_W_INSTALLED != 0
-}
-
-fn install_font_detour() -> bool {
     if DETOUR.get().is_some() {
         return true;
     }
-    let Some(original) = find_create_font_indirect_w() else {
-        debug("[explorer-hook] CreateFontIndirectW not found; no hook installed");
+    // Resolve the entry point BEFORE suspending threads: GetModuleHandleW /
+    // GetProcAddress acquire the loader lock, and a suspended thread could be
+    // holding it (e.g. a shell-extension DLL being loaded while a window is
+    // created) — that would deadlock the whole shell.
+    let Some(original) = find_ext_text_out_w() else {
+        debug("[explorer-hook] ExtTextOutW not found; no hook installed");
         return false;
     };
     // Make the direct-call fallback available before the patch goes live.
-    let _ = ORIGINAL_W.set(original);
+    let _ = ORIGINAL.set(original);
+    // Suspend only around the lock-free patch (disassembly + memory write).
+    let suspended = suspend_other_threads();
+    let ok = enable_ext_text_out_detour(original);
+    drop(suspended);
+    if is_explorer() {
+        report_state(if ok { STATUS_HOOK_INSTALLED } else { 0 });
+    }
+    ok
+}
+
+fn enable_ext_text_out_detour(original: ExtTextOutWFn) -> bool {
     // SAFETY: the detour is created once, enabled, and kept alive in DETOUR
     // for the lifetime of the process. Other threads are suspended by the
     // caller, so the non-atomic patch write cannot race a mid-call thread.
     unsafe {
-        match GenericDetour::new(original, hook_create_font_indirect_w) {
-            Ok(detour) => {
-                if let Err(e) = detour.enable() {
-                    debug(&format!("[explorer-hook] detour enable failed: {e}"));
-                    return false;
-                }
-                let _ = DETOUR.set(detour);
-                debug("[explorer-hook] CreateFontIndirectW detour installed");
-                true
-            }
-            Err(e) => {
-                debug(&format!("[explorer-hook] detour setup failed: {e}"));
-                false
-            }
+        let Some(detour) =
+            Detour::new(original as usize, hook_ext_text_out_w as *const () as usize)
+        else {
+            debug("[explorer-hook] detour setup failed");
+            return false;
+        };
+        if !detour.enable() {
+            debug("[explorer-hook] detour enable failed");
+            return false;
         }
-    }
-}
-
-// CreateFontIndirectExW is optional — if gdi32 ever lacks the export, skip it
-// rather than failing the whole hook.
-fn install_font_ex_detour() -> bool {
-    if DETOUR_EX.get().is_some() {
-        return true;
-    }
-    let Some(original) = find_create_font_indirect_ex_w() else {
-        debug("[explorer-hook] CreateFontIndirectExW not found; skipping");
-        return false;
-    };
-    let _ = ORIGINAL_EX.set(original);
-    // SAFETY: the detour is created once, enabled, and kept alive in DETOUR_EX
-    // for the lifetime of the process. Other threads are suspended by the
-    // caller (see install_font_detour).
-    unsafe {
-        match GenericDetour::new(original, hook_create_font_indirect_ex_w) {
-            Ok(detour) => {
-                if let Err(e) = detour.enable() {
-                    debug(&format!("[explorer-hook] Ex detour enable failed: {e}"));
-                    return false;
-                }
-                let _ = DETOUR_EX.set(detour);
-                debug("[explorer-hook] CreateFontIndirectExW detour installed");
-                true
-            }
-            Err(e) => {
-                debug(&format!("[explorer-hook] Ex detour setup failed: {e}"));
-                false
-            }
-        }
+        let _ = DETOUR.set(detour);
+        debug("[explorer-hook] ExtTextOutW detour installed");
+        true
     }
 }
 
 // Restore the pristine function bytes on DLL_PROCESS_DETACH so a later
-// re-enable patches a clean entry. Without this, gdi32 stays patched after
-// the module unloads and a re-install would detour the old jump bytes,
-// corrupting the chain. Other threads are suspended while the bytes are
-// written back, same as the install side.
+// re-enable patches a clean entry.
 fn disable_detours() {
     let suspended = suspend_other_threads();
-    // SAFETY: disable() restores the original prolog; the detours live for
-    // the process lifetime and are only disabled here at detach.
+    // SAFETY: disable() restores the original prolog. The trampoline is
+    // intentionally leaked (a few dozen bytes) rather than freed, so a thread
+    // that was suspended mid-fallback can't resume into freed memory.
     unsafe {
         if let Some(detour) = DETOUR.get() {
-            let _ = detour.disable();
-        }
-        if let Some(detour) = DETOUR_EX.get() {
-            let _ = detour.disable();
+            detour.disable();
         }
     }
     drop(suspended);
 }
 
 // Exported so the app can hand it to SetWindowsHookExW. The hook only exists
-// to make Windows load this DLL into explorer.exe through the documented hook
-// mechanism (no CreateRemoteThread / VirtualAllocEx), which is why it does not
-// trip the injection signatures that trip Windows Defender. The first call
-// also runs the deferred detour install (out of DllMain / the loader lock);
-// every callback is then forwarded straight through.
+// to make Windows load this DLL into the targets through the documented hook
+// mechanism. The first call also runs the deferred detour install (out of
+// DllMain / the loader lock); every callback is then forwarded straight through.
 #[no_mangle]
 pub unsafe extern "system" fn hook_callback(
     code: i32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Only target processes install the detour; every other host just forwards.
-    // With a global WH_CBT hook this fires on window creation, before the
-    // window's fonts are rasterized, so the fix reaches fast-starting applets.
     if IS_TARGET.load(Ordering::Acquire) && !INSTALL_ATTEMPTED.swap(true, Ordering::SeqCst) {
-        // Runs on the hooked thread; fires on the first processed callback
-        // after the DLL is loaded. On failure, reset so the next callback
-        // retries — the callback fires on every window creation, so this
-        // self-heals.
+        log("hook_callback: first window event, installing detour");
         if !install_detour() {
             INSTALL_ATTEMPTED.store(false, Ordering::SeqCst);
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
+}
+
+#[cfg(test)]
+mod prolog_dump {
+    use super::*;
+
+    #[test]
+    fn dump_ext_text_out_bytes() {
+        unsafe {
+            let m = LoadLibraryW(w!("gdi32.dll"));
+            println!("gdi32 module handle: {m:?}");
+            let Ok(m) = m else { return; };
+            let p = GetProcAddress(m, s!("ExtTextOutW"));
+            println!("ExtTextOutW proc: {p:?}");
+            let Some(p) = p else { return; };
+            let addr = p as usize as *const u8;
+            let bytes = std::slice::from_raw_parts(addr, 48);
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+            println!("ExtTextOutW first 48 bytes: {}", hex.join(" "));
+            // The `call rel32` at offset 0x28 targets ExtTextOutW+0x8F90.
+            let helper = addr.add(0x8F90);
+            let hb = std::slice::from_raw_parts(helper, 32);
+            let hhex: Vec<String> = hb.iter().map(|b| format!("{b:02X}")).collect();
+            println!("helper(+0x8F90) first 32 bytes: {}", hhex.join(" "));
+        }
+    }
+
+    // Hook a local function (which cannot re-enter) to prove the detour and
+    // trampoline themselves are sound, independent of ExtTextOutW re-entrancy.
+    #[test]
+    fn detour_local_roundtrip() {
+        unsafe {
+            type AddOneFn = unsafe extern "system" fn(i32) -> i32;
+
+            #[inline(never)]
+            unsafe extern "system" fn add_one(x: i32) -> i32 {
+                x + 1
+            }
+
+            static LOCAL: OnceLock<Detour> = OnceLock::new();
+
+            #[inline(never)]
+            unsafe extern "system" fn add_one_hook(x: i32) -> i32 {
+                let orig: AddOneFn = std::mem::transmute(LOCAL.get().unwrap().trampoline());
+                orig(x) + 100
+            }
+
+            let d = Detour::new(add_one as *const () as usize, add_one_hook as *const () as usize)
+                .expect("new");
+            d.enable();
+            let _ = LOCAL.set(d);
+
+            println!("add_one(5) via hook = {} (expect 106)", add_one(5));
+            let orig: AddOneFn = std::mem::transmute(LOCAL.get().unwrap().trampoline());
+            println!("trampoline(5) = {} (expect 6)", orig(5));
+        }
+    }
+
+    // Round-trip the original ExtTextOutW through our trampoline WITHOUT
+    // explorer. Exercises the re-entrancy guard, since gdi32!ExtTextOutW calls
+    // back into itself internally.
+    #[test]
+    fn trampoline_roundtrip() {
+        unsafe {
+            let original = find_ext_text_out_w().expect("find ExtTextOutW");
+            let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
+            let text = wide("test");
+
+            #[allow(improper_ctypes_definitions)]
+            unsafe extern "system" fn noop(
+                hdc: HDC,
+                x: i32,
+                y: i32,
+                o: ETO_OPTIONS,
+                r: *const RECT,
+                s: PCWSTR,
+                c: u32,
+                d: *const i32,
+            ) -> BOOL {
+                if IN_EXT_TEXT_OUT.with(|f| f.get()) {
+                    return call_original_ext_text_out(hdc, x, y, o, r, s, c, d);
+                }
+                IN_EXT_TEXT_OUT.with(|f| f.set(true));
+                let out = call_original_ext_text_out(hdc, x, y, o, r, s, c, d);
+                IN_EXT_TEXT_OUT.with(|f| f.set(false));
+                out
+            }
+
+            let detour = Detour::new(original as usize, noop as *const () as usize).expect("new");
+            assert!(detour.enable());
+            let _ = DETOUR.set(detour);
+
+            for i in 0..3 {
+                let r = original(
+                    hdc,
+                    10 * i,
+                    10 * i,
+                    ETO_OPTIONS(0),
+                    std::ptr::null(),
+                    PCWSTR(text.as_ptr()),
+                    4,
+                    std::ptr::null(),
+                );
+                assert!(r.as_bool(), "roundtrip #{i} should return TRUE");
+            }
+            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
+        }
+    }
 }
 
 #[no_mangle]
@@ -477,10 +854,6 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
-            // Keep DllMain minimal: cache the target decision once, then map
-            // the shared state. The detour install is deferred to the first
-            // hook callback so no heavy work (VirtualAlloc, disassembly,
-            // patching) runs under the loader lock.
             let target = is_target();
             IS_TARGET.store(target, Ordering::Release);
             if target {

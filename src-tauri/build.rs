@@ -17,6 +17,9 @@ fn build_explorer_hook() {
 
     println!("cargo:rerun-if-changed=explorer-hook/Cargo.toml");
     println!("cargo:rerun-if-changed=explorer-hook/src/lib.rs");
+    println!("cargo:rerun-if-changed=explorer-hook/src/render.rs");
+    println!("cargo:rerun-if-changed=explorer-hook/src/font.rs");
+    println!("cargo:rerun-if-changed=explorer-hook/src/detour.rs");
 
     let status = std::process::Command::new("cargo")
         .args([
