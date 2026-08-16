@@ -4,6 +4,23 @@
 // the common requestAnimationFrame, resize, scroll, and cleanup behavior so a
 // future dropdown only needs to provide trigger/menu getters and a placement
 // callback.
+
+// The menu is absolutely positioned inside the tab's scrollable content pane,
+// so its real clipping edges are that pane's, not the window's: the window
+// bottom includes chrome below the pane (status bar, paddings), which would
+// let a "fits" menu poke past the pane's visible bottom and summon a
+// scrollbar. Walk up to the nearest scrollable ancestor and measure against
+// it; fall back to the document element (whose rect is the viewport).
+function findScrollContainer(el) {
+  let node = el?.parentElement ?? null;
+  while (node) {
+    const style = getComputedStyle(node);
+    if (/(auto|scroll|overlay)/.test(style.overflowY)) return node;
+    node = node.parentElement;
+  }
+  return document.documentElement;
+}
+
 export function updateDropdownPlacement(triggerEl, menuEl, options = {}) {
   if (!triggerEl || !menuEl) return 'down-right';
   const gap = Number.isFinite(options.gap) ? options.gap : 6;
@@ -14,10 +31,13 @@ export function updateDropdownPlacement(triggerEl, menuEl, options = {}) {
 
   const triggerRect = triggerEl.getBoundingClientRect();
   const menuRect = menuEl.getBoundingClientRect();
-  const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
-  const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
-  const belowSpace = Math.max(0, viewportHeight - triggerRect.bottom - viewportMargin - gap);
-  const aboveSpace = Math.max(0, triggerRect.top - viewportMargin - gap);
+  const containerRect = findScrollContainer(menuEl).getBoundingClientRect();
+  const viewportWidth = containerRect.width;
+  const viewportHeight = containerRect.height;
+  const containerTop = containerRect.top;
+  const containerBottom = containerRect.bottom;
+  const belowSpace = Math.max(0, containerBottom - triggerRect.bottom - viewportMargin - gap);
+  const aboveSpace = Math.max(0, triggerRect.top - containerTop - viewportMargin - gap);
   const opensUp = menuRect.height > belowSpace && aboveSpace > belowSpace;
 
   const rightAlignedLeft = triggerRect.right - menuRect.width;

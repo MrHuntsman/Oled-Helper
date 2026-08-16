@@ -1,7 +1,169 @@
 <script>
   // Inlined data URI ,  see App.svelte for why icons never hit the network.
+  import { invoke } from '@tauri-apps/api/core';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
-  import { taskbarDimmer, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs } from './stores.svelte.js';
+  import { taskbarDimmer, screenDimmer, saveConfig, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs } from './stores.svelte.js';
+
+  let { screen = false } = $props();
+  let screenError = $state('');
+  let screenTimeoutDragging = $state(false);
+  let screenOpacityDragging = $state(false);
+  let screenOpacityHovering = $state(false);
+  let screenFadeInDragging = $state(false);
+  let screenFadeInHovering = $state(false);
+  let screenFadeOutDragging = $state(false);
+  let screenFadeOutHovering = $state(false);
+
+  function screenFmtSeconds(seconds) {
+    return `${seconds} sec`;
+  }
+
+  function applyScreenDimmer(persist = false) {
+    screenDimmer.seconds = Math.max(5, Math.min(180, Math.round(Number(screenDimmer.seconds) || 30)));
+    screenDimmer.opacity = Math.max(0, Math.min(1, Number(screenDimmer.opacity) || 0));
+    screenDimmer.fadeInDurationMs = Math.max(0, Math.min(5000, Math.round(Number(screenDimmer.fadeInDurationMs) || 0)));
+    screenDimmer.fadeOutDurationMs = Math.max(0, Math.min(5000, Math.round(Number(screenDimmer.fadeOutDurationMs) || 0)));
+    invoke('power_set_screen_protector', {
+      enabled: screenDimmer.enabled,
+      seconds: screenDimmer.seconds,
+      opacity: screenDimmer.opacity,
+      fadeInDurationMs: screenDimmer.fadeInDurationMs,
+      fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+    }).catch((e) => {
+      screenError = String(e);
+      console.warn('[screen-dimmer] apply failed', e);
+    });
+    if (persist) saveConfig();
+  }
+
+  async function refreshScreenDimmer() {
+    try {
+      const state = await invoke('power_get_state');
+      if (!screenTimeoutDragging) {
+        screenDimmer.enabled = state.screen_protector_enabled === true;
+        screenDimmer.seconds = state.screen_protector_seconds;
+      }
+      if (!screenOpacityDragging) screenDimmer.opacity = state.screen_protector_opacity;
+      if (!screenFadeInDragging) screenDimmer.fadeInDurationMs = state.screen_protector_fade_in_duration_ms;
+      if (!screenFadeOutDragging) screenDimmer.fadeOutDurationMs = state.screen_protector_fade_out_duration_ms;
+      screenError = '';
+    } catch (e) {
+      screenError = String(e);
+      console.warn('[screen-dimmer] state read failed', e);
+    }
+  }
+
+  function restoreScreenDimmerDefaults() {
+    screenDimmer.enabled = false;
+    screenDimmer.seconds = 30;
+    screenDimmer.opacity = 0.8;
+    screenDimmer.fadeInDurationMs = 2000;
+    screenDimmer.fadeOutDurationMs = 500;
+    screenDimmer.fadeLinked = false;
+    applyScreenDimmer(true);
+  }
+
+  function toggleScreenDimmer() {
+    screenDimmer.enabled = !screenDimmer.enabled;
+    applyScreenDimmer(true);
+  }
+
+  let screenDimmerMasterAttention = $state(false);
+  let screenDimmerMasterAttentionTimer = null;
+  let screenDimmerMasterAttentionRaf = 0;
+
+  function flashScreenDimmerMasterSwitch() {
+    screenDimmerMasterAttention = false;
+    cancelAnimationFrame(screenDimmerMasterAttentionRaf);
+    screenDimmerMasterAttentionRaf = requestAnimationFrame(() => { screenDimmerMasterAttention = true; });
+    clearTimeout(screenDimmerMasterAttentionTimer);
+    screenDimmerMasterAttentionTimer = setTimeout(() => { screenDimmerMasterAttention = false; }, 850);
+  }
+
+  function handleDisabledScreenDimmerInteraction(e) {
+    if (screenDimmer.enabled) return;
+    if (e.type === 'keydown' && !['Enter', ' ', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    flashScreenDimmerMasterSwitch();
+  }
+
+  function handleDisabledScreenDimmerWheel(e) {
+    if (!screenDimmer.enabled) {
+      e.preventDefault();
+      e.stopPropagation();
+      flashScreenDimmerMasterSwitch();
+    }
+  }
+
+  $effect(() => {
+    if (screenDimmer.enabled) return;
+    screenTimeoutDragging = false;
+    screenOpacityDragging = false;
+    screenOpacityHovering = false;
+    screenFadeInDragging = false;
+    screenFadeInHovering = false;
+    screenFadeOutDragging = false;
+    screenFadeOutHovering = false;
+  });
+
+  $effect(() => () => {
+    clearTimeout(screenDimmerMasterAttentionTimer);
+    cancelAnimationFrame(screenDimmerMasterAttentionRaf);
+  });
+
+  function toggleScreenFadeLinked() {
+    screenDimmer.fadeLinked = !screenDimmer.fadeLinked;
+    if (screenDimmer.fadeLinked) {
+      screenDimmer.fadeOutDurationMs = screenDimmer.fadeInDurationMs;
+    }
+    applyScreenDimmer(true);
+  }
+
+  $effect(() => {
+    if (!screen) return;
+    refreshScreenDimmer();
+    const poll = setInterval(refreshScreenDimmer, 3000);
+    return () => clearInterval(poll);
+  });
+
+  $effect(() => {
+    if (!screenTimeoutDragging && !screenOpacityDragging && !screenFadeInDragging && !screenFadeOutDragging) return;
+    function onUp() {
+      screenTimeoutDragging = false;
+      screenOpacityDragging = false;
+      screenFadeInDragging = false;
+      screenFadeOutDragging = false;
+    }
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  });
+
+  function handleScreenTimeoutInput(event) {
+    screenDimmer.seconds = Number(event.currentTarget.value);
+    applyScreenDimmer(false);
+  }
+
+  function handleScreenOpacityInput(event) {
+    screenDimmer.opacity = Number(event.currentTarget.value) / 100;
+    applyScreenDimmer(false);
+  }
+
+  function handleScreenFadeInInput(event) {
+    screenDimmer.fadeInDurationMs = Number(event.currentTarget.value);
+    if (screenDimmer.fadeLinked) screenDimmer.fadeOutDurationMs = screenDimmer.fadeInDurationMs;
+    applyScreenDimmer(false);
+  }
+
+  function handleScreenFadeOutInput(event) {
+    screenDimmer.fadeOutDurationMs = Number(event.currentTarget.value);
+    if (screenDimmer.fadeLinked) screenDimmer.fadeInDurationMs = screenDimmer.fadeOutDurationMs;
+    applyScreenDimmer(false);
+  }
 
   function toggleDimmer() {
     const next = !taskbarDimmer.enabled;
@@ -44,7 +206,6 @@
     }
   }
 
-  let fadeLinked = $state(true);
   let opacityDragging = $state(false);
   let opacityHovering = $state(false);
   let dimmerMasterAttention = $state(false);
@@ -56,7 +217,7 @@
   let fadeOutHovering = $state(false);
 
   $effect(() => {
-    if (!opacityDragging && !fadeInDragging && !fadeOutDragging) return;
+    if (screen || (!opacityDragging && !fadeInDragging && !fadeOutDragging)) return;
     function onUp() { opacityDragging = false; fadeInDragging = false; fadeOutDragging = false; }
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
@@ -113,25 +274,25 @@
 
   function handleFadeInInput(event) {
     const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
-    const fadeOut = fadeLinked ? duration : taskbarDimmer.fadeOutDurationMs;
+    const fadeOut = taskbarDimmer.fadeLinked ? duration : taskbarDimmer.fadeOutDurationMs;
     setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, duration, fadeOut, false);
   }
 
   function commitFadeIn(event) {
     const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
-    const fadeOut = fadeLinked ? duration : taskbarDimmer.fadeOutDurationMs;
+    const fadeOut = taskbarDimmer.fadeLinked ? duration : taskbarDimmer.fadeOutDurationMs;
     setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, duration, fadeOut);
   }
 
   function handleFadeOutInput(event) {
     const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
-    const fadeIn = fadeLinked ? duration : taskbarDimmer.fadeInDurationMs;
+    const fadeIn = taskbarDimmer.fadeLinked ? duration : taskbarDimmer.fadeInDurationMs;
     setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, fadeIn, duration, false);
   }
 
   function commitFadeOut(event) {
     const duration = Math.max(0, Math.min(1000, +event.currentTarget.value));
-    const fadeIn = fadeLinked ? duration : taskbarDimmer.fadeInDurationMs;
+    const fadeIn = taskbarDimmer.fadeLinked ? duration : taskbarDimmer.fadeInDurationMs;
     setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, fadeIn, duration);
   }
 
@@ -148,15 +309,125 @@
   // pointerleave event so it can never desync from what the cursor is doing.
   let chainSuppressHover = $state(false);
   function toggleFadeLinked() {
-    fadeLinked = !fadeLinked;
-    if (fadeLinked && taskbarDimmer.fadeOutDurationMs !== taskbarDimmer.fadeInDurationMs) {
+    taskbarDimmer.fadeLinked = !taskbarDimmer.fadeLinked;
+    if (taskbarDimmer.fadeLinked && taskbarDimmer.fadeOutDurationMs !== taskbarDimmer.fadeInDurationMs) {
       setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeInDurationMs);
+    } else {
+      // Unlinking (or linking with already-equal values) doesn't change the
+      // dimmer values, but the link state itself is persisted.
+      saveConfig();
     }
     chainSuppressHover = true;
   }
 </script>
 
-<div class="tab-body">
+{#if screen}
+  <div class="tab-body">
+    <div class="tab-heading tab-heading-2line">
+      <div class="tab-heading-toggle" class:attention-pulse={screenDimmerMasterAttention} role="button" tabindex="0" onclick={toggleScreenDimmer} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleScreenDimmer(); } }} title="Enable Screen Dimmer" aria-label="Enable Screen Dimmer" aria-pressed={screenDimmer.enabled}>
+        <img class="tab-icon" src={tabDimmerIcon} alt="" />
+        <div class="tab-heading-titles">
+          <div class="tab-heading-title-row">
+            <h2>Screen Dimmer</h2>
+          </div>
+          <span class="subtitle">Dims the display after inactivity to reduce static OLED content.</span>
+        </div>
+        <div class="tab-heading-spacer"></div>
+        <span class={`pill${screenDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
+      </div>
+      <button class="restore-defaults-btn" onclick={restoreScreenDimmerDefaults}>↻ Restore Tab Defaults</button>
+    </div>
+    <div class="separator"></div>
+
+    {#if screenError}
+      <p class="power-error" role="alert">⚠ {screenError}</p>
+    {/if}
+
+    <div class="dimmer-control-group" class:disabled={!screenDimmer.enabled}>
+      {#if !screenDimmer.enabled}
+        <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Screen Dimmer controls disabled" onclick={handleDisabledScreenDimmerInteraction} onwheel={handleDisabledScreenDimmerWheel}></button>
+      {/if}
+      <div class="dimmer-control">
+        <div class="dimmer-control-heading">
+          <span class="settings-row-label">Dim display after</span>
+          <span class="slider-val">{screenFmtSeconds(screenDimmer.seconds)}</span>
+        </div>
+        <div class="slider-track-wrap dimmer-slider-track">
+          <input class="dimmer-opacity" type="range" min="5" max="180" step="1"
+            value={screenDimmer.seconds} style="--fill:{((screenDimmer.seconds - 5) / 175) * 100}%"
+            disabled={!screenDimmer.enabled}
+            oninput={handleScreenTimeoutInput} onchange={() => { applyScreenDimmer(true); }}
+            onpointerdown={() => screenTimeoutDragging = true} onpointerup={() => screenTimeoutDragging = false} />
+        </div>
+        <div class="dimmer-scale"><span>5 sec</span><span>180 sec</span></div>
+      </div>
+
+    <div class="dimmer-control">
+      <div class="dimmer-control-heading">
+        <span class="settings-row-label">Overlay opacity</span>
+        <span class="slider-val">{Math.round(screenDimmer.opacity * 100)}%</span>
+      </div>
+      <div class="slider-track-wrap dimmer-slider-track">
+        <input class="dimmer-opacity has-ticks-dimmer" type="range" min="0" max="100" step="1"
+          value={Math.round(screenDimmer.opacity * 100)} style="--fill:{screenDimmer.opacity * 100}%"
+          disabled={!screenDimmer.enabled}
+          oninput={handleScreenOpacityInput} onchange={() => { applyScreenDimmer(true); }}
+          onpointerdown={() => screenOpacityDragging = true} onpointerup={() => screenOpacityDragging = false}
+          onpointerenter={() => screenOpacityHovering = true} onpointerleave={() => screenOpacityHovering = false} />
+        <div class="slider-tooltip" class:visible={screenOpacityDragging || screenOpacityHovering} style="left:calc(9px + ({screenDimmer.opacity} * (100% - 18px)))">{Math.round(screenDimmer.opacity * 100)}%</div>
+      </div>
+      <div class="dimmer-scale"><span>Subtle</span><span>Dark</span></div>
+    </div>
+
+    <div class="dimmer-fade-row">
+      <div class="dimmer-control dimmer-fade-col">
+        <div class="dimmer-control-heading">
+          <span class="settings-row-label">Fade in duration</span>
+          <span class="slider-val">{screenDimmer.fadeInDurationMs === 0 ? 'OFF' : `${screenDimmer.fadeInDurationMs} ms`}</span>
+        </div>
+        <div class="slider-track-wrap dimmer-slider-track">
+          <input class="dimmer-opacity has-ticks-dimmer-fade" type="range" min="0" max="5000" step="50"
+            value={screenDimmer.fadeInDurationMs} style="--fill:{(screenDimmer.fadeInDurationMs / 5000) * 100}%"
+            disabled={!screenDimmer.enabled}
+            oninput={handleScreenFadeInInput} onchange={() => { applyScreenDimmer(true); }}
+            onpointerdown={() => screenFadeInDragging = true} onpointerup={() => screenFadeInDragging = false}
+            onpointerenter={() => screenFadeInHovering = true} onpointerleave={() => screenFadeInHovering = false} />
+          <div class="slider-tooltip" class:visible={screenFadeInDragging || screenFadeInHovering} style="left:calc(9px + ({screenDimmer.fadeInDurationMs / 5000} * (100% - 18px)))">{screenDimmer.fadeInDurationMs === 0 ? 'OFF' : `${screenDimmer.fadeInDurationMs} ms`}</div>
+        </div>
+        <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
+      </div>
+
+      <div class="dimmer-chain-btn-wrap">
+        <button class="dimmer-chain-btn" class:linked={screenDimmer.fadeLinked} disabled={!screenDimmer.enabled} onclick={toggleScreenFadeLinked} title={screenDimmer.fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={screenDimmer.fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={screenDimmer.fadeLinked}>
+          <svg viewBox="0 0 24 24" fill="none">
+            <path class="chain-bar" d="M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path class="chain-hook chain-hook-a" d="M11 6.5L12.5 5C14.4 3.1 17.5 3.1 19.4 5C21.3 6.9 21.3 10 19.4 11.9L17.9 13.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path class="chain-hook chain-hook-b" d="M13 17.5L11.5 19C9.6 20.9 6.5 20.9 4.6 19C2.7 17.1 2.7 14 4.6 12.1L6.1 10.6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="dimmer-control dimmer-fade-col">
+        <div class="dimmer-control-heading">
+          <span class="settings-row-label">Fade out duration</span>
+          <span class="slider-val">{screenDimmer.fadeOutDurationMs === 0 ? 'OFF' : `${screenDimmer.fadeOutDurationMs} ms`}</span>
+        </div>
+        <div class="slider-track-wrap dimmer-slider-track">
+          <input class="dimmer-opacity has-ticks-dimmer-fade" type="range" min="0" max="5000" step="50"
+            value={screenDimmer.fadeOutDurationMs} style="--fill:{(screenDimmer.fadeOutDurationMs / 5000) * 100}%"
+            disabled={!screenDimmer.enabled}
+            oninput={handleScreenFadeOutInput} onchange={() => { applyScreenDimmer(true); }}
+            onpointerdown={() => screenFadeOutDragging = true} onpointerup={() => screenFadeOutDragging = false}
+            onpointerenter={() => screenFadeOutHovering = true} onpointerleave={() => screenFadeOutHovering = false} />
+          <div class="slider-tooltip" class:visible={screenFadeOutDragging || screenFadeOutHovering} style="left:calc(9px + ({screenDimmer.fadeOutDurationMs / 5000} * (100% - 18px)))">{screenDimmer.fadeOutDurationMs === 0 ? 'OFF' : `${screenDimmer.fadeOutDurationMs} ms`}</div>
+        </div>
+        <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
+      </div>
+    </div>
+    </div>
+  </div>
+{:else}
+  <div class="tab-body">
   <div class="tab-heading tab-heading-2line">
     <div class="tab-heading-toggle" class:disabled={!taskbarDimmer.available} class:attention-pulse={dimmerMasterAttention} role="button" tabindex="0" onclick={() => { if (taskbarDimmer.available) toggleDimmer(); }} onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && taskbarDimmer.available) { e.preventDefault(); toggleDimmer(); } }} title="Enable Taskbar Dimmer" aria-label="Enable Taskbar Dimmer" aria-pressed={taskbarDimmer.enabled}>
       <img class="tab-icon" src={tabDimmerIcon} alt="" />
@@ -230,7 +501,7 @@
       </div>
 
       <div class="dimmer-chain-btn-wrap">
-        <button class="dimmer-chain-btn" class:linked={fadeLinked} disabled={!taskbarDimmer.available || !taskbarDimmer.enabled} class:suppress-hover={chainSuppressHover} onclick={toggleFadeLinked} onpointerleave={() => chainSuppressHover = false} title={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={fadeLinked}>
+        <button class="dimmer-chain-btn" class:linked={taskbarDimmer.fadeLinked} disabled={!taskbarDimmer.available || !taskbarDimmer.enabled} class:suppress-hover={chainSuppressHover} onclick={toggleFadeLinked} onpointerleave={() => chainSuppressHover = false} title={taskbarDimmer.fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-label={taskbarDimmer.fadeLinked ? 'Unlink fade durations' : 'Link fade durations'} aria-pressed={taskbarDimmer.fadeLinked}>
           <svg viewBox="0 0 24 24" fill="none">
             <path class="chain-bar" d="M10 14L14 10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
             <path class="chain-hook chain-hook-a" d="M11 6.5L12.5 5C14.4 3.1 17.5 3.1 19.4 5C21.3 6.9 21.3 10 19.4 11.9L17.9 13.4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -309,4 +580,5 @@
   {#if !taskbarDimmer.available}
     <p class="gpu-error">Windows taskbar overlay is unavailable.</p>
   {/if}
-</div>
+  </div>
+{/if}

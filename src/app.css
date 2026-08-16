@@ -148,7 +148,7 @@ button {
 .top-bar .title { font-size: 15px; font-weight: 700; letter-spacing: -0.3px; color: #fff; }
 .top-bar .version { font-size: 10px; color: var(--text-weak); }
 .top-bar .spacer { flex: 1; }
-.top-bar .top-btn-icon { width: 16px; height: 16px; opacity: 0.95; }
+.top-bar .top-btn-icon { width: 22px; height: 22px; opacity: 0.95; }
 .top-bar .top-exit-icon { flex-shrink: 0; opacity: 0.95; }
 .top-bar .top-btn {
   display: flex;
@@ -229,7 +229,7 @@ button {
   border-radius: 2px;
   background: var(--accent);
 }
-.nav-icon { width: 16px; height: 16px; opacity: 0.95; flex-shrink: 0; }
+.nav-icon { width: 22px; height: 22px; opacity: 0.95; flex-shrink: 0; }
 .nav-btn.active .nav-icon { opacity: 1; }
 
 .sidebar-spacer { flex: 1; }
@@ -401,7 +401,7 @@ button {
   gap: 8px;
   margin-bottom: 8px;
 }
-.tab-heading .tab-icon { width: 32px; height: 32px; opacity: 1; }
+.tab-heading .tab-icon { width: 36px; height: 36px; opacity: 1; }
 .tab-heading h2 { font-size: 18px; font-weight: 700; white-space: nowrap; }
 .tab-heading .subtitle { color: var(--text-weak); font-size: 13px; }
 .tab-heading-spacer { flex: 1; }
@@ -2928,6 +2928,33 @@ button {
   border-width: 0 1.6px 1.6px 0;
   transform: rotate(45deg);
 }
+/* Dim-before-off preview button (Debug tab header, right of the tray-notice
+   button): a compact text chip, narrower than the icon-only .copy-btn row it
+   sits in. */
+.diag-dim-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  height: 26px;
+  color: var(--text-weak);
+  background: var(--hover);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-size: 11px;
+  white-space: nowrap;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+}
+.diag-dim-btn:hover, .diag-dim-btn:focus-visible {
+  color: var(--text);
+  background: var(--hover);
+  border-color: var(--accent);
+  outline: none;
+}
+.diag-actions-note {
+  color: var(--text-weak);
+  font-size: 11px;
+  white-space: nowrap;
+}
 .diag-detection-bar {
   display: flex;
   align-items: center;
@@ -3936,4 +3963,52 @@ button {
   color: #E05555;
   font-size: 12px;
   line-height: 1.4;
+}
+
+/* ── Power tab ─────────────────────────────────────────────────────── */
+.power-error { color: #E05555; margin: 4px 0 8px; font-size: 12px; }
+.power-row-gap { height: 14px; }
+/* Screensaver picker row: the dropdown button sits left-aligned and sizes
+   itself to its content. */
+.power-screensaver-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+/* Custom screensaver dropdown: a native <select> popup opens downward and gets
+   clipped by the bottom of the tab, so this uses a trigger button + a
+   collision-aware .hz-menu that flips upward when there is no room below. */
+.power-select-wrap { position: relative; display: inline-flex; max-width: 280px; }
+.power-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: #1c1c22;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: border-color 0.08s, background 0.08s;
+}
+.power-select-trigger:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--hover);
+}
+.power-select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.power-select-trigger:disabled { opacity: 0.35; cursor: default; }
+.power-select-caret {
+  width: 0;
+  height: 0;
+  flex-shrink: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
 }

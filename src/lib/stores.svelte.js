@@ -156,6 +156,8 @@ export const taskbarDimmer = $state({
   opacity: 0.95,
   fadeInDurationMs: 300,
   fadeOutDurationMs: 300,
+  // Whether the fade-in/fade-out sliders are chained (one drag drives both).
+  fadeLinked: true,
   available: true,
   hoverDetection: 'event',
   pollIntervalMs: 100,
@@ -165,6 +167,18 @@ export const taskbarDimmer = $state({
 // decides whether the hook DLL fixes Explorer's text (Grayscale/Off
 // modes) or leaves it at system ClearType.
 export const textSettings = $state({ explorerHookEnabled: false });
+
+// Screen Dimmer settings persisted in config. The backend needs these at
+// startup so the idle watcher and overlay use the saved values immediately.
+export const screenDimmer = $state({
+  enabled: false,
+  seconds: 30,
+  opacity: 0.8,
+  fadeInDurationMs: 2000,
+  fadeOutDurationMs: 500,
+  // Whether the fade-in/fade-out sliders are chained (one drag drives both).
+  fadeLinked: true,
+});
 
 // Debug-tab logging switches, independent of each other:
 //   verbosePeriodic ,  vendor/EDID detailed diagnostics (set_detailed_logging)
@@ -458,9 +472,33 @@ export async function loadConfig(prefetchedCfg = null) {
     clampHighNitsRange();
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
     if (cfg && typeof cfg.explorer_hook_enabled === 'boolean') textSettings.explorerHookEnabled = cfg.explorer_hook_enabled;
+    if (cfg && typeof cfg.screen_protector_enabled === 'boolean') {
+      screenDimmer.enabled = cfg.screen_protector_enabled;
+    }
+    if (cfg && typeof cfg.screen_protector_seconds === 'number') {
+      screenDimmer.seconds = Math.max(5, Math.min(180, Math.round(cfg.screen_protector_seconds)));
+    } else if (cfg && typeof cfg.screen_protector_minutes === 'number') {
+      // Migrate configs written before this control changed from minutes to
+      // seconds. The new control intentionally caps the migrated value at
+      // three minutes.
+      screenDimmer.seconds = Math.max(5, Math.min(180, Math.round(cfg.screen_protector_minutes * 60)));
+    }
+    if (cfg && typeof cfg.screen_protector_opacity === 'number') {
+      screenDimmer.opacity = Math.max(0, Math.min(1, cfg.screen_protector_opacity));
+    }
+    if (cfg && typeof cfg.screen_protector_fade_in_duration_ms === 'number') {
+      screenDimmer.fadeInDurationMs = Math.max(0, Math.min(5000, Math.round(cfg.screen_protector_fade_in_duration_ms)));
+    }
+    if (cfg && typeof cfg.screen_protector_fade_out_duration_ms === 'number') {
+      screenDimmer.fadeOutDurationMs = Math.max(0, Math.min(5000, Math.round(cfg.screen_protector_fade_out_duration_ms)));
+    }
+    if (cfg && typeof cfg.screen_protector_fade_linked === 'boolean') {
+      screenDimmer.fadeLinked = cfg.screen_protector_fade_linked;
+    }
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
     if (cfg && typeof cfg.taskbar_dimmer_fade_out_duration_ms === 'number') taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_out_duration_ms)));
+    if (cfg && typeof cfg.taskbar_dimmer_fade_linked === 'boolean') taskbarDimmer.fadeLinked = cfg.taskbar_dimmer_fade_linked;
     if (cfg && typeof cfg.taskbar_dimmer_hover_detection === 'string') {
       taskbarDimmer.hoverDetection = cfg.taskbar_dimmer_hover_detection;
       Object.assign(dimmerDetections, detectionDefaultsForMode(cfg.taskbar_dimmer_hover_detection));
@@ -544,9 +582,16 @@ export function saveConfig() {
     high_nits_step: crush.highNitsStep,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     explorer_hook_enabled: textSettings.explorerHookEnabled,
+    screen_protector_enabled: screenDimmer.enabled,
+    screen_protector_seconds: screenDimmer.seconds,
+    screen_protector_opacity: screenDimmer.opacity,
+    screen_protector_fade_in_duration_ms: screenDimmer.fadeInDurationMs,
+    screen_protector_fade_out_duration_ms: screenDimmer.fadeOutDurationMs,
+    screen_protector_fade_linked: screenDimmer.fadeLinked,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
     taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
     taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,
+    taskbar_dimmer_fade_linked: taskbarDimmer.fadeLinked,
     taskbar_dimmer_hover_detection: taskbarDimmer.hoverDetection || 'event',
     taskbar_dimmer_poll_interval_ms: taskbarDimmer.pollIntervalMs,
     display_menu_resolution_sort: displayMenuPrefs.resolutionSort,

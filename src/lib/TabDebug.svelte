@@ -8,6 +8,7 @@
   let logCopyFailed = $state(false);
   let configFolderError = $state('');
   let noticeReset = $state(false);
+  let dimPreviewState = $state('');
 
   async function openConfigFolder() {
     configFolderError = '';
@@ -75,6 +76,18 @@
     }
   }
 
+  // Runs the screen-protector fade (dim to black, hold until input, restore)
+  // without waiting out the real idle timeout.
+  async function triggerDimPreview() {
+    try {
+      await invoke('power_dim_preview');
+      dimPreviewState = 'Dimmed — move mouse to restore';
+      setTimeout(() => { dimPreviewState = ''; }, 10000);
+    } catch (e) {
+      console.warn('[debug] screen protector preview failed', e);
+    }
+  }
+
   async function copyGpuLog() {
     const lines = logEntries.map(e => `[${formatTs(e.ts)}] [${e.level.toUpperCase()}] ${e.message}`).join('\n');
     const text = `OLED Helper ,  Runtime Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
@@ -132,6 +145,10 @@
             <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M15.3 3v4h-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M13.7 10A6 6 0 1 1 12.3 3.8L15.3 7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
           {/if}
         </button>
+        <button class="diag-dim-btn" onclick={triggerDimPreview} title="Run the screen-protector fade without waiting for the idle timeout">Screen protector preview</button>
+        {#if dimPreviewState}
+          <span class="diag-actions-note">{dimPreviewState}</span>
+        {/if}
       </div>
     </div>
 

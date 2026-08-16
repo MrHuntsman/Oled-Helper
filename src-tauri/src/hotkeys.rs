@@ -33,10 +33,12 @@ pub const HK_TOGGLE_HDR: i32 = 8;
 pub const HK_HOLD_COMPARE: i32 = 16;
 pub const HK_DECREASE_SDR_BRIGHTNESS: i32 = 32;
 pub const HK_INCREASE_SDR_BRIGHTNESS: i32 = 33;
+pub const HK_TURN_OFF_DISPLAY: i32 = 64;
+pub const HK_TOGGLE_SCREEN_DIMMER: i32 = 128;
 
 // action name → (hotkey id, auto-repeat). Auto-repeat bindings are registered
 // without MOD_NOREPEAT so the OS keeps sending WM_HOTKEY while the key is held.
-pub const ACTIONS: [(&str, i32, bool); 8] = [
+pub const ACTIONS: [(&str, i32, bool); 10] = [
     ("toggle_taskbar_dimmer", HK_TOGGLE_DIMMER, false),
     ("toggle_black_crush", HK_TOGGLE_CRUSH, false),
     ("decrease_black_crush", HK_DECREASE, true),
@@ -45,6 +47,8 @@ pub const ACTIONS: [(&str, i32, bool); 8] = [
     ("hold_compare", HK_HOLD_COMPARE, false),
     ("decrease_sdr_brightness", HK_DECREASE_SDR_BRIGHTNESS, true),
     ("increase_sdr_brightness", HK_INCREASE_SDR_BRIGHTNESS, true),
+    ("turn_off_display", HK_TURN_OFF_DISPLAY, false),
+    ("toggle_screen_dimmer", HK_TOGGLE_SCREEN_DIMMER, false),
 ];
 
 static APP: OnceLock<AppHandle> = OnceLock::new();

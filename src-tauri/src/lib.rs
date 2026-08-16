@@ -5,6 +5,7 @@ mod flyout_window;
 mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
+mod power;
 mod taskbar_dimmer;
 mod text_rendering;
 mod tray_balloon;
@@ -529,6 +530,7 @@ pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
 fn request_shutdown_and_exit(app: &AppHandle) {
     taskbar_dimmer::shutdown();
     hotkeys::shutdown();
+    power::shutdown();
     shutdown_gamma_worker(app);
     explorer_hook::shutdown();
     app.exit(0);
@@ -669,9 +671,10 @@ fn apply_pending_hdr_mode(mode: &str) -> Result<(), String> {
 
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
 // used to validate --open-tab forwarding on restart.
-const KNOWN_TABS: [&str; 9] = [
+const KNOWN_TABS: [&str; 10] = [
     "crush",
     "dimmer",
+    "screen-dimmer",
     "windows-hdr",
     "hotkeys",
     "text",
@@ -1089,6 +1092,13 @@ pub fn run() {
             text_rendering::text_rendering_set_cleartype_level,
             text_rendering::text_rendering_reset,
             text_rendering::text_rendering_restart_app,
+            power::power_get_state,
+            power::power_set_display_timeout,
+            power::power_set_sleep_timeout,
+            power::power_set_screensaver,
+            power::power_turn_off_display,
+            power::power_set_screen_protector,
+            power::power_dim_preview,
             text_rendering::text_preview_show,
             text_rendering::text_preview_update,
             text_rendering::text_preview_set_bounds,
@@ -1209,6 +1219,16 @@ pub fn run() {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_fade_out_duration_ms;
             }
+
+            // Start the screen protector watcher if a timeout was persisted,
+            // so the dim works even before the frontend loads its config.
+            crate::power::init(
+                saved_config.screen_protector_enabled,
+                saved_config.screen_protector_seconds,
+                saved_config.screen_protector_opacity,
+                saved_config.screen_protector_fade_in_duration_ms,
+                saved_config.screen_protector_fade_out_duration_ms,
+            );
 
             flyout_window::prewarm(app.handle());
             log::info!("[tray] mode flyout window ready");
@@ -1401,6 +1421,7 @@ pub fn run() {
                     // ramp is reset before the process exits.
                     taskbar_dimmer::shutdown();
                     hotkeys::shutdown();
+                    power::shutdown();
                     shutdown_gamma_worker(window.app_handle());
                 }
                 _ => {}

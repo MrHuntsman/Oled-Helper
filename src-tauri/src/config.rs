@@ -53,6 +53,27 @@ pub struct AppConfig {
     // and the hook DLL is not injected unless the user enables it.
     #[serde(default)]
     pub explorer_hook_enabled: bool,
+    // Power tab screen protector: seconds of idle before the display fades
+    // and stays dimmed until input (10–180 seconds). Enabled separately via
+    // the Screen Dimmer title-section toggle.
+    #[serde(default = "default_screen_protector_seconds")]
+    pub screen_protector_seconds: u32,
+    // Whether the screen dimmer is enabled. Off by default; configs written
+    // before this flag existed are migrated (a non-zero timeout meant on).
+    #[serde(default)]
+    pub screen_protector_enabled: bool,
+    // Screen Dimmer overlay opacity and transition durations. Opacity is the
+    // black-overlay amount (0.0 = no dim, 1.0 = black); durations are ms.
+    #[serde(default = "default_screen_protector_opacity")]
+    pub screen_protector_opacity: f64,
+    #[serde(default = "default_screen_protector_fade_in_duration")]
+    pub screen_protector_fade_in_duration_ms: u64,
+    #[serde(default = "default_screen_protector_fade_out_duration")]
+    pub screen_protector_fade_out_duration_ms: u64,
+    // Whether the Screen Dimmer's fade-in/fade-out sliders are chained (one
+    // drag drives both). Persisted so the link state survives restarts.
+    #[serde(default = "default_true")]
+    pub screen_protector_fade_linked: bool,
     // High Nits strip range: the grid is a fixed 3×7 (21 cells) with no
     // zoom; the user picks Min and Max directly (independently of each
     // other) and Step (nits between neighboring cells) is derived on the
@@ -87,6 +108,9 @@ pub struct AppConfig {
     pub taskbar_dimmer_fade_in_duration_ms: u64,
     #[serde(default = "default_dimmer_ease_duration")]
     pub taskbar_dimmer_fade_out_duration_ms: u64,
+    // Whether the Taskbar Dimmer's fade-in/fade-out sliders are chained.
+    #[serde(default = "default_true")]
+    pub taskbar_dimmer_fade_linked: bool,
     #[serde(default = "default_hover_detection")]
     pub taskbar_dimmer_hover_detection: String,
     // Whether the one-time "still running in the tray" balloon has been shown
@@ -118,6 +142,18 @@ fn default_true() -> bool {
 }
 fn default_dimmer_opacity() -> f64 {
     0.95
+}
+fn default_screen_protector_seconds() -> u32 {
+    30
+}
+fn default_screen_protector_opacity() -> f64 {
+    0.8
+}
+fn default_screen_protector_fade_in_duration() -> u64 {
+    2000
+}
+fn default_screen_protector_fade_out_duration() -> u64 {
+    500
 }
 fn default_high_nits_min() -> u32 {
     100
@@ -153,6 +189,12 @@ impl Default for AppConfig {
             hide_calibration_interface: false,
             black_strip_gap_enabled: true,
             explorer_hook_enabled: false,
+            screen_protector_seconds: default_screen_protector_seconds(),
+            screen_protector_enabled: false,
+            screen_protector_opacity: default_screen_protector_opacity(),
+            screen_protector_fade_in_duration_ms: default_screen_protector_fade_in_duration(),
+            screen_protector_fade_out_duration_ms: default_screen_protector_fade_out_duration(),
+            screen_protector_fade_linked: true,
             high_nits_min: default_high_nits_min(),
             high_nits_max: None,
             high_nits_step: default_high_nits_step(),
@@ -160,6 +202,7 @@ impl Default for AppConfig {
             taskbar_dimmer_opacity: default_dimmer_opacity(),
             taskbar_dimmer_fade_in_duration_ms: default_dimmer_ease_duration(),
             taskbar_dimmer_fade_out_duration_ms: default_dimmer_ease_duration(),
+            taskbar_dimmer_fade_linked: true,
             taskbar_dimmer_hover_detection: default_hover_detection(),
             taskbar_dimmer_poll_interval_ms: default_poll_interval(),
             tray_notice_shown: false,
@@ -246,9 +289,42 @@ pub fn load_config(app: AppHandle) -> AppConfig {
                 AppConfig::default()
             });
             migrate_legacy_ease_duration(&text, &mut config);
+            migrate_legacy_screen_protector(&text, &mut config);
+            migrate_screen_protector_enabled(&text, &mut config);
             config
         }
         Err(_) => AppConfig::default(),
+    }
+}
+
+fn migrate_screen_protector_enabled(raw_json: &str, config: &mut AppConfig) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+        return;
+    };
+    let Some(obj) = value.as_object() else { return };
+    if obj.contains_key("screen_protector_enabled") {
+        return;
+    }
+    // Configs written before the enable toggle existed: a non-zero timeout
+    // meant the protector was on.
+    if config.screen_protector_seconds > 0 {
+        config.screen_protector_enabled = true;
+    }
+}
+
+fn migrate_legacy_screen_protector(raw_json: &str, config: &mut AppConfig) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+        return;
+    };
+    let Some(obj) = value.as_object() else { return };
+    if obj.contains_key("screen_protector_seconds") {
+        return;
+    }
+    if let Some(minutes) = obj
+        .get("screen_protector_minutes")
+        .and_then(|v| v.as_u64())
+    {
+        config.screen_protector_seconds = minutes.saturating_mul(60).min(180) as u32;
     }
 }
 

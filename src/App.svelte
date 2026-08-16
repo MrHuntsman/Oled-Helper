@@ -1,12 +1,14 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
+  import TabPower from './lib/TabPower.svelte';
+  import TabPowerIcon from './lib/TabPowerIcon.svelte';
   import TabWindowsHdr from './lib/TabWindowsHdr.svelte';
   import TabDebug from './lib/TabDebug.svelte';
   import TabSystem from './lib/TabSystem.svelte';
@@ -891,6 +893,17 @@
       case 'toggle_taskbar_dimmer':
         setTaskbarDimmer(!taskbarDimmer.enabled);
         break;
+      case 'toggle_screen_dimmer':
+        screenDimmer.enabled = !screenDimmer.enabled;
+        invoke('power_set_screen_protector', {
+          enabled: screenDimmer.enabled,
+          seconds: screenDimmer.seconds,
+          opacity: screenDimmer.opacity,
+          fadeInDurationMs: screenDimmer.fadeInDurationMs,
+          fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+        }).catch((e) => console.warn('[hotkey] screen dimmer toggle failed', e));
+        saveConfig();
+        break;
       case 'toggle_hdr':
         toggleWindowsHdr();
         break;
@@ -899,6 +912,9 @@
         break;
       case 'increase_sdr_brightness':
         adjustSdrBrightnessForHotkey(1);
+        break;
+      case 'turn_off_display':
+        invoke('power_turn_off_display').catch(() => {});
         break;
     }
   }
@@ -1220,11 +1236,17 @@
     <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
       <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
     </button>
+    <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} onclick={() => app.activeTab = 'screen-dimmer'}>
+      <img class="nav-icon" src={tabDimmerIcon} alt="" /> Screen Dimmer
+    </button>
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
       <TabTextIcon class="nav-icon" /> Text rendering
+    </button>
+    <button class="nav-btn" class:active={app.activeTab === 'power'} onclick={() => app.activeTab = 'power'}>
+      <TabPowerIcon class="nav-icon" /> Power
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
@@ -1240,10 +1262,14 @@
         <TabCrush />
       {:else if app.activeTab === 'dimmer'}
         <TabDimmer />
+      {:else if app.activeTab === 'screen-dimmer'}
+        <TabDimmer screen={true} />
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
       {:else if app.activeTab === 'text'}
         <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} menuOpen={resMenuOpen || hzMenuOpen || favoritesMenuOpen || resCtxMenu.open || hzCtxMenu.open} />
+      {:else if app.activeTab === 'power'}
+        <TabPower />
       {:else if app.activeTab === 'windows-hdr'}
         <TabWindowsHdr />
       {:else if app.activeTab === 'debug'}
