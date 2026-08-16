@@ -19,6 +19,8 @@
 //     directly as pvParam ("The pvParam parameter is ..."), not a pointer to it.
 // There is no SPI action for gamma, so it is written to the registry directly.
 
+use text_raster::{composite_run, rasterize, Content, RenderMode};
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
@@ -939,6 +941,81 @@ pub(crate) fn destroy_text_preview(app: &tauri::AppHandle) -> Result<(), String>
 #[tauri::command]
 pub fn text_preview_destroy(app: tauri::AppHandle) -> Result<(), String> {
     destroy_text_preview(&app)
+}
+
+// Loads the preview font once and caches it. Segoe UI is Explorer's default,
+// so the preview matches what the hook renders; Arial is the fallback.
+fn preview_font() -> Option<std::sync::Arc<[u8]>> {
+    static FONT: std::sync::OnceLock<Option<std::sync::Arc<[u8]>>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        for path in [r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf"] {
+            if let Ok(data) = std::fs::read(path) {
+                if !data.is_empty() {
+                    return Some(std::sync::Arc::from(data));
+                }
+            }
+        }
+        None
+    })
+    .clone()
+}
+
+/// Rasterize a short sample of text with the real swash engine (the same code
+/// the Explorer hook uses) and return its flattened coverage bitmap, so the
+/// preview shows the actual fringing for the selected mode instead of the
+/// browser's own font rasterizer. The three knobs (all 0..=100) mirror the
+/// hook's shared-memory state so the preview matches what Explorer renders;
+/// LCD filter strength 0 means no filtering (the filter is off).
+#[derive(serde::Serialize)]
+pub struct PreviewRender {
+    pub width: u32,
+    pub height: u32,
+    /// "mask" (grayscale/crisp, 1 byte/pixel) or "subpixel" (4 bytes/pixel RGBA).
+    pub content: &'static str,
+    /// Raw coverage, row-major, top-down.
+    pub data: Vec<u8>,
+}
+
+#[tauri::command]
+pub fn text_preview_render(
+    mode: String,
+    text: String,
+    size: f32,
+    lcd_strength: u32,
+    crosstalk: u32,
+    boldness: u32,
+) -> Result<PreviewRender, String> {
+    let render_mode = match mode.as_str() {
+        "off" => RenderMode::Crisp,
+        "grayscale" => RenderMode::Grayscale,
+        "rgb" => RenderMode::SubpixelRgb,
+        "bgr" => RenderMode::SubpixelBgr,
+        "rgwb" => RenderMode::SubpixelRgwb,
+        "rwbg" => RenderMode::SubpixelRwbg,
+        _ => return Err(format!("unknown mode: {mode}")),
+    };
+    if size <= 0.0 || size > 512.0 {
+        return Err(format!("size out of range: {size}"));
+    }
+    let font = preview_font().ok_or_else(|| "no system font available for the preview".to_string())?;
+    let opts = text_raster::RenderOptions {
+        lcd_strength: lcd_strength.min(100) as u8,
+        crosstalk: crosstalk.min(100) as u8,
+        boldness: boldness.min(100) as u8,
+    };
+    let run = rasterize(&font, 0, size, &text, render_mode, opts)
+        .ok_or_else(|| "preview rasterization failed".to_string())?;
+    let bitmap = composite_run(&run).ok_or_else(|| "preview text is empty".to_string())?;
+    let content = match bitmap.content {
+        Content::SubpixelMask => "subpixel",
+        _ => "mask",
+    };
+    Ok(PreviewRender {
+        width: bitmap.width,
+        height: bitmap.height,
+        content,
+        data: bitmap.data,
+    })
 }
 
 // ── Restore-animation settle detection ──────────────────────────────────

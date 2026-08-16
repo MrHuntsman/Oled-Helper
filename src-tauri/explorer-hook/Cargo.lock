@@ -28,6 +28,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "swash",
+ "text-raster",
  "windows",
 ]
 
@@ -131,6 +132,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "text-raster"
+version = "0.1.0"
+dependencies = [
+ "swash",
 ]
 
 [[package]]

@@ -1,15 +1,13 @@
 <script>
-  // Text rendering / subpixel tuning tab. Reads and writes the real Windows
-  // ClearType settings (GDI + DirectWrite/WPF) through the text_rendering
-  // commands in the Rust backend. Settings live in HKCU (per-user, no admin)
-  // and persist in the Windows registry itself, so no app config is involved.
+  // Text rendering / subpixel tuning tab. The registry-based ClearType method
+  // is disabled; text now flows through the swash rasterizer hook (see
+  // src-tauri/src/explorer_hook.rs and text-raster/). The preview renders that
+  // same swash output, so the fringing shown matches what Explorer produces.
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
-  import { app, textSettings, saveConfig } from './stores.svelte.js';
+  import { textSettings, saveConfig } from './stores.svelte.js';
 
   let { modalOpen = false, menuOpen = false } = $props();
 
@@ -18,6 +16,8 @@
     { id: 'grayscale', label: 'Grayscale' },
     { id: 'rgb', label: 'RGB' },
     { id: 'bgr', label: 'BGR' },
+    { id: 'rgwb', label: 'RGWB' },
+    { id: 'rwbg', label: 'RWBG' },
   ];
   let state = $state({
     effective_mode: 'rgb',
@@ -32,21 +32,9 @@
 
   let contrastDragging = $state(false);
   let contrastHovering = $state(false);
-  // Coalescing for the system-wide contrast write: dragging fires an oninput
-  // per frame, and each write is an SPI call + registry write + WM_SETTINGCHANGE
-  // broadcast to every top-level window. The preview follows live via
-  // text_preview_update (a cheap repaint); the real write is flushed at most
-  // once per CONTRAST_APPLY_MS with the latest value.
-  const CONTRAST_APPLY_MS = 80;
-  let contrastApplyTimer = null;
-  let contrastPending = null;
 
   // Explorer hook state from the backend's explorer_hook_status command
-  // (polled while mounted): active = DLL verified in the running explorer.exe;
-  // applied = active AND the current explorer.exe generation was hooked and
-  // verified, so every window in it renders through the hook. Fonts are
-  // rasterized at window creation, so a mode change only reaches already-open
-  // windows after they are closed or Explorer restarts.
+  // (polled while mounted): active = DLL verified in the running explorer.exe.
   let hookStatus = $state({ enabled: false, active: false, applied: false });
   async function refreshHookStatus() {
     try {
@@ -56,63 +44,12 @@
     }
   }
 
-  // Legacy refs retained while the native preview is being migrated; the
-  // visible comparison samples are stable HTML text rather than canvases.
-  let grayscaleCanvas = $state(null);
-  let rgbCanvas = $state(null);
-  let bgrCanvas = $state(null);
-  let nativePreviewHost = $state(null);
-  let nativePreviewResizeObserver = null;
-  let nativePreviewVisible = false;
-  let nativePreviewSyncRaf = 0;
-  let nativePreviewBoundsSyncing = false;
-  let nativePreviewBoundsPending = false;
-
-  // The main window minimizes to the tray, so restoring replays the Windows
-  // restore (maximize) animation. Hold the native preview hidden until that
-  // animation has had time to finish so the text sample doesn't appear over
-  // the transition. The hold is armed from the backend's window-visibility
-  // events (animated restores) and extended by window resize events while it
-  // is active.
-  const PREVIEW_HOLD_MS = 350;
-  let previewHoldUntil = 0;
-  let previewHoldRetryTimer = null;
-  // True while a restore/maximize animation is in progress. Manual resizes
-  // must keep the preview following live, so the hold is only extended while
-  // this is set (the animation resizes the window through its path). It is
-  // armed wherever the hold is armed by a restore indicator and cleared by
-  // window-restore-settled (which always fires, via the pixel-watch or its
-  // 1.2s timeout fallback).
-  let restoreInProgress = false;
-  // Timestamp of the last `window-restore-settled` event (0 = none yet). The
-  // backend's visual settle detector emits it the moment the restore
-  // animation finishes, which lets the preview appear exactly when the
-  // animation ends instead of after a fixed delay. The fixed hold below stays
-  // as a fallback in case the event is lost.
-  let restoreSettledAt = 0;
-
-  // Backend-driven show events (tray icon / tray menu, or the WM_SIZE
-  // SIZE_RESTORED emit in lib.rs) stamp app.windowRestoredAt together with
-  // whether the restore animates. Arm or clear the preview hold to match: an
-  // animated restore (the window was minimized) must wait out the animation,
-  // an instant show (close-to-tray) must not be delayed. Only fresh stamps
-  // are honored, so switching back to this tab later never replays a hold
-  // from an old restore.
-  $effect(() => {
-    const stamp = app.windowRestoredAt;
-    if (!stamp || Date.now() - stamp > 2000) return;
-    // A new restore is starting — forget a settle from a previous one so the
-    // hold can arm again if needed.
-    restoreSettledAt = 0;
-    if (app.windowRestoreAnimated) {
-      restoreInProgress = true;
-      previewHoldUntil = Math.max(previewHoldUntil, stamp + PREVIEW_HOLD_MS);
-    } else {
-      restoreInProgress = false;
-      previewHoldUntil = 0;
-    }
-    scheduleNativePreviewBounds();
-  });
+  // Canvas the preview renders into. It shows the actual swash output (the
+  // same engine the Explorer hook uses), so the fringing is real.
+  let previewCanvas = $state(null);
+  // Zoom level (%) for the right preview column, driven by the mini slider
+  // above the canvas. Session-only, like the rest of the preview state.
+  let previewZoom = $state(400);
 
   // Sync the persisted master toggle into the backend hook module so it
   // gates the hook (Explorer untouched when off).
@@ -120,11 +57,38 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled }).catch(() => {});
   }
 
+  // Push the three render knobs (filter strength, crosstalk, boldness) to the
+  // backend so Explorer applies them live. Debounced at 33ms to match the
+  // preview render, so Explorer tracks the drag without repainting per event.
+  let knobSyncTimer = null;
+  function scheduleKnobSync() {
+    clearTimeout(knobSyncTimer);
+    knobSyncTimer = setTimeout(() => {
+      invoke('explorer_hook_set_render_knobs', {
+        lcdStrength: textSettings.lcdFilterStrength,
+        crosstalk: textSettings.crosstalk,
+        boldness: textSettings.boldness,
+      }).catch((e) => console.warn('[text] render knobs sync failed', e));
+    }, 33);
+  }
+
+  // Shared handler for the three tuning sliders: update the value, persist,
+  // push to the hook (debounced), and re-render the preview (debounced — a
+  // drag fires dozens of input events, and each rasterization batch is a few
+  // backend calls, so rendering on the final value keeps the UI responsive).
+  function onKnobInput(field, value) {
+    textSettings[field] = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+    saveConfig();
+    scheduleKnobSync();
+    schedulePreviewRender();
+  }
+
   async function refreshState() {
     try {
       const s = await invoke('text_rendering_get_state');
       state = { ...state, ...s };
       syncExplorerToggle();
+      scheduleKnobSync();
       syncExplorerHook(state.effective_mode);
     } catch (e) {
       error = String(e);
@@ -134,18 +98,12 @@
     }
   }
 
-  // Mirror the mode into Explorer. The shell hard-codes ClearType and ignores
-  // the registry, so Grayscale/Off only reach Explorer through the hook DLL
-  // (see src-tauri/src/explorer_hook.rs): grayscale → force
-  // grayscale, off → force non-antialiased (crisp), rgb/bgr → pass through.
   function syncExplorerHook(mode) {
     invoke('explorer_hook_set_mode', { mode })
       .then(refreshHookStatus)
       .catch((e) => console.warn('[text] explorer hook failed', e));
   }
 
-  // Master toggle: on → load the hook and follow the mode; off → stop the
-  // hook and write passthrough so Explorer returns to system ClearType.
   function onToggleExplorerHook() {
     textSettings.explorerHookEnabled = !textSettings.explorerHookEnabled;
     saveConfig();
@@ -159,10 +117,10 @@
     busy = true;
     error = '';
     try {
-      await      invoke('text_rendering_set_mode', { mode });
+      await invoke('text_rendering_set_mode', { mode });
       state.effective_mode = mode;
       syncExplorerHook(mode);
-      await updateNativePreview();
+      await renderPreview();
     } catch (e) {
       error = String(e);
       console.warn('[text] set_mode failed', e);
@@ -171,41 +129,11 @@
     }
   }
 
-  // Contrast is a ClearType-only setting: grayscale and off text has no color
-  // fringing to intensify, so the control is disabled (and ignored) outside
-  // RGB/BGR.
+  // Contrast is parked: it is not wired to the swash rasterizer yet, so the
+  // preview does not reflect it. The slider keeps local state so it stays
+  // responsive for when the knob is added.
   function applyContrast(value) {
-    if (state.effective_mode !== 'rgb' && state.effective_mode !== 'bgr') return;
     state.contrast = value;
-    // Preview follows the thumb every tick — this is a cheap repaint of the
-    // native window, not a system settings change.
-    invoke('text_preview_update', {
-      mode: state.effective_mode,
-      gamma: state.gamma,
-      contrast: value,
-    }).catch((e) => console.warn('[text] native preview update failed', e));
-    // Coalesce the real write: at most one in flight per CONTRAST_APPLY_MS,
-    // always carrying the latest value so the final thumb position lands.
-    contrastPending = value;
-    if (contrastApplyTimer === null) {
-      contrastApplyTimer = setTimeout(() => {
-        contrastApplyTimer = null;
-        const pending = contrastPending;
-        contrastPending = null;
-        if (pending !== null) {
-          invoke('text_rendering_set_contrast', { contrast: pending })
-            // The preview is a real GDI window: it renders with the system's
-            // currently applied settings, so it only shows the new value
-            // AFTER the write lands. Repaint it post-write or the preview
-            // stays one step behind (drag and keyboard behave differently).
-            .then(() => updateNativePreview())
-            .catch((e) => {
-              error = String(e);
-              console.warn('[text] set_contrast failed', e);
-            });
-        }
-      }, CONTRAST_APPLY_MS);
-    }
   }
 
   async function resetDefaults() {
@@ -213,14 +141,13 @@
     error = '';
     try {
       await invoke('text_rendering_reset');
-      // Restore the Explorer hook toggle to its (off) default too.
       if (textSettings.explorerHookEnabled) {
         textSettings.explorerHookEnabled = false;
         saveConfig();
         syncExplorerToggle();
       }
       await refreshState();
-      await updateNativePreview();
+      await renderPreview();
     } catch (e) {
       error = String(e);
       console.warn('[text] reset failed', e);
@@ -229,337 +156,178 @@
     }
   }
 
-  function scheduleNativePreviewBounds() {
-    if (nativePreviewSyncRaf) cancelAnimationFrame(nativePreviewSyncRaf);
-    nativePreviewSyncRaf = requestAnimationFrame(() => {
-      nativePreviewSyncRaf = 0;
-      syncNativePreviewBounds();
-    });
+  // ── Swash preview ─────────────────────────────────────────────────────
+  // Rasterizes sample text with the real swash engine (text_preview_render)
+  // and composites the returned coverage onto a canvas. Left column at 100%,
+  // right column at 400% so the subpixel fringing is visible.
+  const PREVIEW_TEXT = 'The quick brown fox jumps over the lazy dog';
+  const PREVIEW_FG = [255, 255, 255];
+  const PREVIEW_BG = [20, 20, 24];
+
+  // Last rasterized sample bitmaps, keyed by (mode + knobs + dpr). Zoom only
+  // changes how the SAME bitmaps are drawn, so a zoom or resize never needs a
+  // backend round-trip; only a mode/knob change invalidates the cache.
+  let previewCache = null;
+  // Generation counter so a slow rasterization batch from an older render
+  // cannot paint over a newer one that started meanwhile.
+  let previewGen = 0;
+
+  // Debounced re-render for slider drags (see onKnobInput). 33ms keeps
+  // dragging smooth (≈30 fps) while avoiding the queue pile-up of a render
+  // per input event.
+  let previewRenderTimer = null;
+  function schedulePreviewRender() {
+    clearTimeout(previewRenderTimer);
+    previewRenderTimer = setTimeout(() => renderPreview(), 33);
   }
 
-  // Called on window move. Never starts a hold here: dragging the window must
-  // keep the preview following live. Only extend a hold already in progress
-  // (a restore animation moves the window through its path).
-  function onWindowMoved() {
-    if (Date.now() < previewHoldUntil) previewHoldUntil = Date.now() + PREVIEW_HOLD_MS;
-    scheduleNativePreviewBounds();
-  }
+  async function renderPreview() {
+    const canvas = previewCanvas;
+    if (!canvas || !loaded) return;
+    const dpr = window.devicePixelRatio || 1;
+    // Size the backing store from the canvas's OWN CSS box (width: 100%),
+    // not the parent panel's client size — the panel is taller than the
+    // canvas (caption row + padding), so using it as the source gives the
+    // backing store a different aspect ratio than the displayed box and the
+    // browser stretches the drawing to fit.
+    const cssWidth = canvas.clientWidth;
+    if (cssWidth <= 0) return;
 
-  // Called on window resize. Only a restore/maximize animation needs the
-  // preview held back; a manual resize must keep it following live, so never
-  // start a hold here — just extend one already in progress (the animation
-  // resizes the window through its path).
-  function onWindowResized() {
-    if (restoreInProgress) previewHoldUntil = Date.now() + PREVIEW_HOLD_MS;
-    scheduleNativePreviewBounds();
-  }
+    const mode = state.effective_mode;
+    const zoom = previewZoom / 100;
+    const key = `${mode}|${textSettings.lcdFilterStrength}|${textSettings.crosstalk}|${textSettings.boldness}|${dpr}`;
+    const gen = ++previewGen;
 
-  async function syncNativePreviewBounds() {
-    if (nativePreviewBoundsSyncing) {
-      nativePreviewBoundsPending = true;
-      return;
-    }
-    nativePreviewBoundsSyncing = true;
-    try {
-      // Hide while a modal or a bottom-panel dropdown/context menu is open:
-      // the preview is a separate popup HWND floating above the WebView, so
-      // HTML menus that open over it would be drawn underneath (cut off).
-      // With the preview hidden the menu renders fully; it reappears when
-      // the menu closes.
-      if (modalOpen || menuOpen) {
-        if (nativePreviewVisible) {
-          nativePreviewVisible = false;
-          await invoke('text_preview_hide');
-        }
+    let left;
+    let right;
+    if (previewCache && previewCache.key === key) {
+      left = previewCache.left;
+      right = previewCache.right;
+    } else {
+      try {
+        // Rasterize at device-pixel density (size × dpr) so each bitmap pixel
+        // maps to exactly one physical pixel when drawn back at CSS size — the
+        // 100% column is crisp on HiDPI instead of half-resolution. On a 1×
+        // display dpr = 1 and this is identical to before.
+        left = await Promise.all(
+          [8, 10, 12, 15].map((size) => invoke('text_preview_render', { mode, text: PREVIEW_TEXT, size: size * dpr, lcdStrength: textSettings.lcdFilterStrength, crosstalk: textSettings.crosstalk, boldness: textSettings.boldness })),
+        );
+        right = await Promise.all(
+          [12, 15].map((size) => invoke('text_preview_render', { mode, text: PREVIEW_TEXT, size: size * dpr, lcdStrength: textSettings.lcdFilterStrength, crosstalk: textSettings.crosstalk, boldness: textSettings.boldness })),
+        );
+      } catch (e) {
+        console.warn('[text] preview render failed', e);
         return;
       }
-      // Wait out the window's restore/maximize animation before showing the
-      // preview. Re-check once the hold expires so the sample appears right
-      // after the transition instead of waiting for the next layout event.
-      if (Date.now() < previewHoldUntil) {
-        clearTimeout(previewHoldRetryTimer);
-        previewHoldRetryTimer = setTimeout(() => {
-          previewHoldRetryTimer = null;
-          scheduleNativePreviewBounds();
-        }, previewHoldUntil - Date.now());
-        return;
-      }
-      if (!nativePreviewHost) return;
-      const rect = nativePreviewHost.getBoundingClientRect();
-      const viewport = nativePreviewHost.closest('.content')?.getBoundingClientRect();
-      const left = viewport ? Math.max(rect.left, viewport.left) : rect.left;
-      const top = viewport ? Math.max(rect.top, viewport.top) : rect.top;
-      const right = viewport ? Math.min(rect.right, viewport.right) : rect.right;
-      const bottom = viewport ? Math.min(rect.bottom, viewport.bottom) : rect.bottom;
-      const width = right - left;
-      const height = bottom - top;
+      // A newer render started while the batch was in flight: drop this one
+      // rather than paint stale bitmaps over the fresh state.
+      if (gen !== previewGen) return;
+      previewCache = { key, left, right };
+    }
 
-      // The native preview is an owned popup rather than a WebView DOM node, so
-      // explicitly clip it to the visible content viewport. This keeps it from
-      // floating over the header, other tabs, or other applications after scroll.
-      if (width <= 0 || height <= 0) {
-        if (nativePreviewVisible) {
-          nativePreviewVisible = false;
-          await invoke('text_preview_hide');
-        }
-        return;
-      }
+    const gap = 6;
+    const leftTotal = left.reduce((a, r) => a + r.height / dpr, 0) + gap * (left.length - 1);
+    const rightTotal = right.reduce((a, r) => a + (r.height * zoom) / dpr, 0);
+    // Grow the canvas so the zoomed right column always fits; the tab body
+    // scrolls, so a taller preview is fine. Setting the same value is a no-op.
+    const targetH = Math.max(126, Math.ceil(Math.max(leftTotal, rightTotal)) + 4);
+    if (parseInt(canvas.style.height || '0', 10) !== targetH) {
+      canvas.style.height = targetH + 'px';
+    }
+    const cssHeight = canvas.clientHeight;
+    // Clear + redraw only AFTER the new bitmaps are in hand, so the canvas
+    // never sits blank during the async rasterization gap (the old preview
+    // stays visible until the new one replaces it).
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = `rgb(${PREVIEW_BG[0]},${PREVIEW_BG[1]},${PREVIEW_BG[2]})`;
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
 
-      const scale = window.devicePixelRatio || 1;
-      await invoke('text_preview_set_bounds', {
-        x: Math.round(left * scale),
-        y: Math.round(top * scale),
-        width: Math.round(width * scale),
-        height: Math.round(height * scale),
-      });
-      nativePreviewVisible = true;
-    } catch (e) {
-      console.warn('[text] native preview positioning failed', e);
-    } finally {
-      nativePreviewBoundsSyncing = false;
-      if (nativePreviewBoundsPending) {
-        nativePreviewBoundsPending = false;
-        scheduleNativePreviewBounds();
-      }
+    const splitX = Math.floor(cssWidth / 2);
+    const leftX = 10;
+    const rightX = splitX + 12;
+
+    // Left column (100%): stacked rows, vertically centered.
+    let leftY = Math.max(0, (cssHeight - leftTotal) / 2);
+    for (const r of left) {
+      drawRun(ctx, r, leftX, leftY, 1);
+      leftY += r.height / dpr + gap;
+    }
+
+    // Right column (slider zoom): the last two sizes.
+    let rightY = Math.max(0, (cssHeight - rightTotal) / 2);
+    for (const r of right) {
+      drawRun(ctx, r, rightX, rightY, zoom);
+      rightY += (r.height * zoom) / dpr;
     }
   }
 
-  $effect(() => {
-    if (modalOpen || menuOpen) {
-      nativePreviewVisible = false;
-      invoke('text_preview_hide').catch(() => {});
-    } else if (loaded) {
-      scheduleNativePreviewBounds();
-    }
-  });
-
-  async function updateNativePreview() {
-    try {
-      await invoke('text_preview_update', {
-        mode: state.effective_mode,
-        gamma: state.gamma,
-        contrast: state.contrast,
-      });
-    } catch (e) {
-      console.warn('[text] native preview update failed', e);
-    }
-  }
-
-  // ── Subpixel preview simulation ───────────────────────────────────────
-  // Renders the same text through an RGB / BGR / grayscale subpixel filter so
-  // the user can compare color fringing without touching the OS. White text is
-  // rasterized onto a transparent offscreen canvas at 3x horizontal scale and
-  // its alpha channel is used as per-subpixel coverage.
-  function renderPreview() {
-    if (!grayscaleCanvas || !rgbCanvas || !bgrCanvas) return;
-    const text = 'The quick brown fox';
-    const fontSize = 18;
-    const font = `${fontSize}px "Segoe UI", Inter, system-ui, sans-serif`;
-    const measure = document.createElement('canvas').getContext('2d');
-    measure.font = font;
-    const tw = Math.ceil(measure.measureText(text).width);
-    const th = Math.ceil(fontSize * 1.4);
-
-    const scale = 3;
+  function drawRun(ctx, run, x, y, zoom) {
+    const w = run.width;
+    const h = run.height;
+    const subpixel = run.content === 'subpixel';
+    const bpp = subpixel ? 4 : 1;
+    const data = run.data;
     const off = document.createElement('canvas');
-    off.width = tw * scale;
-    off.height = th;
-    const octx = off.getContext('2d', { willReadFrequently: true });
-    octx.scale(scale, 1);
-    octx.font = font;
-    octx.textBaseline = 'top';
-    octx.fillStyle = '#fff';
-    octx.fillText(text, 0, 3);
-    const src = octx.getImageData(0, 0, tw * scale, th).data;
-
-    const fg = [232, 232, 236];
-    const bg = [17, 17, 21];
-
-    function draw(mode, canvas) {
-      canvas.width = tw;
-      canvas.height = th;
-      const ctx = canvas.getContext('2d');
-      const img = ctx.createImageData(tw, th);
-      const out = img.data;
-      for (let y = 0; y < th; y++) {
-        const row = y * tw * scale;
-        for (let x = 0; x < tw; x++) {
-          const a0 = src[(row + x * scale) * 4 + 3] / 255;
-          const a1 = src[(row + x * scale + 1) * 4 + 3] / 255;
-          const a2 = src[(row + x * scale + 2) * 4 + 3] / 255;
-          let cr;
-          let cg;
-          let cb;
-          if (mode === 'rgb') {
-            cr = a0; cg = a1; cb = a2;
-          } else if (mode === 'bgr') {
-            cr = a2; cg = a1; cb = a0;
-          } else {
-            const l = (a0 + a1 + a2) / 3;
-            cr = l; cg = l; cb = l;
-          }
-          const o = (y * tw + x) * 4;
-          out[o] = Math.round(bg[0] + (fg[0] - bg[0]) * cr);
-          out[o + 1] = Math.round(bg[1] + (fg[1] - bg[1]) * cg);
-          out[o + 2] = Math.round(bg[2] + (fg[2] - bg[2]) * cb);
-          out[o + 3] = 255;
+    off.width = w;
+    off.height = h;
+    const octx = off.getContext('2d');
+    const img = octx.createImageData(w, h);
+    const out = img.data;
+    for (let py = 0; py < h; py++) {
+      for (let px = 0; px < w; px++) {
+        const s = (py * w + px) * bpp;
+        let cr;
+        let cg;
+        let cb;
+        if (subpixel) {
+          cr = data[s] / 255;
+          cg = data[s + 1] / 255;
+          cb = data[s + 2] / 255;
+        } else {
+          const c = data[s] / 255;
+          cr = c;
+          cg = c;
+          cb = c;
         }
+        const o = (py * w + px) * 4;
+        out[o] = Math.round(PREVIEW_BG[0] + (PREVIEW_FG[0] - PREVIEW_BG[0]) * cr);
+        out[o + 1] = Math.round(PREVIEW_BG[1] + (PREVIEW_FG[1] - PREVIEW_BG[1]) * cg);
+        out[o + 2] = Math.round(PREVIEW_BG[2] + (PREVIEW_FG[2] - PREVIEW_BG[2]) * cb);
+        out[o + 3] = 255;
       }
-      ctx.putImageData(img, 0, 0);
     }
-
-    draw('grayscale', grayscaleCanvas);
-    draw('rgb', rgbCanvas);
-    draw('bgr', bgrCanvas);
+    octx.putImageData(img, 0, 0);
+    // Bitmaps are rasterized at device density (size × dpr), so dividing by
+    // dpr maps each bitmap pixel to one physical pixel. At zoom=1 that's a
+    // crisp 100%; at zoom=4 each bitmap pixel becomes 4 CSS px (the fringing
+    // inspection view).
+    const dpr = window.devicePixelRatio || 1;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, x, y, (w * zoom) / dpr, (h * zoom) / dpr);
   }
 
   onMount(() => {
     let disposed = false;
-    let unlistenWindowMoved = null;
-    const scrollParents = [
-      nativePreviewHost?.closest('.content'),
-      nativePreviewHost?.closest('.tab-body'),
-    ].filter((element, index, elements) => element && elements.indexOf(element) === index);
-    const onLayoutChange = () => scheduleNativePreviewBounds();
+    let resizeObserver = null;
 
-    // Destroy-and-recreate lifecycle for the native preview. Hiding it (via
-    // ShowWindow) is not enough: the preview is an owned popup and Windows
-    // re-shows owned windows that were visible when their owner restores from
-    // minimized — mid restore-animation, bypassing set_bounds. So on any
-    // visibility loss the preview is destroyed entirely (there is then no
-    // HWND Windows could auto-show), and recreated once the window is visible
-    // again, after the restore animation has settled.
-    const recreateNativePreview = () => {
-      invoke('text_preview_show', {
-        mode: state.effective_mode,
-        gamma: state.gamma,
-        contrast: state.contrast,
-      })
-        .then(() => {
-          if (!modalOpen && !menuOpen) scheduleNativePreviewBounds();
-        })
-        .catch((e) => console.warn('[text] native preview recreate failed', e));
-    };
+    refreshState().then(async () => {
+      if (disposed) return;
+      await renderPreview();
+    });
 
-    // Backend-driven show/hide events (tray icon, tray menu, or the WM_SIZE
-    // SIZE_RESTORED emit in lib.rs for taskbar restores). This is the primary
-    // recreate trigger for a taskbar restore: document.visibilitychange does
-    // NOT fire when a WebView2 host window is minimized/restored via the
-    // taskbar (only for close-to-tray hides), so without this event the
-    // mounted tab would never learn the window came back — the preview stays
-    // destroyed until the user switches tabs (remount).
-    let unlistenWindowVisibility = null;
-    listen('window-visibility', (event) => {
-      const payload = event.payload;
-      const object = payload !== null && typeof payload === 'object';
-      const visible = object ? payload.visible !== false : payload !== false;
-      const animated = object ? payload.animated === true : false;
-      if (!visible) {
-        // Backend-driven hide (tray toggle minimize / close-to-tray). The tab
-        // unmounts right after, but destroy immediately so no owned popup
-        // survives even if the unmount is delayed.
-        nativePreviewVisible = false;
-        invoke('text_preview_destroy').catch(() => {});
-      } else {
-        // A show while this tab is still mounted means the window was
-        // restored without unmounting us — the taskbar-restore-after-minimize
-        // case. The restore animates (the backend only emits animated=true
-        // for a genuine minimize→restore), so arm the hold and recreate. A
-        // fresh window-restore-settled event clears the hold shortly after.
-        if (animated) {
-          restoreSettledAt = 0;
-          restoreInProgress = true;
-          previewHoldUntil = Math.max(previewHoldUntil, Date.now() + PREVIEW_HOLD_MS);
-        }
-        recreateNativePreview();
-      }
-    }).then((stop) => { unlistenWindowVisibility = stop; }).catch(() => {});
-
-    // The backend's visual settle detector: the restore animation has
-    // finished (or the timeout fallback fired). Stop waiting — show the
-    // preview now, at the exact moment the animation ended.
-    let unlistenRestoreSettled = null;
-    listen('window-restore-settled', () => {
-      restoreSettledAt = Date.now();
-      restoreInProgress = false;
-      previewHoldUntil = 0;
-      scheduleNativePreviewBounds();
-    }).then((stop) => { unlistenRestoreSettled = stop; }).catch(() => {});
-
-    // Fallback destroy/recreate via document visibility. Unreliable for
-    // taskbar minimize/restore in WebView2 (see above), but it does fire for
-    // close-to-tray hides and costs nothing to keep.
-    const onVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        nativePreviewVisible = false;
-        invoke('text_preview_destroy').catch(() => {});
-      } else if (document.visibilityState === 'visible') {
-        // A taskbar restore never fires window-visibility, so reaching this
-        // handler with the tab still mounted means the window was minimized
-        // and the restore animates — arm the hold here. (For backend-driven
-        // shows the windowRestoredAt effect above overrides the hold to match
-        // the real animated-vs-instant state.)
-        if (Date.now() - (app.windowShownAt || 0) > 100) {
-          restoreSettledAt = 0;
-          restoreInProgress = true;
-          previewHoldUntil = Math.max(previewHoldUntil, Date.now() + PREVIEW_HOLD_MS);
-        }
-        recreateNativePreview();
-      }
-    };
-    document.addEventListener('visibilitychange', onVisibilityChange);
-
-    getCurrentWindow().onMoved(onWindowMoved).then((unlisten) => {
-      if (disposed) unlisten();
-      else unlistenWindowMoved = unlisten;
-    }).catch(() => {});
-
-    refreshState()
-      .then(async () => {
-        if (disposed) return;
-        try {
-          await invoke('text_preview_show', {
-            mode: state.effective_mode,
-            gamma: state.gamma,
-            contrast: state.contrast,
-          });
-          if (!modalOpen) scheduleNativePreviewBounds();
-        } catch (e) {
-          console.warn('[text] native preview unavailable', e);
-        }
-      });
-    nativePreviewResizeObserver = new ResizeObserver(onLayoutChange);
-    if (nativePreviewHost) nativePreviewResizeObserver.observe(nativePreviewHost);
-    window.addEventListener('resize', onWindowResized);
-    scrollParents.forEach((parent) => parent.addEventListener('scroll', onLayoutChange, { passive: true }));
-
-    // Poll the hook status while mounted so the Explorer status reflects
-    // reality (toggle, mode changes, Explorer restarts, watchdog
-    // re-hook) without wiring every event path.
     refreshHookStatus();
     const hookStatusPoll = setInterval(refreshHookStatus, 2000);
 
+    resizeObserver = new ResizeObserver(() => renderPreview());
+    if (previewCanvas?.parentElement) resizeObserver.observe(previewCanvas.parentElement);
+
     return () => {
       disposed = true;
-      if (contrastApplyTimer) clearTimeout(contrastApplyTimer);
-      contrastApplyTimer = null;
       clearInterval(hookStatusPoll);
-      if (nativePreviewSyncRaf) cancelAnimationFrame(nativePreviewSyncRaf);
-      if (previewHoldRetryTimer) clearTimeout(previewHoldRetryTimer);
-      previewHoldRetryTimer = null;
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-      nativePreviewResizeObserver?.disconnect();
-      nativePreviewResizeObserver = null;
-      window.removeEventListener('resize', onWindowResized);
-      scrollParents.forEach((parent) => parent.removeEventListener('scroll', onLayoutChange));
-      unlistenWindowMoved?.();
-      unlistenWindowVisibility?.();
-      unlistenRestoreSettled?.();
-      // The tab unmounts when the window hides (close-to-tray, tray minimize)
-      // or when the user switches tabs. Destroy the preview so no owned popup
-      // survives to be auto-shown over the next restore animation; it is
-      // recreated on the next mount.
-      invoke('text_preview_destroy').catch(() => {});
+      resizeObserver?.disconnect();
     };
   });
 </script>
@@ -629,14 +397,46 @@
   <div class="text-render-preview-panel">
     <div class="text-render-preview-caption-row">
       <span class="text-render-preview-caption text-render-preview-caption-left">100% zoom</span>
-      <span class="text-render-preview-caption text-render-preview-caption-right">400% zoom</span>
+      <span class="text-render-preview-caption text-render-preview-caption-right">{previewZoom}% zoom</span>
     </div>
-    <div class="text-render-native-preview-host" bind:this={nativePreviewHost} role="img" aria-label="Live native Windows text rendering preview">
-      <span class="text-render-native-preview-fallback">
-        {menuOpen || modalOpen
-          ? 'The live text preview is hidden while a menu is open.'
-          : 'Loading live text preview…'}
-      </span>
+    <div class="text-render-preview-zoom-row">
+      <span class="text-render-preview-zoom-label">Zoom</span>
+      <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+        <input type="range" class="slider-sm" min="100" max="800" step="100" value={previewZoom}
+          style="--fill:{((previewZoom - 100) / 700) * 100}%"
+          oninput={(e) => { previewZoom = Math.round(Number(e.currentTarget.value) / 100) * 100; renderPreview(); }} />
+      </div>
+      <span class="slider-val">{previewZoom}%</span>
+    </div>
+    <canvas class="text-render-preview-canvas" bind:this={previewCanvas} role="img" aria-label="Live text rendering preview"></canvas>
+    <div class="text-render-knobs">
+      <div class="text-render-knob-row">
+        <span class="text-render-knob-label">LCD filter</span>
+        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={textSettings.lcdFilterStrength}
+            style="--fill:{textSettings.lcdFilterStrength}%"
+            oninput={(e) => onKnobInput('lcdFilterStrength', e.currentTarget.value)} />
+        </div>
+        <span class="slider-val">{textSettings.lcdFilterStrength}</span>
+      </div>
+      <div class="text-render-knob-row">
+        <span class="text-render-knob-label">Crosstalk</span>
+        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={textSettings.crosstalk}
+            style="--fill:{textSettings.crosstalk}%"
+            oninput={(e) => onKnobInput('crosstalk', e.currentTarget.value)} />
+        </div>
+        <span class="slider-val">{textSettings.crosstalk}</span>
+      </div>
+      <div class="text-render-knob-row">
+        <span class="text-render-knob-label">Boldness</span>
+        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={textSettings.boldness}
+            style="--fill:{textSettings.boldness}%"
+            oninput={(e) => onKnobInput('boldness', e.currentTarget.value)} />
+        </div>
+        <span class="slider-val">{textSettings.boldness}</span>
+      </div>
     </div>
   </div>
 
@@ -646,7 +446,7 @@
         <span class="settings-row-label">Windows Explorer</span>
       </span>
     </div>
-    <p class="text-render-explorer-desc">Windows Explorer ignores grayscale and always renders its text with ClearType RGB.<br>This fix loads a hook into Windows Explorer and forces grayscale rendering.</p>
+    <p class="text-render-explorer-desc">Windows Explorer ignores the system text setting and always renders with ClearType.<br>This fix re-renders Explorer's text using your selected mode.</p>
     <p class="text-render-explorer-warning">⚠ It could trigger a false positive in your antivirus.</p>
     <div class="text-render-explorer-actions">
       <label class="text-render-explorer-toggle">

@@ -3879,27 +3879,64 @@ button {
   font-weight: 600;
   letter-spacing: 0.3px;
 }
-.text-render-native-preview-host {
-  position: relative;
+/* Mini zoom slider for the right preview column; right-aligned above the
+   canvas so it reads as a control for the zoomed half. */
+.text-render-preview-zoom-row {
   display: flex;
   align-items: center;
-  justify-content: center;
-  /* Same as the surrounding panel (rgba(0,0,0,0.12) over --panel); the
-     native HWND paints this exact color so the preview blends into the
-     panel with no visible seam. */
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 2px 0 0;
+}
+.text-render-preview-zoom-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-weak);
+  letter-spacing: 0.3px;
+}
+/* Tuning knobs (LCD filter strength, crosstalk, boldness) under the preview
+   canvas. Each row: label, compact slider, numeric value. */
+.text-render-knobs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 8px;
+  /* Half the tab width, leaving the right half free for a second group of
+     sliders (e.g. per-mode tweaks) later. */
+  width: 50%;
+}
+.text-render-knob-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.text-render-knob-label {
+  flex: 0 0 68px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-weak);
+  letter-spacing: 0.3px;
+}
+.text-render-knobs .slider-track-wrap-sm {
+  flex: 1;
+  flex-basis: 0;
+}
+.text-render-knobs .slider-val {
+  flex: 0 0 34px;
+  font-size: 12px;
+  text-align: right;
+}
+.text-render-preview-zoom-row .slider-val {
+  font-size: 12px;
+  min-width: 44px;
+  text-align: right;
+}
+.text-render-preview-canvas {
+  display: block;
+  width: 100%;
   height: 126px;
-  min-height: 126px;
   margin: 4px 0 8px;
   border-radius: 6px;
-  background: rgba(0, 0, 0, 0.12);
-  overflow: hidden;
-}
-.text-render-native-preview-fallback {
-  color: var(--text);
-  font: 16px/1.3 'Segoe UI', Inter, system-ui, sans-serif;
-  text-align: center;
-  padding: 0 16px;
-  white-space: normal;
 }
 .text-render-inline-modes {
   display: inline-flex;

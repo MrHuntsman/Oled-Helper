@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 iced-x86 = "1"
 swash = "0.2"
+text-raster = { path = "../text-raster" }
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

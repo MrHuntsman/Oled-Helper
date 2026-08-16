@@ -1,0 +1,12 @@
+[package]
+name = "text-raster"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+description = "Shared swash-based glyph rasterizer used by the explorer hook and the in-app preview"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+swash = "0.2"

@@ -165,8 +165,15 @@ export const taskbarDimmer = $state({
 
 // Text rendering tab settings persisted in config. The Explorer hook toggle
 // decides whether the hook DLL fixes Explorer's text (Grayscale/Off
-// modes) or leaves it at system ClearType.
-export const textSettings = $state({ explorerHookEnabled: false });
+// modes) or leaves it at system ClearType. The three render knobs (all
+// 0..100) tune LCD filter strength (0 = off, the default), WOLED crosstalk
+// compensation, and faux boldness.
+export const textSettings = $state({
+  explorerHookEnabled: false,
+  lcdFilterStrength: 0,
+  crosstalk: 0,
+  boldness: 0,
+});
 
 // Screen Dimmer settings persisted in config. The backend needs these at
 // startup so the idle watcher and overlay use the saved values immediately.
@@ -472,6 +479,9 @@ export async function loadConfig(prefetchedCfg = null) {
     clampHighNitsRange();
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
     if (cfg && typeof cfg.explorer_hook_enabled === 'boolean') textSettings.explorerHookEnabled = cfg.explorer_hook_enabled;
+    if (cfg && typeof cfg.lcd_filter_strength === 'number') textSettings.lcdFilterStrength = Math.max(0, Math.min(100, Math.round(cfg.lcd_filter_strength)));
+    if (cfg && typeof cfg.crosstalk === 'number') textSettings.crosstalk = Math.max(0, Math.min(100, Math.round(cfg.crosstalk)));
+    if (cfg && typeof cfg.boldness === 'number') textSettings.boldness = Math.max(0, Math.min(100, Math.round(cfg.boldness)));
     if (cfg && typeof cfg.screen_protector_enabled === 'boolean') {
       screenDimmer.enabled = cfg.screen_protector_enabled;
     }
@@ -582,6 +592,9 @@ export function saveConfig() {
     high_nits_step: crush.highNitsStep,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     explorer_hook_enabled: textSettings.explorerHookEnabled,
+    lcd_filter_strength: textSettings.lcdFilterStrength,
+    crosstalk: textSettings.crosstalk,
+    boldness: textSettings.boldness,
     screen_protector_enabled: screenDimmer.enabled,
     screen_protector_seconds: screenDimmer.seconds,
     screen_protector_opacity: screenDimmer.opacity,

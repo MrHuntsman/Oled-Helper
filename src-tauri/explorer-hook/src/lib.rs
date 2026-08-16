@@ -21,7 +21,6 @@
 
 mod detour;
 mod font;
-mod render;
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -32,13 +31,15 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use detour::Detour;
+use swash::scale::image::Content;
 use windows::core::{s, w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    AlphaBlend, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetCurrentObject,
-    GetObjectW, GetTextAlign, GetTextColor, HDC, LOGFONTW, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, ETO_OPTIONS,
-    ETO_GLYPH_INDEX, ETO_PDY, OBJ_FONT, TA_BASELINE, TA_BOTTOM, TA_CENTER, TA_RIGHT,
+    AlphaBlend, BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
+    GetCurrentObject, GetObjectW, GetTextAlign, GetTextColor, HDC, LOGFONTW, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    DIB_RGB_COLORS, ETO_OPTIONS, ETO_GLYPH_INDEX, ETO_PDY, OBJ_FONT, SRCCOPY, TA_BASELINE,
+    TA_BOTTOM, TA_CENTER, TA_RIGHT,
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -58,14 +59,18 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 
-// Shared memory layout (12 bytes): the app writes the mode at offset 0; the
-// DLL writes its own state back at offsets 4 and 8 so the app can verify the
-// hook is really installed in the CURRENT explorer.exe instead of trusting
-// that the module merely loaded.
+// Shared memory layout (24 bytes): the app writes the mode at offset 0 and
+// the three render knobs (filter strength, crosstalk, boldness) at 12/16/20;
+// the DLL writes its own state back at offsets 4 and 8 so the app can verify
+// the hook is really installed in the CURRENT explorer.exe instead of
+// trusting that the module merely loaded.
 const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
-const STATE_SIZE: usize = 12;
+const STATE_LCD_STRENGTH: usize = 12;
+const STATE_CROSSTALK: usize = 16;
+const STATE_BOLDNESS: usize = 20;
+const STATE_SIZE: usize = 24;
 // Status bit written by the DLL once the ExtTextOutW detour is installed.
 const STATUS_HOOK_INSTALLED: u32 = 1;
 
@@ -138,6 +143,29 @@ fn state_mode() -> u32 {
         STATE.get()
             .map(|addr| *((addr + STATE_MODE) as *const u32))
             .unwrap_or(0)
+    }
+}
+
+// Read a u32 knob from shared memory with a default, clamped to 0..=100.
+fn state_knob(offset: usize, default: u32) -> u8 {
+    // SAFETY: STATE is written once in map_state; the mapped view stays valid
+    // for the lifetime of the process.
+    let v = unsafe {
+        STATE.get()
+            .map(|addr| *((addr + offset) as *const u32))
+            .unwrap_or(default)
+    };
+    v.min(100) as u8
+}
+
+// Per-draw render options for the current draw. The LCD filter is applied at
+// its strength, where 0 = off; crosstalk and boldness pass straight through.
+// Defaults are all off/no-op when the app has not written the knobs yet.
+fn state_render_options() -> text_raster::RenderOptions {
+    text_raster::RenderOptions {
+        lcd_strength: state_knob(STATE_LCD_STRENGTH, 0),
+        crosstalk: state_knob(STATE_CROSSTALK, 0),
+        boldness: state_knob(STATE_BOLDNESS, 0),
     }
 }
 
@@ -232,11 +260,17 @@ fn text_color_rgb(hdc: HDC) -> (u8, u8, u8) {
     (r, g, b)
 }
 
+// Per-channel linear blend: out = text*cov + bg*(1-cov), cov in [0, 255]. This
+// is the per-subpixel compositing ClearType uses for the colored fringes.
+fn blend_channel(text: u8, bg: u8, cov: u8) -> u8 {
+    ((text as u32 * cov as u32 + bg as u32 * (255 - cov as u32)) / 255) as u8
+}
+
 // ── Blit ──────────────────────────────────────────────────────────────
 
 // Compute the tight bounding box of a rasterized run in run-local coordinates
 // (origin = left edge + baseline). Returns (left, top, width, height).
-fn run_bounds(run: &render::RasterizedText) -> Option<(i32, i32, i32, i32)> {
+fn run_bounds(run: &text_raster::RasterizedText) -> Option<(i32, i32, i32, i32)> {
     if run.glyphs.is_empty() {
         return None;
     }
@@ -267,7 +301,7 @@ unsafe fn blit_run(
     hdc: HDC,
     x: i32,
     y: i32,
-    run: &render::RasterizedText,
+    run: &text_raster::RasterizedText,
     color: (u8, u8, u8),
 ) -> bool {
     let Some((min_left, min_top, w, h)) = run_bounds(run) else {
@@ -278,7 +312,7 @@ unsafe fn blit_run(
         return false;
     }
 
-    // Build a 32bpp premultiplied BGRA DIB section.
+    // Build a 32bpp BGRA DIB section.
     let mut bmi = BITMAPINFO::default();
     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
     bmi.bmiHeader.biWidth = w;
@@ -296,32 +330,6 @@ unsafe fn blit_run(
             let _ = DeleteObject(hbitmap.into());
         }
         return false;
-    }
-
-    // Composite each glyph's coverage into the DIB as premultiplied BGRA.
-    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
-    buf.fill(0);
-    for g in &run.glyphs {
-        let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
-        let dst_top = g.y.floor() as i32 - g.bitmap_top - min_top;
-        for row in 0..g.height as usize {
-            for col in 0..g.width as usize {
-                let c = g.coverage[row * g.width as usize + col];
-                if c == 0 {
-                    continue;
-                }
-                let dx = dst_left as usize + col;
-                let dy = dst_top as usize + row;
-                if dx >= w as usize || dy >= h as usize {
-                    continue;
-                }
-                let i = (dy * w as usize + dx) * 4;
-                buf[i] = (color.2 as u32 * c as u32 / 255) as u8; // B
-                buf[i + 1] = (color.1 as u32 * c as u32 / 255) as u8; // G
-                buf[i + 2] = (color.0 as u32 * c as u32 / 255) as u8; // R
-                buf[i + 3] = c; // A
-            }
-        }
     }
 
     let memdc = CreateCompatibleDC(Some(hdc));
@@ -346,18 +354,84 @@ unsafe fn blit_run(
     let dest_x = origin_x + min_left;
     let dest_y = origin_y + min_top;
 
-    let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8,
-        BlendFlags: 0,
-        SourceConstantAlpha: 255,
-        AlphaFormat: AC_SRC_ALPHA as u8,
+    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+
+    let ok = match run.content {
+        // Grayscale/crisp: composite coverage into a fresh DIB as premultiplied
+        // BGRA text, then AlphaBlend so the destination shows through the
+        // transparent pixels.
+        Content::Mask => {
+            buf.fill(0);
+            for g in &run.glyphs {
+                let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
+                let dst_top = g.y.floor() as i32 - g.bitmap_top - min_top;
+                for row in 0..g.height as usize {
+                    for col in 0..g.width as usize {
+                        let c = g.coverage[row * g.width as usize + col];
+                        if c == 0 {
+                            continue;
+                        }
+                        let dx = dst_left as usize + col;
+                        let dy = dst_top as usize + row;
+                        if dx >= w as usize || dy >= h as usize {
+                            continue;
+                        }
+                        let i = (dy * w as usize + dx) * 4;
+                        buf[i] = (color.2 as u32 * c as u32 / 255) as u8; // B
+                        buf[i + 1] = (color.1 as u32 * c as u32 / 255) as u8; // G
+                        buf[i + 2] = (color.0 as u32 * c as u32 / 255) as u8; // R
+                        buf[i + 3] = c; // A
+                    }
+                }
+            }
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            AlphaBlend(hdc, dest_x, dest_y, w, h, memdc, 0, 0, w, h, blend).as_bool()
+        }
+        // Subpixel: read the destination background, blend each color channel
+        // against its own coverage, and write the result back. This is the
+        // per-channel compositing ClearType uses for its colored fringes.
+        Content::SubpixelMask => {
+            let read_ok = BitBlt(memdc, 0, 0, w, h, Some(hdc), dest_x, dest_y, SRCCOPY).is_ok();
+            if !read_ok {
+                false
+            } else {
+                for g in &run.glyphs {
+                    let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
+                    let dst_top = g.y.floor() as i32 - g.bitmap_top - min_top;
+                    for row in 0..g.height as usize {
+                        for col in 0..g.width as usize {
+                            let dx = dst_left as usize + col;
+                            let dy = dst_top as usize + row;
+                            if dx >= w as usize || dy >= h as usize {
+                                continue;
+                            }
+                            let src = (row * g.width as usize + col) * 4;
+                            let rc = g.coverage[src];
+                            let gc = g.coverage[src + 1];
+                            let bc = g.coverage[src + 2];
+                            let i = (dy * w as usize + dx) * 4;
+                            buf[i] = blend_channel(color.2, buf[i], bc); // B
+                            buf[i + 1] = blend_channel(color.1, buf[i + 1], gc); // G
+                            buf[i + 2] = blend_channel(color.0, buf[i + 2], rc); // R
+                            buf[i + 3] = 255; // opaque result
+                        }
+                    }
+                }
+                BitBlt(hdc, dest_x, dest_y, w, h, Some(memdc), 0, 0, SRCCOPY).is_ok()
+            }
+        }
+        Content::Color => false,
     };
-    let ok = AlphaBlend(hdc, dest_x, dest_y, w, h, memdc, 0, 0, w, h, blend);
 
     let _ = SelectObject(memdc, old);
     let _ = DeleteObject(hbitmap.into());
     let _ = DeleteDC(memdc);
-    ok.as_bool()
+    ok
 }
 
 // ── Detour ────────────────────────────────────────────────────────────
@@ -381,8 +455,12 @@ unsafe extern "system" fn try_render_swash(
 ) -> bool {
     let mode = state_mode();
     let render_mode = match mode {
-        1 => render::RenderMode::Grayscale,
-        2 => render::RenderMode::Crisp,
+        1 => text_raster::RenderMode::Grayscale,
+        2 => text_raster::RenderMode::Crisp,
+        3 => text_raster::RenderMode::SubpixelRgb,
+        4 => text_raster::RenderMode::SubpixelBgr,
+        5 => text_raster::RenderMode::SubpixelRgwb,
+        6 => text_raster::RenderMode::SubpixelRwbg,
         _ => return false,
     };
     // Only count attempts that actually reach the swash path (mode 1/2), so
@@ -424,7 +502,8 @@ unsafe extern "system" fn try_render_swash(
     };
 
     let text = String::from_utf16_lossy(std::slice::from_raw_parts(string.as_ptr(), count as usize));
-    let Some(run) = render::rasterize(&font_data, 0, px, &text, render_mode) else {
+    let opts = state_render_options();
+    let Some(run) = text_raster::rasterize(&font_data, 0, px, &text, render_mode, opts) else {
         return fallback("rasterize failed");
     };
 
@@ -483,7 +562,7 @@ unsafe fn try_render_glyph_indices(
     string: PCWSTR,
     count: u32,
     dx: *const i32,
-    mode: render::RenderMode,
+    mode: text_raster::RenderMode,
 ) -> bool {
     let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
     let verbose = n < 100 || n % 10000 == 0;
@@ -508,7 +587,16 @@ unsafe fn try_render_glyph_indices(
             .collect()
     };
 
-    let Some(run) = render::rasterize_glyphs(&font_data, 0, px, glyph_ids, &advances, mode) else {
+    let opts = state_render_options();
+    let Some(run) = text_raster::rasterize_glyphs(
+        &font_data,
+        0,
+        px,
+        glyph_ids,
+        &advances,
+        mode,
+        opts,
+    ) else {
         if verbose {
             log(&format!("render #{n}: glyph-index fallback (rasterize failed)"));
         }

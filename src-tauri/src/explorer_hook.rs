@@ -11,8 +11,9 @@
 // fonts are rasterized, so the fix reaches fast-starting applets (Device
 // Manager, classic Control Panel, etc.) that a per-process watchdog would
 // miss. The DLL reads a session-local shared-memory mode that this module
-// writes: 0 = pass through, 1 = force grayscale, 2 = force crisp. Because the
-// hook sits on the draw path, a mode change applies on the next repaint (live).
+// writes: 0 = pass through, 1 = force grayscale, 2 = force crisp, 3 = subpixel
+// RGB, 4 = subpixel BGR, 5 = WOLED RGWB, 6 = WOLED RWBG. Because the hook
+// sits on the draw path, a mode change applies on the next repaint (live).
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,16 +23,19 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tauri::Manager;
-use windows::core::{s, w, PCWSTR};
+use windows::core::{s, w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM,
+    CloseHandle, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM, HWND,
 };
+use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, WH_CBT,
+    EnumWindows, FindWindowW, GetClassNameW, GetWindowThreadProcessId, PostMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HWND_BROADCAST, WH_CBT, WM_FONTCHANGE,
+    WM_SETTINGCHANGE,
 };
 
 type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
@@ -43,9 +47,12 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 // its own bookkeeping — the DLL loading only proves the module mapped, not
 // that the detour installed).
 static STATE_VIEW: OnceLock<usize> = OnceLock::new();
-const STATE_SIZE: usize = 12;
+const STATE_SIZE: usize = 24;
 const STATE_STATUS_OFFSET: usize = 4;
 const STATE_PID_OFFSET: usize = 8;
+const STATE_LCD_STRENGTH_OFFSET: usize = 12;
+const STATE_CROSSTALK_OFFSET: usize = 16;
+const STATE_BOLDNESS_OFFSET: usize = 20;
 // The ExtTextOutW detour is what makes the fix real; the app requires this
 // status bit for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
@@ -64,8 +71,14 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 // is never touched and the DLL is not loaded. Defaults to off; the
 // frontend syncs the stored value on load.
 static TOGGLE: AtomicBool = AtomicBool::new(false);
-// Last mode-state from the Text tab (0/1/2), gated by TOGGLE in apply_state.
+// Last mode-state from the Text tab (0..6), gated by TOGGLE in apply_state.
 static LAST_STATE: AtomicU32 = AtomicU32::new(0);
+// Render knobs from the Text tab sliders (0..=100): LCD filter strength (0 =
+// off), WOLED crosstalk compensation, and faux boldness. Written into the
+// shared memory so the DLL reads them on every draw.
+static LCD_STRENGTH: AtomicU32 = AtomicU32::new(0);
+static CROSSTALK: AtomicU32 = AtomicU32::new(0);
+static BOLDNESS: AtomicU32 = AtomicU32::new(0);
 // True once the hook is verified in a NEW explorer.exe generation while the
 // feature was already active, so the Text tab can show "✓ Fix applied". Fonts
 // are rasterized at window creation, so a mode change only fully applies after
@@ -123,6 +136,28 @@ fn write_state(mode: u32) -> Result<(), String> {
     Ok(())
 }
 
+fn write_state_knobs() -> Result<(), String> {
+    let ptr = ensure_state_mapped()?;
+    // SAFETY: ptr is the mapped view, valid for the process lifetime; offsets
+    // 12/16/20 are u32 slots we own.
+    unsafe {
+        let base = ptr as *mut u8;
+        std::ptr::write_volatile(
+            base.add(STATE_LCD_STRENGTH_OFFSET) as *mut u32,
+            LCD_STRENGTH.load(Ordering::Acquire),
+        );
+        std::ptr::write_volatile(
+            base.add(STATE_CROSSTALK_OFFSET) as *mut u32,
+            CROSSTALK.load(Ordering::Acquire),
+        );
+        std::ptr::write_volatile(
+            base.add(STATE_BOLDNESS_OFFSET) as *mut u32,
+            BOLDNESS.load(Ordering::Acquire),
+        );
+    }
+    Ok(())
+}
+
 // Read the DLL's own report (pid + status) back from the shared memory. The
 // pid lets us tie the report to the CURRENT explorer.exe generation: a stale
 // report from a previous generation is ignored by pid mismatch. Returns
@@ -157,6 +192,55 @@ fn explorer_target() -> Option<(u32, u32)> {
             return None;
         }
         Some((pid, tid))
+    }
+}
+
+// Force Explorer's text-bearing windows to repaint after a mode change so the
+// hook's new mode shows immediately instead of waiting for a natural repaint
+// (hover, scroll, resize). The hook reads the mode on every draw, so this only
+// has to make Explorer draw again. EnumWindows/RedrawWindow are safe from any
+// thread; RDW_INVALIDATE (no RDW_UPDATENOW) only queues a repaint.
+fn invalidate_explorer_windows() {
+    let Some((pid, _)) = explorer_target() else {
+        return;
+    };
+    unsafe {
+        let _ = EnumWindows(Some(invalidate_proc), LPARAM(pid as isize));
+    }
+}
+
+unsafe extern "system" fn invalidate_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let target_pid = lparam.0 as u32;
+    let mut pid = 0u32;
+    if GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 || pid != target_pid {
+        return BOOL(1);
+    }
+    let mut class = [0u16; 64];
+    let len = GetClassNameW(hwnd, &mut class);
+    if len <= 0 {
+        return BOOL(1);
+    }
+    let class = String::from_utf16_lossy(&class[..len as usize]);
+    if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" || class == "CabinetWClass" {
+        let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
+    BOOL(1)
+}
+
+// Notify every top-level window that a text-rendering setting changed, so the
+// hooked hosts that don't get a targeted invalidate (classic Control Panel,
+// MMC consoles, Device Manager, rundll32 applets) repaint their text. Posted
+// asynchronously so a mode click never blocks on other apps' message loops.
+fn broadcast_rendering_change() {
+    unsafe {
+        let msg = wide("Windows");
+        let _ = PostMessageW(
+            Some(HWND_BROADCAST),
+            WM_SETTINGCHANGE,
+            WPARAM(0),
+            LPARAM(msg.as_ptr() as isize),
+        );
+        let _ = PostMessageW(Some(HWND_BROADCAST), WM_FONTCHANGE, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -265,28 +349,41 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
     let enabled = TOGGLE.load(Ordering::Acquire) && last != 0;
     ENABLED.store(enabled, Ordering::Release);
     // When disabled, write passthrough so an already-loaded Explorer stops
-    // rewriting fonts immediately (no restart needed for that).
+    // rewriting fonts immediately (no restart needed for that). Keep the LCD
+    // filter flag in sync regardless, so the DLL never reads a stale value.
     write_state(if enabled { last } else { 0 })?;
+    write_state_knobs()?;
     if enabled {
         ensure_watchdog_running(app.clone());
         ensure_hooked(app)?;
     } else {
         uninstall_all_hooks();
     }
+    // Repaint Explorer's open windows so the new mode (or the return to
+    // ClearType when disabled) is visible immediately, and broadcast a
+    // settings change so the other hooked hosts repaint too.
+    invalidate_explorer_windows();
+    broadcast_rendering_change();
     Ok(())
 }
 
 /// Follow the Text rendering tab's mode in Explorer:
-///   grayscale → force grayscale (ANTIALIASED_QUALITY)
-///   off       → force no antialiasing, crisp (NONANTIALIASED_QUALITY)
-///   rgb/bgr   → pass through (Explorer keeps its ClearType + the system
-///               orientation the app already sets)
+///   grayscale → force grayscale
+///   off       → force no antialiasing, crisp
+///   rgb       → swash subpixel antialiasing (RGB panel)
+///   bgr       → swash subpixel antialiasing (BGR panel)
+///   rgwb      → WOLED RGBW subpixel antialiasing (R, G, W, B)
+///   rwbg      → WOLED RGBW subpixel antialiasing (R, W, B, G)
 /// Stores the mode and applies it through the master toggle.
 #[tauri::command]
 pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
     let state = match mode.as_str() {
         "grayscale" => 1,
         "off" => 2,
+        "rgb" => 3,
+        "bgr" => 4,
+        "rgwb" => 5,
+        "rwbg" => 6,
         _ => 0,
     };
     if LAST_STATE.load(Ordering::Acquire) != state {
@@ -296,6 +393,25 @@ pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(),
     }
     LAST_STATE.store(state, Ordering::Release);
     apply_state(&app)
+}
+
+/// Set the render knobs from the Text tab sliders: LCD filter strength
+/// (0 = off), WOLED crosstalk compensation, and faux boldness (all 0..=100).
+/// Written to the shared memory so the DLL applies them on the next repaint
+/// (live).
+#[tauri::command]
+pub fn explorer_hook_set_render_knobs(
+    lcd_strength: u32,
+    crosstalk: u32,
+    boldness: u32,
+) -> Result<(), String> {
+    LCD_STRENGTH.store(lcd_strength.min(100), Ordering::Release);
+    CROSSTALK.store(crosstalk.min(100), Ordering::Release);
+    BOLDNESS.store(boldness.min(100), Ordering::Release);
+    write_state_knobs()?;
+    invalidate_explorer_windows();
+    broadcast_rendering_change();
+    Ok(())
 }
 
 /// Master toggle for the Explorer hook (Text tab). Off stops the hook and
@@ -365,6 +481,9 @@ fn verify_report(pid: u32) {
     if prev == pid {
         return;
     }
+    // A fresh hook just installed (first load or Explorer restart): repaint so
+    // already-open windows pick up the mode immediately.
+    invalidate_explorer_windows();
     if prev != 0 {
         RESTARTED_WHILE_ACTIVE.store(true, Ordering::Release);
         log::info!("[explorer-hook] verified hook in restarted explorer.exe (pid {pid})");
