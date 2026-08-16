@@ -15,6 +15,8 @@
 // RGB, 4 = subpixel BGR, 5 = WOLED RGWB, 6 = WOLED RWBG. Because the hook
 // sits on the draw path, a mode change applies on the next repaint (live).
 
+use crate::monitors::all_monitors;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -41,18 +43,36 @@ use windows::Win32::UI::WindowsAndMessaging::{
 type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 // The mapped view of the shared state (created once, leaked for app
-// lifetime). Layout: u32 mode (app->explorer) + u32 status + u32 pid
-// (explorer->app, written by the DLL at attach so the app can VERIFY the
-// hook is really installed in the current explorer.exe instead of trusting
-// its own bookkeeping — the DLL loading only proves the module mapped, not
-// that the detour installed).
+// lifetime). Layout (192 bytes):
+//    0  u32 global mode (app->explorer)
+//    4  u32 status + 8 u32 pid (explorer->app, written by the DLL at attach
+//       so the app can VERIFY the hook is really installed in the current
+//       explorer.exe instead of trusting its own bookkeeping — the DLL
+//       loading only proves the module mapped, not that the detour
+//       installed)
+//   12  u32 lcd strength, 16 u32 crosstalk, 20 u32 boldness
+//   24  u32 per-monitor flag (0/1)
+//   28  u32 monitor count
+//   32  monitor table: up to 8 entries x 20 bytes
+//       u32 hmonitor (system-wide monitor handle)
+//       u32 resolution (horzres | vertres<<16)
+//       u32 physical size (horzsize | vertsize<<16)
+//       u32 dpi (logpixelsx | logpixelsy<<16)
+//       u32 mode | primary<<8  (mode 0 = use global)
+// The DLL reads the table on every draw to pick the mode for the monitor the
+// DC belongs to (see explorer-hook/src/lib.rs, resolve_draw_mode).
 static STATE_VIEW: OnceLock<usize> = OnceLock::new();
-const STATE_SIZE: usize = 24;
+const STATE_SIZE: usize = 192;
 const STATE_STATUS_OFFSET: usize = 4;
 const STATE_PID_OFFSET: usize = 8;
 const STATE_LCD_STRENGTH_OFFSET: usize = 12;
 const STATE_CROSSTALK_OFFSET: usize = 16;
 const STATE_BOLDNESS_OFFSET: usize = 20;
+const STATE_PER_MONITOR_OFFSET: usize = 24;
+const STATE_MONITOR_COUNT_OFFSET: usize = 28;
+const STATE_MONITORS_OFFSET: usize = 32;
+const MAX_MONITORS: usize = 8;
+const MONITOR_ENTRY_STRIDE: usize = 20;
 // The ExtTextOutW detour is what makes the fix real; the app requires this
 // status bit for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
@@ -79,6 +99,12 @@ static LAST_STATE: AtomicU32 = AtomicU32::new(0);
 static LCD_STRENGTH: AtomicU32 = AtomicU32::new(0);
 static CROSSTALK: AtomicU32 = AtomicU32::new(0);
 static BOLDNESS: AtomicU32 = AtomicU32::new(0);
+// Per-monitor rendering (Text tab): master flag plus per-monitor mode
+// assignments keyed by the monitor's stable signature (see MonitorEntry::sig).
+// Mode values match the DLL: 1..=6 as in explorer_hook_set_mode; absent =
+// "use the global mode".
+static PER_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
+static MONITOR_MODES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 // True once the hook is verified in a NEW explorer.exe generation while the
 // feature was already active, so the Text tab can show "✓ Fix applied". Fonts
 // are rasterized at window creation, so a mode change only fully applies after
@@ -154,6 +180,62 @@ fn write_state_knobs() -> Result<(), String> {
             base.add(STATE_BOLDNESS_OFFSET) as *mut u32,
             BOLDNESS.load(Ordering::Acquire),
         );
+    }
+    Ok(())
+}
+
+// ── Per-monitor mode table ────────────────────────────────────────────
+// Each connected monitor gets one entry in the shared table: its system-wide
+// HMONITOR handle (for window-DC attribution) plus a device-caps signature
+// (resolution + physical size + DPI, for memory-DC attribution) and the
+// assigned mode. The DLL matches a draw's DC against these on every draw.
+// The monitor list comes from the shared monitors module (all_monitors),
+// which also supplies the CCD friendly names shown in the UI.
+
+// Write the per-monitor flag + table into the shared memory so the DLL can
+// resolve a draw's monitor on every repaint. Called on every per-monitor
+// change and on apply_state.
+fn write_state_table() -> Result<(), String> {
+    let ptr = ensure_state_mapped()?;
+    let entries = all_monitors();
+    let modes = MONITOR_MODES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    // SAFETY: ptr is the mapped view, valid for the process lifetime; the
+    // table region (offsets 24..192) is plain u32 slots we own.
+    unsafe {
+        let base = ptr as *mut u8;
+        std::ptr::write_volatile(
+            base.add(STATE_PER_MONITOR_OFFSET) as *mut u32,
+            if PER_MONITOR_ENABLED.load(Ordering::Acquire) {
+                1
+            } else {
+                0
+            },
+        );
+        let count = entries.len().min(MAX_MONITORS) as u32;
+        std::ptr::write_volatile(base.add(STATE_MONITOR_COUNT_OFFSET) as *mut u32, count);
+        for (i, e) in entries.iter().take(MAX_MONITORS).enumerate() {
+            let entry = base.add(STATE_MONITORS_OFFSET + i * MONITOR_ENTRY_STRIDE);
+            std::ptr::write_volatile(entry as *mut u32, e.hmonitor);
+            std::ptr::write_volatile(
+                entry.add(4) as *mut u32,
+                e.width | (e.height << 16),
+            );
+            std::ptr::write_volatile(
+                entry.add(8) as *mut u32,
+                e.phys_width | (e.phys_height << 16),
+            );
+            std::ptr::write_volatile(
+                entry.add(12) as *mut u32,
+                e.dpi_x | (e.dpi_y << 16),
+            );
+            std::ptr::write_volatile(
+                entry.add(16) as *mut u32,
+                modes.get(&e.sig()).copied().unwrap_or(0).min(6) | ((e.primary as u32) << 8),
+            );
+        }
     }
     Ok(())
 }
@@ -353,6 +435,7 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
     // filter flag in sync regardless, so the DLL never reads a stale value.
     write_state(if enabled { last } else { 0 })?;
     write_state_knobs()?;
+    write_state_table()?;
     if enabled {
         ensure_watchdog_running(app.clone());
         ensure_hooked(app)?;
@@ -393,6 +476,80 @@ pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(),
     }
     LAST_STATE.store(state, Ordering::Release);
     apply_state(&app)
+}
+
+/// Per-monitor master switch for the Explorer hook (Text tab). When on, each
+/// draw's DC is attributed to a monitor and rendered with that monitor's
+/// assigned mode; monitors without an assignment fall back to the global mode.
+#[tauri::command]
+pub fn explorer_hook_set_per_monitor(enabled: bool) -> Result<(), String> {
+    PER_MONITOR_ENABLED.store(enabled, Ordering::Release);
+    write_state_table()?;
+    invalidate_explorer_windows();
+    broadcast_rendering_change();
+    Ok(())
+}
+
+/// Assign a per-monitor render mode: `mode` is one of the mode ids
+/// ("grayscale"/"off"/"rgb"/"bgr"/"rgwb"/"rwbg"); "global" clears the
+/// assignment so the monitor uses the global mode. `sig` is the monitor's
+/// stable signature from `explorer_hook_monitors`.
+#[tauri::command]
+pub fn explorer_hook_set_monitor_mode(sig: String, mode: String) -> Result<(), String> {
+    let value = match mode.as_str() {
+        "grayscale" => 1,
+        "off" => 2,
+        "rgb" => 3,
+        "bgr" => 4,
+        "rgwb" => 5,
+        "rwbg" => 6,
+        _ => 0, // "global"
+    };
+    {
+        let mut modes = MONITOR_MODES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if value == 0 {
+            modes.remove(&sig);
+        } else {
+            modes.insert(sig, value);
+        }
+    }
+    write_state_table()?;
+    invalidate_explorer_windows();
+    broadcast_rendering_change();
+    Ok(())
+}
+
+/// The connected monitors for the per-monitor UI. `sig` is the stable key
+/// used to persist assignments; `index` is the enumeration position shown to
+/// the user; `friendly_name` is the CCD/EDID name (e.g. "LG OLED C4") when
+/// available.
+#[derive(serde::Serialize)]
+pub struct ExplorerMonitorInfo {
+    sig: String,
+    index: u32,
+    width: u32,
+    height: u32,
+    primary: bool,
+    friendly_name: String,
+}
+
+#[tauri::command]
+pub fn explorer_hook_monitors() -> Result<Vec<ExplorerMonitorInfo>, String> {
+    Ok(all_monitors()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| ExplorerMonitorInfo {
+            sig: e.sig(),
+            index: i as u32,
+            width: e.width,
+            height: e.height,
+            primary: e.primary,
+            friendly_name: e.friendly_name.clone(),
+        })
+        .collect())
 }
 
 /// Set the render knobs from the Text tab sliders: LCD filter strength

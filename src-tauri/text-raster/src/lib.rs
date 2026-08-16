@@ -10,6 +10,10 @@
 //! The module is deliberately free of Win32 code so it can be unit-tested in
 //! isolation.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
 use swash::proxy::MetricsProxy;
 pub use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
@@ -51,6 +55,7 @@ impl Default for RenderOptions {
 /// How the current mode maps to rasterization. Mode 0 (passthrough) never
 /// reaches this code — the caller forwards to GDI instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum RenderMode {
     /// Force grayscale antialiasing (Format::Alpha, 8-bit coverage).
     Grayscale,
@@ -79,8 +84,10 @@ pub struct PlacedGlyph {
     pub bitmap_top: i32,
     pub width: u32,
     pub height: u32,
-    /// 8-bit coverage, `width * height` bytes, row-major.
-    pub coverage: Vec<u8>,
+    /// 8-bit coverage, `width * height` bytes, row-major. Shared with the
+    /// glyph cache via `Arc` — the blit only reads it, so the run and the
+    /// cache share one immutable buffer instead of copying it per draw.
+    pub coverage: Arc<[u8]>,
 }
 
 /// The result of rasterizing a single run of text.
@@ -205,6 +212,262 @@ fn apply_crosstalk(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
     }
 }
 
+// ── Per-glyph coverage cache ─────────────────────────────────────────
+// Explorer repaints the same text (filenames, toolbar labels) many times per
+// second while resizing or hovering, and the swash rasterization on every
+// draw is the dominant cost. Cache the FINAL coverage bitmap per
+// (font, size, glyph, phase, mode, knobs) and memcpy it out on hit. Bounded
+// by a byte budget + entry count with FIFO eviction.
+
+const GLYPH_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const GLYPH_CACHE_MAX_ENTRIES: usize = 8192;
+const GLYPH_ENTRY_OVERHEAD: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphCacheKey {
+    /// `font_data.as_ptr()` — stable because every caller (the hook's
+    /// `cached_font` and the preview's `preview_font`) keeps the font bytes in
+    /// a process-lifetime cache, so the pointer identifies the face.
+    font: usize,
+    font_index: u32,
+    /// `pixel_size.to_bits()` — exact f32 identity, deterministic per caller.
+    size: u32,
+    glyph: u16,
+    /// Subpixel phase bits (`offset.x/y.to_bits()`). The glyph-index path
+    /// always uses (0,0), so those draws hit regardless of x position.
+    phase_x: u32,
+    phase_y: u32,
+    mode: u8,
+    lcd: u8,
+    crosstalk: u8,
+    boldness: u8,
+}
+
+/// The rasterized bitmap for one glyph (position-independent).
+#[derive(Clone)]
+struct CachedGlyph {
+    bitmap_left: i32,
+    bitmap_top: i32,
+    width: u32,
+    height: u32,
+    coverage: Arc<[u8]>,
+}
+
+struct GlyphCache {
+    map: HashMap<GlyphCacheKey, Arc<CachedGlyph>>,
+    /// Insertion order for FIFO eviction.
+    order: VecDeque<GlyphCacheKey>,
+    bytes: usize,
+}
+
+static GLYPH_CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
+// Hit/miss counters for the hook's verbose log (see glyph_cache_stats).
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+fn glyph_cache() -> &'static Mutex<GlyphCache> {
+    GLYPH_CACHE.get_or_init(|| {
+        Mutex::new(GlyphCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        })
+    })
+}
+
+/// Cache lookup; counts hits. Hands out an `Arc` (a refcount bump — no
+/// coverage copy), which the caller reads immediately and drops.
+fn cache_get(key: &GlyphCacheKey) -> Option<Arc<CachedGlyph>> {
+    let cache = glyph_cache().lock().unwrap_or_else(|p| p.into_inner());
+    match cache.map.get(key) {
+        Some(g) => {
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            Some(g.clone())
+        }
+        None => {
+            CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Insert, evicting FIFO while over the budget.
+fn cache_insert(key: GlyphCacheKey, glyph: Arc<CachedGlyph>) {
+    let mut cache = glyph_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let cost = glyph.coverage.len() + GLYPH_ENTRY_OVERHEAD;
+    while !cache.order.is_empty()
+        && (cache.bytes + cost > GLYPH_CACHE_MAX_BYTES
+            || cache.map.len() >= GLYPH_CACHE_MAX_ENTRIES)
+    {
+        if let Some(old_key) = cache.order.pop_front() {
+            if let Some(old) = cache.map.remove(&old_key) {
+                cache.bytes = cache.bytes.saturating_sub(old.coverage.len() + GLYPH_ENTRY_OVERHEAD);
+            }
+        }
+    }
+    cache.order.push_back(key);
+    cache.map.insert(key, glyph);
+    cache.bytes += cost;
+}
+
+/// Cumulative cache stats (hits, misses, live entries) for diagnostics.
+pub fn glyph_cache_stats() -> (u64, u64, usize) {
+    let entries = glyph_cache()
+        .lock()
+        .map(|c| c.map.len())
+        .unwrap_or(0);
+    (
+        CACHE_HITS.load(Ordering::Relaxed),
+        CACHE_MISSES.load(Ordering::Relaxed),
+        entries,
+    )
+}
+
+/// Batch lookup: lock the cache ONCE and return the cached glyph for every
+/// key (None for misses). A fully cached run is one lock acquisition instead
+/// of one per glyph, which matters for Explorer's repaints (a 79-glyph run
+/// redrawn every frame).
+fn cache_get_batch(keys: &[GlyphCacheKey]) -> Vec<Option<Arc<CachedGlyph>>> {
+    let mut cache = glyph_cache().lock().unwrap_or_else(|p| p.into_inner());
+    keys.iter()
+        .map(|k| match cache.map.get(k) {
+            Some(g) => {
+                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                Some(g.clone())
+            }
+            None => {
+                CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        })
+        .collect()
+}
+
+/// The cache key for one glyph. Everything that changes the output bitmap is
+/// in the key: font identity (stable pointer), size, glyph id, subpixel
+/// phase, mode, and the render knobs.
+fn glyph_cache_key(
+    font_ptr: usize,
+    font_index: u32,
+    pixel_size: f32,
+    glyph_id: u16,
+    offset: Vector,
+    mode: RenderMode,
+    opts: RenderOptions,
+) -> GlyphCacheKey {
+    GlyphCacheKey {
+        font: font_ptr,
+        font_index,
+        size: pixel_size.to_bits(),
+        glyph: glyph_id,
+        phase_x: offset.x.to_bits(),
+        phase_y: offset.y.to_bits(),
+        mode: mode as u8,
+        lcd: opts.lcd_strength,
+        crosstalk: opts.crosstalk,
+        boldness: opts.boldness,
+    }
+}
+
+/// Per-glyph outcome: rendered bitmap (shared with the cache), skip (empty
+/// glyph), or unsupported content (bail the whole run so the caller falls
+/// back to GDI).
+enum GlyphResult {
+    Rendered(Arc<CachedGlyph>),
+    Skip,
+    Unsupported,
+}
+
+/// Rasterize one glyph (or reuse the cached bitmap), applying the LCD filter,
+/// crosstalk, and crisp threshold so the cache stores the FINAL coverage.
+/// The caller supplies the run-local offset (subpixel phase).
+fn rasterize_glyph_cached(
+    scaler: &mut swash::scale::Scaler,
+    font_ptr: usize,
+    font_index: u32,
+    pixel_size: f32,
+    glyph_id: u16,
+    offset: Vector,
+    format: Format,
+    embolden: f32,
+    mode: RenderMode,
+    opts: RenderOptions,
+) -> GlyphResult {
+    let key = glyph_cache_key(font_ptr, font_index, pixel_size, glyph_id, offset, mode, opts);
+    if let Some(cached) = cache_get(&key) {
+        return GlyphResult::Rendered(cached);
+    }
+    rasterize_glyph_uncached(scaler, key, glyph_id, offset, format, embolden, mode, opts)
+}
+
+/// Render a glyph without touching the cache, then insert the result. Used by
+/// [`rasterize_glyph_cached`] and by the glyph-index path after a batch
+/// lookup already confirmed the miss.
+fn rasterize_glyph_uncached(
+    scaler: &mut swash::scale::Scaler,
+    key: GlyphCacheKey,
+    glyph_id: u16,
+    offset: Vector,
+    format: Format,
+    embolden: f32,
+    mode: RenderMode,
+    opts: RenderOptions,
+) -> GlyphResult {
+    let sources = [
+        Source::ColorOutline(0),
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::Outline,
+    ];
+    let mut render = Render::new(&sources);
+    render.format(format);
+    render.offset(offset);
+    if embolden > 0.0 {
+        render.embolden(embolden);
+    }
+    let image = render.render(scaler, glyph_id);
+    let Some(image) = image else {
+        return GlyphResult::Skip;
+    };
+    if image.placement.width == 0 || image.placement.height == 0 {
+        return GlyphResult::Skip;
+    }
+    // Only accept the coverage formats we know how to composite. Color (BGRA)
+    // or bitmap strikes use a different byte layout; bail out so the caller
+    // falls back to GDI rather than misread the buffer.
+    if !matches!(image.content, Content::Mask | Content::SubpixelMask) {
+        return GlyphResult::Unsupported;
+    }
+    let bpp = match image.content {
+        Content::Mask => 1,
+        _ => 4,
+    };
+    if image.data.len() != (image.placement.width * image.placement.height * bpp) as usize {
+        return GlyphResult::Unsupported;
+    }
+    let mut data = image.data;
+    if matches!(image.content, Content::SubpixelMask) {
+        apply_lcd_filter(&mut data, image.placement.width, image.placement.height, opts.lcd_strength);
+        apply_crosstalk(&mut data, image.placement.width, image.placement.height, opts.crosstalk);
+    }
+    let coverage: Arc<[u8]> = match mode {
+        RenderMode::Crisp => data
+            .into_iter()
+            .map(|a| if a >= 128 { 255 } else { 0 })
+            .collect::<Vec<_>>()
+            .into(),
+        _ => data.into(),
+    };
+    let glyph = Arc::new(CachedGlyph {
+        bitmap_left: image.placement.left,
+        bitmap_top: image.placement.top,
+        width: image.placement.width,
+        height: image.placement.height,
+        coverage,
+    });
+    cache_insert(key, glyph.clone());
+    GlyphResult::Rendered(glyph)
+}
+
 /// Shape and rasterize `text` with a single font at `pixel_size`.
 ///
 /// `font_data` is the raw bytes of the font file and `font_index` selects the
@@ -234,6 +497,28 @@ pub fn rasterize(
         .materialize_metrics(&font, &[])
         .scale(pixel_size);
 
+    // Whitespace-only runs carry no ink. Returning an empty run here skips
+    // the shaper + scaler build entirely — spaces and separators are drawn
+    // constantly by Explorer (each as its own count=1 ExtTextOutW) and would
+    // otherwise pay the full swash setup for a glyph that has no outline. The
+    // advance is taken from the font's hmtx so right/center-aligned draws
+    // keep their reference point (it is unused by the blit for empty runs).
+    if text.chars().all(|c| c.is_whitespace()) {
+        let proxy = MetricsProxy::from_font(&font);
+        let glyph_metrics = proxy.materialize_glyph_metrics(&font, &[]).scale(pixel_size);
+        let advance = text
+            .chars()
+            .map(|c| glyph_metrics.advance_width(font.charmap().map(c)))
+            .sum::<f32>();
+        return Some(RasterizedText {
+            glyphs: Vec::new(),
+            advance,
+            ascent: metrics.ascent,
+            descent: metrics.descent,
+            content: mode_format(mode).1,
+        });
+    }
+
     // Shape the run. Milestone 1 assumes a single left-to-right Latin run;
     // script/direction itemization is added later.
     let mut shape_context = ShapeContext::new();
@@ -258,6 +543,10 @@ pub fn rasterize(
     // Faux bold: 0..=100 maps to 0..1px of outline stroke thickening.
     let embolden = opts.boldness as f32 / 100.0;
 
+    // Font bytes identity for the glyph cache: the caller keeps the Arc alive
+    // for the process lifetime, so the pointer is stable across draws.
+    let font_ptr = font_data.as_ptr() as usize;
+
     let mut glyphs: Vec<PlacedGlyph> = Vec::new();
     let mut pen = 0.0f32;
     let mut failed = false;
@@ -274,63 +563,40 @@ pub fn rasterize(
             // Fractional subpixel phase for this glyph. Grayscale still applies
             // it so coverage lands smoothly; crisp is thresholded afterward.
             let offset = Vector::new(gx.fract(), glyph.y.fract());
-            let sources = [
-                Source::ColorOutline(0),
-                Source::ColorBitmap(StrikeWith::BestFit),
-                Source::Outline,
-            ];
-            let mut render = Render::new(&sources);
-            render.format(format);
-            render.offset(offset);
-            if embolden > 0.0 {
-                render.embolden(embolden);
+            match rasterize_glyph_cached(
+                &mut scaler,
+                font_ptr,
+                font_index,
+                pixel_size,
+                glyph.id,
+                offset,
+                format,
+                embolden,
+                mode,
+                opts,
+            ) {
+                GlyphResult::Rendered(c) => {
+                    glyphs.push(PlacedGlyph {
+                        x: gx,
+                        y: glyph.y,
+                        bitmap_left: c.bitmap_left,
+                        bitmap_top: c.bitmap_top,
+                        width: c.width,
+                        height: c.height,
+                        coverage: c.coverage.clone(),
+                    });
+                    pen += glyph.advance;
+                }
+                // Empty glyph: draw nothing, keep the pen (matches prior
+                // behavior of skipping the rasterization).
+                GlyphResult::Skip => {}
+                // Color/bitmap content we cannot composite: fail the run so
+                // the caller falls back to GDI untouched.
+                GlyphResult::Unsupported => {
+                    failed = true;
+                    return;
+                }
             }
-            let image = render.render(&mut scaler, glyph.id);
-            let Some(image) = image else {
-                continue;
-            };
-            if image.placement.width == 0 || image.placement.height == 0 {
-                continue;
-            }
-            // Only accept the coverage formats we know how to composite. Color
-            // (BGRA) or bitmap strikes use a different byte layout; bail out so
-            // the caller falls back to GDI rather than misread the buffer.
-            if !matches!(image.content, Content::Mask | Content::SubpixelMask) {
-                failed = true;
-                return;
-            }
-            let bpp = match image.content {
-                Content::Mask => 1,
-                _ => 4,
-            };
-            if image.data.len()
-                != (image.placement.width * image.placement.height * bpp) as usize
-            {
-                failed = true;
-                return;
-            }
-            let mut data = image.data;
-            if matches!(image.content, Content::SubpixelMask) {
-                apply_lcd_filter(&mut data, image.placement.width, image.placement.height, opts.lcd_strength);
-                apply_crosstalk(&mut data, image.placement.width, image.placement.height, opts.crosstalk);
-            }
-            let coverage = match mode {
-                RenderMode::Crisp => data
-                    .into_iter()
-                    .map(|a| if a >= 128 { 255 } else { 0 })
-                    .collect(),
-                _ => data,
-            };
-            glyphs.push(PlacedGlyph {
-                x: gx,
-                y: glyph.y,
-                bitmap_left: image.placement.left,
-                bitmap_top: image.placement.top,
-                width: image.placement.width,
-                height: image.placement.height,
-                coverage,
-            });
-            pen += glyph.advance;
         }
     });
 
@@ -382,15 +648,36 @@ pub fn rasterize_glyphs(
 
     let (format, content) = mode_format(mode);
 
-    let mut scale_context = ScaleContext::new();
-    let mut scaler = scale_context
-        .builder(font)
-        .size(pixel_size)
-        .hint(true)
-        .build();
-
     // Faux bold: 0..=100 maps to 0..1px of outline stroke thickening.
     let embolden = opts.boldness as f32 / 100.0;
+
+    // Font bytes identity for the glyph cache: the caller keeps the Arc alive
+    // for the process lifetime, so the pointer is stable across draws.
+    let font_ptr = font_data.as_ptr() as usize;
+
+    // Glyph-index runs carry no subpixel phase (rasterize at the integer
+    // origin), so every glyph's key is known up front. Look the whole run up
+    // in one lock acquisition: when every glyph is cached — the common
+    // repaint case while resizing, where only the position changes — the
+    // swash scaler is never built.
+    let keys: Vec<GlyphCacheKey> = glyph_ids
+        .iter()
+        .map(|&id| {
+            glyph_cache_key(font_ptr, font_index, pixel_size, id, Vector::new(0.0, 0.0), mode, opts)
+        })
+        .collect();
+    let mut cached = cache_get_batch(&keys);
+    let all_hit = cached.iter().all(Option::is_some);
+    // The scaler borrows its scale context, so the context must live in the
+    // same scope; both are only built when the run has any cache miss.
+    let mut scale_context = if all_hit {
+        None
+    } else {
+        Some(ScaleContext::new())
+    };
+    let mut scaler = scale_context
+        .as_mut()
+        .map(|sc| sc.builder(font).size(pixel_size).hint(true).build());
 
     let mut glyphs: Vec<PlacedGlyph> = Vec::new();
     let mut pen = 0.0f32;
@@ -403,62 +690,58 @@ pub fn rasterize_glyphs(
             glyph_metrics.advance_width(id)
         };
 
-        // Glyph-index runs carry no subpixel phase, so rasterize at the
-        // integer origin; grayscale coverage still lands smoothly.
-        let sources = [
-            Source::ColorOutline(0),
-            Source::ColorBitmap(StrikeWith::BestFit),
-            Source::Outline,
-        ];
-        let mut render = Render::new(&sources);
-        render.format(format);
-        render.offset(Vector::new(0.0, 0.0));
-        if embolden > 0.0 {
-            render.embolden(embolden);
-        }
-        let image = render.render(&mut scaler, id);
-        let Some(image) = image else {
-            pen += advance;
-            continue;
-        };
-        if image.placement.width == 0 || image.placement.height == 0 {
+        if let Some(c) = cached[i].take() {
+            glyphs.push(PlacedGlyph {
+                x: pen,
+                y: 0.0,
+                bitmap_left: c.bitmap_left,
+                bitmap_top: c.bitmap_top,
+                width: c.width,
+                height: c.height,
+                coverage: c.coverage.clone(),
+            });
             pen += advance;
             continue;
         }
-        if !matches!(image.content, Content::Mask | Content::SubpixelMask) {
+
+        // Cache miss: rasterize now. The scaler is built lazily, so fully
+        // cached repaints never pay for it.
+        let Some(scaler) = scaler.as_mut() else {
             failed = true;
             break;
-        }
-        let bpp = match image.content {
-            Content::Mask => 1,
-            _ => 4,
         };
-        if image.data.len() != (image.placement.width * image.placement.height * bpp) as usize {
-            failed = true;
-            break;
+        match rasterize_glyph_uncached(
+            scaler,
+            keys[i],
+            id,
+            Vector::new(0.0, 0.0),
+            format,
+            embolden,
+            mode,
+            opts,
+        ) {
+            GlyphResult::Rendered(c) => {
+                glyphs.push(PlacedGlyph {
+                    x: pen,
+                    y: 0.0,
+                    bitmap_left: c.bitmap_left,
+                    bitmap_top: c.bitmap_top,
+                    width: c.width,
+                    height: c.height,
+                    coverage: c.coverage.clone(),
+                });
+                pen += advance;
+            }
+            // Empty glyph: draw nothing but still advance (matches prior
+            // behavior of advancing past un-rasterized glyphs).
+            GlyphResult::Skip => {
+                pen += advance;
+            }
+            GlyphResult::Unsupported => {
+                failed = true;
+                break;
+            }
         }
-        let mut data = image.data;
-        if matches!(image.content, Content::SubpixelMask) {
-            apply_lcd_filter(&mut data, image.placement.width, image.placement.height, opts.lcd_strength);
-            apply_crosstalk(&mut data, image.placement.width, image.placement.height, opts.crosstalk);
-        }
-        let coverage = match mode {
-            RenderMode::Crisp => data
-                .into_iter()
-                .map(|a| if a >= 128 { 255 } else { 0 })
-                .collect(),
-            _ => data,
-        };
-        glyphs.push(PlacedGlyph {
-            x: pen,
-            y: 0.0,
-            bitmap_left: image.placement.left,
-            bitmap_top: image.placement.top,
-            width: image.placement.width,
-            height: image.placement.height,
-            coverage,
-        });
-        pen += advance;
     }
 
     if failed {
@@ -659,6 +942,68 @@ mod tests {
         assert_eq!(buf[2 * 4], 111); // R of pixel 2 (peak)
         assert_eq!(buf[2 * 4 + 1], 63); // G of pixel 2
         assert_eq!(buf[2 * 4 + 2], 15); // B of pixel 2
+    }
+
+    #[test]
+    fn whitespace_short_circuits_without_shaping() {
+        let Some(font) = load_test_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        // Whitespace-only text must produce an empty run with the font's
+        // advance (used by right/center alignment) and no glyphs. The fast
+        // path returns before any shaper/scaler/cache work, which the code
+        // structure guarantees; the stats counters are global across the
+        // parallel test binary, so they are not asserted here.
+        let out = rasterize(
+            &font,
+            0,
+            16.0,
+            "   ",
+            RenderMode::Grayscale,
+            RenderOptions::default(),
+        )
+        .expect("font parses");
+        assert!(out.glyphs.is_empty());
+        assert!(out.advance > 0.0, "space advance should be non-zero");
+    }
+
+    #[test]
+    fn glyph_cache_hits_on_repeat() {
+        let Some(font) = load_test_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        // First render fills the cache; the second (identical) render should
+        // hit it for every glyph. Counts are cumulative across tests, so
+        // compare the delta rather than absolute values.
+        let before = super::glyph_cache_stats();
+        let _ = rasterize(
+            &font,
+            0,
+            16.0,
+            "Ag",
+            RenderMode::Grayscale,
+            RenderOptions::default(),
+        );
+        let after_first = super::glyph_cache_stats();
+        let _ = rasterize(
+            &font,
+            0,
+            16.0,
+            "Ag",
+            RenderMode::Grayscale,
+            RenderOptions::default(),
+        );
+        let after_second = super::glyph_cache_stats();
+        assert!(
+            after_first.1 > before.1,
+            "first render should have missed at least once"
+        );
+        assert!(
+            after_second.0 > after_first.0,
+            "second identical render should hit the cache"
+        );
     }
 
     #[test]

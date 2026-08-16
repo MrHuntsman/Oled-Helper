@@ -592,7 +592,12 @@ pub fn query_current_display() -> Option<DisplayInfo> {
     let (native_width, native_height, native_source) = native_resolution()
         .map(|(w, h, source)| (w, h, source.to_string()))
         .unwrap_or((0, 0, String::new()));
-    let monitor_name = cached_edid_monitor_name(&target).unwrap_or(target.monitor_name);
+    // Prefer the shared monitors module's CCD friendly name (same source the
+    // per-monitor table and the CCD output-info match use); fall back to the
+    // EDID name when CCD yields nothing.
+    let monitor_name = crate::monitors::primary_friendly_name().unwrap_or_else(|| {
+        cached_edid_monitor_name(&target).unwrap_or_else(|| target.monitor_name.clone())
+    });
     let output = crate::hdr_toggle::query_display_output_info(&monitor_name);
     Some(DisplayInfo {
         width: devmode.dmPelsWidth,

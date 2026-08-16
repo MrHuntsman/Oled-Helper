@@ -3850,6 +3850,49 @@ button {
   color: var(--text-weak);
   margin: 0;
 }
+/* Per-monitor rendering list (Text tab): one row per monitor with a mode
+   select, inside its own dimmer-control below the mode picker. */
+.text-render-per-monitor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.text-render-per-monitor-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.text-render-per-monitor-name {
+  font-weight: 500;
+  min-width: 130px;
+}
+.text-render-per-monitor-res {
+  color: var(--text-weak);
+  font-size: 12px;
+  min-width: 90px;
+}
+.text-render-per-monitor-select {
+  margin-left: auto;
+  background: #1c1c22;
+  color: var(--text);
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+.text-render-per-monitor-select:hover,
+.text-render-per-monitor-select:focus-visible {
+  border-color: var(--accent);
+}
+.text-render-per-monitor-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-weak);
+}
 /* The preview (caption row + native sample) lives in its own bordered panel,
    visually separate from the mode controls above it. */
 .text-render-preview-panel {

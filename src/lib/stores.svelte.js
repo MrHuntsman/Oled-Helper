@@ -173,6 +173,11 @@ export const textSettings = $state({
   lcdFilterStrength: 0,
   crosstalk: 0,
   boldness: 0,
+  // Per-monitor rendering (M3): master flag plus per-monitor mode
+  // assignments keyed by the monitor's stable signature ("WxH|phys|dpi") →
+  // mode id ("rgb", "rwbg", ...). Absent = use the global mode.
+  perMonitorEnabled: false,
+  perMonitorModes: {},
 });
 
 // Screen Dimmer settings persisted in config. The backend needs these at
@@ -482,6 +487,8 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.lcd_filter_strength === 'number') textSettings.lcdFilterStrength = Math.max(0, Math.min(100, Math.round(cfg.lcd_filter_strength)));
     if (cfg && typeof cfg.crosstalk === 'number') textSettings.crosstalk = Math.max(0, Math.min(100, Math.round(cfg.crosstalk)));
     if (cfg && typeof cfg.boldness === 'number') textSettings.boldness = Math.max(0, Math.min(100, Math.round(cfg.boldness)));
+    if (cfg && typeof cfg.per_monitor_enabled === 'boolean') textSettings.perMonitorEnabled = cfg.per_monitor_enabled;
+    if (cfg && typeof cfg.per_monitor_modes === 'object' && cfg.per_monitor_modes) textSettings.perMonitorModes = { ...cfg.per_monitor_modes };
     if (cfg && typeof cfg.screen_protector_enabled === 'boolean') {
       screenDimmer.enabled = cfg.screen_protector_enabled;
     }
@@ -595,6 +602,8 @@ export function saveConfig() {
     lcd_filter_strength: textSettings.lcdFilterStrength,
     crosstalk: textSettings.crosstalk,
     boldness: textSettings.boldness,
+    per_monitor_enabled: textSettings.perMonitorEnabled,
+    per_monitor_modes: { ...textSettings.perMonitorModes },
     screen_protector_enabled: screenDimmer.enabled,
     screen_protector_seconds: screenDimmer.seconds,
     screen_protector_opacity: screenDimmer.opacity,

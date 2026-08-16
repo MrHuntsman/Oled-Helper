@@ -5,6 +5,7 @@ mod flyout_window;
 mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
+mod monitors;
 mod power;
 mod taskbar_dimmer;
 mod text_rendering;
@@ -1108,6 +1109,9 @@ pub fn run() {
             explorer_hook::explorer_hook_set_mode,
             explorer_hook::explorer_hook_set_enabled,
             explorer_hook::explorer_hook_set_render_knobs,
+            explorer_hook::explorer_hook_set_per_monitor,
+            explorer_hook::explorer_hook_set_monitor_mode,
+            explorer_hook::explorer_hook_monitors,
             explorer_hook::explorer_hook_status,
             flyout_window::set_flyout_hdr,
             flyout_window::flyout_frontend_ready,

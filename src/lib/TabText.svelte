@@ -104,6 +104,43 @@
       .catch((e) => console.warn('[text] explorer hook failed', e));
   }
 
+  // ── Per-monitor rendering (M3) ────────────────────────────────────────
+  // The connected monitors, from the backend's monitor-table enumeration.
+  let monitors = $state([]);
+
+  // Push the per-monitor toggle and all assignments to the backend so the
+  // hook's shared-memory table reflects the current config.
+  function syncPerMonitor() {
+    invoke('explorer_hook_set_per_monitor', { enabled: textSettings.perMonitorEnabled }).catch(() => {});
+    for (const [sig, mode] of Object.entries(textSettings.perMonitorModes)) {
+      invoke('explorer_hook_set_monitor_mode', { sig, mode }).catch(() => {});
+    }
+  }
+
+  function refreshMonitors() {
+    invoke('explorer_hook_monitors')
+      .then((list) => { monitors = list || []; })
+      .catch((e) => console.warn('[text] monitor list failed', e));
+  }
+
+  function onTogglePerMonitor() {
+    textSettings.perMonitorEnabled = !textSettings.perMonitorEnabled;
+    saveConfig();
+    syncPerMonitor();
+    if (textSettings.perMonitorEnabled) refreshMonitors();
+  }
+
+  function onMonitorModeChange(sig, mode) {
+    if (mode === 'global') delete textSettings.perMonitorModes[sig];
+    else textSettings.perMonitorModes[sig] = mode;
+    saveConfig();
+    invoke('explorer_hook_set_monitor_mode', { sig, mode }).catch(() => {});
+  }
+
+  function perMonitorModeFor(sig) {
+    return textSettings.perMonitorModes[sig] || 'global';
+  }
+
   function onToggleExplorerHook() {
     textSettings.explorerHookEnabled = !textSettings.explorerHookEnabled;
     saveConfig();
@@ -318,6 +355,8 @@
       await renderPreview();
     });
 
+    refreshMonitors();
+    syncPerMonitor();
     refreshHookStatus();
     const hookStatusPoll = setInterval(refreshHookStatus, 2000);
 
@@ -392,6 +431,53 @@
         </div>
       {/if}
     </div>
+  </div>
+
+  <div class="dimmer-control">
+    <div class="dimmer-control-heading">
+      <span class="hdr-control-title">
+        <span class="settings-row-label">Per-monitor rendering</span>
+        <span class="info-tip-wrap">
+          <button class="info-tip-btn" aria-label="About per-monitor rendering" tabindex="0">Info</button>
+          <span class="info-tip info-tip-right">
+            <span>
+              Use a different text rendering mode on each monitor — for example
+              RWBG on your WOLED and RGB on an LCD.<br>
+              <br>
+              Assignments are matched to the monitor's resolution, physical
+              size and DPI; a monitor that can't be identified falls back to
+              the global mode.
+            </span>
+          </span>
+        </span>
+      </span>
+    </div>
+    <p class="text-render-explorer-desc">Different monitors often have different subpixel layouts. When this is on, each draw is attributed to its monitor and rendered with that monitor's mode.</p>
+    <div class="text-render-explorer-actions">
+      <label class="text-render-explorer-toggle">
+        <input type="checkbox" checked={textSettings.perMonitorEnabled} onchange={onTogglePerMonitor} />
+        <span class="text-render-explorer-toggle-label">Use per-monitor modes</span>
+      </label>
+    </div>
+    {#if textSettings.perMonitorEnabled}
+      <div class="text-render-per-monitor-list">
+        {#each monitors as mon (mon.sig)}
+          <div class="text-render-per-monitor-row">
+            <span class="text-render-per-monitor-name">{mon.friendly_name || `Monitor ${mon.index + 1}`}{mon.primary ? ' · Primary' : ''}</span>
+            <span class="text-render-per-monitor-res">{mon.width}×{mon.height}</span>
+            <select class="text-render-per-monitor-select" value={perMonitorModeFor(mon.sig)} onchange={(e) => onMonitorModeChange(mon.sig, e.currentTarget.value)} aria-label="Mode for monitor {mon.index + 1}">
+              <option value="global">Global</option>
+              {#each MODES as m (m.id)}
+                <option value={m.id}>{m.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/each}
+        {#if monitors.length === 0}
+          <p class="text-render-per-monitor-empty">No monitors detected.</p>
+        {/if}
+      </div>
+    {/if}
   </div>
 
   <div class="text-render-preview-panel">

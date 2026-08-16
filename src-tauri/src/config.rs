@@ -53,6 +53,14 @@ pub struct AppConfig {
     // and the hook DLL is not injected unless the user enables it.
     #[serde(default)]
     pub explorer_hook_enabled: bool,
+    // Per-monitor rendering for the Explorer hook (Text tab): master flag plus
+    // per-monitor mode assignments keyed by the monitor's stable signature
+    // ("WxH|physWxphysH|dpiXxdpiY") → mode id string ("rgb", "rwbg", ...).
+    // Absent assignments = use the global mode.
+    #[serde(default)]
+    pub per_monitor_enabled: bool,
+    #[serde(default)]
+    pub per_monitor_modes: HashMap<String, String>,
     // Power tab screen protector: seconds of idle before the display fades
     // and stays dimmed until input (10–180 seconds). Enabled separately via
     // the Screen Dimmer title-section toggle.
@@ -189,6 +197,8 @@ impl Default for AppConfig {
             hide_calibration_interface: false,
             black_strip_gap_enabled: true,
             explorer_hook_enabled: false,
+            per_monitor_enabled: false,
+            per_monitor_modes: HashMap::new(),
             screen_protector_seconds: default_screen_protector_seconds(),
             screen_protector_enabled: false,
             screen_protector_opacity: default_screen_protector_opacity(),

@@ -36,10 +36,13 @@ use windows::core::{s, w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, LRESULT, WPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    GetCurrentObject, GetObjectW, GetTextAlign, GetTextColor, HDC, LOGFONTW, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    DIB_RGB_COLORS, ETO_OPTIONS, ETO_GLYPH_INDEX, ETO_PDY, OBJ_FONT, SRCCOPY, TA_BASELINE,
-    TA_BOTTOM, TA_CENTER, TA_RIGHT,
+    GetBkColor, GetCurrentObject, GetDeviceCaps, GetObjectW, GetTextAlign, GetTextColor,
+    HBITMAP, HDC, LOGFONTW, MonitorFromWindow, SelectObject, SetDIBitsToDevice, WindowFromDC,
+    AC_SRC_ALPHA,
+    AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
+    ETO_GLYPH_INDEX, ETO_OPAQUE, ETO_OPTIONS, ETO_PDY, HORZRES, HORZSIZE, LOGPIXELSX,
+    LOGPIXELSY, MONITOR_DEFAULTTONEAREST, OBJ_FONT, SRCCOPY, TA_BASELINE, TA_BOTTOM,
+    TA_CENTER, TA_RIGHT, VERTRES, VERTSIZE, HMONITOR, GET_DEVICE_CAPS_INDEX,
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -59,18 +62,25 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 
-// Shared memory layout (24 bytes): the app writes the mode at offset 0 and
+// Shared memory layout (192 bytes): the app writes the mode at offset 0 and
 // the three render knobs (filter strength, crosstalk, boldness) at 12/16/20;
 // the DLL writes its own state back at offsets 4 and 8 so the app can verify
 // the hook is really installed in the CURRENT explorer.exe instead of
-// trusting that the module merely loaded.
+// trusting that the module merely loaded. The per-monitor table lives at
+// 24/28/32+ (flag, count, up to 8 entries x 20 bytes) — see
+// resolve_draw_mode.
 const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
 const STATE_LCD_STRENGTH: usize = 12;
 const STATE_CROSSTALK: usize = 16;
 const STATE_BOLDNESS: usize = 20;
-const STATE_SIZE: usize = 24;
+const STATE_PER_MONITOR: usize = 24;
+const STATE_MONITOR_COUNT: usize = 28;
+const STATE_MONITORS: usize = 32;
+const STATE_SIZE: usize = 192;
+const MONITOR_ENTRY_STRIDE: usize = 20;
+const MAX_MONITORS: usize = 8;
 // Status bit written by the DLL once the ExtTextOutW detour is installed.
 const STATUS_HOOK_INSTALLED: u32 = 1;
 
@@ -111,6 +121,10 @@ static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static LOG_START: OnceLock<Instant> = OnceLock::new();
 static PROC_NAME: OnceLock<String> = OnceLock::new();
 static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
+// Count of draws that took the opaque (ETO_OPAQUE) fast path — the plain
+// buffer + SetDIBitsToDevice route. Exposed in the verbose log so we can see
+// how much of Explorer's text is opaque (list views etc.).
+static OPAQUE_DRAWS: AtomicU32 = AtomicU32::new(0);
 
 fn proc_name() -> &'static str {
     PROC_NAME.get_or_init(process_base_name).as_str()
@@ -167,6 +181,114 @@ fn state_render_options() -> text_raster::RenderOptions {
         crosstalk: state_knob(STATE_CROSSTALK, 0),
         boldness: state_knob(STATE_BOLDNESS, 0),
     }
+}
+
+// ── Per-monitor mode resolution ───────────────────────────────────────
+// The app writes a monitor table (system-wide HMONITOR handles + device-caps
+// signatures + per-monitor mode) into the shared memory. Each draw's DC is
+// attributed to a monitor and rendered with that monitor's mode. Window DCs
+// match by HMONITOR (MonitorFromWindow); memory DCs have no window, so they
+// match by the device-caps signature (resolution + physical size + DPI). The
+// counters show in the verbose log which attribution path fired.
+
+static MON_WINDOW: AtomicU32 = AtomicU32::new(0);
+static MON_CAPS: AtomicU32 = AtomicU32::new(0);
+static MON_NONE: AtomicU32 = AtomicU32::new(0);
+
+fn state_per_monitor_enabled() -> bool {
+    // SAFETY: STATE is written once in map_state; the mapped view stays valid
+    // for the lifetime of the process.
+    unsafe {
+        STATE.get()
+            .map(|addr| *((addr + STATE_PER_MONITOR) as *const u32) != 0)
+            .unwrap_or(false)
+    }
+}
+
+fn state_monitor_count() -> usize {
+    // SAFETY: as above; the count is clamped so a stale app build cannot make
+    // us read past the mapping.
+    unsafe {
+        STATE.get()
+            .map(|addr| (*((addr + STATE_MONITOR_COUNT) as *const u32) as usize).min(MAX_MONITORS))
+            .unwrap_or(0)
+    }
+}
+
+// Entry i as (hmonitor, resolution, physical size, dpi, mode | flags<<8).
+// Offsets within an entry are all 4-aligned (STATE_MONITORS is 32).
+fn state_monitor_entry(i: usize) -> Option<(u32, u32, u32, u32, u32)> {
+    if i >= state_monitor_count() {
+        return None;
+    }
+    // SAFETY: STATE is valid for the process lifetime and the index is
+    // clamped to the written count (<= MAX_MONITORS).
+    unsafe {
+        let base = STATE.get()? + STATE_MONITORS + i * MONITOR_ENTRY_STRIDE;
+        Some((
+            *((base) as *const u32),
+            *((base + 4) as *const u32),
+            *((base + 8) as *const u32),
+            *((base + 12) as *const u32),
+            *((base + 16) as *const u32),
+        ))
+    }
+}
+
+// Device-caps signature of an HDC, packed exactly like the app's table
+// entries so memory-DC draws can be matched when no window is available.
+fn hdc_caps_sig(hdc: HDC) -> (u32, u32, u32) {
+    unsafe {
+        let caps = |index: GET_DEVICE_CAPS_INDEX| GetDeviceCaps(Some(hdc), index).max(0) as u32;
+        (
+            (caps(HORZRES) & 0xFFFF) | (caps(VERTRES) << 16),
+            (caps(HORZSIZE) & 0xFFFF) | (caps(VERTSIZE) << 16),
+            (caps(LOGPIXELSX) & 0xFFFF) | (caps(LOGPIXELSY) << 16),
+        )
+    }
+}
+
+// Per-monitor mode for this draw's DC, when per-monitor is enabled and the
+// DC resolves to a monitor with an assigned mode. An entry with mode 0 means
+// "use global" → None; a monitor that cannot be attributed also yields None
+// (caller falls back to the global mode).
+fn resolve_draw_mode(hdc: HDC) -> Option<u32> {
+    let count = state_monitor_count();
+    if count == 0 {
+        return None;
+    }
+    let mode_of = |mode_flags: u32| -> Option<u32> {
+        let mode = mode_flags & 0xFF;
+        if mode == 0 { None } else { Some(mode) }
+    };
+    // 1. Window DC: HWND → monitor → exact HMONITOR match.
+    let hwnd = unsafe { WindowFromDC(hdc) };
+    if !hwnd.0.is_null() {
+        let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if !hmon.0.is_null() {
+            let want = hmon.0 as usize as u32;
+            for i in 0..count {
+                if let Some((h, _, _, _, mf)) = state_monitor_entry(i) {
+                    if h == want {
+                        MON_WINDOW.fetch_add(1, Ordering::Relaxed);
+                        return mode_of(mf);
+                    }
+                }
+            }
+        }
+    }
+    // 2. Memory DC: match the device-caps signature against the table.
+    let (res, phys, dpi) = hdc_caps_sig(hdc);
+    for i in 0..count {
+        if let Some((_, er, ep, ed, mf)) = state_monitor_entry(i) {
+            if er == res && ep == phys && ed == dpi {
+                MON_CAPS.fetch_add(1, Ordering::Relaxed);
+                return mode_of(mf);
+            }
+        }
+    }
+    MON_NONE.fetch_add(1, Ordering::Relaxed);
+    None
 }
 
 fn report_state(status: u32) {
@@ -294,25 +416,9 @@ fn run_bounds(run: &text_raster::RasterizedText) -> Option<(i32, i32, i32, i32)>
     Some((min_left, min_top, (max_right - min_left).max(1), (max_bottom - min_top).max(1)))
 }
 
-// Alpha-blend the rasterized run into the HDC at the text reference point,
-// honoring the HDC's text alignment. Transparent background only (opaque /
-// ETO_OPAQUE handled in a later pass).
-unsafe fn blit_run(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    run: &text_raster::RasterizedText,
-    color: (u8, u8, u8),
-) -> bool {
-    let Some((min_left, min_top, w, h)) = run_bounds(run) else {
-        return true; // empty run, nothing to draw
-    };
-    // A malformed glyph position must never produce a giant allocation.
-    if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
-        return false;
-    }
-
-    // Build a 32bpp BGRA DIB section.
+/// Create a 32bpp top-down DIB section of w×h and return it with its pixel
+/// pointer, or None on any failure (caller frees nothing then).
+unsafe fn create_dib_section(hdc: HDC, w: i32, h: i32) -> Option<(HBITMAP, *mut u8)> {
     let mut bmi = BITMAPINFO::default();
     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
     bmi.bmiHeader.biWidth = w;
@@ -323,17 +429,40 @@ unsafe fn blit_run(
     let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
     let hbitmap = match CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
         Ok(hb) => hb,
-        Err(_) => return false,
+        Err(_) => return None,
     };
     if hbitmap.is_invalid() || bits.is_null() {
         if !hbitmap.is_invalid() {
             let _ = DeleteObject(hbitmap.into());
         }
+        return None;
+    }
+    Some((hbitmap, bits as *mut u8))
+}
+
+// Render the rasterized run into the HDC at the text reference point,
+// honoring the HDC's text alignment. Two paths:
+//  - ETO_OPAQUE: the destination under the text is guaranteed to be the solid
+//    background color, so the run is composited over GetBkColor into a plain
+//    heap buffer and written with a single SetDIBitsToDevice — no DIB, no DC,
+//    no AlphaBlend, and (for subpixel) no destination read-back.
+//  - transparent: per-run DIB + AlphaBlend (Mask) / background read-back
+//    blend (Subpixel).
+unsafe fn blit_run(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    run: &text_raster::RasterizedText,
+    color: (u8, u8, u8),
+    opaque: bool,
+) -> bool {
+    let Some((min_left, min_top, w, h)) = run_bounds(run) else {
+        return true; // empty run, nothing to draw
+    };
+    // A malformed glyph position must never produce a giant allocation.
+    if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
         return false;
     }
-
-    let memdc = CreateCompatibleDC(Some(hdc));
-    let old = SelectObject(memdc, hbitmap.into());
 
     // Translate the reference point to the run origin using text alignment.
     let align = GetTextAlign(hdc);
@@ -354,7 +483,22 @@ unsafe fn blit_run(
     let dest_x = origin_x + min_left;
     let dest_y = origin_y + min_top;
 
-    let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
+    if opaque {
+        OPAQUE_DRAWS.fetch_add(1, Ordering::Relaxed);
+        return blit_opaque(hdc, dest_x, dest_y, w, h, min_left, min_top, run, color);
+    }
+
+    // ── Transparent background: per-run DIB + AlphaBlend / read-back ──
+    let Some((hbitmap, bits)) = create_dib_section(hdc, w, h) else {
+        return false;
+    };
+    let memdc = CreateCompatibleDC(Some(hdc));
+    if memdc.is_invalid() {
+        let _ = DeleteObject(hbitmap.into());
+        return false;
+    }
+    let _ = SelectObject(memdc, hbitmap.into());
+    let buf = std::slice::from_raw_parts_mut(bits, (w * h * 4) as usize);
 
     let ok = match run.content {
         // Grayscale/crisp: composite coverage into a fresh DIB as premultiplied
@@ -396,6 +540,9 @@ unsafe fn blit_run(
         // against its own coverage, and write the result back. This is the
         // per-channel compositing ClearType uses for its colored fringes.
         Content::SubpixelMask => {
+            // Zero first so a clipped or partial background read leaves black
+            // rather than garbage pixels.
+            buf.fill(0);
             let read_ok = BitBlt(memdc, 0, 0, w, h, Some(hdc), dest_x, dest_y, SRCCOPY).is_ok();
             if !read_ok {
                 false
@@ -428,10 +575,129 @@ unsafe fn blit_run(
         Content::Color => false,
     };
 
-    let _ = SelectObject(memdc, old);
-    let _ = DeleteObject(hbitmap.into());
+    // DC first so the bitmap is deselected before DeleteObject (which refuses
+    // to delete a selected object).
     let _ = DeleteDC(memdc);
+    let _ = DeleteObject(hbitmap.into());
     ok
+}
+
+// Opaque fast path (ETO_OPAQUE): the destination under the text is the solid
+// background color, so composite over GetBkColor into a plain heap buffer and
+// write it with one SetDIBitsToDevice call. The result is fully opaque —
+// nothing to alpha-blend, and no DIB/DC objects to create or destroy. For
+// subpixel this also skips the destination read-back entirely: the background
+// is known, not read.
+unsafe fn blit_opaque(
+    hdc: HDC,
+    dest_x: i32,
+    dest_y: i32,
+    w: i32,
+    h: i32,
+    min_left: i32,
+    min_top: i32,
+    run: &text_raster::RasterizedText,
+    color: (u8, u8, u8),
+) -> bool {
+    // COLORREF is 0x00BBGGRR (same layout as the text color).
+    let bk = unsafe { GetBkColor(hdc) }.0;
+    let bk_r = (bk & 0xFF) as u8;
+    let bk_g = ((bk >> 8) & 0xFF) as u8;
+    let bk_b = ((bk >> 16) & 0xFF) as u8;
+
+    let mut buf = vec![0u8; (w * h * 4) as usize];
+    // Base layer = the solid background color, fully opaque — exactly what GDI
+    // paints for an ETO_OPAQUE fill before the text.
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = bk_b;
+        px[1] = bk_g;
+        px[2] = bk_r;
+        px[3] = 255;
+    }
+
+    let ok = match run.content {
+        // Grayscale/crisp: each coverage sample lerps the text color toward
+        // the background color.
+        Content::Mask => {
+            for g in &run.glyphs {
+                let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
+                let dst_top = g.y.floor() as i32 - g.bitmap_top - min_top;
+                for row in 0..g.height as usize {
+                    for col in 0..g.width as usize {
+                        let c = g.coverage[row * g.width as usize + col];
+                        if c == 0 {
+                            continue;
+                        }
+                        let dx = dst_left as usize + col;
+                        let dy = dst_top as usize + row;
+                        if dx >= w as usize || dy >= h as usize {
+                            continue;
+                        }
+                        let i = (dy * w as usize + dx) * 4;
+                        buf[i] = blend_channel(color.2, bk_b, c); // B
+                        buf[i + 1] = blend_channel(color.1, bk_g, c); // G
+                        buf[i + 2] = blend_channel(color.0, bk_r, c); // R
+                        buf[i + 3] = 255;
+                    }
+                }
+            }
+            true
+        }
+        // Subpixel: blend each color channel against its own coverage over the
+        // solid background — no destination read-back needed.
+        Content::SubpixelMask => {
+            for g in &run.glyphs {
+                let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
+                let dst_top = g.y.floor() as i32 - g.bitmap_top - min_top;
+                for row in 0..g.height as usize {
+                    for col in 0..g.width as usize {
+                        let dx = dst_left as usize + col;
+                        let dy = dst_top as usize + row;
+                        if dx >= w as usize || dy >= h as usize {
+                            continue;
+                        }
+                        let src = (row * g.width as usize + col) * 4;
+                        let rc = g.coverage[src];
+                        let gc = g.coverage[src + 1];
+                        let bc = g.coverage[src + 2];
+                        let i = (dy * w as usize + dx) * 4;
+                        buf[i] = blend_channel(color.2, bk_b, bc); // B
+                        buf[i + 1] = blend_channel(color.1, bk_g, gc); // G
+                        buf[i + 2] = blend_channel(color.0, bk_r, rc); // R
+                        buf[i + 3] = 255;
+                    }
+                }
+            }
+            true
+        }
+        Content::Color => false,
+    };
+    if !ok {
+        return false;
+    }
+
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // negative = top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    // Returns the number of scanlines written; 0 (or fewer than h) on failure.
+    SetDIBitsToDevice(
+        hdc,
+        dest_x,
+        dest_y,
+        w as u32,
+        h as u32,
+        0,
+        0,
+        0,
+        h as u32,
+        buf.as_ptr() as *const core::ffi::c_void,
+        &bmi,
+        DIB_RGB_COLORS,
+    ) == h
 }
 
 // ── Detour ────────────────────────────────────────────────────────────
@@ -453,7 +719,15 @@ unsafe extern "system" fn try_render_swash(
     count: u32,
     dx: *const i32,
 ) -> bool {
-    let mode = state_mode();
+    let global_mode = state_mode();
+    // Per-monitor mode selection: when enabled, attribute this draw's DC to
+    // a monitor and use its assigned mode; unassigned or unattributable
+    // draws fall back to the global mode.
+    let mode = if state_per_monitor_enabled() && global_mode != 0 {
+        resolve_draw_mode(hdc).unwrap_or(global_mode)
+    } else {
+        global_mode
+    };
     let render_mode = match mode {
         1 => text_raster::RenderMode::Grayscale,
         2 => text_raster::RenderMode::Crisp,
@@ -483,7 +757,7 @@ unsafe extern "system" fn try_render_swash(
     }
     // ETO_GLYPH_INDEX: the string is an array of glyph indices, not UTF-16.
     if options.0 & ETO_GLYPH_INDEX.0 != 0 {
-        return try_render_glyph_indices(hdc, x, y, string, count, dx, render_mode);
+        return try_render_glyph_indices(hdc, x, y, options, string, count, dx, render_mode);
     }
     if options.0 & ETO_PDY.0 != 0 {
         return fallback(&format!("ETO_PDY (options={:#x})", options.0));
@@ -508,13 +782,18 @@ unsafe extern "system" fn try_render_swash(
     };
 
     if verbose {
+        let (hits, misses, entries) = text_raster::glyph_cache_stats();
         log(&format!(
-            "render #{n}: px={px} glyphs={} -> blit",
-            run.glyphs.len()
+            "render #{n}: px={px} glyphs={} -> blit (cache hits={hits} misses={misses} entries={entries} | opaque={} mon w={} c={} n={})",
+            run.glyphs.len(),
+            OPAQUE_DRAWS.load(Ordering::Relaxed),
+            MON_WINDOW.load(Ordering::Relaxed),
+            MON_CAPS.load(Ordering::Relaxed),
+            MON_NONE.load(Ordering::Relaxed)
         ));
     }
     let color = text_color_rgb(hdc);
-    blit_run(hdc, x, y, &run, color)
+    blit_run(hdc, x, y, &run, color, options.0 & ETO_OPAQUE.0 != 0)
 }
 
 // Resolve the font selected into the HDC to (file bytes, pixel size). Shared
@@ -559,6 +838,7 @@ unsafe fn try_render_glyph_indices(
     hdc: HDC,
     x: i32,
     y: i32,
+    options: ETO_OPTIONS,
     string: PCWSTR,
     count: u32,
     dx: *const i32,
@@ -604,13 +884,18 @@ unsafe fn try_render_glyph_indices(
     };
 
     if verbose {
+        let (hits, misses, entries) = text_raster::glyph_cache_stats();
         log(&format!(
-            "render #{n}: glyph-index px={px} glyphs={} -> blit",
-            run.glyphs.len()
+            "render #{n}: glyph-index px={px} glyphs={} -> blit (cache hits={hits} misses={misses} entries={entries} | opaque={} mon w={} c={} n={})",
+            run.glyphs.len(),
+            OPAQUE_DRAWS.load(Ordering::Relaxed),
+            MON_WINDOW.load(Ordering::Relaxed),
+            MON_CAPS.load(Ordering::Relaxed),
+            MON_NONE.load(Ordering::Relaxed)
         ));
     }
     let color = text_color_rgb(hdc);
-    blit_run(hdc, x, y, &run, color)
+    blit_run(hdc, x, y, &run, color, options.0 & ETO_OPAQUE.0 != 0)
 }
 
 // Re-entrancy guard: gdi32!ExtTextOutW calls back into itself internally, so

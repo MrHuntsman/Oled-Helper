@@ -29,17 +29,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use windows::Win32::Devices::Display::{
-    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QueryDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-    DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo,
+    DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
     DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SDR_WHITE_LEVEL, DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY, QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SDR_WHITE_LEVEL,
+    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
 };
-use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID, WIN32_ERROR,
-};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LUID, WIN32_ERROR};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
 };
@@ -54,63 +50,12 @@ use windows::Win32::System::Registry::{
     REG_VALUE_TYPE,
 };
 
+use crate::monitors::{query_active_paths, target_device_name, target_monitor_name};
+
 #[derive(serde::Serialize, Clone, Copy, PartialEq, Eq)]
 pub struct HdrCapability {
     pub supported: bool,
     pub enabled: bool,
-}
-
-fn query_active_paths(
-) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
-    const MAX_TOPOLOGY_RETRIES: usize = 4;
-    unsafe {
-        for attempt in 0..=MAX_TOPOLOGY_RETRIES {
-            let mut path_count: u32 = 0;
-            let mut mode_count: u32 = 0;
-            let sizes_result = GetDisplayConfigBufferSizes(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut path_count,
-                &mut mode_count,
-            );
-            if sizes_result != ERROR_SUCCESS {
-                return Err(format!(
-                    "GetDisplayConfigBufferSizes failed: {sizes_result:?}"
-                ));
-            }
-
-            let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> =
-                vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-            let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> =
-                vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-
-            let query_result = QueryDisplayConfig(
-                QDC_ONLY_ACTIVE_PATHS,
-                &mut path_count,
-                paths.as_mut_ptr(),
-                &mut mode_count,
-                modes.as_mut_ptr(),
-                None,
-            );
-
-            // Topology can change between the size query and the fetch (e.g. a
-            // display waking up); retry once more if the buffer is now too small.
-            if query_result == ERROR_INSUFFICIENT_BUFFER {
-                if attempt == MAX_TOPOLOGY_RETRIES {
-                    return Err("display topology kept changing while querying HDR state".into());
-                }
-                std::thread::yield_now();
-                continue;
-            }
-            if query_result != ERROR_SUCCESS {
-                return Err(format!("QueryDisplayConfig failed: {query_result:?}"));
-            }
-
-            paths.truncate(path_count as usize);
-            modes.truncate(mode_count as usize);
-            return Ok((paths, modes));
-        }
-        Err("unable to query active display paths".into())
-    }
 }
 
 fn get_advanced_color_info(
@@ -581,35 +526,6 @@ fn color_encoding_label(enc: DISPLAYCONFIG_COLOR_ENCODING) -> &'static str {
         DISPLAYCONFIG_COLOR_ENCODING_YCBCR420 => "YCbCr 4:2:0",
         DISPLAYCONFIG_COLOR_ENCODING_INTENSITY => "Intensity",
         _ => "Unknown",
-    }
-}
-
-// Friendly monitor name from a CCD target (trimmed UTF-16, no padding).
-fn target_monitor_name(name: &DISPLAYCONFIG_TARGET_DEVICE_NAME) -> String {
-    let end = name
-        .monitorFriendlyDeviceName
-        .iter()
-        .position(|&c| c == 0)
-        .unwrap_or(name.monitorFriendlyDeviceName.len());
-    String::from_utf16_lossy(&name.monitorFriendlyDeviceName[..end])
-}
-
-fn target_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_TARGET_DEVICE_NAME> {
-    unsafe {
-        let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME {
-            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-                size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
-                adapterId: path.targetInfo.adapterId,
-                id: path.targetInfo.id,
-            },
-            ..Default::default()
-        };
-        let result = DisplayConfigGetDeviceInfo(&mut name.header);
-        if WIN32_ERROR(result as u32) != ERROR_SUCCESS {
-            return None;
-        }
-        Some(name)
     }
 }
 
