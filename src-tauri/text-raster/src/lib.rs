@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use swash::proxy::MetricsProxy;
 pub use swash::scale::image::Content;
+use swash::scale::image::Image;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::shape::{Direction, ShapeContext};
 use swash::text::Script;
@@ -56,12 +57,15 @@ pub struct RenderOptions {
     /// spread (100) that smears the fringe over more subpixels. 0 = the
     /// historical lcddefault. Only affects subpixel modes.
     pub filter_width: u8,
-    /// Custom subpixel centers (R, G, B) as fractions of a pixel, used only
-    /// when `mode == RenderMode::Custom`. None = the mode's default layout.
-    /// Lets the user tune a panel's physical subpixel geometry against the
-    /// live preview (the WOLED quad and QD-OLED layouts are just fixed
-    /// presets of the same mechanism).
-    pub subpixel_offsets: Option<[f32; 3]>,
+    /// Custom subpixel centers (R, G, B) as per-channel (x, y) fractions of
+    /// a pixel, used only when `mode == RenderMode::Custom`. None = the
+    /// mode's default layout. Lets the user tune a panel's physical subpixel
+    /// geometry against the live preview (the WOLED quad and QD-OLED layouts
+    /// are just fixed presets of the same mechanism). Horizontal-only layouts
+    /// (all y = 0) reuse swash's native 1D subpixel path; any vertical
+    /// component is rendered as three per-channel alpha passes shifted by
+    /// that channel's (x, y).
+    pub subpixel_offsets: Option<[[f32; 2]; 3]>,
 }
 
 impl Default for RenderOptions {
@@ -146,16 +150,53 @@ fn mode_format(mode: RenderMode) -> (Format, Content) {
     }
 }
 
-/// The swash format for a render: the mode's layout, or the user's custom
-/// subpixel centers when mode is Custom and offsets are present.
+/// The swash format for a 1D render: the mode's layout, or the user's custom
+/// x-centers when mode is Custom and offsets are present. Layouts with any
+/// vertical component never reach here — `custom_2d_offsets` routes them to
+/// the three-pass path — so only the x components are the native centers.
 fn render_format(mode: RenderMode, opts: RenderOptions) -> Format {
     let (format, _) = mode_format(mode);
     if mode == RenderMode::Custom {
         if let Some(offsets) = opts.subpixel_offsets {
-            return Format::CustomSubpixel(offsets);
+            return Format::CustomSubpixel([offsets[0][0], offsets[1][0], offsets[2][0]]);
         }
     }
     format
+}
+
+/// The effective custom subpixel centers when a render must use the 2D
+/// three-pass path: the mode is Custom, offsets are supplied, and at least
+/// one channel has a vertical component (swash's native subpixel rasterizer
+/// only supports per-channel x offsets).
+fn custom_2d_offsets(mode: RenderMode, opts: RenderOptions) -> Option<[[f32; 2]; 3]> {
+    if mode != RenderMode::Custom {
+        return None;
+    }
+    let offsets = opts.subpixel_offsets?;
+    if offsets.iter().any(|[_, y]| *y != 0.0) {
+        Some(offsets)
+    } else {
+        None
+    }
+}
+
+/// Subpixel phase quantum: 1/16 of a pixel. The character path's pen position
+/// carries an arbitrary fractional phase; snapping it to sixteenths collapses
+/// that continuum into 16 buckets (imperceptible at render time) so repeated
+/// draws at nearby x positions share glyph-cache entries instead of
+/// re-rasterizing a slightly different phase every time.
+const PHASE_QUANTUM: f32 = 1.0 / 16.0;
+
+/// Quantize a subpixel phase to [`PHASE_QUANTUM`], wrapping a value that
+/// rounds up to exactly 1.0 back to 0 so the phase stays in [0, 1) and the
+/// cache key is canonical.
+fn quantize_phase(v: f32) -> f32 {
+    let snapped = (v / PHASE_QUANTUM).round() * PHASE_QUANTUM;
+    if snapped >= 1.0 {
+        snapped - 1.0
+    } else {
+        snapped
+    }
 }
 
 /// FreeType's `lcddefault` filter weights (sum 272, slightly over-unity to
@@ -338,10 +379,14 @@ struct GlyphCacheKey {
     damping: u8,
     filter_width: u8,
     /// Custom subpixel center bits (0 when unused) — tuned offsets must not
-    /// share cache entries with the fixed layouts.
-    sub_r: u32,
-    sub_g: u32,
-    sub_b: u32,
+    /// share cache entries with the fixed layouts. All six (x, y) offsets are
+    /// carried so a 2D layout never collides with a horizontal-only one.
+    sub_rx: u32,
+    sub_ry: u32,
+    sub_gx: u32,
+    sub_gy: u32,
+    sub_bx: u32,
+    sub_by: u32,
 }
 
 /// The rasterized bitmap for one glyph (position-independent).
@@ -456,9 +501,11 @@ fn glyph_cache_key(
     mode: RenderMode,
     opts: RenderOptions,
 ) -> GlyphCacheKey {
-    let (sub_r, sub_g, sub_b) = match opts.subpixel_offsets {
-        Some([r, g, b]) => (r.to_bits(), g.to_bits(), b.to_bits()),
-        None => (0, 0, 0),
+    let (sub_rx, sub_ry, sub_gx, sub_gy, sub_bx, sub_by) = match opts.subpixel_offsets {
+        Some([[rx, ry], [gx, gy], [bx, by]]) => {
+            (rx.to_bits(), ry.to_bits(), gx.to_bits(), gy.to_bits(), bx.to_bits(), by.to_bits())
+        }
+        None => (0, 0, 0, 0, 0, 0),
     };
     GlyphCacheKey {
         font: font_ptr,
@@ -474,9 +521,12 @@ fn glyph_cache_key(
         gamma: opts.gamma,
         damping: opts.damping,
         filter_width: opts.filter_width,
-        sub_r,
-        sub_g,
-        sub_b,
+        sub_rx,
+        sub_ry,
+        sub_gx,
+        sub_gy,
+        sub_bx,
+        sub_by,
     }
 }
 
@@ -524,6 +574,12 @@ fn rasterize_glyph_uncached(
     mode: RenderMode,
     opts: RenderOptions,
 ) -> GlyphResult {
+    // A custom layout with any vertical component cannot use swash's native
+    // subpixel rasterizer (its offsets are x-only): render three per-channel
+    // alpha passes instead and combine them into one RGBA buffer.
+    if let Some(offsets) = custom_2d_offsets(mode, opts) {
+        return rasterize_glyph_2d(scaler, key, glyph_id, offset, embolden, offsets, opts);
+    }
     let sources = [
         Source::ColorOutline(0),
         Source::ColorBitmap(StrikeWith::BestFit),
@@ -557,17 +613,33 @@ fn rasterize_glyph_uncached(
     }
     let mut data = image.data;
     if matches!(image.content, Content::SubpixelMask) {
-        apply_lcd_filter(
-            &mut data,
-            image.placement.width,
-            image.placement.height,
-            opts.lcd_strength,
-            opts.filter_width,
-        );
-        apply_crosstalk(&mut data, image.placement.width, image.placement.height, opts.crosstalk);
-        apply_gamma(&mut data, image.placement.width, image.placement.height, opts.gamma);
-        apply_damping(&mut data, image.placement.width, image.placement.height, opts.damping);
+        postprocess_subpixel(&mut data, image.placement.width, image.placement.height, opts);
     }
+    let glyph = finish_glyph(key, image.placement.left, image.placement.top, image.placement.width, image.placement.height, data, mode);
+    GlyphResult::Rendered(glyph)
+}
+
+/// The subpixel post-processing knobs shared by the native and 2D paths. All
+/// four operate on a 4-byte-per-pixel RGBA buffer and only affect subpixel
+/// coverage (callers gate on `Content::SubpixelMask`).
+fn postprocess_subpixel(data: &mut [u8], width: u32, height: u32, opts: RenderOptions) {
+    apply_lcd_filter(data, width, height, opts.lcd_strength, opts.filter_width);
+    apply_crosstalk(data, width, height, opts.crosstalk);
+    apply_gamma(data, width, height, opts.gamma);
+    apply_damping(data, width, height, opts.damping);
+}
+
+/// Finalize a rendered glyph: apply the crisp threshold when the mode is
+/// Crisp, then wrap it into a cache entry and store it.
+fn finish_glyph(
+    key: GlyphCacheKey,
+    bitmap_left: i32,
+    bitmap_top: i32,
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+    mode: RenderMode,
+) -> Arc<CachedGlyph> {
     let coverage: Arc<[u8]> = match mode {
         RenderMode::Crisp => data
             .into_iter()
@@ -577,13 +649,89 @@ fn rasterize_glyph_uncached(
         _ => data.into(),
     };
     let glyph = Arc::new(CachedGlyph {
-        bitmap_left: image.placement.left,
-        bitmap_top: image.placement.top,
-        width: image.placement.width,
-        height: image.placement.height,
+        bitmap_left,
+        bitmap_top,
+        width,
+        height,
         coverage,
     });
     cache_insert(key, glyph.clone());
+    glyph
+}
+
+/// Render a custom 2D subpixel glyph: three per-channel alpha passes, each
+/// shifted by that channel's (x, y) center, combined into one 4-byte-per-pixel
+/// RGBA buffer. The three placements are unioned so the per-channel vertical
+/// shifts can enlarge the bitmap by a pixel. Color/bitmap strikes cannot be
+/// split into channel passes, so they bail (the caller falls back to GDI).
+fn rasterize_glyph_2d(
+    scaler: &mut swash::scale::Scaler,
+    key: GlyphCacheKey,
+    glyph_id: u16,
+    phase: Vector,
+    embolden: f32,
+    offsets: [[f32; 2]; 3],
+    opts: RenderOptions,
+) -> GlyphResult {
+    let sources = [
+        Source::ColorOutline(0),
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::Outline,
+    ];
+    let mut passes: Vec<Image> = Vec::with_capacity(3);
+    for [cx, cy] in offsets {
+        let mut render = Render::new(&sources);
+        render.format(Format::Alpha);
+        render.offset(Vector::new(phase.x + cx, phase.y + cy));
+        if embolden > 0.0 {
+            render.embolden(embolden);
+        }
+        let Some(image) = render.render(scaler, glyph_id) else {
+            return GlyphResult::Skip;
+        };
+        if image.content != Content::Mask {
+            // Color/bitmap content has no per-channel alpha to split.
+            return GlyphResult::Unsupported;
+        }
+        if image.placement.width == 0 || image.placement.height == 0 {
+            // Empty glyph (space/separator): draw nothing, like the native path.
+            return GlyphResult::Skip;
+        }
+        passes.push(image);
+    }
+    // Union the three placements (each vertical shift can move a pass's top
+    // by a pixel) into one tight buffer.
+    let min_left = passes.iter().map(|p| p.placement.left).min().unwrap();
+    let min_top = passes.iter().map(|p| p.placement.top).min().unwrap();
+    let max_right = passes
+        .iter()
+        .map(|p| p.placement.left + p.placement.width as i32)
+        .max()
+        .unwrap();
+    let max_bottom = passes
+        .iter()
+        .map(|p| p.placement.top + p.placement.height as i32)
+        .max()
+        .unwrap();
+    let width = (max_right - min_left).max(1) as u32;
+    let height = (max_bottom - min_top).max(1) as u32;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+    for (c, pass) in passes.iter().enumerate() {
+        let dx = (pass.placement.left - min_left) as usize;
+        let dy = (pass.placement.top - min_top) as usize;
+        for row in 0..pass.placement.height as usize {
+            let src_row = row * pass.placement.width as usize;
+            let dst_row = (dy + row) * width as usize;
+            for col in 0..pass.placement.width as usize {
+                let cov = pass.data[src_row + col];
+                if cov != 0 {
+                    data[(dst_row + dx + col) * 4 + c] = cov;
+                }
+            }
+        }
+    }
+    postprocess_subpixel(&mut data, width, height, opts);
+    let glyph = finish_glyph(key, min_left, min_top, width, height, data, RenderMode::Custom);
     GlyphResult::Rendered(glyph)
 }
 
@@ -682,9 +830,10 @@ pub fn rasterize(
             // glyphs), so accumulate the advance into a pen to position each
             // glyph; marks already carry their base-relative x.
             let gx = pen + glyph.x;
-            // Fractional subpixel phase for this glyph. Grayscale still applies
-            // it so coverage lands smoothly; crisp is thresholded afterward.
-            let offset = Vector::new(gx.fract(), glyph.y.fract());
+            // Fractional subpixel phase for this glyph, quantized to 1/16 px so
+            // nearby draws hit the cache. Grayscale still applies it so
+            // coverage lands smoothly; crisp is thresholded afterward.
+            let offset = Vector::new(quantize_phase(gx.fract()), quantize_phase(glyph.y.fract()));
             match rasterize_glyph_cached(
                 &mut scaler,
                 font_ptr,
@@ -1041,7 +1190,7 @@ mod tests {
             "A",
             RenderMode::Custom,
             RenderOptions {
-                subpixel_offsets: Some([-0.5, 0.0, 0.5]),
+                subpixel_offsets: Some([[-0.5, 0.0], [0.0, 0.0], [0.5, 0.0]]),
                 ..RenderOptions::default()
             },
         )
@@ -1053,6 +1202,82 @@ mod tests {
         let b = &default.glyphs[0].coverage;
         assert!(a.len() == b.len(), "same glyph size at same px");
         assert!(a != b, "different offsets must change the fringe");
+    }
+
+    #[test]
+    fn custom_subpixel_2d_offsets_are_honored() {
+        let Some(font) = load_test_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        // A vertical component forces the three-pass path instead of swash's
+        // native 1D subpixel rasterization (which only supports per-channel x).
+        // "A B" also exercises the empty-glyph (space) path so a space can't
+        // abort the whole run.
+        let flat = rasterize(
+            &font,
+            0,
+            16.0,
+            "A B",
+            RenderMode::Custom,
+            RenderOptions {
+                subpixel_offsets: Some([[-0.375, 0.0], [-0.125, 0.0], [0.375, 0.0]]),
+                ..RenderOptions::default()
+            },
+        )
+        .expect("font parses");
+        let shifted = rasterize(
+            &font,
+            0,
+            16.0,
+            "A B",
+            RenderMode::Custom,
+            RenderOptions {
+                subpixel_offsets: Some([[-0.375, 0.25], [-0.125, 0.0], [0.375, -0.25]]),
+                ..RenderOptions::default()
+            },
+        )
+        .expect("font parses");
+        assert_eq!(shifted.content, Content::SubpixelMask);
+        assert_eq!(shifted.glyphs.len(), 2, "the space glyph must be skipped");
+        let g = &shifted.glyphs[0];
+        assert_eq!(
+            g.coverage.len(),
+            (g.width * g.height * 4) as usize,
+            "2D subpixel coverage must be 4 bytes/pixel"
+        );
+        assert!(
+            g.coverage.chunks(4).any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0),
+            "2D subpixel coverage must carry ink"
+        );
+        // The vertical shift must change the fringe versus the flat x-only
+        // layout; if y were ignored the two would rasterize identically.
+        assert_ne!(
+            flat.glyphs[0].coverage, shifted.glyphs[0].coverage,
+            "a vertical offset must change the coverage"
+        );
+    }
+
+    #[test]
+    fn phase_quantization_snaps_to_sixteenths() {
+        // Sixteenth-of-a-pixel buckets: nearby phases collapse to the same
+        // bucket so repeated draws at slightly different x positions share a
+        // glyph-cache entry.
+        assert_eq!(quantize_phase(0.0), 0.0);
+        assert_eq!(quantize_phase(0.06), 0.0625);
+        assert_eq!(quantize_phase(0.07), 0.0625);
+        assert_eq!(quantize_phase(0.10), 0.125);
+        assert_eq!(quantize_phase(0.5), 0.5);
+        assert_eq!(quantize_phase(0.9375), 0.9375);
+        // A phase just below 1.0 rounds up and wraps back to 0 (canonical key).
+        assert_eq!(quantize_phase(0.98), 0.0);
+        assert_eq!(quantize_phase(1.0), 0.0);
+        // Every output is a multiple of 1/16.
+        for i in 0..64 {
+            let q = quantize_phase(i as f32 / 64.0);
+            let k = (q * 16.0).round();
+            assert!((q * 16.0 - k).abs() < 1e-5, "phase not a sixteenth: {q}");
+        }
     }
 
     #[test]

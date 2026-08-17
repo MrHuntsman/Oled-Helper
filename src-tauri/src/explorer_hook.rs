@@ -44,7 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 // The mapped view of the shared state (created once, leaked for app
-// lifetime). Layout (512 bytes):
+// lifetime). Layout (608 bytes):
 //    0  u32 global mode (app->explorer; the system effective mode, synced
 //       on Text-tab load)
 //    4  u32 status + 8 u32 pid (explorer->app, written by the DLL at attach
@@ -55,7 +55,7 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //   12  unused padding (old global knob slots, kept at 0)
 //   24  u32 per-monitor flag (0/1)
 //   28  u32 monitor count
-//   32  monitor table: up to 8 entries x 60 bytes
+//   32  monitor table: up to 8 entries x 72 bytes
 //       u32 hmonitor (system-wide monitor handle)
 //       u32 resolution (horzres | vertres<<16)
 //       u32 physical size (horzsize | vertsize<<16)
@@ -63,19 +63,28 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //       u32 mode | primary<<8  (mode 0 = system default, 7 = custom)
 //       u32 lcd strength, crosstalk, boldness, gamma, damping, filter width
 //           (all 0..=100)
-//       u32 custom subpixel r/g/b (f32 bits; all-zero = not set)
+//       u32 custom subpixel centers r/g/b x/y (f32 bits; all-zero = not set)
+// After the table, the hook-scope blocklist (count + up to 8 exe names x 32
+// UTF-16 units); offset 12 holds the hook-scope flags (bit 0 = all apps).
 // The DLL reads the table on every draw to pick the mode + knob sextet +
 // custom offsets for the monitor the DC belongs to (see
 // explorer-hook/src/lib.rs, resolve_draw_options).
 static STATE_VIEW: OnceLock<usize> = OnceLock::new();
-const STATE_SIZE: usize = 32 + 8 * 60;
 const STATE_STATUS_OFFSET: usize = 4;
 const STATE_PID_OFFSET: usize = 8;
+const STATE_SCOPE_OFFSET: usize = 12;
 const STATE_PER_MONITOR_OFFSET: usize = 24;
 const STATE_MONITOR_COUNT_OFFSET: usize = 28;
 const STATE_MONITORS_OFFSET: usize = 32;
 const MAX_MONITORS: usize = 8;
-const MONITOR_ENTRY_STRIDE: usize = 60;
+const MONITOR_ENTRY_STRIDE: usize = 72;
+const STATE_BLOCKLIST_COUNT_OFFSET: usize = 608;
+const STATE_BLOCKLIST_ENTRIES_OFFSET: usize = 612;
+const BLOCKLIST_ENTRY_WORDS: usize = 32;
+const BLOCKLIST_ENTRY_STRIDE: usize = BLOCKLIST_ENTRY_WORDS * 2;
+const MAX_BLOCKLIST: usize = 8;
+const STATE_SIZE: usize = STATE_BLOCKLIST_ENTRIES_OFFSET + MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE;
+const SCOPE_HOOK_ALL: u32 = 1;
 // The ExtTextOutW detour is what makes the fix real; the app requires this
 // status bit for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
@@ -105,10 +114,18 @@ static LAST_STATE: AtomicU32 = AtomicU32::new(0);
 static PER_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static MONITOR_MODES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32, u32, u32, u32, u32)>>> = OnceLock::new();
-// Custom subpixel centers per monitor (mode 7): sig → [r, g, b] as f32
-// fractions of a pixel. All-zero triplets are treated as unset (the entry
-// writes 0, and the DLL only uses them when the mode is 7).
-static MONITOR_CUSTOM: OnceLock<Mutex<HashMap<String, [f32; 3]>>> = OnceLock::new();
+// Custom subpixel centers per monitor (mode 7): sig → [[r, g, b] x (x, y)]
+// as f32 fractions of a pixel. All-zero pairs are treated as unset (the
+// entry writes 0, and the DLL only uses them when the mode is 7).
+static MONITOR_CUSTOM: OnceLock<Mutex<HashMap<String, [[f32; 2]; 3]>>> = OnceLock::new();
+// Text hook scope (Text tab): whether the detour applies to every GUI
+// process ("all apps", the default — many GDI apps force ClearType per-font
+// and ignore the registry setting) or only the shell/Control Panel hosts,
+// plus the exe-name blocklist as the escape hatch. Pushed into shared
+// memory so the DLL's attach/callback decisions and per-draw scope guard
+// see them.
+static HOOK_ALL_APPS: AtomicBool = AtomicBool::new(true);
+static BLOCKLIST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 // True once the hook is verified in a NEW explorer.exe generation while the
 // feature was already active, so the Text tab can show "✓ Fix applied". Fonts
 // are rasterized at window creation, so a mode change only fully applies after
@@ -193,7 +210,7 @@ fn write_state_table() -> Result<(), String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     // SAFETY: ptr is the mapped view, valid for the process lifetime; the
-    // table region (offsets 24..416) is plain u32 slots we own.
+    // table region (offsets 24..608) is plain u32 slots we own.
     unsafe {
         let base = ptr as *mut u8;
         std::ptr::write_volatile(
@@ -209,7 +226,10 @@ fn write_state_table() -> Result<(), String> {
         for (i, e) in entries.iter().take(MAX_MONITORS).enumerate() {
             let entry = base.add(STATE_MONITORS_OFFSET + i * MONITOR_ENTRY_STRIDE);
             let (lcd, ct, bd, gm, dm, fw) = knobs.get(&e.sig()).copied().unwrap_or((0, 0, 0, 0, 0, 0));
-            let [sr, sg, sb] = custom.get(&e.sig()).copied().unwrap_or([0.0, 0.0, 0.0]);
+            let [[srx, sry], [sgx, sgy], [sbx, sby]] = custom
+                .get(&e.sig())
+                .copied()
+                .unwrap_or([[0.0; 2]; 3]);
             std::ptr::write_volatile(entry as *mut u32, e.hmonitor);
             std::ptr::write_volatile(
                 entry.add(4) as *mut u32,
@@ -233,9 +253,72 @@ fn write_state_table() -> Result<(), String> {
             std::ptr::write_volatile(entry.add(32) as *mut u32, gm.min(100));
             std::ptr::write_volatile(entry.add(36) as *mut u32, dm.min(100));
             std::ptr::write_volatile(entry.add(40) as *mut u32, fw.min(100));
-            std::ptr::write_volatile(entry.add(44) as *mut u32, sr.to_bits());
-            std::ptr::write_volatile(entry.add(48) as *mut u32, sg.to_bits());
-            std::ptr::write_volatile(entry.add(52) as *mut u32, sb.to_bits());
+            std::ptr::write_volatile(entry.add(44) as *mut u32, srx.to_bits());
+            std::ptr::write_volatile(entry.add(48) as *mut u32, sry.to_bits());
+            std::ptr::write_volatile(entry.add(52) as *mut u32, sgx.to_bits());
+            std::ptr::write_volatile(entry.add(56) as *mut u32, sgy.to_bits());
+            std::ptr::write_volatile(entry.add(60) as *mut u32, sbx.to_bits());
+            std::ptr::write_volatile(entry.add(64) as *mut u32, sby.to_bits());
+        }
+    }
+    write_scope()?;
+    Ok(())
+}
+
+// Normalize a blocklist exe name: trim, lowercase, and append ".exe" when
+// the user typed a bare name (e.g. "notepad" → "notepad.exe").
+fn normalize_exe(name: &str) -> String {
+    let mut n = name.trim().to_ascii_lowercase();
+    if !n.is_empty() && !n.contains('.') {
+        n.push_str(".exe");
+    }
+    n
+}
+
+// Write the hook-scope flag (offset 12) and the blocklist (count + up to 8
+// exe names as 32 UTF-16 units each) into the shared memory so the DLL's
+// attach decision and per-draw scope guard see the current values. The
+// region is zeroed first so a shorter previous list cannot leave stale
+// entries that still match.
+fn write_scope() -> Result<(), String> {
+    let ptr = ensure_state_mapped()?;
+    let list = BLOCKLIST
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let entries: Vec<String> = list
+        .iter()
+        .filter(|s| !s.is_empty())
+        .take(MAX_BLOCKLIST)
+        .cloned()
+        .collect();
+    // SAFETY: ptr is the mapped view, valid for the process lifetime; the
+    // scope + blocklist region (offsets 12 and 608..1124) is ours.
+    unsafe {
+        let base = ptr as *mut u8;
+        std::ptr::write_volatile(
+            base.add(STATE_SCOPE_OFFSET) as *mut u32,
+            if HOOK_ALL_APPS.load(Ordering::Acquire) {
+                SCOPE_HOOK_ALL
+            } else {
+                0
+            },
+        );
+        std::ptr::write_volatile(
+            base.add(STATE_BLOCKLIST_COUNT_OFFSET) as *mut u32,
+            entries.len() as u32,
+        );
+        std::ptr::write_bytes(
+            base.add(STATE_BLOCKLIST_ENTRIES_OFFSET),
+            0,
+            MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE,
+        );
+        for (i, exe) in entries.iter().enumerate() {
+            let entry = base.add(STATE_BLOCKLIST_ENTRIES_OFFSET + i * BLOCKLIST_ENTRY_STRIDE)
+                as *mut u16;
+            for (j, unit) in exe.encode_utf16().take(BLOCKLIST_ENTRY_WORDS - 1).enumerate() {
+                *entry.add(j) = unit;
+            }
         }
     }
     Ok(())
@@ -510,6 +593,35 @@ pub fn explorer_hook_set_per_monitor(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Hook scope (Text tab): `hook_all` widens the swash detour from the
+/// shell/Control Panel hosts to every GUI process (the default — GDI apps
+/// like 7-Zip force ClearType per-font and ignore the registry setting);
+/// `blocklist` excludes specific exe names from the detour as the escape
+/// hatch. Written into shared memory so the DLL's per-draw guard applies it
+/// live (newly started processes take it at attach).
+#[tauri::command]
+pub fn explorer_hook_set_scope(
+    hook_all: bool,
+    blocklist: Vec<String>,
+) -> Result<(), String> {
+    HOOK_ALL_APPS.store(hook_all, Ordering::Release);
+    {
+        let mut list = BLOCKLIST
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *list = blocklist
+            .iter()
+            .map(|s| normalize_exe(s))
+            .filter(|s| !s.is_empty())
+            .take(MAX_BLOCKLIST)
+            .collect();
+    }
+    write_scope()?;
+    broadcast_rendering_change();
+    Ok(())
+}
+
 /// Assign a per-monitor render mode: `mode` is one of the mode ids
 /// ("grayscale"/"off"/"rgb"/"bgr"/"custom"); "default" clears the
 /// assignment so the monitor uses the system text setting. `sig` is the
@@ -607,15 +719,19 @@ pub fn explorer_hook_set_monitor_knobs(
 }
 
 /// Assign a per-monitor custom subpixel layout: the R/G/B subpixel centers
-/// as fractions of a pixel (e.g. RGB stripe ≈ [-1/3, 0, 1/3]; the WOLED quad
-/// ≈ [-0.375, -0.125, 0.375]). Only used when the monitor's mode is
-/// "custom". All-zero clears the entry (falls back to the mode default).
+/// as (x, y) fractions of a pixel (e.g. RGB stripe ≈ [-1/3, 0], [0, 0],
+/// [1/3, 0]; the WOLED quad ≈ [-0.375, 0], [-0.125, 0], [0.375, 0]). Only
+/// used when the monitor's mode is "custom". All-zero clears the entry
+/// (falls back to the mode default).
 #[tauri::command]
 pub fn explorer_hook_set_monitor_custom(
     sig: String,
-    r: f32,
-    g: f32,
-    b: f32,
+    r_x: f32,
+    r_y: f32,
+    g_x: f32,
+    g_y: f32,
+    b_x: f32,
+    b_y: f32,
 ) -> Result<(), String> {
     {
         let mut custom = MONITOR_CUSTOM
@@ -623,8 +739,12 @@ pub fn explorer_hook_set_monitor_custom(
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         // Sanity-bound the centers to ±1 pixel (the usable subpixel space).
-        let offsets = [r.clamp(-1.0, 1.0), g.clamp(-1.0, 1.0), b.clamp(-1.0, 1.0)];
-        if offsets == [0.0, 0.0, 0.0] {
+        let offsets = [
+            [r_x.clamp(-1.0, 1.0), r_y.clamp(-1.0, 1.0)],
+            [g_x.clamp(-1.0, 1.0), g_y.clamp(-1.0, 1.0)],
+            [b_x.clamp(-1.0, 1.0), b_y.clamp(-1.0, 1.0)],
+        ];
+        if offsets == [[0.0; 2]; 3] {
             custom.remove(&sig);
         } else {
             custom.insert(sig, offsets);
@@ -647,6 +767,20 @@ pub fn apply_startup_state(
     cfg: &crate::config::AppConfig,
 ) -> Result<(), String> {
     TOGGLE.store(cfg.explorer_hook_enabled, Ordering::Release);
+    HOOK_ALL_APPS.store(cfg.explorer_hook_all_apps, Ordering::Release);
+    {
+        let mut list = BLOCKLIST
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *list = cfg
+            .explorer_hook_blocklist
+            .iter()
+            .map(|s| normalize_exe(s))
+            .filter(|s| !s.is_empty())
+            .take(MAX_BLOCKLIST)
+            .collect();
+    }
     if !cfg.explorer_hook_enabled {
         return Ok(());
     }

@@ -73,6 +73,18 @@ pub struct AppConfig {
     // and the hook DLL is not injected unless the user enables it.
     #[serde(default)]
     pub explorer_hook_enabled: bool,
+    // Text-tab hook scope: whether the swash detour applies to every GUI
+    // process (all apps — the default) or only the shell/Control Panel
+    // hosts. Many GDI apps (7-Zip, WinRAR, ...) force ClearType per-font and
+    // ignore the registry grayscale setting, and the hook is the only layer
+    // that reaches them; games are unaffected (they don't draw GDI text, and
+    // anti-cheat blocks the injection anyway).
+    #[serde(default = "default_true")]
+    pub explorer_hook_all_apps: bool,
+    // Escape hatch for the all-apps scope: exe names (with or without the
+    // .exe suffix, case-insensitive) excluded from the detour.
+    #[serde(default)]
+    pub explorer_hook_blocklist: Vec<String>,
     // Per-monitor rendering for the Explorer hook (Text tab): master flag plus
     // per-monitor mode assignments keyed by the monitor's stable signature
     // ("WxH|physWxphysH|dpiXxdpiY") → mode id string ("rgb", "bgr", "custom",
@@ -84,11 +96,12 @@ pub struct AppConfig {
     // at the system defaults).
     #[serde(default)]
     pub per_monitor_knobs: HashMap<String, MonitorKnobs>,
-    // Per-monitor custom subpixel centers (R/G/B fractions of a pixel) for
-    // the "custom" render mode, keyed by the monitor's stable signature.
-    // Absent entries = use the mode's default layout.
-    #[serde(default)]
-    pub per_monitor_custom: HashMap<String, [f32; 3]>,
+    // Per-monitor custom subpixel centers (per-channel (x, y) fractions of a
+    // pixel) for the "custom" render mode, keyed by the monitor's stable
+    // signature. Absent entries = use the mode's default layout. Legacy flat
+    // [r, g, b] configs are upgraded to y = 0 by the deserializer.
+    #[serde(default, deserialize_with = "deserialize_subpixel_offsets")]
+    pub per_monitor_custom: HashMap<String, [[f32; 2]; 3]>,
     // The monitor selected in the app's per-monitor selector: its stable
     // signature, or empty when the selector is still loading. Restored so
     // the selector keeps its position across restarts.
@@ -178,6 +191,35 @@ pub struct AppConfig {
     pub favorite_display_modes: Vec<FavoriteDisplayMode>,
 }
 
+/// Deserialize `per_monitor_custom`: accepts the current 2D shape
+/// (sig → [[r_x, r_y], [g_x, g_y], [b_x, b_y]]) and upgrades the legacy flat
+/// [r, g, b] shape to y = 0 so pre-2D configs keep their horizontal layout.
+fn deserialize_subpixel_offsets<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, [[f32; 2]; 3]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum SubpixelOffsets {
+        TwoD([[f32; 2]; 3]),
+        Flat([f32; 3]),
+    }
+
+    let map = HashMap::<String, SubpixelOffsets>::deserialize(deserializer)?;
+    Ok(map
+        .into_iter()
+        .map(|(sig, offsets)| {
+            let offsets = match offsets {
+                SubpixelOffsets::TwoD(offsets) => offsets,
+                SubpixelOffsets::Flat([r, g, b]) => [[r, 0.0], [g, 0.0], [b, 0.0]],
+            };
+            (sig, offsets)
+        })
+        .collect())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -230,6 +272,8 @@ impl Default for AppConfig {
             hide_calibration_interface: false,
             black_strip_gap_enabled: true,
             explorer_hook_enabled: false,
+            explorer_hook_all_apps: true,
+            explorer_hook_blocklist: Vec::new(),
             per_monitor_modes: HashMap::new(),
             per_monitor_knobs: HashMap::new(),
             per_monitor_custom: HashMap::new(),
@@ -629,5 +673,30 @@ mod tests {
         assert_eq!(parsed.high_nits_min, 100);
         assert_eq!(parsed.high_nits_max, None);
         assert_eq!(parsed.high_nits_step, 100);
+    }
+    #[test]
+    fn legacy_flat_subpixel_offsets_upgrade_to_y_zero() {
+        let parsed: AppConfig =
+            serde_json::from_str(r#"{"per_monitor_custom": {"sig": [0.1, 0.2, 0.3]}}"#).unwrap();
+        assert_eq!(
+            parsed.per_monitor_custom["sig"],
+            [[0.1, 0.0], [0.2, 0.0], [0.3, 0.0]]
+        );
+    }
+    #[test]
+    fn subpixel_offsets_2d_round_trip() {
+        let config = AppConfig {
+            per_monitor_custom: HashMap::from([(
+                "sig".to_string(),
+                [[-0.375, 0.25], [-0.125, 0.0], [0.375, -0.25]],
+            )]),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.per_monitor_custom["sig"],
+            [[-0.375, 0.25], [-0.125, 0.0], [0.375, -0.25]]
+        );
     }
 }

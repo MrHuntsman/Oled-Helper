@@ -7,7 +7,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
-  import { textSettings, saveConfig, activeMonitor, syncTextPerMonitor } from './stores.svelte.js';
+  import { textSettings, saveConfig, activeMonitor, syncTextPerMonitor, syncTextScope } from './stores.svelte.js';
 
   let { modalOpen = false, menuOpen = false } = $props();
 
@@ -24,8 +24,18 @@
   const CUSTOM_OFFSET_MAX = 1;
   const CUSTOM_OFFSET_STEP = 0.01;
   // Sensible starting point for a fresh custom profile: the WOLED quad
-  // positions (R/G/B across a 4-subpixel pixel, white derived by the panel).
-  const CUSTOM_OFFSET_DEFAULT = { r: -0.375, g: -0.125, b: 0.375 };
+  // positions (R/G/B across a 4-subpixel pixel, white derived by the panel),
+  // horizontal-only so every y = 0.
+  const CUSTOM_OFFSET_DEFAULT = { rx: -0.375, ry: 0, gx: -0.125, gy: 0, bx: 0.375, by: 0 };
+  // The six Subpixel center axes (R/G/B × x/y) in slider order.
+  const CUSTOM_AXES = [
+    { key: 'rx', label: 'R X' },
+    { key: 'ry', label: 'R Y' },
+    { key: 'gx', label: 'G X' },
+    { key: 'gy', label: 'G Y' },
+    { key: 'bx', label: 'B X' },
+    { key: 'by', label: 'B Y' },
+  ];
   let state = $state({
     effective_mode: 'rgb',
     gamma: 1400,
@@ -97,6 +107,19 @@
     if (k.lcd === 0 && k.crosstalk === 0 && k.boldness === 0
       && k.gamma === 0 && k.damping === 0 && k.filterWidth === 0) {
       delete textSettings.perMonitorKnobs[sig];
+      // Dropping the local entry means the debounced sync loop won't iterate
+      // it, so push an explicit all-zero sextet to clear the hook's copy too.
+      // Without this, a fast drag to 0 would leave Explorer at the old value
+      // while the preview (driven by the store) already shows 0.
+      invoke('explorer_hook_set_monitor_knobs', {
+        sig,
+        lcdStrength: 0,
+        crosstalk: 0,
+        boldness: 0,
+        gamma: 0,
+        damping: 0,
+        filterWidth: 0,
+      }).catch(() => {});
     } else {
       textSettings.perMonitorKnobs[sig] = k;
     }
@@ -153,6 +176,14 @@
     if (mode === 'custom' && !textSettings.perMonitorCustom[sig]) {
       textSettings.perMonitorCustom[sig] = { ...CUSTOM_OFFSET_DEFAULT };
     }
+    // The primary monitor drives the system-wide DirectWrite/GDI text
+    // setting: write the registry so DirectWrite apps follow it (the hook
+    // only covers GDI). DirectWrite reads these values at process start, so
+    // this reaches new app instances rather than live ones.
+    if (activeMonitor.mon.primary) {
+      invoke('text_rendering_set_mode', { mode })
+        .catch((e) => console.warn('[text] registry mode sync failed', e));
+    }
     saveConfig();
     syncTextPerMonitor();
     schedulePreviewRender();
@@ -197,6 +228,33 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled })
       .then(refreshHookStatus)
       .catch((e) => console.warn('[text] explorer hook toggle failed', e));
+  }
+
+  // Scope toggle: "apply to all apps" hooks every GUI process (the default)
+  // rather than just Explorer/Control Panel, fixing GDI apps that force
+  // ClearType (7-Zip, WinRAR, ...). Pushed to the hook live; the DLL's
+  // per-draw guard applies it immediately.
+  function onToggleHookAllApps() {
+    textSettings.hookAllApps = !textSettings.hookAllApps;
+    syncTextScope();
+    saveConfig();
+  }
+
+  // Blocklist editor: comma/semicolon/newline-separated exe names, applied
+  // on change (Enter or blur). Bare names get .exe appended; duplicates and
+  // empty entries are dropped.
+  let blocklistText = $state(textSettings.hookBlocklist.join(', '));
+  function applyBlocklist() {
+    const names = [...new Set(
+      blocklistText.split(/[,;\n]/)
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => s.length > 0)
+        .map((s) => (s.includes('.') ? s : `${s}.exe`)),
+    )];
+    textSettings.hookBlocklist = names;
+    blocklistText = names.join(', ');
+    syncTextScope();
+    saveConfig();
   }
 
   async function applyMode(mode) {
@@ -290,7 +348,7 @@
     const mode = previewMode();
     const zoom = previewZoom / 100;
     const offs = customOffsets();
-    const key = `${mode}|${knobValue('lcd')}|${knobValue('crosstalk')}|${knobValue('boldness')}|${knobValue('gamma')}|${knobValue('damping')}|${knobValue('filterWidth')}|${mode === 'custom' ? `${offs.r}|${offs.g}|${offs.b}` : ''}|${dpr}`;
+    const key = `${mode}|${knobValue('lcd')}|${knobValue('crosstalk')}|${knobValue('boldness')}|${knobValue('gamma')}|${knobValue('damping')}|${knobValue('filterWidth')}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
     const gen = ++previewGen;
 
     let left;
@@ -313,9 +371,12 @@
           gamma: knobValue('gamma'),
           damping: knobValue('damping'),
           filterWidth: knobValue('filterWidth'),
-          offsetR: mode === 'custom' ? offs.r : null,
-          offsetG: mode === 'custom' ? offs.g : null,
-          offsetB: mode === 'custom' ? offs.b : null,
+          offsetRX: mode === 'custom' ? offs.rx : null,
+          offsetRY: mode === 'custom' ? offs.ry : null,
+          offsetGX: mode === 'custom' ? offs.gx : null,
+          offsetGY: mode === 'custom' ? offs.gy : null,
+          offsetBX: mode === 'custom' ? offs.bx : null,
+          offsetBY: mode === 'custom' ? offs.by : null,
         };
         left = await Promise.all(
           [8, 10, 12, 15].map((size) => invoke('text_preview_render', { ...renderArgs, size: size * dpr })),
@@ -562,33 +623,17 @@
     {#if shownMode() === 'custom'}
       <div class="text-render-custom-offsets">
         <div class="text-render-custom-heading">Subpixel centers</div>
-        <div class="text-render-knob-row">
-          <span class="text-render-knob-label">R</span>
-          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-            <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue('r')}
-              style="--fill:{((customValue('r') - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
-              oninput={(e) => onCustomInput('r', e.currentTarget.value)} />
+        {#each CUSTOM_AXES as axis (axis.key)}
+          <div class="text-render-knob-row">
+            <span class="text-render-knob-label">{axis.label}</span>
+            <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+              <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue(axis.key)}
+                style="--fill:{((customValue(axis.key) - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
+                oninput={(e) => onCustomInput(axis.key, e.currentTarget.value)} />
+            </div>
+            <span class="slider-val">{customValue(axis.key).toFixed(3)}</span>
           </div>
-          <span class="slider-val">{customValue('r').toFixed(3)}</span>
-        </div>
-        <div class="text-render-knob-row">
-          <span class="text-render-knob-label">G</span>
-          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-            <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue('g')}
-              style="--fill:{((customValue('g') - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
-              oninput={(e) => onCustomInput('g', e.currentTarget.value)} />
-          </div>
-          <span class="slider-val">{customValue('g').toFixed(3)}</span>
-        </div>
-        <div class="text-render-knob-row">
-          <span class="text-render-knob-label">B</span>
-          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-            <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue('b')}
-              style="--fill:{((customValue('b') - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
-              oninput={(e) => onCustomInput('b', e.currentTarget.value)} />
-          </div>
-          <span class="slider-val">{customValue('b').toFixed(3)}</span>
-        </div>
+        {/each}
       </div>
     {/if}
   </div>
@@ -610,6 +655,20 @@
         <span class="restart-explorer-hint">Note: Current open windows will need a restart.</span>
       {/if}
     </div>
+    {#if textSettings.explorerHookEnabled}
+      <div class="text-render-scope">
+        <label class="text-render-explorer-toggle">
+          <input type="checkbox" checked={textSettings.hookAllApps} onchange={onToggleHookAllApps} />
+          <span class="text-render-explorer-toggle-label">Apply to all apps</span>
+        </label>
+        <p class="text-render-explorer-desc">GDI apps that force ClearType (7-Zip, WinRAR, …) are re-rendered too. Browsers aren't hooked (their text is Skia, not GDI) but still follow the registry setting — grayscale/RGB/BGR applies, just not the 2D remap. Games' in-game text is engine-rendered and ignores both.</p>
+        <label class="text-render-blocklist">
+          <span class="text-render-explorer-toggle-label">Excluded apps</span>
+          <input type="text" class="text-render-blocklist-input" placeholder="e.g. notepad.exe, winrar"
+            bind:value={blocklistText} onchange={applyBlocklist} />
+        </label>
+      </div>
+    {/if}
   </div>
 
   <div class="separator"></div>

@@ -144,11 +144,24 @@ export function syncTextPerMonitor() {
   for (const [sig, offs] of Object.entries(textSettings.perMonitorCustom)) {
     invoke('explorer_hook_set_monitor_custom', {
       sig,
-      r: offs.r,
-      g: offs.g,
-      b: offs.b,
+      rX: offs.rx,
+      rY: offs.ry,
+      gX: offs.gx,
+      gY: offs.gy,
+      bX: offs.bx,
+      bY: offs.by,
     }).catch(() => {});
   }
+}
+
+// Push the hook scope (all-apps flag + blocklist) to the backend so its
+// shared-memory values match the store. The backend applies scope at startup
+// from the config, so this only needs to run on user changes.
+export function syncTextScope() {
+  invoke('explorer_hook_set_scope', {
+    hookAll: textSettings.hookAllApps,
+    blocklist: [...textSettings.hookBlocklist],
+  }).catch(() => {});
 }
 
 export function activeMonitorSig() {
@@ -252,6 +265,12 @@ export const taskbarDimmer = $state({
 // compensation, and faux boldness.
 export const textSettings = $state({
   explorerHookEnabled: false,
+  // Hook scope: whether the swash detour applies to every GUI process
+  // (all apps — the default; GDI apps like 7-Zip force ClearType and ignore
+  // the registry setting) or only the shell/Control Panel hosts. The
+  // blocklist is the escape hatch: exe names excluded from the detour.
+  hookAllApps: true,
+  hookBlocklist: [],
   // Per-monitor mode assignments keyed by the monitor's stable signature
   // ("WxH|phys|dpi") → mode id ("rgb", "bgr", "custom", ...). Absent = the
   // system default ("Default" in the UI). Whether per-monitor resolution is
@@ -262,9 +281,10 @@ export const textSettings = $state({
   // that monitor. Like modes, the presence of any knob entry activates
   // per-monitor resolution.
   perMonitorKnobs: {},
-  // Per-monitor custom subpixel centers, sig → { r, g, b } (fractions of a
-  // pixel). Used when the monitor's mode is 'custom' — the live calibration
-  // controls. Absent = the mode's default layout.
+  // Per-monitor custom subpixel centers, sig → { rx, ry, gx, gy, bx, by }
+  // (per-channel x/y fractions of a pixel). Used when the monitor's mode is
+  // 'custom' — the live calibration controls. Absent = the mode's default
+  // layout.
   perMonitorCustom: {},
 });
 
@@ -497,6 +517,29 @@ function profileKey(hz, info = crushInfo()) {
 function clampAdjustment(value) { return Math.max(-150, Math.min(150, Math.round(Number(value) || 0))); }
 function clampKnob(value) { return Math.max(0, Math.min(100, Math.round(Number(value) || 0))); }
 function clampOffset(value) { const n = Number(value); return Number.isFinite(n) ? Math.max(-1, Math.min(1, n)) : 0; }
+// Normalize a per-monitor custom offset entry from config. Accepts the 2D
+// [[rx, ry], [gx, gy], [bx, by]] shape (current) and the legacy flat [r, g, b]
+// shape (upgraded to y = 0). Returns null for malformed entries.
+function customOffsetsFromConfig(offs) {
+  if (!Array.isArray(offs) || offs.length !== 3) return null;
+  const channels = [];
+  for (let c = 0; c < 3; c++) {
+    const channel = offs[c];
+    if (Array.isArray(channel) && channel.length >= 2) {
+      channels.push([channel[0], channel[1]]);
+    } else if (Array.isArray(channel)) {
+      return null; // malformed channel
+    } else {
+      channels.push([channel, 0]); // legacy flat value → y = 0
+    }
+  }
+  const [r, g, b] = channels;
+  return {
+    rx: clampOffset(r[0]), ry: clampOffset(r[1]),
+    gx: clampOffset(g[0]), gy: clampOffset(g[1]),
+    bx: clampOffset(b[0]), by: clampOffset(b[1]),
+  };
+}
 function profileValue(key) {
   return key && Object.prototype.hasOwnProperty.call(crush.blackProfiles, key)
     ? clampAdjustment(crush.blackProfiles[key])
@@ -589,6 +632,10 @@ export async function loadConfig(prefetchedCfg = null) {
     clampHighNitsRange();
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
     if (cfg && typeof cfg.explorer_hook_enabled === 'boolean') textSettings.explorerHookEnabled = cfg.explorer_hook_enabled;
+    if (cfg && typeof cfg.explorer_hook_all_apps === 'boolean') textSettings.hookAllApps = cfg.explorer_hook_all_apps;
+    if (cfg && Array.isArray(cfg.explorer_hook_blocklist)) {
+      textSettings.hookBlocklist = cfg.explorer_hook_blocklist.filter((n) => typeof n === 'string');
+    }
     if (cfg && typeof cfg.per_monitor_modes === 'object' && cfg.per_monitor_modes) {
       // Drop mode ids that no longer exist. The fixed RGWB/RWBG presets were
       // removed (the Custom mode covers those layouts); keeping a stale id
@@ -617,13 +664,8 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.per_monitor_custom === 'object' && cfg.per_monitor_custom) {
       textSettings.perMonitorCustom = {};
       for (const [sig, offs] of Object.entries(cfg.per_monitor_custom)) {
-        if (offs && Array.isArray(offs) && offs.length === 3) {
-          textSettings.perMonitorCustom[sig] = {
-            r: clampOffset(offs[0]),
-            g: clampOffset(offs[1]),
-            b: clampOffset(offs[2]),
-          };
-        }
+        const normalized = customOffsetsFromConfig(offs);
+        if (normalized) textSettings.perMonitorCustom[sig] = normalized;
       }
     }
     // Restore the per-monitor selector after the monitor list loads.
@@ -748,10 +790,12 @@ export function saveConfig() {
     high_nits_step: crush.highNitsStep,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     explorer_hook_enabled: textSettings.explorerHookEnabled,
+    explorer_hook_all_apps: textSettings.hookAllApps,
+    explorer_hook_blocklist: [...textSettings.hookBlocklist],
     per_monitor_modes: { ...textSettings.perMonitorModes },
     per_monitor_knobs: { ...textSettings.perMonitorKnobs },
     per_monitor_custom: Object.fromEntries(
-      Object.entries(textSettings.perMonitorCustom).map(([sig, o]) => [sig, [o.r, o.g, o.b]]),
+      Object.entries(textSettings.perMonitorCustom).map(([sig, o]) => [sig, [[o.rx, o.ry], [o.gx, o.gy], [o.bx, o.by]]]),
     ),
     active_monitor_sig: activeMonitor.mon ? activeMonitor.mon.sig : '',
     screen_protector_enabled: screenDimmer.enabled,

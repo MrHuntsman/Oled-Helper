@@ -3862,6 +3862,36 @@ button {
   color: var(--text-weak);
   margin: 0;
 }
+/* Hook scope section under the Explorer toggle: all-apps checkbox, hint,
+   and the exe blocklist input (escape hatch for apps that misbehave). */
+.text-render-scope {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--divider);
+}
+.text-render-scope .text-render-explorer-desc {
+  margin: 6px 0 0;
+}
+.text-render-blocklist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.text-render-blocklist-input {
+  background: var(--panel);
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.text-render-blocklist-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
 /* The preview (caption row + native sample) lives in its own bordered panel,
    visually separate from the mode controls above it. */
 .text-render-preview-panel {

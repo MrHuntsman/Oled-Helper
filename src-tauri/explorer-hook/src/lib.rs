@@ -62,24 +62,34 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 
-// Shared memory layout (512 bytes): the app writes the mode at offset 0 and
+// Shared memory layout (1124 bytes): the app writes the mode at offset 0 and
 // the DLL writes its own state back at offsets 4 and 8 so the app can verify
 // the hook is really installed in the CURRENT explorer.exe instead of
-// trusting that the module merely loaded. Slots 12/16/20 are unused padding
-// (the old global knob triplet). The per-monitor table lives at 24/28/32+
-// (flag, count, up to 8 entries x 60 bytes), each entry carrying the
-// monitor's mode, knob sextet (lcd filter, crosstalk, boldness, gamma,
-// damping, filter width), and custom subpixel offsets — see
-// resolve_draw_options.
+// trusting that the module merely loaded. Offset 12 holds the hook-scope
+// flags (bit 0 = "apply to all apps"; 13..23 padding). The per-monitor table
+// lives at 24/28/32+ (flag, count, up to 8 entries x 72 bytes), each entry
+// carrying the monitor's mode, knob sextet (lcd filter, crosstalk, boldness,
+// gamma, damping, filter width), and custom subpixel centers as six (x, y)
+// f32 bit patterns — see resolve_draw_options. The blocklist follows the
+// table at 608+ (count, up to 8 entries x 64 bytes = 32 UTF-16 chars): exe
+// names excluded from the detour while "all apps" scope is on.
 const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
+const STATE_SCOPE: usize = 12;
 const STATE_PER_MONITOR: usize = 24;
 const STATE_MONITOR_COUNT: usize = 28;
 const STATE_MONITORS: usize = 32;
-const STATE_SIZE: usize = 32 + 8 * 60;
-const MONITOR_ENTRY_STRIDE: usize = 60;
+const MONITOR_ENTRY_STRIDE: usize = 72;
 const MAX_MONITORS: usize = 8;
+const STATE_BLOCKLIST_COUNT: usize = 608;
+const STATE_BLOCKLIST_ENTRIES: usize = 612;
+const BLOCKLIST_ENTRY_WORDS: usize = 32;
+const BLOCKLIST_ENTRY_STRIDE: usize = BLOCKLIST_ENTRY_WORDS * 2;
+const MAX_BLOCKLIST: usize = 8;
+const STATE_SIZE: usize = STATE_BLOCKLIST_ENTRIES + MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE;
+// Scope flag bits at STATE_SCOPE.
+const SCOPE_HOOK_ALL: u32 = 1;
 // Status bit written by the DLL once the ExtTextOutW detour is installed.
 const STATUS_HOOK_INSTALLED: u32 = 1;
 
@@ -108,8 +118,12 @@ static ORIGINAL: OnceLock<ExtTextOutWFn> = OnceLock::new();
 // so the next hook callback retries (the callback fires on every window
 // creation, so a transient failure self-heals).
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
-// Cached in DllMain so the hook callback doesn't re-query the process image
-// path on every window-creation event.
+// Whether this process is a shell/Control Panel host (cached in DllMain so
+// the hook callback doesn't re-query the process image path on every
+// window-creation event). The all-apps scope decision is NOT cached here:
+// it is re-evaluated per draw from the shared-memory flag + blocklist so the
+// app's "apply to all apps" toggle and blocklist edits are live for
+// already-loaded processes.
 static IS_TARGET: AtomicBool = AtomicBool::new(false);
 
 // ── File logging (%TEMP%\OledHelperHook.log) ───────────────────────────
@@ -193,11 +207,11 @@ fn state_monitor_count() -> usize {
 
 // Entry i as (hmonitor, resolution, physical size, dpi, mode | flags<<8,
 // lcd strength, crosstalk, boldness, gamma, damping, filter width, subpixel
-// r/g/b as u32 bit patterns). Offsets within an entry are all 4-aligned
+// r/g/b x/y as u32 bit patterns). Offsets within an entry are all 4-aligned
 // (STATE_MONITORS is 32).
 fn state_monitor_entry(
     i: usize,
-) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)> {
+) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)> {
     if i >= state_monitor_count() {
         return None;
     }
@@ -220,6 +234,9 @@ fn state_monitor_entry(
             *((base + 44) as *const u32),
             *((base + 48) as *const u32),
             *((base + 52) as *const u32),
+            *((base + 56) as *const u32),
+            *((base + 60) as *const u32),
+            *((base + 64) as *const u32),
         ))
     }
 }
@@ -237,14 +254,14 @@ fn hdc_caps_sig(hdc: HDC) -> (u32, u32, u32) {
     }
 }// Per-monitor render options for this draw's DC, when per-monitor is enabled:
 // the attributed monitor's mode (0 = system default / passthrough), its knob
-// sextet (0 = no adjustment), and its custom subpixel centers (all-zero = no
-// custom offsets; only meaningful for mode 7, Custom). A monitor that cannot
-// be attributed yields None → the caller falls back to the global mode +
-// fallback knobs. Every connected monitor is in the table, so a successful
-// attribution is the normal path; the table entry's mode is 0 for monitors
-// left at the system default, which still resolves here so their knobs can
-// apply.
-fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [f32; 3])> {
+// sextet (0 = no adjustment), and its custom subpixel centers as per-channel
+// (x, y) pairs (all-zero = no custom offsets; only meaningful for mode 7,
+// Custom). A monitor that cannot be attributed yields None → the caller falls
+// back to the global mode + fallback knobs. Every connected monitor is in the
+// table, so a successful attribution is the normal path; the table entry's
+// mode is 0 for monitors left at the system default, which still resolves
+// here so their knobs can apply.
+fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [[f32; 2]; 3])> {
     let count = state_monitor_count();
     if count == 0 {
         return None;
@@ -265,8 +282,12 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [f32; 
             filter_width.min(100) as u8,
         )
     };
-    let offsets_of = |r: u32, g: u32, b: u32| -> [f32; 3] {
-        [f32::from_bits(r), f32::from_bits(g), f32::from_bits(b)]
+    let offsets_of = |rx: u32, ry: u32, gx: u32, gy: u32, bx: u32, by: u32| -> [[f32; 2]; 3] {
+        [
+            [f32::from_bits(rx), f32::from_bits(ry)],
+            [f32::from_bits(gx), f32::from_bits(gy)],
+            [f32::from_bits(bx), f32::from_bits(by)],
+        ]
     };
     // 1. Window DC: HWND → monitor → exact HMONITOR match.
     let hwnd = unsafe { WindowFromDC(hdc) };
@@ -275,13 +296,13 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [f32; 
         if !hmon.0.is_null() {
             let want = hmon.0 as usize as u32;
             for i in 0..count {
-                if let Some((h, _, _, _, mf, lcd, ct, bd, gm, dm, fw, sr, sg, sb)) =
+                if let Some((h, _, _, _, mf, lcd, ct, bd, gm, dm, fw, srx, sry, sgx, sgy, sbx, sby)) =
                     state_monitor_entry(i)
                 {
                     if h == want {
                         MON_WINDOW.fetch_add(1, Ordering::Relaxed);
                         let (l, c, b, g, d, f) = knobs_of(lcd, ct, bd, gm, dm, fw);
-                        return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(sr, sg, sb)));
+                        return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
                     }
                 }
             }
@@ -290,13 +311,13 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [f32; 
     // 2. Memory DC: match the device-caps signature against the table.
     let (res, phys, dpi) = hdc_caps_sig(hdc);
     for i in 0..count {
-        if let Some((_, er, ep, ed, mf, lcd, ct, bd, gm, dm, fw, sr, sg, sb)) =
+        if let Some((_, er, ep, ed, mf, lcd, ct, bd, gm, dm, fw, srx, sry, sgx, sgy, sbx, sby)) =
             state_monitor_entry(i)
         {
             if er == res && ep == phys && ed == dpi {
                 MON_CAPS.fetch_add(1, Ordering::Relaxed);
                 let (l, c, b, g, d, f) = knobs_of(lcd, ct, bd, gm, dm, fw);
-                return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(sr, sg, sb)));
+                return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
             }
         }
     }
@@ -358,14 +379,73 @@ fn is_explorer() -> bool {
 
 // Everything the app wants the detour in: Explorer plus the classic Control
 // Panel host processes and the MMC admin consoles. SystemProperties is a
-// family of executables, matched by prefix.
+// family of executables, matched by prefix. 7-Zip's GUI hosts are included
+// because their filename lists are text-heavy GDI surface (and they ignore
+// the registry grayscale setting by forcing ClearType per-font).
 fn is_target() -> bool {
-    let lower = process_base_name().to_ascii_lowercase();
+    let lower = proc_name().to_ascii_lowercase();
     lower == "explorer.exe"
         || lower == "control.exe"
         || lower == "rundll32.exe"
         || lower == "mmc.exe"
+        || lower == "7zfm.exe"
+        || lower == "7zg.exe"
         || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
+}
+
+// ── Hook scope (all apps vs shell) ────────────────────────────────────
+// The app can widen the detour to every GUI process (default), since many
+// GDI apps (7-Zip, WinRAR, ...) force ClearType per-font and ignore the
+// registry grayscale setting. The scope flag lives in shared memory so it
+// can change at runtime; the exe blocklist is the escape hatch for apps
+// that misbehave or trip AV.
+
+// Whether the app's "apply to all apps" scope flag is set. A single
+// shared-memory word read, so it is safe to consult on every draw.
+fn hook_all_enabled() -> bool {
+    // SAFETY: STATE is written once in map_state; the mapped view stays valid
+    // for the lifetime of the process. Unmapped (app not running) = shell-only.
+    unsafe {
+        STATE.get()
+            .map(|addr| *((addr + STATE_SCOPE) as *const u32) & SCOPE_HOOK_ALL != 0)
+            .unwrap_or(false)
+    }
+}
+
+// Whether this process's exe name is on the app's blocklist. Compares against
+// the cached process base name (PROC_NAME), so it only does real work once.
+fn blocklisted() -> bool {
+    let Some(base) = STATE.get() else {
+        return false;
+    };
+    // SAFETY: the count is clamped to MAX_BLOCKLIST and every entry is 32
+    // UTF-16 units within the mapping the app owns.
+    unsafe {
+        let count = (*((base + STATE_BLOCKLIST_COUNT) as *const u32) as usize).min(MAX_BLOCKLIST);
+        if count == 0 {
+            return false;
+        }
+        let name = proc_name().to_ascii_lowercase();
+        for i in 0..count {
+            let entry = base + STATE_BLOCKLIST_ENTRIES + i * BLOCKLIST_ENTRY_STRIDE;
+            let words = std::slice::from_raw_parts(entry as *const u16, BLOCKLIST_ENTRY_WORDS);
+            let mut len = 0;
+            while len < words.len() && words[len] != 0 {
+                len += 1;
+            }
+            if String::from_utf16_lossy(&words[..len]).to_ascii_lowercase() == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Full detour scope for a draw: shell/Control Panel hosts always, plus any
+// other process while all-apps scope is on and it is not blocklisted. This
+// is the per-draw guard, so both the toggle and the blocklist apply live.
+fn in_hook_scope() -> bool {
+    IS_TARGET.load(Ordering::Acquire) || (hook_all_enabled() && !blocklisted())
 }
 
 fn map_state() {
@@ -763,7 +843,8 @@ unsafe extern "system" fn try_render_swash(
                 // tuned offsets yet — render the mode's default layout
                 // (render_format falls back to the WOLED quad positions)
                 // rather than sampling all three channels at the same point.
-                let subpixel_offsets = if mode == 7 && offs != [0.0, 0.0, 0.0] {
+                let all_zero = offs.iter().all(|&[x, y]| x == 0.0 && y == 0.0);
+                let subpixel_offsets = if mode == 7 && !all_zero {
                     Some(offs)
                 } else {
                     None
@@ -1004,6 +1085,14 @@ unsafe extern "system" fn hook_ext_text_out_w(
     if IN_EXT_TEXT_OUT.with(|f| f.get()) {
         return call_original_ext_text_out(hdc, x, y, options, lprect, string, count, dx);
     }
+    // Scope guard: shell/Control Panel hosts always render through the hook;
+    // other processes only while all-apps scope is on AND not blocklisted.
+    // Re-evaluated per draw so the toggle and blocklist apply live to
+    // already-loaded processes; the detour stays installed but passes
+    // through while out of scope.
+    if !in_hook_scope() {
+        return call_original_ext_text_out(hdc, x, y, options, lprect, string, count, dx);
+    }
     IN_EXT_TEXT_OUT.with(|f| f.set(true));
 
     // A panic in the swash path must never take down the shell: catch it and
@@ -1161,7 +1250,13 @@ pub unsafe extern "system" fn hook_callback(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if IS_TARGET.load(Ordering::Acquire) && !INSTALL_ATTEMPTED.swap(true, Ordering::SeqCst) {
+    // Re-evaluate scope on every callback (cheap: the flag is a shared-memory
+    // word and the blocklist compare uses the cached process name), so a
+    // process that was already running when the app flipped "all apps" on
+    // gets the detour without a restart. INSTALL_ATTEMPTED stays false for
+    // out-of-scope processes so a later scope change still installs; it only
+    // latches once the install is attempted (or succeeded).
+    if in_hook_scope() && !INSTALL_ATTEMPTED.swap(true, Ordering::SeqCst) {
         log("hook_callback: first window event, installing detour");
         if !install_detour() {
             INSTALL_ATTEMPTED.store(false, Ordering::SeqCst);
@@ -1286,15 +1381,21 @@ pub unsafe extern "system" fn DllMain(
 ) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
-            let target = is_target();
-            IS_TARGET.store(target, Ordering::Release);
-            if target {
-                map_state();
-            }
+            // Map the state FIRST so the all-apps scope flag is readable.
+            // OpenFileMappingW fails fast when the app is not running,
+            // leaving STATE unset (scope falls back to shell-only). Only the
+            // shell/Control Panel decision is cached; the all-apps scope is
+            // re-evaluated per draw in in_hook_scope.
+            map_state();
+            IS_TARGET.store(is_target(), Ordering::Release);
             BOOL(1)
         }
         DLL_PROCESS_DETACH => {
-            if IS_TARGET.load(Ordering::Acquire) {
+            // Disable whenever the detour was actually installed — a process
+            // hooked via all-apps scope has IS_TARGET false but still carries
+            // the patch, and leaving it in place as the DLL unloads would
+            // jump into unmapped memory on the next ExtTextOutW call.
+            if DETOUR.get().is_some() {
                 disable_detours();
             }
             BOOL(1)

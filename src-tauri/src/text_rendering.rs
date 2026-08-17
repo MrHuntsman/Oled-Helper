@@ -43,12 +43,12 @@ const AVALON_SUBKEY: &str = r"Software\Microsoft\Avalon.Graphics\DISPLAY1";
 const DEFAULT_GAMMA: u32 = 1400;
 const DEFAULT_CONTRAST: u32 = 1400;
 
-// TEMPORARY: disables the registry/SystemParametersInfo ClearType path (the
-// "old method") while the swash rasterizer hook (explorer-hook) is validated.
-// When off, a mode change only drives the hook and writes nothing to the
-// system, so Explorer's text is provably rendered by the hook alone. Set to
-// true to restore the registry-based behavior.
-static REGISTRY_METHOD_ENABLED: bool = false;
+// The registry + SystemParametersInfo ClearType path is ENABLED. It was
+// temporarily gated off while the swash rasterizer hook was validated; it is
+// now the channel that reaches DirectWrite/WPF apps, which the hook (a GDI
+// ExtTextOutW detour) cannot touch. A mode change drives both: the hook live
+// in Explorer, and this registry path system-wide (DirectWrite apps read it
+// at process start).
 
 #[derive(serde::Serialize, Clone)]
 pub struct TextRenderingState {
@@ -302,7 +302,10 @@ fn apply_directwrite(mode: &str) -> Result<(), String> {
     // ClearTypeLevel: 0 = grayscale edges, 50 = medium, 100 = full color.
     let (pixel_structure, cleartype_level) = match mode {
         "off" | "grayscale" => (0u32, 0u32),
-        "rgb" => (1u32, 100u32),
+        // Custom (the hook's per-panel subpixel mode) has no DirectWrite
+        // equivalent — DirectWrite only knows flat/RGB/BGR — so fall back to
+        // standard RGB ClearType for the system-wide path.
+        "rgb" | "custom" => (1u32, 100u32),
         "bgr" => (2u32, 100u32),
         _ => return Err(format!("unknown mode: {mode}")),
     };
@@ -323,7 +326,9 @@ fn apply_mode(mode: &str) -> Result<(), String> {
             set_smoothing_enabled(true)?;
             set_smoothing_type(false)?;
         }
-        "rgb" => {
+        // Custom maps to standard RGB ClearType system-wide (see
+        // apply_directwrite) — the tuned subpixel layout only lives in the hook.
+        "rgb" | "custom" => {
             set_smoothing_enabled(true)?;
             set_smoothing_type(true)?;
             set_orientation(true)?;
@@ -988,9 +993,12 @@ pub fn text_preview_render(
     gamma: u32,
     damping: u32,
     filter_width: u32,
-    offset_r: Option<f32>,
-    offset_g: Option<f32>,
-    offset_b: Option<f32>,
+    offset_r_x: Option<f32>,
+    offset_r_y: Option<f32>,
+    offset_g_x: Option<f32>,
+    offset_g_y: Option<f32>,
+    offset_b_x: Option<f32>,
+    offset_b_y: Option<f32>,
 ) -> Result<PreviewRender, String> {
     let render_mode = match mode.as_str() {
         "off" => RenderMode::Crisp,
@@ -1004,13 +1012,26 @@ pub fn text_preview_render(
         return Err(format!("size out of range: {size}"));
     }
     let font = preview_font().ok_or_else(|| "no system font available for the preview".to_string())?;
-    // Custom mode: the user's subpixel centers. Missing/invalid values fall
-    // back to the mode default (render_format does this in the rasterizer).
-    let subpixel_offsets = match (offset_r, offset_g, offset_b) {
-        (Some(r), Some(g), Some(b))
-            if r.is_finite() && g.is_finite() && b.is_finite() && mode == "custom" =>
+    // Custom mode: the user's subpixel centers (per-channel x/y). Missing or
+    // invalid values fall back to the mode default (render_format does this
+    // in the rasterizer).
+    let subpixel_offsets = match (
+        offset_r_x, offset_r_y, offset_g_x, offset_g_y, offset_b_x, offset_b_y,
+    ) {
+        (Some(rx), Some(ry), Some(gx), Some(gy), Some(bx), Some(by))
+            if rx.is_finite()
+                && ry.is_finite()
+                && gx.is_finite()
+                && gy.is_finite()
+                && bx.is_finite()
+                && by.is_finite()
+                && mode == "custom" =>
         {
-            Some([r.clamp(-1.0, 1.0), g.clamp(-1.0, 1.0), b.clamp(-1.0, 1.0)])
+            Some([
+                [rx.clamp(-1.0, 1.0), ry.clamp(-1.0, 1.0)],
+                [gx.clamp(-1.0, 1.0), gy.clamp(-1.0, 1.0)],
+                [bx.clamp(-1.0, 1.0), by.clamp(-1.0, 1.0)],
+            ])
         }
         _ => None,
     };
@@ -1242,21 +1263,18 @@ pub fn text_rendering_get_state() -> Result<TextRenderingState, String> {
 
 #[tauri::command]
 pub fn text_rendering_set_mode(mode: String) -> Result<(), String> {
-    if !REGISTRY_METHOD_ENABLED {
-        return Ok(());
-    }
     apply_mode(&mode)
 }
 
 #[tauri::command]
 pub fn text_rendering_set_gamma(gamma: u32) -> Result<(), String> {
-    if !REGISTRY_METHOD_ENABLED {
-        return Ok(());
-    }
     if !(1000..=2200).contains(&gamma) {
         return Err(format!("gamma out of range: {gamma}"));
     }
+    // GDI reads FontSmoothingGamma; DirectWrite/WPF read GammaLevel (same
+    // 1000..=2200 range), so keep both in sync.
     write_dword(DESKTOP_SUBKEY, "FontSmoothingGamma", gamma)?;
+    write_dword(AVALON_SUBKEY, "GammaLevel", gamma)?;
     broadcast_settings_change();
     log_smoothing_state(&format!("gamma set to {gamma}"));
     Ok(())
@@ -1267,9 +1285,6 @@ pub fn text_rendering_set_gamma(gamma: u32) -> Result<(), String> {
 // preview does not change; DirectWrite apps read it at startup.
 #[tauri::command]
 pub fn text_rendering_set_cleartype_level(level: u32) -> Result<(), String> {
-    if !REGISTRY_METHOD_ENABLED {
-        return Ok(());
-    }
     if level > 100 {
         return Err(format!("cleartype level out of range: {level}"));
     }
@@ -1280,11 +1295,11 @@ pub fn text_rendering_set_cleartype_level(level: u32) -> Result<(), String> {
 
 #[tauri::command]
 pub fn text_rendering_reset() -> Result<(), String> {
-    if !REGISTRY_METHOD_ENABLED {
-        return Ok(());
-    }
     apply_mode("rgb")?;
+    // apply_mode already restores PixelStructure + ClearTypeLevel; reset the
+    // gamma on both the GDI and DirectWrite sides too.
     write_dword(DESKTOP_SUBKEY, "FontSmoothingGamma", DEFAULT_GAMMA)?;
+    write_dword(AVALON_SUBKEY, "GammaLevel", DEFAULT_GAMMA)?;
     Ok(())
 }
 

@@ -1206,6 +1206,7 @@ pub fn run() {
             text_rendering::text_preview_render,
             explorer_hook::explorer_hook_set_mode,
             explorer_hook::explorer_hook_set_enabled,
+            explorer_hook::explorer_hook_set_scope,
             explorer_hook::explorer_hook_set_per_monitor,
             explorer_hook::explorer_hook_set_monitor_mode,
             explorer_hook::explorer_hook_set_monitor_knobs,
