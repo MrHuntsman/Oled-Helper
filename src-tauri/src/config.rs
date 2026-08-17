@@ -29,24 +29,24 @@ pub struct FavoriteDisplayMode {
     pub hz: u32,
 }
 
-// A monitor's render knob sextet (Text tab): LCD filter strength, WOLED
-// crosstalk compensation, faux boldness, coverage gamma, fringe damping, and
-// filter width, all 0..=100 (0 = off). Stored per monitor alongside the
-// per-monitor mode.
+// A monitor's render knob triplet (Text tab): LCD filter strength, faux
+// boldness, and fringe damping, all 0..=100. The LCD filter interpolates
+// the subpixel FIR between identity (0, sharpest) and FreeType's light
+// filter (100, the crisp default — also the value when the knob is absent
+// in an old config). (The crosstalk / gamma / filter-width knobs were
+// removed; stale fields in old configs are ignored by serde.)
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorKnobs {
-    #[serde(default)]
+    #[serde(default = "default_lcd_strength")]
     pub lcd: u32,
-    #[serde(default)]
-    pub crosstalk: u32,
     #[serde(default)]
     pub boldness: u32,
     #[serde(default)]
-    pub gamma: u32,
-    #[serde(default)]
     pub damping: u32,
-    #[serde(default)]
-    pub filter_width: u32,
+}
+
+fn default_lcd_strength() -> u32 {
+    100
 }
 
 #[derive(Serialize, Deserialize, Clone)]

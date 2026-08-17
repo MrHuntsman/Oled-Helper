@@ -755,6 +755,25 @@ button {
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
 
+/* Boldness slider ticks (0–30 step 5 → 5 ticks at 1/6..5/6). Unlike the
+   shared .has-ticks rule, the positions account for thumb travel: the
+   .slider-sm thumb is 12px wide, so its center travels [6px, 100% - 6px]
+   rather than [0, 100%] — calc((100% - 12px) * f + 6px) is the thumb-center
+   x for fraction f (same pattern as .has-ticks-dimmer with its 18px thumb).
+   Without the offset the outer ticks drift from the thumb's actual stops
+   (only the center tick aligns, hence the perceived misalignment). */
+.text-render-knobs input[type=range].has-ticks-bold {
+  background:
+    linear-gradient(to right,
+      transparent calc((100% - 12px) * 0.1667 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.1667 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.1667 + 6px + 0.75px), transparent calc((100% - 12px) * 0.1667 + 6px + 0.75px),
+      transparent calc((100% - 12px) * 0.3333 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.3333 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.3333 + 6px + 0.75px), transparent calc((100% - 12px) * 0.3333 + 6px + 0.75px),
+      transparent calc((100% - 12px) * 0.5 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.5 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.5 + 6px + 0.75px), transparent calc((100% - 12px) * 0.5 + 6px + 0.75px),
+      transparent calc((100% - 12px) * 0.6667 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.6667 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.6667 + 6px + 0.75px), transparent calc((100% - 12px) * 0.6667 + 6px + 0.75px),
+      transparent calc((100% - 12px) * 0.8333 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.8333 + 6px - 0.75px), rgba(255,255,255,0.45) calc((100% - 12px) * 0.8333 + 6px + 0.75px), transparent calc((100% - 12px) * 0.8333 + 6px + 0.75px)
+    ),
+    linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
+}
+
 .slider-tooltip {
   position: absolute;
   bottom: calc(100% + 8px);
@@ -3812,40 +3831,13 @@ button {
 .text-render-modes-row .text-render-inline-modes {
   margin: 0;
 }
-.text-render-explorer-desc {
+/* Antivirus false-positive heads-up: amber, with the warning glyph. Sits
+   directly under the coverage heading (no description paragraph anymore). */
+.text-render-explorer-warning {
   margin: 4px 0 10px;
   font-size: 12px;
   line-height: 1.5;
-  color: var(--text-weak);
-}
-/* Antivirus false-positive heads-up: amber, with the warning glyph. */
-.text-render-explorer-warning {
-  margin: -4px 0 10px;
-  font-size: 12px;
-  line-height: 1.5;
   color: #E0A93C;
-}
-.text-render-explorer-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-}
-.text-render-explorer-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  cursor: pointer;
-  user-select: none;
-  white-space: nowrap;
-}
-.text-render-explorer-toggle input[type="checkbox"] {
-  accent-color: var(--accent);
-  width: 14px;
-  height: 14px;
-  cursor: pointer;
-  flex-shrink: 0;
 }
 .text-render-explorer-toggle-label {
   display: flex;
@@ -3862,15 +3854,22 @@ button {
   color: var(--text-weak);
   margin: 0;
 }
-/* Hook scope section under the Explorer toggle: all-apps checkbox, hint,
-   and the exe blocklist input (escape hatch for apps that misbehave). */
-.text-render-scope {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--divider);
+/* Hook coverage selector: three full-width stops reusing the inline-mode
+   segmented look (Registry only / Shell apps / All apps), with the exe
+   blocklist input (escape hatch) under the All-apps stop. */
+.text-render-scope-options {
+  display: flex;
+  gap: 2px;
+  margin: 4px 0 8px;
+  padding: 2px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--hover) 55%, transparent);
 }
-.text-render-scope .text-render-explorer-desc {
-  margin: 6px 0 0;
+.text-render-scope-options .text-render-inline-mode {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
 }
 .text-render-blocklist {
   display: flex;
@@ -3908,8 +3907,8 @@ button {
 }
 /* Each caption centers over its own column: the preview splits at the
    halfway point, so both halves get a centered label — "100% zoom" over the
-   native-size rows on the left, "400% zoom" over the zoomed rows on the
-   right. */
+   native-size rows on the left, "{previewZoom}% zoom" over the zoomed rows
+   on the right (the zoom is fixed, there is no slider). */
 .text-render-preview-caption-left,
 .text-render-preview-caption-right {
   flex: 0 0 50%;
@@ -3921,56 +3920,71 @@ button {
   font-weight: 600;
   letter-spacing: 0.3px;
 }
-/* Mini zoom slider for the right preview column; right-aligned above the
-   canvas so it reads as a control for the zoomed half. */
-.text-render-preview-zoom-row {
+
+/* Tuning controls under the preview canvas. Custom mode shows two
+   side-by-side columns — filters left, subpixel centers right — boxed as a
+   matching pair; other modes show only the filters column at full width. */
+.text-render-knobs-columns {
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  margin: 2px 0 0;
-}
-.text-render-preview-zoom-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-weak);
-  letter-spacing: 0.3px;
-}
-/* Tuning knobs (LCD filter strength, crosstalk, boldness) under the preview
-   canvas. Each row: label, compact slider, numeric value. */
-.text-render-knobs {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+  gap: 10px;
+  align-items: stretch;
   margin: 2px 0 8px;
-  /* Half the tab width, leaving the right half free for a second group of
-     sliders (e.g. per-mode tweaks) later. */
-  width: 50%;
 }
+.text-render-knobs,
 .text-render-custom-offsets {
+  flex: 1 1 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin: 2px 0 8px;
   padding: 8px;
   border: 1px solid var(--divider);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.12);
 }
+/* Non-custom modes show only the Filters column: keep it at the same
+   width it has in Custom mode (half of the row) instead of stretching
+   across the full width. */
+.text-render-knobs-columns.single .text-render-knobs {
+  flex: 0 1 calc(50% - 5px);
+}
 .text-render-custom-heading {
   font-size: 11px;
   font-weight: 600;
-  color: var(--text-weak);
+  color: var(--text);
   letter-spacing: 0.3px;
   margin-bottom: 2px;
 }
-.text-render-custom-offsets .text-render-knob-row {
-  width: 50%;
+/* Heading row: section title left, small reset button right. */
+.text-render-custom-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.text-render-custom-heading-row .text-render-custom-heading {
+  margin-bottom: 0;
+}
+.text-render-custom-reset {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+.text-render-custom-reset:hover {
+  color: #fff;
 }
 .text-render-knob-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* Nest the controls under the section title: the labels start inset
+     from the column's left edge, below "Filters" / "Subpixel centers". */
+  padding-left: 10px;
 }
 .text-render-knob-label {
   flex: 0 0 68px;
@@ -3979,20 +3993,39 @@ button {
   color: var(--text-weak);
   letter-spacing: 0.3px;
 }
-.text-render-knobs .slider-track-wrap-sm {
+/* Mirror the indent on the right column: the Subpixel centers rows are
+   also inset from the box's right edge, below the section title. */
+.text-render-custom-offsets .text-render-knob-row {
+  padding-right: 10px;
+}
+.text-render-knobs .slider-track-wrap-sm,
+.text-render-custom-offsets .slider-track-wrap-sm {
   flex: 1;
   flex-basis: 0;
 }
-.text-render-knobs .slider-val {
-  flex: 0 0 34px;
+.text-render-knobs .slider-val,
+.text-render-custom-offsets .slider-val {
+  /* Fixed-width slot sized to the widest value, so the slider does not
+     shift as the value changes. The number is left-aligned so it hugs the
+     slider: a right-aligned slot wasted its width on short values ("0",
+     "5") as a gap between slider and number. The base .slider-val rule's
+     52px min-width is neutralized too. */
+  flex: 0 0 30px;
   font-size: 12px;
-  text-align: right;
+  min-width: 0;
+  text-align: left;
 }
-.text-render-preview-zoom-row .slider-val {
-  font-size: 12px;
-  min-width: 44px;
+/* Custom offsets go to three decimals ("-0.375"), wider than the integer
+   knob values, so that column's slot is wider. Right-aligned with tabular
+   numerals so the readout stays fixed when a value crosses zero: the sign
+   only prepends a minus, the digits never shift (a left-aligned slot made
+   negative values one glyph wider and stuck out past the positive ones). */
+.text-render-custom-offsets .slider-val {
+  flex-basis: 46px;
   text-align: right;
+  font-variant-numeric: tabular-nums;
 }
+
 .text-render-preview-canvas {
   display: block;
   width: 100%;

@@ -969,9 +969,9 @@ fn preview_font() -> Option<std::sync::Arc<[u8]>> {
 /// Rasterize a short sample of text with the real swash engine (the same code
 /// the Explorer hook uses) and return its flattened coverage bitmap, so the
 /// preview shows the actual fringing for the selected mode instead of the
-/// browser's own font rasterizer. The three knobs (all 0..=100) mirror the
-/// hook's shared-memory state so the preview matches what Explorer renders;
-/// LCD filter strength 0 means no filtering (the filter is off).
+/// browser's own font rasterizer. The knobs (all 0..=100) mirror the hook's
+/// shared-memory state so the preview matches what Explorer renders; LCD
+/// filter strength 0 means no filtering (the filter is off).
 #[derive(serde::Serialize)]
 pub struct PreviewRender {
     pub width: u32,
@@ -988,11 +988,8 @@ pub fn text_preview_render(
     text: String,
     size: f32,
     lcd_strength: u32,
-    crosstalk: u32,
     boldness: u32,
-    gamma: u32,
     damping: u32,
-    filter_width: u32,
     offset_r_x: Option<f32>,
     offset_r_y: Option<f32>,
     offset_g_x: Option<f32>,
@@ -1037,11 +1034,8 @@ pub fn text_preview_render(
     };
     let opts = text_raster::RenderOptions {
         lcd_strength: lcd_strength.min(100) as u8,
-        crosstalk: crosstalk.min(100) as u8,
-        boldness: boldness.min(100) as u8,
-        gamma: gamma.min(100) as u8,
+        boldness: boldness.min(30) as u8,
         damping: damping.min(100) as u8,
-        filter_width: filter_width.min(100) as u8,
         subpixel_offsets,
     };
     let run = rasterize(&font, 0, size, &text, render_mode, opts)

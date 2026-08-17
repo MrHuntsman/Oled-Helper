@@ -7,12 +7,12 @@
   import { invoke } from '@tauri-apps/api/core';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
-  import { textSettings, saveConfig, activeMonitor, syncTextPerMonitor, syncTextScope } from './stores.svelte.js';
+  import { textSettings, saveConfig, activeMonitor, syncTextPerMonitor, syncTextScope, BOLDNESS_MAX } from './stores.svelte.js';
 
   let { modalOpen = false, menuOpen = false } = $props();
 
   const MODES = [
-    { id: 'off', label: 'Off' },
+    { id: 'off', label: 'No filter' },
     { id: 'grayscale', label: 'Grayscale' },
     { id: 'rgb', label: 'RGB' },
     { id: 'bgr', label: 'BGR' },
@@ -29,12 +29,12 @@
   const CUSTOM_OFFSET_DEFAULT = { rx: -0.375, ry: 0, gx: -0.125, gy: 0, bx: 0.375, by: 0 };
   // The six Subpixel center axes (R/G/B × x/y) in slider order.
   const CUSTOM_AXES = [
-    { key: 'rx', label: 'R X' },
-    { key: 'ry', label: 'R Y' },
-    { key: 'gx', label: 'G X' },
-    { key: 'gy', label: 'G Y' },
-    { key: 'bx', label: 'B X' },
-    { key: 'by', label: 'B Y' },
+    { key: 'rx', label: 'Red X' },
+    { key: 'ry', label: 'Red Y' },
+    { key: 'gx', label: 'Green X' },
+    { key: 'gy', label: 'Green Y' },
+    { key: 'bx', label: 'Blue X' },
+    { key: 'by', label: 'Blue Y' },
   ];
   let state = $state({
     effective_mode: 'rgb',
@@ -62,7 +62,7 @@
   let previewCanvas = $state(null);
   // Zoom level (%) for the right preview column, driven by the mini slider
   // above the canvas. Session-only, like the rest of the preview state.
-  let previewZoom = $state(400);
+  let previewZoom = $state(800);
 
   // Sync the persisted master toggle into the backend hook module so it
   // gates the hook (Explorer untouched when off).
@@ -72,12 +72,14 @@
 
   // The knob the sliders show: the selected monitor's per-monitor value.
   // Knobs are part of each monitor's profile; before the selector has a
-  // monitor (pre-load) there is nothing to edit, so the value is 0.
+  // monitor (pre-load) there is nothing to edit, so the value is 0. An
+  // absent entry means "the defaults": lcd = 100 (full light filter),
+  // boldness/damping = 0.
   function knobValue(field) {
     if (!activeMonitor.mon) return 0;
     const k = textSettings.perMonitorKnobs[activeMonitor.mon.sig];
     if (k) return k[field];
-    return 0;
+    return field === 'lcd' ? 100 : 0;
   }
 
   // Push the per-monitor knob assignments (and the mode assignments + enabled
@@ -95,30 +97,36 @@
   // preview (debounced — a drag fires dozens of input events, and each
   // rasterization batch is a few backend calls, so rendering on the final
   // value keeps the UI responsive).
+  // The boldness knob is stored 0..=30 but IS real pixels of stroke
+  // thickening (swash emboldens the outline by boldness/100 px), so the
+  // slider reads in px: 0.00..0.30, one notch = 0.05px. No "px" suffix —
+  // it would need a wider value slot and shorten the slider vs its peers.
+  function formatBoldness(v) {
+    return (v / 100).toFixed(2);
+  }
+
   function onKnobInput(field, value) {
     if (!activeMonitor.mon) return;
     const v = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
     const sig = activeMonitor.mon.sig;
     const k = textSettings.perMonitorKnobs[sig]
-      || { lcd: 0, crosstalk: 0, boldness: 0, gamma: 0, damping: 0, filterWidth: 0 };
+      || { lcd: 100, boldness: 0, damping: 0 };
     k[field] = v;
-    // An all-zero sextet is "no adjustment" — drop the entry so it does
-    // not silently keep per-monitor resolution active.
-    if (k.lcd === 0 && k.crosstalk === 0 && k.boldness === 0
-      && k.gamma === 0 && k.damping === 0 && k.filterWidth === 0) {
+    // An all-default triplet (lcd 100 = full light filter, no bold, no
+    // damping) is "no adjustment" — drop the entry so it does not silently
+    // keep per-monitor resolution active. Note lcd 0 (no filter) is a real
+    // setting, not "off": only the defaults clear.
+    if (k.lcd === 100 && k.boldness === 0 && k.damping === 0) {
       delete textSettings.perMonitorKnobs[sig];
       // Dropping the local entry means the debounced sync loop won't iterate
-      // it, so push an explicit all-zero sextet to clear the hook's copy too.
-      // Without this, a fast drag to 0 would leave Explorer at the old value
-      // while the preview (driven by the store) already shows 0.
+      // it, so push an explicit all-default triplet to clear the hook's copy
+      // too. Without this, a fast drag to 0 would leave Explorer at the old
+      // value while the preview (driven by the store) already shows 0.
       invoke('explorer_hook_set_monitor_knobs', {
         sig,
-        lcdStrength: 0,
-        crosstalk: 0,
+        lcdStrength: 100,
         boldness: 0,
-        gamma: 0,
         damping: 0,
-        filterWidth: 0,
       }).catch(() => {});
     } else {
       textSettings.perMonitorKnobs[sig] = k;
@@ -162,9 +170,27 @@
   // mode, or the system text setting when it has no override (the base state —
   // unconfigured monitors follow the system, which is RGB for most setups).
   // Restore defaults (the tab's reset button) clears overrides back to this.
+  // Custom is not representable through the registry, so while scope is
+  // registry-only a stored custom assignment displays as the system mode
+  // (the radio group keeps a valid selection). The assignment itself is kept
+  // so widening coverage restores it.
+  function applicableMode(mode) {
+    if (isRegistryOnly() && mode === 'custom') return state.effective_mode;
+    return mode;
+  }
+
   function shownMode() {
-    if (activeMonitor.mon) return textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode;
-    return state.effective_mode;
+    if (activeMonitor.mon) return applicableMode(textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode);
+    return applicableMode(state.effective_mode);
+  }
+
+  // LCD filter and fringe reduction only affect subpixel rendering (see
+  // text-raster RenderOptions); grayscale and No filter ignore them, so
+  // those sliders only show for the subpixel modes. Boldness emboldens the
+  // outline and works on every mode.
+  function isSubpixelMode() {
+    const m = shownMode();
+    return m === 'rgb' || m === 'bgr' || m === 'custom';
   }
 
   // Assign the selected monitor's mode override.
@@ -201,6 +227,38 @@
     return customOffsets()[axis];
   }
 
+  // Restore the filter knobs to "no adjustment" (the defaults: full light
+  // filter, no bold, no damping) for the selected monitor. The debounced
+  // sync only iterates existing entries, so an explicit all-default triplet
+  // is pushed to clear the hook's copy too (same as the fast-drag-to-0 fix
+  // in onKnobInput).
+  function resetKnobs() {
+    if (!activeMonitor.mon) return;
+    const sig = activeMonitor.mon.sig;
+    delete textSettings.perMonitorKnobs[sig];
+    invoke('explorer_hook_set_monitor_knobs', {
+      sig,
+      lcdStrength: 100,
+      boldness: 0,
+      damping: 0,
+    }).catch(() => {});
+    saveConfig();
+    scheduleKnobSync();
+    schedulePreviewRender();
+  }
+
+  // Restore the six subpixel centers to the seeded default (the WOLED quad
+  // positions) for the selected monitor: persist, push to the hook
+  // (debounced), and re-render the preview.
+  function resetCustomOffsets() {
+    if (!activeMonitor.mon) return;
+    const sig = activeMonitor.mon.sig;
+    textSettings.perMonitorCustom[sig] = { ...CUSTOM_OFFSET_DEFAULT };
+    saveConfig();
+    scheduleKnobSync();
+    schedulePreviewRender();
+  }
+
   // Update one custom subpixel center, persist, push to the hook (debounced),
   // and re-render the preview.
   function onCustomInput(axis, value) {
@@ -216,28 +274,46 @@
   }
 
   // The mode the preview rasterizes with: the selected monitor's override,
-  // or the system default.
+  // or the system default. Custom falls back to the system mode under
+  // registry-only scope (see applicableMode).
   function previewMode() {
-    if (activeMonitor.mon) return textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode;
-    return state.effective_mode;
+    if (activeMonitor.mon) return applicableMode(textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode);
+    return applicableMode(state.effective_mode);
   }
 
-  function onToggleExplorerHook() {
-    textSettings.explorerHookEnabled = !textSettings.explorerHookEnabled;
+  // Coverage levels: registry-only (no hook), shell hosts, or every GUI
+  // process. The three stops map onto the two persisted booleans
+  // (explorerHookEnabled + hookAllApps), so the storage and backend are
+  // unchanged — this is one control over existing state.
+  function currentScope() {
+    if (!textSettings.explorerHookEnabled) return 'registry';
+    return textSettings.hookAllApps ? 'all' : 'shell';
+  }
+
+  // Registry-only scope: the registry path (GDI FontSmoothing* + DirectWrite
+  // Avalon params) can express grayscale/RGB/BGR/off but NOT the 2D subpixel
+  // offsets (Custom) or the swash filter knobs, so those controls hide.
+  function isRegistryOnly() {
+    return currentScope() === 'registry';
+  }
+
+  // Pick a coverage level and push the matching backend state. Registry
+  // disables the hook entirely (mode 0 → passthrough); shell/all enable it
+  // with the all-apps flag off/on. Scope reaches the DLL live (per-draw
+  // guard), so already-running non-shell apps stop being re-rendered the
+  // moment "shell" is picked.
+  function setScope(scope) {
+    if (scope === 'registry') {
+      textSettings.explorerHookEnabled = false;
+    } else {
+      textSettings.explorerHookEnabled = true;
+      textSettings.hookAllApps = scope === 'all';
+      syncTextScope();
+    }
     saveConfig();
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled })
       .then(refreshHookStatus)
       .catch((e) => console.warn('[text] explorer hook toggle failed', e));
-  }
-
-  // Scope toggle: "apply to all apps" hooks every GUI process (the default)
-  // rather than just Explorer/Control Panel, fixing GDI apps that force
-  // ClearType (7-Zip, WinRAR, ...). Pushed to the hook live; the DLL's
-  // per-draw guard applies it immediately.
-  function onToggleHookAllApps() {
-    textSettings.hookAllApps = !textSettings.hookAllApps;
-    syncTextScope();
-    saveConfig();
   }
 
   // Blocklist editor: comma/semicolon/newline-separated exe names, applied
@@ -313,6 +389,11 @@
   // and composites the returned coverage onto a canvas. Left column at 100%,
   // right column at 400% so the subpixel fringing is visible.
   const PREVIEW_TEXT = 'The quick brown fox jumps over the lazy dog';
+  // The right (zoomed) column shows the fringing-test characters instead of
+  // the pangram: at 800% zoom only a handful of glyphs fit, and these five
+  // are the best-to-worst fringe revealers (single-pixel stem l, dense M,
+  // paired stems H, stem+flag 1, tiny !). Kept unspaced so they fit.
+  const PREVIEW_TEXT_FRINGE = 'lMH1!';
   const PREVIEW_FG = [255, 255, 255];
   const PREVIEW_BG = [20, 20, 24];
 
@@ -348,7 +429,7 @@
     const mode = previewMode();
     const zoom = previewZoom / 100;
     const offs = customOffsets();
-    const key = `${mode}|${knobValue('lcd')}|${knobValue('crosstalk')}|${knobValue('boldness')}|${knobValue('gamma')}|${knobValue('damping')}|${knobValue('filterWidth')}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
+    const key = `${mode}|${knobValue('lcd')}|${knobValue('boldness')}|${knobValue('damping')}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
     const gen = ++previewGen;
 
     let left;
@@ -366,11 +447,8 @@
           mode,
           text: PREVIEW_TEXT,
           lcdStrength: knobValue('lcd'),
-          crosstalk: knobValue('crosstalk'),
           boldness: knobValue('boldness'),
-          gamma: knobValue('gamma'),
           damping: knobValue('damping'),
-          filterWidth: knobValue('filterWidth'),
           offsetRX: mode === 'custom' ? offs.rx : null,
           offsetRY: mode === 'custom' ? offs.ry : null,
           offsetGX: mode === 'custom' ? offs.gx : null,
@@ -382,7 +460,7 @@
           [8, 10, 12, 15].map((size) => invoke('text_preview_render', { ...renderArgs, size: size * dpr })),
         );
         right = await Promise.all(
-          [12, 15].map((size) => invoke('text_preview_render', { ...renderArgs, size: size * dpr })),
+          [15].map((size) => invoke('text_preview_render', { ...renderArgs, text: PREVIEW_TEXT_FRINGE, size: size * dpr })),
         );
       } catch (e) {
         console.warn('[text] preview render failed', e);
@@ -425,7 +503,7 @@
       leftY += r.height / dpr + gap;
     }
 
-    // Right column (slider zoom): the last two sizes.
+    // Right column (slider zoom): the largest size only.
     let rightY = Math.max(0, (cssHeight - rightTotal) / 2);
     for (const r of right) {
       drawRun(ctx, r, rightX, rightY, zoom);
@@ -518,7 +596,41 @@
     <div class="tab-heading-spacer"></div>
     <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore defaults</button>
   </div>
-  <div class="separator"></div>
+  <div class="separator"></div>    <div class="dimmer-control">
+      <div class="dimmer-control-heading">
+        <span class="hdr-control-title">
+          <span class="settings-row-label">Text coverage</span>
+          <span class="info-tip-wrap">
+            <button class="info-tip-btn" aria-label="About text coverage" tabindex="0">Info</button>
+            <span class="info-tip info-tip-right">
+              <span>
+                Where the selected mode is applied:<br>
+                <br>
+                <b>Registry only</b> — apps that follow Windows text settings (browsers, DirectWrite apps on their next start).<br>
+                <b>Shell apps</b> — adds live re-rendering for Explorer, Control Panel and MMC.<br>
+                <b>All apps</b> — hooks every GDI process (2D remap + filters); browsers and games aren't affected.
+              </span>
+            </span>
+          </span>
+        </span>
+      </div>
+      <p class="text-render-explorer-warning">⚠ May trigger antivirus false positives.</p>
+      <div class="text-render-scope-options" role="radiogroup" aria-label="Text rendering coverage">
+        <button type="button" role="radio" aria-checked={currentScope() === 'registry'} class="text-render-inline-mode" class:active={currentScope() === 'registry'} onclick={() => setScope('registry')}>Registry only</button>
+        <button type="button" role="radio" aria-checked={currentScope() === 'shell'} class="text-render-inline-mode" class:active={currentScope() === 'shell'} onclick={() => setScope('shell')}>Shell apps</button>
+        <button type="button" role="radio" aria-checked={currentScope() === 'all'} class="text-render-inline-mode" class:active={currentScope() === 'all'} onclick={() => setScope('all')}>All apps</button>
+      </div>
+    {#if currentScope() === 'all'}
+      <label class="text-render-blocklist">
+        <span class="text-render-explorer-toggle-label">Excluded apps</span>
+        <input type="text" class="text-render-blocklist-input" placeholder="e.g. notepad.exe, winrar"
+          bind:value={blocklistText} onchange={applyBlocklist} />
+      </label>
+    {/if}
+    {#if hookStatus.active}
+      <span class="restart-explorer-hint">Note: Current open windows will need a restart.</span>
+    {/if}
+  </div>
 
   <div class="dimmer-control">
     <div class="dimmer-control-heading">
@@ -539,11 +651,13 @@
     <div class="text-render-modes-row">
       <div class="text-render-inline-modes" role="radiogroup" aria-label="Preview subpixel mode">
         {#each MODES as m (m.id)}
-          <button type="button" class="text-render-inline-mode" class:active={shownMode() === m.id} role="radio" aria-checked={shownMode() === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
-            {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
-            {m.label}
-            {#if m.id === 'grayscale'}<span class="text-render-recommended-badge">Recommended</span>{/if}
-          </button>
+          {#if !(isRegistryOnly() && m.id === 'custom')}
+            <button type="button" class="text-render-inline-mode" class:active={shownMode() === m.id} role="radio" aria-checked={shownMode() === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
+              {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
+              {m.label}
+              {#if m.id === 'grayscale'}<span class="text-render-recommended-badge">Recommended</span>{/if}
+            </button>
+          {/if}
         {/each}
       </div>
     </div>
@@ -554,17 +668,15 @@
       <span class="text-render-preview-caption text-render-preview-caption-left">100% zoom</span>
       <span class="text-render-preview-caption text-render-preview-caption-right">{previewZoom}% zoom</span>
     </div>
-    <div class="text-render-preview-zoom-row">
-      <span class="text-render-preview-zoom-label">Zoom</span>
-      <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-        <input type="range" class="slider-sm" min="100" max="800" step="100" value={previewZoom}
-          style="--fill:{((previewZoom - 100) / 700) * 100}%"
-          oninput={(e) => { previewZoom = Math.round(Number(e.currentTarget.value) / 100) * 100; renderPreview(); }} />
-      </div>
-      <span class="slider-val">{previewZoom}%</span>
-    </div>
     <canvas class="text-render-preview-canvas" bind:this={previewCanvas} role="img" aria-label="Live text rendering preview"></canvas>
-    <div class="text-render-knobs">
+    {#if !isRegistryOnly() && shownMode() !== 'off'}
+    <div class="text-render-knobs-columns" class:single={shownMode() !== 'custom'}>
+      <div class="text-render-knobs">
+        <div class="text-render-custom-heading-row">
+          <div class="text-render-custom-heading">Filters</div>
+          <button type="button" class="text-render-custom-reset" onclick={resetKnobs}>↻ Reset</button>
+        </div>
+      {#if isSubpixelMode()}
       <div class="text-render-knob-row">
         <span class="text-render-knob-label">LCD filter</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
@@ -574,35 +686,19 @@
         </div>
         <span class="slider-val">{knobValue('lcd')}</span>
       </div>
-      <div class="text-render-knob-row">
-        <span class="text-render-knob-label">Crosstalk</span>
-        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('crosstalk')}
-            style="--fill:{knobValue('crosstalk')}%"
-            oninput={(e) => onKnobInput('crosstalk', e.currentTarget.value)} />
-        </div>
-        <span class="slider-val">{knobValue('crosstalk')}</span>
-      </div>
+      {/if}
       <div class="text-render-knob-row">
         <span class="text-render-knob-label">Boldness</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('boldness')}
-            style="--fill:{knobValue('boldness')}%"
+          <input type="range" class="slider-sm has-ticks-bold" min="0" max={BOLDNESS_MAX} step="5" value={knobValue('boldness')}
+            style="--fill:{(knobValue('boldness') / BOLDNESS_MAX) * 100}%"
             oninput={(e) => onKnobInput('boldness', e.currentTarget.value)} />
         </div>
-        <span class="slider-val">{knobValue('boldness')}</span>
+        <span class="slider-val">{formatBoldness(knobValue('boldness'))}</span>
       </div>
+      {#if isSubpixelMode()}
       <div class="text-render-knob-row">
-        <span class="text-render-knob-label">Weight</span>
-        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('gamma')}
-            style="--fill:{knobValue('gamma')}%"
-            oninput={(e) => onKnobInput('gamma', e.currentTarget.value)} />
-        </div>
-        <span class="slider-val">{knobValue('gamma')}</span>
-      </div>
-      <div class="text-render-knob-row">
-        <span class="text-render-knob-label">Fringe damp</span>
+        <span class="text-render-knob-label">Fringe reduction</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
           <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('damping')}
             style="--fill:{knobValue('damping')}%"
@@ -610,19 +706,14 @@
         </div>
         <span class="slider-val">{knobValue('damping')}</span>
       </div>
-      <div class="text-render-knob-row">
-        <span class="text-render-knob-label">Filter width</span>
-        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('filterWidth')}
-            style="--fill:{knobValue('filterWidth')}%"
-            oninput={(e) => onKnobInput('filterWidth', e.currentTarget.value)} />
-        </div>
-        <span class="slider-val">{knobValue('filterWidth')}</span>
+      {/if}
       </div>
-    </div>
     {#if shownMode() === 'custom'}
       <div class="text-render-custom-offsets">
-        <div class="text-render-custom-heading">Subpixel centers</div>
+        <div class="text-render-custom-heading-row">
+          <div class="text-render-custom-heading">Subpixel centers</div>
+          <button type="button" class="text-render-custom-reset" onclick={resetCustomOffsets}>↻ Reset</button>
+        </div>
         {#each CUSTOM_AXES as axis (axis.key)}
           <div class="text-render-knob-row">
             <span class="text-render-knob-label">{axis.label}</span>
@@ -636,38 +727,7 @@
         {/each}
       </div>
     {/if}
-  </div>
-
-  <div class="dimmer-control">
-    <div class="dimmer-control-heading">
-      <span class="hdr-control-title">
-        <span class="settings-row-label">Windows Explorer</span>
-      </span>
     </div>
-    <p class="text-render-explorer-desc">Windows Explorer ignores the system text setting and always renders with ClearType.<br>This fix re-renders Explorer's text using your selected mode.</p>
-    <p class="text-render-explorer-warning">⚠ It could trigger a false positive in your antivirus.</p>
-    <div class="text-render-explorer-actions">
-      <label class="text-render-explorer-toggle">
-        <input type="checkbox" checked={textSettings.explorerHookEnabled} onchange={onToggleExplorerHook} />
-        <span class="text-render-explorer-toggle-label">Fix Windows Explorer</span>
-      </label>
-      {#if hookStatus.active}
-        <span class="restart-explorer-hint">Note: Current open windows will need a restart.</span>
-      {/if}
-    </div>
-    {#if textSettings.explorerHookEnabled}
-      <div class="text-render-scope">
-        <label class="text-render-explorer-toggle">
-          <input type="checkbox" checked={textSettings.hookAllApps} onchange={onToggleHookAllApps} />
-          <span class="text-render-explorer-toggle-label">Apply to all apps</span>
-        </label>
-        <p class="text-render-explorer-desc">GDI apps that force ClearType (7-Zip, WinRAR, …) are re-rendered too. Browsers aren't hooked (their text is Skia, not GDI) but still follow the registry setting — grayscale/RGB/BGR applies, just not the 2D remap. Games' in-game text is engine-rendered and ignores both.</p>
-        <label class="text-render-blocklist">
-          <span class="text-render-explorer-toggle-label">Excluded apps</span>
-          <input type="text" class="text-render-blocklist-input" placeholder="e.g. notepad.exe, winrar"
-            bind:value={blocklistText} onchange={applyBlocklist} />
-        </label>
-      </div>
     {/if}
   </div>
 

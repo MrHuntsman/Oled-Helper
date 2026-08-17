@@ -42,7 +42,7 @@ use windows::Win32::Graphics::Gdi::{
     AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
     ETO_GLYPH_INDEX, ETO_OPAQUE, ETO_OPTIONS, ETO_PDY, HORZRES, HORZSIZE, LOGPIXELSX,
     LOGPIXELSY, MONITOR_DEFAULTTONEAREST, OBJ_FONT, SRCCOPY, TA_BASELINE, TA_BOTTOM,
-    TA_CENTER, TA_RIGHT, VERTRES, VERTSIZE, HMONITOR, GET_DEVICE_CAPS_INDEX,
+    TA_CENTER, TA_RIGHT, VERTRES, VERTSIZE, GET_DEVICE_CAPS_INDEX,
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -68,9 +68,10 @@ use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 // trusting that the module merely loaded. Offset 12 holds the hook-scope
 // flags (bit 0 = "apply to all apps"; 13..23 padding). The per-monitor table
 // lives at 24/28/32+ (flag, count, up to 8 entries x 72 bytes), each entry
-// carrying the monitor's mode, knob sextet (lcd filter, crosstalk, boldness,
-// gamma, damping, filter width), and custom subpixel centers as six (x, y)
-// f32 bit patterns — see resolve_draw_options. The blocklist follows the
+// carrying the monitor's mode, knob triplet (lcd filter strength, boldness,
+// damping; the crosstalk / gamma / filter-width slots are reserved, always
+// 0), and custom subpixel centers as six (x, y) f32 bit patterns — see
+// resolve_draw_options. The blocklist follows the
 // table at 608+ (count, up to 8 entries x 64 bytes = 32 UTF-16 chars): exe
 // names excluded from the detour while "all apps" scope is on.
 const STATE_MODE: usize = 0;
@@ -92,6 +93,16 @@ const STATE_SIZE: usize = STATE_BLOCKLIST_ENTRIES + MAX_BLOCKLIST * BLOCKLIST_EN
 const SCOPE_HOOK_ALL: u32 = 1;
 // Status bit written by the DLL once the ExtTextOutW detour is installed.
 const STATUS_HOOK_INSTALLED: u32 = 1;
+
+// Layout-generation marker embedded in the DLL. The app refuses to serve a
+// locked on-disk copy that lacks the CURRENT marker (an older shared-memory
+// layout could misread the table or read past the app's mapping), and
+// instead prefers the alternate slot carrying the current bytes. KEEP THIS
+// IN SYNC with the app's HOOK_LAYOUT_MARKER in src/explorer_hook.rs and bump
+// it whenever STATE_SIZE / the shared-memory layout changes.
+#[used]
+#[no_mangle]
+pub static HOOK_LAYOUT_MARKER: [u8; 13] = *b"OH2-SMEM-1124";
 
 #[allow(improper_ctypes_definitions)]
 type ExtTextOutWFn = unsafe extern "system" fn(
@@ -206,9 +217,11 @@ fn state_monitor_count() -> usize {
 }
 
 // Entry i as (hmonitor, resolution, physical size, dpi, mode | flags<<8,
-// lcd strength, crosstalk, boldness, gamma, damping, filter width, subpixel
-// r/g/b x/y as u32 bit patterns). Offsets within an entry are all 4-aligned
-// (STATE_MONITORS is 32).
+// lcd filter strength, crosstalk (reserved), boldness, gamma (reserved),
+// damping, filter width (reserved), subpixel r/g/b x/y as u32 bit patterns).
+// The reserved slots are kept at 0 by the app (removed filters) to keep the
+// layout stable. Offsets within an entry are all 4-aligned (STATE_MONITORS
+// is 32).
 fn state_monitor_entry(
     i: usize,
 ) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)> {
@@ -254,32 +267,25 @@ fn hdc_caps_sig(hdc: HDC) -> (u32, u32, u32) {
     }
 }// Per-monitor render options for this draw's DC, when per-monitor is enabled:
 // the attributed monitor's mode (0 = system default / passthrough), its knob
-// sextet (0 = no adjustment), and its custom subpixel centers as per-channel
+// triplet (0 = no adjustment), and its custom subpixel centers as per-channel
 // (x, y) pairs (all-zero = no custom offsets; only meaningful for mode 7,
 // Custom). A monitor that cannot be attributed yields None → the caller falls
 // back to the global mode + fallback knobs. Every connected monitor is in the
 // table, so a successful attribution is the normal path; the table entry's
 // mode is 0 for monitors left at the system default, which still resolves
 // here so their knobs can apply.
-fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [[f32; 2]; 3])> {
+fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, [[f32; 2]; 3])> {
     let count = state_monitor_count();
     if count == 0 {
         return None;
     }
-    let knobs_of = |lcd: u32,
-                    crosstalk: u32,
-                    boldness: u32,
-                    gamma: u32,
-                    damping: u32,
-                    filter_width: u32|
-     -> (u8, u8, u8, u8, u8, u8) {
+    // Boldness is capped at 30 by the app (≈0.3px of stroke thickening);
+    // the clamp here is defense-in-depth for stale shared-memory values.
+    let knobs_of = |lcd: u32, boldness: u32, damping: u32| -> (u8, u8, u8) {
         (
             lcd.min(100) as u8,
-            crosstalk.min(100) as u8,
-            boldness.min(100) as u8,
-            gamma.min(100) as u8,
+            boldness.min(30) as u8,
             damping.min(100) as u8,
-            filter_width.min(100) as u8,
         )
     };
     let offsets_of = |rx: u32, ry: u32, gx: u32, gy: u32, bx: u32, by: u32| -> [[f32; 2]; 3] {
@@ -296,13 +302,13 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [[f32;
         if !hmon.0.is_null() {
             let want = hmon.0 as usize as u32;
             for i in 0..count {
-                if let Some((h, _, _, _, mf, lcd, ct, bd, gm, dm, fw, srx, sry, sgx, sgy, sbx, sby)) =
+                if let Some((h, _, _, _, mf, lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
                     state_monitor_entry(i)
                 {
                     if h == want {
                         MON_WINDOW.fetch_add(1, Ordering::Relaxed);
-                        let (l, c, b, g, d, f) = knobs_of(lcd, ct, bd, gm, dm, fw);
-                        return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
+                        let (l, b, d) = knobs_of(lcd, bd, dm);
+                        return Some((mf & 0xFF, l, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
                     }
                 }
             }
@@ -311,13 +317,13 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [[f32;
     // 2. Memory DC: match the device-caps signature against the table.
     let (res, phys, dpi) = hdc_caps_sig(hdc);
     for i in 0..count {
-        if let Some((_, er, ep, ed, mf, lcd, ct, bd, gm, dm, fw, srx, sry, sgx, sgy, sbx, sby)) =
+        if let Some((_, er, ep, ed, mf, lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
             state_monitor_entry(i)
         {
             if er == res && ep == phys && ed == dpi {
                 MON_CAPS.fetch_add(1, Ordering::Relaxed);
-                let (l, c, b, g, d, f) = knobs_of(lcd, ct, bd, gm, dm, fw);
-                return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
+                let (l, b, d) = knobs_of(lcd, bd, dm);
+                return Some((mf & 0xFF, l, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
             }
         }
     }
@@ -379,17 +385,15 @@ fn is_explorer() -> bool {
 
 // Everything the app wants the detour in: Explorer plus the classic Control
 // Panel host processes and the MMC admin consoles. SystemProperties is a
-// family of executables, matched by prefix. 7-Zip's GUI hosts are included
-// because their filename lists are text-heavy GDI surface (and they ignore
-// the registry grayscale setting by forcing ClearType per-font).
+// family of executables, matched by prefix. Third-party apps (7-Zip, ...)
+// are intentionally NOT here — they're covered by the all-apps scope stop
+// instead, so the shell stop stays a shell-only list.
 fn is_target() -> bool {
     let lower = proc_name().to_ascii_lowercase();
     lower == "explorer.exe"
         || lower == "control.exe"
         || lower == "rundll32.exe"
         || lower == "mmc.exe"
-        || lower == "7zfm.exe"
-        || lower == "7zg.exe"
         || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
 }
 
@@ -819,21 +823,18 @@ unsafe extern "system" fn try_render_swash(
     // per-monitor off) fall back to the global mode with NO knob adjustments
     // (knobs are purely per-monitor now).
     let fallback_opts = text_raster::RenderOptions {
-        lcd_strength: 0,
-        crosstalk: 0,
+        lcd_strength: 100,
         boldness: 0,
-        gamma: 0,
         damping: 0,
-        filter_width: 0,
         subpixel_offsets: None,
     };
     let (mode, opts) = if state_per_monitor_enabled() && global_mode != 0 {
         match resolve_draw_options(hdc) {
-            Some((m, l, c, b, g, d, f, offs)) => {
+            Some((m, l, b, d, offs)) => {
                 // Mode 0 in the table = "no explicit mode" (Default): fall
                 // back to the global mode (the system effective mode, synced
                 // into slot 0 on load) so the monitor still renders the
-                // system text setting — but keep ITS knob sextet so knobs
+                // system text setting — but keep ITS knob triplet so knobs
                 // apply even on a Default monitor. Modes 5/6 (the fixed
                 // RGWB/RWBG WOLED presets) were removed from the product;
                 // a stale entry with one routes the same way. Mode 7
@@ -853,11 +854,8 @@ unsafe extern "system" fn try_render_swash(
                     mode,
                     text_raster::RenderOptions {
                         lcd_strength: l,
-                        crosstalk: c,
                         boldness: b,
-                        gamma: g,
                         damping: d,
-                        filter_width: f,
                         subpixel_offsets,
                     },
                 )

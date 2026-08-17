@@ -24,39 +24,24 @@ use swash::zeno::{Format, Vector};
 use swash::FontRef;
 
 /// Per-draw tuning knobs shared by the preview and the Explorer hook. All
-/// values are 0..=100; defaults match the historical behavior (full LCD
-/// filter, no crosstalk compensation, no faux bold).
+/// values are 0..=100; defaults match the historical behavior (full light
+/// filter, no faux bold, no damping).
 #[derive(Clone, Copy, Debug)]
 pub struct RenderOptions {
-    /// LCD filter strength: interpolates the FreeType 5-tap FIR between the
-    /// identity filter (0, raw box-filter coverage) and the full lcddefault
-    /// filter (100). Only affects subpixel modes.
+    /// LCD filter strength: interpolates the 5-tap FIR between the identity
+    /// filter (0, raw coverage — sharpest, harshest fringing) and FreeType's
+    /// `lcdlight` taps (100, the crisp default that still averages down the
+    /// fringe). Only affects subpixel modes.
     pub lcd_strength: u8,
-    /// WOLED white-subpixel crosstalk compensation: boosts the chroma of
-    /// fringe pixels so the panel's RGB→RGBW conversion does not wash the
-    /// color out. Luminance-preserving; neutral glyph-body pixels are
-    /// untouched (unlike a blanket min() subtraction). Only affects subpixel
-    /// modes.
-    pub crosstalk: u8,
     /// Faux bold: swash's outline embolden, 0..=100 mapped to 0..1px of
     /// stroke thickening. Works on all modes.
     pub boldness: u8,
-    /// Coverage gamma (text weight), 0..=100 mapped to γ 1.0..2.0. Applies a
-    /// power curve to the coverage luminance while preserving per-pixel
-    /// chroma ratios, so it thickens/softens the text without shifting the
-    /// fringe colors. 0 = no change. Works on all modes.
-    pub gamma: u8,
     /// Fringe damping, 0..=100: blends each subpixel pixel toward its
     /// luminance (c → lerp(c, lum, t)). Reduces fringe chroma so colored
-    /// edges fade toward gray — the inverse of crosstalk, useful when
-    /// fringing is more distracting than the color loss. 0 = no damping.
+    /// edges fade toward gray — a desaturation, useful when fringing is
+    /// more distracting than the color loss. 0 = no damping.
     /// Only affects subpixel modes.
     pub damping: u8,
-    /// LCD filter width, 0..=100: interpolates the 5-tap FIR between
-    /// FreeType's lcddefault taps (0, current behavior) and a wider, softer
-    /// spread (100) that smears the fringe over more subpixels. 0 = the
-    /// historical lcddefault. Only affects subpixel modes.
-    pub filter_width: u8,
     /// Custom subpixel centers (R, G, B) as per-channel (x, y) fractions of
     /// a pixel, used only when `mode == RenderMode::Custom`. None = the
     /// mode's default layout. Lets the user tune a panel's physical subpixel
@@ -72,11 +57,8 @@ impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             lcd_strength: 100,
-            crosstalk: 0,
             boldness: 0,
-            gamma: 0,
             damping: 0,
-            filter_width: 0,
             subpixel_offsets: None,
         }
     }
@@ -199,39 +181,33 @@ fn quantize_phase(v: f32) -> f32 {
     }
 }
 
-/// FreeType's `lcddefault` filter weights (sum 272, slightly over-unity to
-/// compensate the low-pass energy loss, matching FreeType).
-const LCD_FILTER_FULL: [f32; 5] = [16.0, 64.0, 112.0, 64.0, 16.0];
-/// The identity filter (strength 0): passes coverage through unchanged.
+/// FreeType's `lcdlight` filter taps: a 5-tap horizontal FIR over the
+/// subpixel stream, dividing by 256. The zero outer taps keep the filter
+/// within one pixel, so glyph edges stay sharp (the lcddefault outer taps
+/// are what smear ink across ~1.7px), while the center taps still average
+/// down the color fringing at glyph edges — the canonical "less blur" LCD
+/// filter. This is the strength knob's top end (100).
+const LCD_FILTER_LIGHT: [f32; 5] = [0.0, 85.0, 86.0, 85.0, 0.0];
+/// The identity filter (strength 0): passes coverage through unchanged —
+/// the sharpest end of the strength knob (raw coverage, harsher fringing).
 const LCD_FILTER_IDENTITY: [f32; 5] = [0.0, 0.0, 256.0, 0.0, 0.0];
-/// A wider, softer spread (sum 272, same energy as lcddefault): pushes more
-/// weight onto the outer taps so the fringe smears across more subpixels.
-/// The width knob interpolates between lcddefault (0) and this (100).
-const LCD_FILTER_WIDE: [f32; 5] = [32.0, 80.0, 96.0, 80.0, 32.0];
 
-/// FreeType's `lcddefault` filter: a 5-tap horizontal FIR applied to the
-/// subpixel coverage stream (R, G, B interleaved), dividing by 256. The
-/// weights sum to 272, so the slight over-unity gain compensates the low-pass
-/// energy loss (matching FreeType). Because each tap advances one SUBPIXEL
-/// rather than one pixel, the filter spans roughly 1.7 pixels and only softens
-/// the color fringing at glyph edges instead of blurring the glyph shape. Edges
-/// are zero-padded.
+/// FreeType's `lcdlight` filter applied to subpixel coverage: a 5-tap
+/// horizontal FIR over the interleaved R, G, B stream, dividing by 256. Each
+/// tap advances one SUBPIXEL rather than one pixel; the zero outer taps keep
+/// the span at one pixel, so only the color fringing at glyph edges is
+/// averaged down while the glyph shape stays sharp.
 ///
 /// `strength` (0..=100) interpolates between the identity filter (raw
-/// coverage, harsher fringing) and the base filter, so it doubles as the
-/// filter's on/off. `width` (0..=100) picks the base filter between the
-/// historical lcddefault taps (0) and a wider, softer spread (100).
-fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8, filter_width: u8) {
+/// coverage — sharpest, harshest fringing) and the light taps (the crisp
+/// default). 0 returns without touching the buffer. Edges are zero-padded.
+fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
     if strength == 0 {
         return;
     }
     let t = strength as f32 / 100.0;
-    let w = filter_width as f32 / 100.0;
-    let base: [f32; 5] = std::array::from_fn(|i| {
-        LCD_FILTER_FULL[i] * (1.0 - w) + LCD_FILTER_WIDE[i] * w
-    });
     let weights: [u32; 5] = std::array::from_fn(|i| {
-        (base[i] * t + LCD_FILTER_IDENTITY[i] * (1.0 - t)).round() as u32
+        (LCD_FILTER_LIGHT[i] * t + LCD_FILTER_IDENTITY[i] * (1.0 - t)).round() as u32
     });
     let w = width as usize;
     for y in 0..height as usize {
@@ -265,35 +241,6 @@ fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8, 
     }
 }
 
-/// Coverage gamma (text weight): applies a power curve to each pixel's
-/// luminance while preserving chroma ratios (all channels scale by the same
-/// factor), so the fringe colors stay put and only the ink weight changes.
-/// `strength` 0..=100 maps to γ 1.0..2.0 (0 = unchanged).
-fn apply_gamma(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
-    if strength == 0 {
-        return;
-    }
-    let gamma = 1.0 + strength as f32 / 100.0; // 1.0..2.0
-    let n = width as usize * height as usize;
-    for i in 0..n {
-        let p = i * 4;
-        let r = coverage[p] as f32;
-        let g = coverage[p + 1] as f32;
-        let b = coverage[p + 2] as f32;
-        let lum = (r + g + b) / 3.0;
-        if lum <= 0.0 {
-            continue;
-        }
-        // scale = lum^(γ-1) makes new_lum = lum^γ (in 0..1 space). Applying
-        // the same scale to all three channels preserves their ratios, so
-        // hue/saturation of the fringe is untouched.
-        let scale = (lum / 255.0).powf(gamma - 1.0);
-        coverage[p] = (r * scale).clamp(0.0, 255.0) as u8;
-        coverage[p + 1] = (g * scale).clamp(0.0, 255.0) as u8;
-        coverage[p + 2] = (b * scale).clamp(0.0, 255.0) as u8;
-    }
-}
-
 /// Fringe damping: blends each subpixel pixel toward its luminance so the
 /// colored fringe fades toward gray. `strength` 0..=100 is the blend factor
 /// (0 = untouched, 100 = fully gray fringe). Luminance-preserving by
@@ -313,36 +260,6 @@ fn apply_damping(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
         coverage[p] = (r + (lum - r) * t).round().clamp(0.0, 255.0) as u8;
         coverage[p + 1] = (g + (lum - g) * t).round().clamp(0.0, 255.0) as u8;
         coverage[p + 2] = (b + (lum - b) * t).round().clamp(0.0, 255.0) as u8;
-    }
-}
-
-/// WOLED white-subpixel crosstalk compensation. The panel derives the W
-/// subpixel from the neutral component of each pixel, which washes colored
-/// fringes toward white. This pushes each channel away from the pixel's mean
-/// (a saturation boost) so the fringes stay colored after the RGB→RGBW
-/// conversion. Because it spreads around the mean, total luminance is
-/// preserved and pixels where all channels are equal (the glyph body) are
-/// untouched — the failure mode of the earlier blanket min() subtraction.
-fn apply_crosstalk(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
-    if strength == 0 {
-        return;
-    }
-    // Max chroma amplification factor at full strength.
-    let k = strength as f32 / 100.0 * 1.2;
-    let n = width as usize * height as usize;
-    for i in 0..n {
-        let p = i * 4;
-        let r = coverage[p] as f32;
-        let g = coverage[p + 1] as f32;
-        let b = coverage[p + 2] as f32;
-        let mean = (r + g + b) / 3.0;
-        let spread = (r - mean).abs().max((g - mean).abs()).max((b - mean).abs());
-        if spread < 0.5 {
-            continue; // neutral pixel (glyph body), nothing to compensate
-        }
-        coverage[p] = (mean + (r - mean) * (1.0 + k)).clamp(0.0, 255.0) as u8;
-        coverage[p + 1] = (mean + (g - mean) * (1.0 + k)).clamp(0.0, 255.0) as u8;
-        coverage[p + 2] = (mean + (b - mean) * (1.0 + k)).clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -373,11 +290,8 @@ struct GlyphCacheKey {
     phase_y: u32,
     mode: u8,
     lcd: u8,
-    crosstalk: u8,
     boldness: u8,
-    gamma: u8,
     damping: u8,
-    filter_width: u8,
     /// Custom subpixel center bits (0 when unused) — tuned offsets must not
     /// share cache entries with the fixed layouts. All six (x, y) offsets are
     /// carried so a 2D layout never collides with a horizontal-only one.
@@ -516,11 +430,8 @@ fn glyph_cache_key(
         phase_y: offset.y.to_bits(),
         mode: mode as u8,
         lcd: opts.lcd_strength,
-        crosstalk: opts.crosstalk,
         boldness: opts.boldness,
-        gamma: opts.gamma,
         damping: opts.damping,
-        filter_width: opts.filter_width,
         sub_rx,
         sub_ry,
         sub_gx,
@@ -539,9 +450,9 @@ enum GlyphResult {
     Unsupported,
 }
 
-/// Rasterize one glyph (or reuse the cached bitmap), applying the LCD filter,
-/// crosstalk, and crisp threshold so the cache stores the FINAL coverage.
-/// The caller supplies the run-local offset (subpixel phase).
+/// Rasterize one glyph (or reuse the cached bitmap), applying the LCD filter
+/// and crisp threshold so the cache stores the FINAL coverage. The caller
+/// supplies the run-local offset (subpixel phase).
 fn rasterize_glyph_cached(
     scaler: &mut swash::scale::Scaler,
     font_ptr: usize,
@@ -619,13 +530,11 @@ fn rasterize_glyph_uncached(
     GlyphResult::Rendered(glyph)
 }
 
-/// The subpixel post-processing knobs shared by the native and 2D paths. All
-/// four operate on a 4-byte-per-pixel RGBA buffer and only affect subpixel
+/// The subpixel post-processing steps shared by the native and 2D paths. All
+/// operate on a 4-byte-per-pixel RGBA buffer and only affect subpixel
 /// coverage (callers gate on `Content::SubpixelMask`).
 fn postprocess_subpixel(data: &mut [u8], width: u32, height: u32, opts: RenderOptions) {
-    apply_lcd_filter(data, width, height, opts.lcd_strength, opts.filter_width);
-    apply_crosstalk(data, width, height, opts.crosstalk);
-    apply_gamma(data, width, height, opts.gamma);
+    apply_lcd_filter(data, width, height, opts.lcd_strength);
     apply_damping(data, width, height, opts.damping);
 }
 
@@ -739,8 +648,8 @@ fn rasterize_glyph_2d(
 ///
 /// `font_data` is the raw bytes of the font file and `font_index` selects the
 /// face within a TTC. `mode` controls grayscale vs crisp output and `opts`
-/// carries the per-draw knobs (LCD filter strength, crosstalk, faux bold).
-/// Returns `None` if the font cannot be parsed.
+/// carries the per-draw knobs (LCD filter strength, faux bold, fringe
+/// damping, filter width). Returns `None` if the font cannot be parsed.
 pub fn rasterize(
     font_data: &[u8],
     font_index: u32,
@@ -1307,47 +1216,40 @@ mod tests {
     }
 
     #[test]
-    fn lcd_filter_spreads_impulse() {
+    fn light_filter_spreads_within_one_pixel() {
         let mut buf = vec![0u8; 5 * 4];
         buf[2 * 4] = 255; // red-channel impulse at pixel 2
-        apply_lcd_filter(&mut buf, 5, 1, 100, 0);
-        // The impulse spreads across neighboring SUBPIXELS (R/G/B boundaries),
-        // not just the red channel of neighboring pixels.
-        assert_eq!(buf[1 * 4 + 1], 15); // G of pixel 1
-        assert_eq!(buf[1 * 4 + 2], 63); // B of pixel 1
-        assert_eq!(buf[2 * 4], 111); // R of pixel 2 (peak)
-        assert_eq!(buf[2 * 4 + 1], 63); // G of pixel 2
-        assert_eq!(buf[2 * 4 + 2], 15); // B of pixel 2
+        apply_lcd_filter(&mut buf, 5, 1, 100);
+        // The light filter (zero outer taps) spreads the impulse only to the
+        // ADJACENT subpixels in the interleaved stream — B of pixel 1 (tap
+        // -1) and G of pixel 2 (tap +1) — while the ±2 taps (G of pixel 1,
+        // B of pixel 2) stay zero. Edges stay sharp, the fringe is still
+        // averaged down.
+        assert_eq!(buf[1 * 4 + 1], 0); // G of pixel 1 (tap -2 is zero)
+        assert_eq!(buf[1 * 4 + 2], 84); // B of pixel 1 (tap -1)
+        assert_eq!(buf[2 * 4], 85); // R of pixel 2 (peak)
+        assert_eq!(buf[2 * 4 + 1], 84); // G of pixel 2 (tap +1)
+        assert_eq!(buf[2 * 4 + 2], 0); // B of pixel 2 (tap +2 is zero)
+        // No energy spills beyond the impulse's pixel ± 1 subpixel.
+        assert_eq!(buf[0 * 4 + 2], 0);
+        assert_eq!(buf[3 * 4], 0);
     }
 
     #[test]
-    fn wide_filter_smears_farther_than_default() {
-        // Same impulse, but the wide filter pushes more weight onto the outer
-        // taps, so the neighbor subpixels receive more energy than lcddefault.
+    fn zero_strength_is_identity() {
+        // Strength 0 = the identity filter: the buffer is untouched, so the
+        // sharpest setting really is raw coverage.
         let mut buf = vec![0u8; 5 * 4];
         buf[2 * 4] = 255;
-        apply_lcd_filter(&mut buf, 5, 1, 100, 100);
-        assert!(buf[1 * 4 + 1] > 15, "wide filter should spread more to neighbors");
-        assert!(buf[2 * 4] < 111, "wide filter should lower the peak");
-    }
-
-    #[test]
-    fn gamma_darkens_mid_tone_keeps_fringe_ratio() {
-        // A mid-gray fringe pixel: gamma raises contrast (darkens below 50%,
-        // lightens above) while preserving the R:G:B ratio so the fringe hue
-        // stays put.
-        let mut buf = vec![0u8; 1 * 4];
-        buf[0] = 128;
-        buf[1] = 64;
-        buf[2] = 32;
         let before = buf.clone();
-        apply_gamma(&mut buf, 1, 1, 100);
-        assert!(buf[0] < before[0], "gamma should darken a sub-mid luminance");
-        let r = buf[0] as f32 / before[0] as f32;
-        let g = buf[1] as f32 / before[1] as f32;
-        let b = buf[2] as f32 / before[2] as f32;
-        let max_diff = (r - g).abs().max((r - b).abs()).max((g - b).abs());
-        assert!(max_diff < 0.05, "channel ratios should be preserved");
+        apply_lcd_filter(&mut buf, 5, 1, 0);
+        assert_eq!(buf, before);
+        // Half strength blends: the impulse still stays within ±1 subpixel.
+        let mut half = vec![0u8; 5 * 4];
+        half[2 * 4] = 255;
+        apply_lcd_filter(&mut half, 5, 1, 50);
+        assert_eq!(half[1 * 4 + 2], 42); // (85 * 0.5) of 255, /256
+        assert_eq!(half[2 * 4], 170); // (86 * 0.5 + 256 * 0.5) of 255, /256
     }
 
     #[test]

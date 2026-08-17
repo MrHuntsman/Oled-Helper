@@ -32,6 +32,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
@@ -61,8 +62,9 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //       u32 physical size (horzsize | vertsize<<16)
 //       u32 dpi (logpixelsx | logpixelsy<<16)
 //       u32 mode | primary<<8  (mode 0 = system default, 7 = custom)
-//       u32 lcd strength, crosstalk, boldness, gamma, damping, filter width
-//           (all 0..=100)
+//       u32 lcd filter strength, boldness, damping (all 0..=100; the
+//           crosstalk / gamma / filter-width slots reserved at 0 — removed
+//           filters)
 //       u32 custom subpixel centers r/g/b x/y (f32 bits; all-zero = not set)
 // After the table, the hook-scope blocklist (count + up to 8 exe names x 32
 // UTF-16 units); offset 12 holds the hook-scope flags (bit 0 = all apps).
@@ -106,14 +108,14 @@ static TOGGLE: AtomicBool = AtomicBool::new(false);
 // Last mode-state from the Text tab (0..7), gated by TOGGLE in apply_state.
 static LAST_STATE: AtomicU32 = AtomicU32::new(0);
 // Per-monitor rendering (Text tab): master flag plus per-monitor mode
-// assignments and knob sextets keyed by the monitor's stable signature
+// assignments and knob triplets keyed by the monitor's stable signature
 // (see MonitorEntry::sig). Mode values match the DLL: 1..=7 as in
 // explorer_hook_set_mode; absent = "system default". Knobs are the LCD
-// filter strength / crosstalk / boldness / gamma / damping / filter width
-// sextets (0..=100); absent = no adjustment.
+// filter strength / boldness / damping triplets (0..=100); absent = the
+// defaults (full light filter, no bold, no damping).
 static PER_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static MONITOR_MODES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
-static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32, u32, u32, u32, u32)>>> = OnceLock::new();
+static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32, u32)>>> = OnceLock::new();
 // Custom subpixel centers per monitor (mode 7): sig → [[r, g, b] x (x, y)]
 // as f32 fractions of a pixel. All-zero pairs are treated as unset (the
 // entry writes 0, and the DLL only uses them when the mode is 7).
@@ -225,7 +227,7 @@ fn write_state_table() -> Result<(), String> {
         std::ptr::write_volatile(base.add(STATE_MONITOR_COUNT_OFFSET) as *mut u32, count);
         for (i, e) in entries.iter().take(MAX_MONITORS).enumerate() {
             let entry = base.add(STATE_MONITORS_OFFSET + i * MONITOR_ENTRY_STRIDE);
-            let (lcd, ct, bd, gm, dm, fw) = knobs.get(&e.sig()).copied().unwrap_or((0, 0, 0, 0, 0, 0));
+            let (lcd, bd, dm) = knobs.get(&e.sig()).copied().unwrap_or((100, 0, 0));
             let [[srx, sry], [sgx, sgy], [sbx, sby]] = custom
                 .get(&e.sig())
                 .copied()
@@ -248,11 +250,14 @@ fn write_state_table() -> Result<(), String> {
                 modes.get(&e.sig()).copied().unwrap_or(0).min(7) | ((e.primary as u32) << 8),
             );
             std::ptr::write_volatile(entry.add(20) as *mut u32, lcd.min(100));
-            std::ptr::write_volatile(entry.add(24) as *mut u32, ct.min(100));
-            std::ptr::write_volatile(entry.add(28) as *mut u32, bd.min(100));
-            std::ptr::write_volatile(entry.add(32) as *mut u32, gm.min(100));
+            // Slots 24 (crosstalk), 32 (gamma), and 40 (filter width) are
+            // reserved: the filters were removed, but the slots stay at 0 so
+            // the shared-memory layout (and HOOK_LAYOUT_MARKER) is unchanged.
+            std::ptr::write_volatile(entry.add(24) as *mut u32, 0);
+            std::ptr::write_volatile(entry.add(28) as *mut u32, bd.min(30));
+            std::ptr::write_volatile(entry.add(32) as *mut u32, 0);
             std::ptr::write_volatile(entry.add(36) as *mut u32, dm.min(100));
-            std::ptr::write_volatile(entry.add(40) as *mut u32, fw.min(100));
+            std::ptr::write_volatile(entry.add(40) as *mut u32, 0);
             std::ptr::write_volatile(entry.add(44) as *mut u32, srx.to_bits());
             std::ptr::write_volatile(entry.add(48) as *mut u32, sry.to_bits());
             std::ptr::write_volatile(entry.add(52) as *mut u32, sgx.to_bits());
@@ -421,38 +426,55 @@ fn global_hook() -> &'static Mutex<Option<usize>> {
 static EMBEDDED_HOOK_DLL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/explorer_hook.dll"));
 
-// Write the embedded DLL to one stable path. Windows limits the number of
-// distinct global hook DLL names/paths that can be active at once (historically
-// 32). Hashing the filename per build eventually exhausts that shared limit
-// because a long-lived Explorer can keep old hook DLL mappings alive even
-// after their hook handles are unregistered.
-fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|e| format!("could not resolve config dir: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("could not create config dir: {e}"))?;
+// Layout-generation marker. MUST match explorer-hook's HOOK_LAYOUT_MARKER
+// (explorer-hook/src/lib.rs); bump both whenever STATE_SIZE / the
+// shared-memory layout changes. Lets us tell a locked previous-build DLL
+// whose layout is still compatible (safe to serve) from one that would
+// misread the current shared memory (must not be served).
+const HOOK_LAYOUT_MARKER: &[u8] = b"OH2-SMEM-1124";
 
-    let path = dir.join("explorer_hook.dll");
-    let needs_write = match fs::read(&path) {
-        Ok(existing) => existing != EMBEDDED_HOOK_DLL,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => {
-            return Err(format!("could not read {}: {error}", path.display()));
-        }
-    };
-    if needs_write {
-        fs::write(&path, EMBEDDED_HOOK_DLL).map_err(|e| {
-            format!(
-                "{} is still in use; restart Explorer once before applying this hook build ({e})",
-                path.display()
-            )
-        })?;
+// Two fixed slot names, so at most two distinct hook DLL paths can ever be
+// active — the Windows limit on distinct global-hook DLL names (historically
+// 32) is untouched — while still letting a fresh build install even when the
+// primary slot is locked by running processes. When a slot's file can be
+// replaced, the stale copy is deleted; locked copies are scheduled for
+// deletion at the next boot (best effort; the pending-rename list is in HKLM,
+// so this may need elevation, and the rotation works without it).
+const HOOK_DLL_SLOTS: [&str; 2] = ["explorer_hook.dll", "explorer_hook_b.dll"];
+
+fn dll_matches_current(path: &std::path::Path) -> bool {
+    matches!(fs::read(path), Ok(bytes) if bytes == EMBEDDED_HOOK_DLL)
+}
+
+// Whether a (possibly locked) on-disk DLL was built against the current
+// shared-memory layout, by searching for the layout marker in its bytes.
+fn dll_has_current_layout(path: &std::path::Path) -> bool {
+    matches!(
+        fs::read(path),
+        Ok(bytes)
+            if bytes
+                .windows(HOOK_LAYOUT_MARKER.len())
+                .any(|w| w == HOOK_LAYOUT_MARKER)
+    )
+}
+
+// fs::write succeeds only when no process has the file mapped; a lock means
+// running processes (Explorer, injected apps) still hold the old build. A
+// matching file short-circuits so we never rewrite unnecessarily.
+fn write_hook_dll(path: &std::path::Path) -> Result<(), String> {
+    if dll_matches_current(path) {
+        return Ok(());
     }
+    fs::write(path, EMBEDDED_HOOK_DLL).map_err(|e| {
+        format!("{} is still in use by running processes ({e})", path.display())
+    })
+}
 
-    // Remove legacy hash-named copies when possible. A live Explorer may still
-    // have one mapped, so deletion is intentionally best effort.
-    if let Ok(entries) = fs::read_dir(&dir) {
+// Best-effort removal of the legacy hash-named copies from older builds. A
+// live Explorer may still have one mapped, so deletion is intentionally
+// best effort; the fixed slots are not affected (their names have no dash).
+fn remove_legacy_hook_dlls(dir: &std::path::Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -461,7 +483,86 @@ fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
             }
         }
     }
-    Ok(path)
+}
+
+// Mark a locked DLL for deletion at the next boot. Best effort: the pending
+// file-operation list lives under HKLM, so this can fail without elevation.
+fn schedule_delete_at_boot(path: &std::path::Path) {
+    let w = wide(&path.to_string_lossy());
+    // SAFETY: MoveFileExW with MOVEFILE_DELAY_UNTIL_REBOOT only records the
+    // path in the session-manager list; no file is touched now.
+    unsafe {
+        let _ = MoveFileExW(PCWSTR(w.as_ptr()), None, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+}
+
+// Get a usable on-disk hook DLL, installing the embedded build if possible.
+// The crash-resilience story: when the app dies (or is updated), the hook
+// handle dies with it, but Windows does NOT force-unload the DLL from
+// processes that already loaded it — Explorer and injected apps keep the old
+// file mapped for the whole session, so a plain overwrite fails (os error
+// 32). Instead of failing forever, this serves the locked-but-compatible
+// previous build (LoadLibraryW works on a locked file, so the hook installs
+// and works this run), prefers the second slot with the CURRENT bytes when
+// the primary is locked, and only errors when neither slot is usable.
+fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("could not resolve config dir: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("could not create config dir: {e}"))?;
+
+    let primary = dir.join(HOOK_DLL_SLOTS[0]);
+    let alternate = dir.join(HOOK_DLL_SLOTS[1]);
+
+    // 1. A slot already carrying the current bytes (a previous run wrote
+    //    it): use it and tidy the other slot. A matching-but-mapped copy is
+    //    fine to serve — loading a mapped file is exactly what the hook does.
+    for (path, other) in [(&primary, &alternate), (&alternate, &primary)] {
+        if dll_matches_current(path) {
+            let _ = fs::remove_file(other);
+            remove_legacy_hook_dlls(&dir);
+            return Ok(path.clone());
+        }
+    }
+
+    // 2. Primary slot, current bytes.
+    if write_hook_dll(&primary).is_ok() {
+        let _ = fs::remove_file(&alternate);
+        remove_legacy_hook_dlls(&dir);
+        return Ok(primary);
+    }
+
+    // 3. Primary is locked. If it holds a COMPATIBLE previous build, prefer
+    //    the alternate slot with the CURRENT bytes so this run gets the new
+    //    build; fall back to serving the locked compatible copy.
+    if dll_has_current_layout(&primary) {
+        if write_hook_dll(&alternate).is_ok() {
+            schedule_delete_at_boot(&primary);
+            remove_legacy_hook_dlls(&dir);
+            return Ok(alternate);
+        }
+        log::warn!(
+            "[explorer-hook] serving previous hook build (locked by running processes, same layout); current build deferred"
+        );
+        remove_legacy_hook_dlls(&dir);
+        return Ok(primary);
+    }
+
+    // 4. Primary locked AND incompatible — only the alternate slot can carry
+    //    the current layout this run.
+    if write_hook_dll(&alternate).is_ok() {
+        schedule_delete_at_boot(&primary);
+        remove_legacy_hook_dlls(&dir);
+        return Ok(alternate);
+    }
+
+    // 5. Both slots unusable: keep the watchdog retrying, and schedule the
+    //    locked files for deletion at the next boot so a future run starts
+    //    clean.
+    schedule_delete_at_boot(&primary);
+    schedule_delete_at_boot(&alternate);
+    Err("the previous hook DLL is still loaded in running processes; the new build will be applied once those processes exit (restart Explorer or reboot)".to_string())
 }
 
 // Load the DLL into this process (so SetWindowsHookExW can resolve its hook
@@ -678,38 +779,34 @@ pub fn explorer_hook_monitors() -> Result<Vec<ExplorerMonitorInfo>, String> {
         .collect())
 }
 
-/// Assign a per-monitor render knob sextet (LCD filter strength, WOLED
-/// crosstalk compensation, faux boldness, coverage gamma, fringe damping,
-/// filter width; all 0..=100, 0 = off). Written into the monitor table so the
-/// DLL applies them to that monitor's draws on the next repaint (live).
-/// All-zero clears the entry.
+/// Assign a per-monitor render knob triplet (LCD filter strength, faux
+/// boldness, fringe damping; 0..=100, boldness capped at 30). The LCD
+/// filter interpolates the subpixel FIR between identity (0, sharpest) and
+/// the light filter (100, the crisp default). Written into the monitor
+/// table so the DLL applies them to that monitor's draws on the next
+/// repaint (live). An entry equal to the defaults (100, 0, 0) — "no
+/// adjustment" — clears the entry.
 #[tauri::command]
 pub fn explorer_hook_set_monitor_knobs(
     sig: String,
     lcd_strength: u32,
-    crosstalk: u32,
     boldness: u32,
-    gamma: u32,
     damping: u32,
-    filter_width: u32,
 ) -> Result<(), String> {
     {
         let mut knobs = MONITOR_KNOBS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let sextet = (
+        let triplet = (
             lcd_strength.min(100),
-            crosstalk.min(100),
-            boldness.min(100),
-            gamma.min(100),
+            boldness.min(30),
             damping.min(100),
-            filter_width.min(100),
         );
-        if sextet == (0, 0, 0, 0, 0, 0) {
+        if triplet == (100, 0, 0) {
             knobs.remove(&sig);
         } else {
-            knobs.insert(sig, sextet);
+            knobs.insert(sig, triplet);
         }
     }
     write_state_table()?;
@@ -807,10 +904,7 @@ pub fn apply_startup_state(
             .unwrap_or_else(|p| p.into_inner());
         knobs.clear();
         for (sig, k) in &cfg.per_monitor_knobs {
-            knobs.insert(
-                sig.clone(),
-                (k.lcd, k.crosstalk, k.boldness, k.gamma, k.damping, k.filter_width),
-            );
+            knobs.insert(sig.clone(), (k.lcd, k.boldness, k.damping));
         }
     }
     {

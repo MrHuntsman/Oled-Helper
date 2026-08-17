@@ -134,11 +134,8 @@ export function syncTextPerMonitor() {
     invoke('explorer_hook_set_monitor_knobs', {
       sig,
       lcdStrength: k.lcd,
-      crosstalk: k.crosstalk,
       boldness: k.boldness,
-      gamma: k.gamma,
       damping: k.damping,
-      filterWidth: k.filterWidth,
     }).catch(() => {});
   }
   for (const [sig, offs] of Object.entries(textSettings.perMonitorCustom)) {
@@ -261,8 +258,9 @@ export const taskbarDimmer = $state({
 // Text rendering tab settings persisted in config. The Explorer hook toggle
 // decides whether the hook DLL fixes Explorer's text (Grayscale/Off
 // modes) or leaves it at system ClearType. The three render knobs (all
-// 0..100) tune LCD filter strength (0 = off, the default), WOLED crosstalk
-// compensation, and faux boldness.
+// 0..100, boldness capped at 30) tune LCD filter strength (0 = no filter,
+// 100 = the crisp FreeType lcdlight filter — the default), faux boldness,
+// and fringe damping.
 export const textSettings = $state({
   explorerHookEnabled: false,
   // Hook scope: whether the swash detour applies to every GUI process
@@ -276,9 +274,9 @@ export const textSettings = $state({
   // system default ("Default" in the UI). Whether per-monitor resolution is
   // active is derived from whether any assignment exists — no stored flag.
   perMonitorModes: {},
-  // Per-monitor render knob sextets, sig → { lcd, crosstalk, boldness,
-  // gamma, damping, filterWidth } (all 0..=100). Absent = no adjustment for
-  // that monitor. Like modes, the presence of any knob entry activates
+  // Per-monitor render knob triplets, sig → { lcd, boldness, damping } (all
+  // 0..=100). Absent = the defaults (full light filter, no bold, no
+  // damping). Like modes, the presence of any knob entry activates
   // per-monitor resolution.
   perMonitorKnobs: {},
   // Per-monitor custom subpixel centers, sig → { rx, ry, gx, gy, bx, by }
@@ -516,6 +514,10 @@ function profileKey(hz, info = crushInfo()) {
 }
 function clampAdjustment(value) { return Math.max(-150, Math.min(150, Math.round(Number(value) || 0))); }
 function clampKnob(value) { return Math.max(0, Math.min(100, Math.round(Number(value) || 0))); }
+// Boldness tops out at 30 (≈0.3px of stroke thickening): the slider max.
+// Old configs with higher values are clamped on load.
+export const BOLDNESS_MAX = 30;
+function clampBoldness(value) { return Math.min(BOLDNESS_MAX, clampKnob(value)); }
 function clampOffset(value) { const n = Number(value); return Number.isFinite(n) ? Math.max(-1, Math.min(1, n)) : 0; }
 // Normalize a per-monitor custom offset entry from config. Accepts the 2D
 // [[rx, ry], [gx, gy], [bx, by]] shape (current) and the legacy flat [r, g, b]
@@ -651,12 +653,11 @@ export async function loadConfig(prefetchedCfg = null) {
       for (const [sig, k] of Object.entries(cfg.per_monitor_knobs)) {
         if (k && typeof k === 'object') {
           textSettings.perMonitorKnobs[sig] = {
-            lcd: clampKnob(k.lcd),
-            crosstalk: clampKnob(k.crosstalk),
-            boldness: clampKnob(k.boldness),
-            gamma: clampKnob(k.gamma),
+            // Missing lcd in an old config means it was saved before the
+            // knob existed — default to the full light filter.
+            lcd: k.lcd == null ? 100 : clampKnob(k.lcd),
+            boldness: clampBoldness(k.boldness),
             damping: clampKnob(k.damping),
-            filterWidth: clampKnob(k.filterWidth),
           };
         }
       }
