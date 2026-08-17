@@ -865,6 +865,28 @@ unsafe extern "system" fn try_render_swash(
     } else {
         (global_mode, fallback_opts)
     };
+    // Filter knobs are mode-scoped: a mode that can't use a filter must not
+    // inherit it from another mode's settings. Crisp ("No filter") applies
+    // NO filters at all — boldness included, so a boldness tuned in
+    // grayscale does not show up on a No-filter monitor. Grayscale applies
+    // only boldness (the LCD filter and fringe damping are subpixel-only;
+    // the rasterizer already ignores them for mask content, this keeps it
+    // explicit). RGB/BGR/Custom use the full knob triplet.
+    let opts = match mode {
+        2 => text_raster::RenderOptions {
+            lcd_strength: 100,
+            boldness: 0,
+            damping: 0,
+            subpixel_offsets: None,
+        },
+        1 => text_raster::RenderOptions {
+            lcd_strength: 0,
+            boldness: opts.boldness,
+            damping: 0,
+            subpixel_offsets: None,
+        },
+        _ => opts,
+    };
     let render_mode = match mode {
         1 => text_raster::RenderMode::Grayscale,
         2 => text_raster::RenderMode::Crisp,

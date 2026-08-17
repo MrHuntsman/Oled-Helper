@@ -1234,6 +1234,29 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_positioner::init())
+        // Persist and restore the main window's geometry (size, position,
+        // maximized) across launches — the official window-state plugin.
+        // Registered at the BUILDER level, not in .setup(): Tauri creates the
+        // config-defined windows (and fires the plugin's window_created hook
+        // synchronously) before the user setup callback runs, so a plugin
+        // registered there never sees the main window and its cache stays
+        // empty (state file written as {} — neither saves nor restores).
+        // Scoped to the "main" window only: the flyout and tray-menu popups
+        // are positioned programmatically every time and must not be
+        // restored. Flags exclude VISIBLE/DECORATIONS/FULLSCREEN so a
+        // close-to-tray hide can never be restored as a hidden window (this
+        // app always starts visible); size/position/maximized are saved on
+        // resize/move/close and flushed on exit.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_filter(|label| label == "main")
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
         .setup(|app| {
             // Gamma safety thread: re-applies the last known ramp every 5
             // seconds so another app resetting the system gamma (fullscreen
@@ -1513,6 +1536,15 @@ pub fn run() {
                     // button and the tray's Exit are the real exits. Hiding
                     // keeps the process alive so the tray icon can reopen it.
                     api.prevent_close();
+                    // Flush the window-state plugin's in-memory geometry to
+                    // disk now: the plugin only writes on process exit, and
+                    // the window may stay hidden in the tray for a long time
+                    // (or the process be killed) before that happens. Save
+                    // while still visible so the pre-hide geometry is kept.
+                    use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+                    let _ = window.app_handle().save_window_state(
+                        StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
+                    );
                     if window.hide().is_ok() {
                         // First close-to-tray ever: tell the user the app is
                         // still running in the tray.

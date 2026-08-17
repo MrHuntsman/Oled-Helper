@@ -1032,11 +1032,31 @@ pub fn text_preview_render(
         }
         _ => None,
     };
-    let opts = text_raster::RenderOptions {
-        lcd_strength: lcd_strength.min(100) as u8,
-        boldness: boldness.min(30) as u8,
-        damping: damping.min(100) as u8,
-        subpixel_offsets,
+    // Filter knobs are mode-scoped (same rule as the hook DLL): a mode that
+    // can't use a filter must not inherit it from another mode's settings.
+    // "No filter" (crisp) applies NO filters — boldness included — and
+    // grayscale applies only boldness (the LCD filter and fringe damping
+    // are subpixel-only; the rasterizer ignores them for mask content, this
+    // keeps it explicit). RGB/BGR/Custom use the full knob triplet.
+    let opts = match render_mode {
+        RenderMode::Crisp => text_raster::RenderOptions {
+            lcd_strength: 100,
+            boldness: 0,
+            damping: 0,
+            subpixel_offsets: None,
+        },
+        RenderMode::Grayscale => text_raster::RenderOptions {
+            lcd_strength: 0,
+            boldness: boldness.min(30) as u8,
+            damping: 0,
+            subpixel_offsets: None,
+        },
+        _ => text_raster::RenderOptions {
+            lcd_strength: lcd_strength.min(100) as u8,
+            boldness: boldness.min(30) as u8,
+            damping: damping.min(100) as u8,
+            subpixel_offsets,
+        },
     };
     let run = rasterize(&font, 0, size, &text, render_mode, opts)
         .ok_or_else(|| "preview rasterization failed".to_string())?;

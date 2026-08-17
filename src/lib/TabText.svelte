@@ -281,6 +281,20 @@
     return applicableMode(state.effective_mode);
   }
 
+  // The knobs the preview must render with for the current mode — the same
+  // mode-scoping rule the hook DLL applies. A mode that can't use a filter
+  // must not inherit it from another mode's settings: "No filter" applies
+  // NO filters (boldness included, so a boldness tuned in grayscale does
+  // not show up on a No-filter preview), grayscale applies only boldness,
+  // and RGB/BGR/Custom use the full triplet. This keeps the preview cache
+  // key and the rendered output identical to what Explorer shows.
+  function effectiveKnobs() {
+    const m = previewMode();
+    if (m === 'off') return { lcd: 100, boldness: 0, damping: 0 };
+    if (m === 'grayscale') return { lcd: 0, boldness: knobValue('boldness'), damping: 0 };
+    return { lcd: knobValue('lcd'), boldness: knobValue('boldness'), damping: knobValue('damping') };
+  }
+
   // Coverage levels: registry-only (no hook), shell hosts, or every GUI
   // process. The three stops map onto the two persisted booleans
   // (explorerHookEnabled + hookAllApps), so the storage and backend are
@@ -295,13 +309,17 @@
   // offsets (Custom) or the swash filter knobs, so those controls hide.
   function isRegistryOnly() {
     return currentScope() === 'registry';
-  }
+  }  // Whether the most recent coverage selection was applied successfully. The
+  // confirmation is deliberately transient so switching scopes stays clear
+  // without adding another persistent row to the panel.
+  let scopeApplied = $state(false);
+  let scopeAppliedTimer = null;
 
-  // Pick a coverage level and push the matching backend state. Registry
-  // disables the hook entirely (mode 0 → passthrough); shell/all enable it
-  // with the all-apps flag off/on. Scope reaches the DLL live (per-draw
-  // guard), so already-running non-shell apps stop being re-rendered the
-  // moment "shell" is picked.
+  // Pick a coverage level and push the matching backend state immediately.
+  // Registry disables the hook entirely (mode 0 → passthrough); shell/all
+  // enable it with the all-apps flag off/on. Scope reaches the DLL live
+  // (per-draw guard), so already-running non-shell apps stop being re-rendered
+  // the moment a new scope is picked.
   function setScope(scope) {
     if (scope === 'registry') {
       textSettings.explorerHookEnabled = false;
@@ -314,6 +332,9 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled })
       .then(refreshHookStatus)
       .catch((e) => console.warn('[text] explorer hook toggle failed', e));
+    scopeApplied = true;
+    clearTimeout(scopeAppliedTimer);
+    scopeAppliedTimer = setTimeout(() => { scopeApplied = false; }, 2000);
   }
 
   // Blocklist editor: comma/semicolon/newline-separated exe names, applied
@@ -429,7 +450,8 @@
     const mode = previewMode();
     const zoom = previewZoom / 100;
     const offs = customOffsets();
-    const key = `${mode}|${knobValue('lcd')}|${knobValue('boldness')}|${knobValue('damping')}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
+    const knobs = effectiveKnobs();
+    const key = `${mode}|${knobs.lcd}|${knobs.boldness}|${knobs.damping}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
     const gen = ++previewGen;
 
     let left;
@@ -446,9 +468,9 @@
         const renderArgs = {
           mode,
           text: PREVIEW_TEXT,
-          lcdStrength: knobValue('lcd'),
-          boldness: knobValue('boldness'),
-          damping: knobValue('damping'),
+          lcdStrength: knobs.lcd,
+          boldness: knobs.boldness,
+          damping: knobs.damping,
           offsetRX: mode === 'custom' ? offs.rx : null,
           offsetRY: mode === 'custom' ? offs.ry : null,
           offsetGX: mode === 'custom' ? offs.gx : null,
@@ -577,6 +599,7 @@
     return () => {
       disposed = true;
       clearInterval(hookStatusPoll);
+      clearTimeout(scopeAppliedTimer);
       resizeObserver?.disconnect();
     };
   });
@@ -599,37 +622,71 @@
   <div class="separator"></div>    <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="hdr-control-title">
-          <span class="settings-row-label">Text coverage</span>
+          <span class="settings-row-label">Level of coverage</span>
           <span class="info-tip-wrap">
             <button class="info-tip-btn" aria-label="About text coverage" tabindex="0">Info</button>
             <span class="info-tip info-tip-right">
               <span>
                 Where the selected mode is applied:<br>
                 <br>
-                <b>Registry only</b> — apps that follow Windows text settings (browsers, DirectWrite apps on their next start).<br>
-                <b>Shell apps</b> — adds live re-rendering for Explorer, Control Panel and MMC.<br>
+                <b>Default</b> — apps that follow Windows text settings (browsers, DirectWrite apps...).<br>
+                <b>Windows shell</b> — adds live re-rendering for Explorer, Control Panel and MMC.<br>
                 <b>All apps</b> — hooks every GDI process (2D remap + filters); browsers and games aren't affected.
               </span>
             </span>
           </span>
+          <span class="restart-explorer-hint text-render-explorer-warning text-render-explorer-warning-inline">⚠ Custom text renderer may trigger antivirus false positives.</span>
         </span>
       </div>
-      <p class="text-render-explorer-warning">⚠ May trigger antivirus false positives.</p>
       <div class="text-render-scope-options" role="radiogroup" aria-label="Text rendering coverage">
-        <button type="button" role="radio" aria-checked={currentScope() === 'registry'} class="text-render-inline-mode" class:active={currentScope() === 'registry'} onclick={() => setScope('registry')}>Registry only</button>
-        <button type="button" role="radio" aria-checked={currentScope() === 'shell'} class="text-render-inline-mode" class:active={currentScope() === 'shell'} onclick={() => setScope('shell')}>Shell apps</button>
-        <button type="button" role="radio" aria-checked={currentScope() === 'all'} class="text-render-inline-mode" class:active={currentScope() === 'all'} onclick={() => setScope('all')}>All apps</button>
+        <button type="button" role="radio" class="text-render-scope-card" class:active={currentScope() === 'registry'} aria-checked={currentScope() === 'registry'} onclick={() => setScope('registry')}>
+          <span class="text-render-scope-radio" aria-hidden="true"></span>
+          <span class="text-render-scope-card-copy">
+            <span class="text-render-scope-card-title">
+              <span class="text-render-scope-card-title-label">Default</span>
+            </span>
+            {#if scopeApplied && currentScope() === 'registry'}<span class="text-render-scope-card-applied">✓ Applied</span>{/if}
+            <span class="text-render-scope-card-desc">Windows text render.<br>Limited coverage and apps/windows need a restart.</span>
+          </span>
+        </button>
+        <button type="button" role="radio" class="text-render-scope-card" class:active={currentScope() === 'shell'} aria-checked={currentScope() === 'shell'} onclick={() => setScope('shell')}>
+          <span class="text-render-scope-radio" aria-hidden="true"></span>
+          <span class="text-render-scope-card-copy">
+            <span class="text-render-scope-card-title">
+              <span class="text-render-scope-card-title-label"><span class="text-render-warning-icon">⚠</span> Windows shell</span>
+              <span class="text-render-scope-card-meta"><span class="text-render-scope-card-custom">Custom</span></span>
+            </span>
+            {#if scopeApplied && currentScope() === 'shell'}<span class="text-render-scope-card-applied">✓ Applied</span>{/if}
+            <span class="text-render-scope-card-desc">Explorer, Control Panel, and MMC.</span>
+          </span>
+        </button>
+        <button type="button" role="radio" class="text-render-scope-card" class:active={currentScope() === 'all'} aria-checked={currentScope() === 'all'} onclick={() => setScope('all')}>
+          <span class="text-render-scope-radio" aria-hidden="true"></span>
+          <span class="text-render-scope-card-copy">
+            <span class="text-render-scope-card-title">
+              <span class="text-render-scope-card-title-label"><span class="text-render-warning-icon">⚠</span> All apps</span>
+              <span class="text-render-scope-card-meta"><span class="text-render-scope-card-custom">Custom</span></span>
+            </span>
+            {#if scopeApplied && currentScope() === 'all'}<span class="text-render-scope-card-applied">✓ Applied</span>{/if}
+            <span class="text-render-scope-card-desc">All GDI apps.</span>
+          </span>
+        </button>
       </div>
+    {#if currentScope() === 'registry'}
+      <span class="restart-explorer-hint">Default windows text render. Registry based. Limited coverage and apps/windows need a restart.</span>
+    {:else if currentScope() === 'shell'}
+      <span class="restart-explorer-hint">Custom hook text renderer. Allows live changes and extends coverage to Explorer, Control Panel and MMC.</span>
+    {:else}
+      <span class="restart-explorer-hint">All apps text render. Hook based, live re-rendering. Covers every GDI process; browsers and games aren't affected.</span>
+    {/if}
     {#if currentScope() === 'all'}
       <label class="text-render-blocklist">
         <span class="text-render-explorer-toggle-label">Excluded apps</span>
-        <input type="text" class="text-render-blocklist-input" placeholder="e.g. notepad.exe, winrar"
+        <input type="text" class="text-render-blocklist-input" placeholder="e.g. notepad.exe, winrar, 7zip"
           bind:value={blocklistText} onchange={applyBlocklist} />
       </label>
     {/if}
-    {#if hookStatus.active}
-      <span class="restart-explorer-hint">Note: Current open windows will need a restart.</span>
-    {/if}
+
   </div>
 
   <div class="dimmer-control">
