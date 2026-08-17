@@ -12,8 +12,10 @@
 // Manager, classic Control Panel, etc.) that a per-process watchdog would
 // miss. The DLL reads a session-local shared-memory mode that this module
 // writes: 0 = pass through, 1 = force grayscale, 2 = force crisp, 3 = subpixel
-// RGB, 4 = subpixel BGR, 5 = WOLED RGWB, 6 = WOLED RWBG. Because the hook
-// sits on the draw path, a mode change applies on the next repaint (live).
+// RGB, 4 = subpixel BGR, 7 = custom subpixel offsets (5/6 were the fixed
+// WOLED RGWB/RWBG presets, removed — the Custom mode covers those layouts).
+// Because the hook sits on the draw path, a mode change applies on the next
+// repaint (live).
 
 use crate::monitors::all_monitors;
 use std::collections::HashMap;
@@ -23,11 +25,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tauri::Manager;
 use windows::core::{s, w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM, HWND,
+    CloseHandle, FreeLibrary, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM, HWND,
 };
 use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -43,36 +44,38 @@ use windows::Win32::UI::WindowsAndMessaging::{
 type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 // The mapped view of the shared state (created once, leaked for app
-// lifetime). Layout (192 bytes):
-//    0  u32 global mode (app->explorer)
+// lifetime). Layout (512 bytes):
+//    0  u32 global mode (app->explorer; the system effective mode, synced
+//       on Text-tab load)
 //    4  u32 status + 8 u32 pid (explorer->app, written by the DLL at attach
 //       so the app can VERIFY the hook is really installed in the current
 //       explorer.exe instead of trusting its own bookkeeping — the DLL
 //       loading only proves the module mapped, not that the detour
 //       installed)
-//   12  u32 lcd strength, 16 u32 crosstalk, 20 u32 boldness
+//   12  unused padding (old global knob slots, kept at 0)
 //   24  u32 per-monitor flag (0/1)
 //   28  u32 monitor count
-//   32  monitor table: up to 8 entries x 20 bytes
+//   32  monitor table: up to 8 entries x 60 bytes
 //       u32 hmonitor (system-wide monitor handle)
 //       u32 resolution (horzres | vertres<<16)
 //       u32 physical size (horzsize | vertsize<<16)
 //       u32 dpi (logpixelsx | logpixelsy<<16)
-//       u32 mode | primary<<8  (mode 0 = use global)
-// The DLL reads the table on every draw to pick the mode for the monitor the
-// DC belongs to (see explorer-hook/src/lib.rs, resolve_draw_mode).
+//       u32 mode | primary<<8  (mode 0 = system default, 7 = custom)
+//       u32 lcd strength, crosstalk, boldness, gamma, damping, filter width
+//           (all 0..=100)
+//       u32 custom subpixel r/g/b (f32 bits; all-zero = not set)
+// The DLL reads the table on every draw to pick the mode + knob sextet +
+// custom offsets for the monitor the DC belongs to (see
+// explorer-hook/src/lib.rs, resolve_draw_options).
 static STATE_VIEW: OnceLock<usize> = OnceLock::new();
-const STATE_SIZE: usize = 192;
+const STATE_SIZE: usize = 32 + 8 * 60;
 const STATE_STATUS_OFFSET: usize = 4;
 const STATE_PID_OFFSET: usize = 8;
-const STATE_LCD_STRENGTH_OFFSET: usize = 12;
-const STATE_CROSSTALK_OFFSET: usize = 16;
-const STATE_BOLDNESS_OFFSET: usize = 20;
 const STATE_PER_MONITOR_OFFSET: usize = 24;
 const STATE_MONITOR_COUNT_OFFSET: usize = 28;
 const STATE_MONITORS_OFFSET: usize = 32;
 const MAX_MONITORS: usize = 8;
-const MONITOR_ENTRY_STRIDE: usize = 20;
+const MONITOR_ENTRY_STRIDE: usize = 60;
 // The ExtTextOutW detour is what makes the fix real; the app requires this
 // status bit for a hook to count as active.
 const STATUS_HOOK_W_INSTALLED: u32 = 1;
@@ -91,20 +94,21 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 // is never touched and the DLL is not loaded. Defaults to off; the
 // frontend syncs the stored value on load.
 static TOGGLE: AtomicBool = AtomicBool::new(false);
-// Last mode-state from the Text tab (0..6), gated by TOGGLE in apply_state.
+// Last mode-state from the Text tab (0..7), gated by TOGGLE in apply_state.
 static LAST_STATE: AtomicU32 = AtomicU32::new(0);
-// Render knobs from the Text tab sliders (0..=100): LCD filter strength (0 =
-// off), WOLED crosstalk compensation, and faux boldness. Written into the
-// shared memory so the DLL reads them on every draw.
-static LCD_STRENGTH: AtomicU32 = AtomicU32::new(0);
-static CROSSTALK: AtomicU32 = AtomicU32::new(0);
-static BOLDNESS: AtomicU32 = AtomicU32::new(0);
 // Per-monitor rendering (Text tab): master flag plus per-monitor mode
-// assignments keyed by the monitor's stable signature (see MonitorEntry::sig).
-// Mode values match the DLL: 1..=6 as in explorer_hook_set_mode; absent =
-// "use the global mode".
+// assignments and knob sextets keyed by the monitor's stable signature
+// (see MonitorEntry::sig). Mode values match the DLL: 1..=7 as in
+// explorer_hook_set_mode; absent = "system default". Knobs are the LCD
+// filter strength / crosstalk / boldness / gamma / damping / filter width
+// sextets (0..=100); absent = no adjustment.
 static PER_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static MONITOR_MODES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32, u32, u32, u32, u32)>>> = OnceLock::new();
+// Custom subpixel centers per monitor (mode 7): sig → [r, g, b] as f32
+// fractions of a pixel. All-zero triplets are treated as unset (the entry
+// writes 0, and the DLL only uses them when the mode is 7).
+static MONITOR_CUSTOM: OnceLock<Mutex<HashMap<String, [f32; 3]>>> = OnceLock::new();
 // True once the hook is verified in a NEW explorer.exe generation while the
 // feature was already active, so the Text tab can show "✓ Fix applied". Fonts
 // are rasterized at window creation, so a mode change only fully applies after
@@ -162,28 +166,6 @@ fn write_state(mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn write_state_knobs() -> Result<(), String> {
-    let ptr = ensure_state_mapped()?;
-    // SAFETY: ptr is the mapped view, valid for the process lifetime; offsets
-    // 12/16/20 are u32 slots we own.
-    unsafe {
-        let base = ptr as *mut u8;
-        std::ptr::write_volatile(
-            base.add(STATE_LCD_STRENGTH_OFFSET) as *mut u32,
-            LCD_STRENGTH.load(Ordering::Acquire),
-        );
-        std::ptr::write_volatile(
-            base.add(STATE_CROSSTALK_OFFSET) as *mut u32,
-            CROSSTALK.load(Ordering::Acquire),
-        );
-        std::ptr::write_volatile(
-            base.add(STATE_BOLDNESS_OFFSET) as *mut u32,
-            BOLDNESS.load(Ordering::Acquire),
-        );
-    }
-    Ok(())
-}
-
 // ── Per-monitor mode table ────────────────────────────────────────────
 // Each connected monitor gets one entry in the shared table: its system-wide
 // HMONITOR handle (for window-DC attribution) plus a device-caps signature
@@ -202,8 +184,16 @@ fn write_state_table() -> Result<(), String> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|p| p.into_inner());
+    let knobs = MONITOR_KNOBS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let custom = MONITOR_CUSTOM
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     // SAFETY: ptr is the mapped view, valid for the process lifetime; the
-    // table region (offsets 24..192) is plain u32 slots we own.
+    // table region (offsets 24..416) is plain u32 slots we own.
     unsafe {
         let base = ptr as *mut u8;
         std::ptr::write_volatile(
@@ -218,6 +208,8 @@ fn write_state_table() -> Result<(), String> {
         std::ptr::write_volatile(base.add(STATE_MONITOR_COUNT_OFFSET) as *mut u32, count);
         for (i, e) in entries.iter().take(MAX_MONITORS).enumerate() {
             let entry = base.add(STATE_MONITORS_OFFSET + i * MONITOR_ENTRY_STRIDE);
+            let (lcd, ct, bd, gm, dm, fw) = knobs.get(&e.sig()).copied().unwrap_or((0, 0, 0, 0, 0, 0));
+            let [sr, sg, sb] = custom.get(&e.sig()).copied().unwrap_or([0.0, 0.0, 0.0]);
             std::ptr::write_volatile(entry as *mut u32, e.hmonitor);
             std::ptr::write_volatile(
                 entry.add(4) as *mut u32,
@@ -233,8 +225,17 @@ fn write_state_table() -> Result<(), String> {
             );
             std::ptr::write_volatile(
                 entry.add(16) as *mut u32,
-                modes.get(&e.sig()).copied().unwrap_or(0).min(6) | ((e.primary as u32) << 8),
+                modes.get(&e.sig()).copied().unwrap_or(0).min(7) | ((e.primary as u32) << 8),
             );
+            std::ptr::write_volatile(entry.add(20) as *mut u32, lcd.min(100));
+            std::ptr::write_volatile(entry.add(24) as *mut u32, ct.min(100));
+            std::ptr::write_volatile(entry.add(28) as *mut u32, bd.min(100));
+            std::ptr::write_volatile(entry.add(32) as *mut u32, gm.min(100));
+            std::ptr::write_volatile(entry.add(36) as *mut u32, dm.min(100));
+            std::ptr::write_volatile(entry.add(40) as *mut u32, fw.min(100));
+            std::ptr::write_volatile(entry.add(44) as *mut u32, sr.to_bits());
+            std::ptr::write_volatile(entry.add(48) as *mut u32, sg.to_bits());
+            std::ptr::write_volatile(entry.add(52) as *mut u32, sb.to_bits());
         }
     }
     Ok(())
@@ -337,11 +338,11 @@ fn global_hook() -> &'static Mutex<Option<usize>> {
 static EMBEDDED_HOOK_DLL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/explorer_hook.dll"));
 
-// Write the embedded DLL into the config dir (next to config.json) so it can
-// be loaded by a full path. A short SHA-256 prefix of the embedded bytes is
-// baked into the filename, so a newer app build writes a fresh file instead of
-// trying to overwrite a DLL an older explorer.exe may still have mapped
-// (Windows locks loaded DLL files).
+// Write the embedded DLL to one stable path. Windows limits the number of
+// distinct global hook DLL names/paths that can be active at once (historically
+// 32). Hashing the filename per build eventually exhausts that shared limit
+// because a long-lived Explorer can keep old hook DLL mappings alive even
+// after their hook handles are unregistered.
 fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -349,24 +350,30 @@ fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("could not resolve config dir: {e}"))?;
     fs::create_dir_all(&dir).map_err(|e| format!("could not create config dir: {e}"))?;
 
-    let digest = Sha256::digest(EMBEDDED_HOOK_DLL);
-    let hash: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-    let path = dir.join(format!("explorer_hook-{hash}.dll"));
-    if !path.exists() {
-        fs::write(&path, EMBEDDED_HOOK_DLL)
-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    let path = dir.join("explorer_hook.dll");
+    let needs_write = match fs::read(&path) {
+        Ok(existing) => existing != EMBEDDED_HOOK_DLL,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return Err(format!("could not read {}: {error}", path.display()));
+        }
+    };
+    if needs_write {
+        fs::write(&path, EMBEDDED_HOOK_DLL).map_err(|e| {
+            format!(
+                "{} is still in use; restart Explorer once before applying this hook build ({e})",
+                path.display()
+            )
+        })?;
     }
-    // Best-effort cleanup of superseded versions. Ignore failures: a DLL still
-    // loaded by a live explorer.exe cannot be deleted, and that is fine — it
-    // gets removed on a later run once the process has restarted.
+
+    // Remove legacy hash-named copies when possible. A live Explorer may still
+    // have one mapped, so deletion is intentionally best effort.
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("explorer_hook-")
-                && name.ends_with(".dll")
-                && name != format!("explorer_hook-{hash}.dll")
-            {
+            if name.starts_with("explorer_hook-") && name.ends_with(".dll") {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -391,8 +398,10 @@ fn install_hook(app: &tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("could not load the explorer hook DLL: {e}"))?;
 
     let proc: HookProcFn = unsafe {
-        let addr = GetProcAddress(module, s!("hook_callback"))
-            .ok_or("hook_callback export not found in the explorer hook DLL")?;
+        let Some(addr) = GetProcAddress(module, s!("hook_callback")) else {
+            let _ = FreeLibrary(module);
+            return Err("hook_callback export not found in the explorer hook DLL".to_string());
+        };
         std::mem::transmute(addr)
     };
 
@@ -401,8 +410,16 @@ fn install_hook(app: &tauri::AppHandle) -> Result<(), String> {
     // Windows maps the DLL into each GUI process for us. WH_CBT fires on
     // window creation, before fonts rasterize, so fast-starting applets get
     // the detour in time.
-    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(proc), Some(HINSTANCE(module.0)), 0) }
-        .map_err(|e| format!("SetWindowsHookExW failed: {e}"))?;
+    let hook = match unsafe { SetWindowsHookExW(WH_CBT, Some(proc), Some(HINSTANCE(module.0)), 0) } {
+        Ok(hook) => hook,
+        Err(error) => {
+            // The hook did not take ownership of this module reference. Free
+            // it so the watchdog's one-second retry loop cannot accumulate
+            // LoadLibrary references while Windows rejects the hook.
+            unsafe { let _ = FreeLibrary(module); }
+            return Err(format!("SetWindowsHookExW failed: {error}"));
+        }
+    };
 
     let mut slot = global_hook().lock().unwrap_or_else(|p| p.into_inner());
     *slot = Some(hook.0 as usize);
@@ -434,7 +451,6 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
     // rewriting fonts immediately (no restart needed for that). Keep the LCD
     // filter flag in sync regardless, so the DLL never reads a stale value.
     write_state(if enabled { last } else { 0 })?;
-    write_state_knobs()?;
     write_state_table()?;
     if enabled {
         ensure_watchdog_running(app.clone());
@@ -450,25 +466,29 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Map a mode string to the hook's mode id (0 = system default / passthrough).
+// The fixed WOLED RGWB/RWBG presets (ids 5/6) were removed — the Custom mode
+// covers those layouts with user-tuned offsets — so a stale string maps to 0.
+fn mode_id(mode: &str) -> u32 {
+    match mode {
+        "grayscale" => 1,
+        "off" => 2,
+        "rgb" => 3,
+        "bgr" => 4,
+        "custom" => 7,
+        _ => 0,
+    }
+}
+
 /// Follow the Text rendering tab's mode in Explorer:
 ///   grayscale → force grayscale
 ///   off       → force no antialiasing, crisp
 ///   rgb       → swash subpixel antialiasing (RGB panel)
 ///   bgr       → swash subpixel antialiasing (BGR panel)
-///   rgwb      → WOLED RGBW subpixel antialiasing (R, G, W, B)
-///   rwbg      → WOLED RGBW subpixel antialiasing (R, W, B, G)
 /// Stores the mode and applies it through the master toggle.
 #[tauri::command]
 pub fn explorer_hook_set_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
-    let state = match mode.as_str() {
-        "grayscale" => 1,
-        "off" => 2,
-        "rgb" => 3,
-        "bgr" => 4,
-        "rgwb" => 5,
-        "rwbg" => 6,
-        _ => 0,
-    };
+    let state = mode_id(&mode);
     if LAST_STATE.load(Ordering::Acquire) != state {
         // The config changed: the running Explorer must be restarted again
         // before the new mode is fully applied everywhere.
@@ -491,20 +511,14 @@ pub fn explorer_hook_set_per_monitor(enabled: bool) -> Result<(), String> {
 }
 
 /// Assign a per-monitor render mode: `mode` is one of the mode ids
-/// ("grayscale"/"off"/"rgb"/"bgr"/"rgwb"/"rwbg"); "global" clears the
-/// assignment so the monitor uses the global mode. `sig` is the monitor's
-/// stable signature from `explorer_hook_monitors`.
+/// ("grayscale"/"off"/"rgb"/"bgr"/"custom"); "default" clears the
+/// assignment so the monitor uses the system text setting. `sig` is the
+/// monitor's stable signature from `explorer_hook_monitors`. The fixed
+/// WOLED RGWB/RWBG presets (ids 5/6) were removed — the Custom mode covers
+/// those layouts with user-tuned offsets — so a stale string maps to 0.
 #[tauri::command]
 pub fn explorer_hook_set_monitor_mode(sig: String, mode: String) -> Result<(), String> {
-    let value = match mode.as_str() {
-        "grayscale" => 1,
-        "off" => 2,
-        "rgb" => 3,
-        "bgr" => 4,
-        "rgwb" => 5,
-        "rwbg" => 6,
-        _ => 0, // "global"
-    };
+    let value = mode_id(&mode); // "default" (and anything unknown) maps to 0
     {
         let mut modes = MONITOR_MODES
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -552,23 +566,136 @@ pub fn explorer_hook_monitors() -> Result<Vec<ExplorerMonitorInfo>, String> {
         .collect())
 }
 
-/// Set the render knobs from the Text tab sliders: LCD filter strength
-/// (0 = off), WOLED crosstalk compensation, and faux boldness (all 0..=100).
-/// Written to the shared memory so the DLL applies them on the next repaint
-/// (live).
+/// Assign a per-monitor render knob sextet (LCD filter strength, WOLED
+/// crosstalk compensation, faux boldness, coverage gamma, fringe damping,
+/// filter width; all 0..=100, 0 = off). Written into the monitor table so the
+/// DLL applies them to that monitor's draws on the next repaint (live).
+/// All-zero clears the entry.
 #[tauri::command]
-pub fn explorer_hook_set_render_knobs(
+pub fn explorer_hook_set_monitor_knobs(
+    sig: String,
     lcd_strength: u32,
     crosstalk: u32,
     boldness: u32,
+    gamma: u32,
+    damping: u32,
+    filter_width: u32,
 ) -> Result<(), String> {
-    LCD_STRENGTH.store(lcd_strength.min(100), Ordering::Release);
-    CROSSTALK.store(crosstalk.min(100), Ordering::Release);
-    BOLDNESS.store(boldness.min(100), Ordering::Release);
-    write_state_knobs()?;
+    {
+        let mut knobs = MONITOR_KNOBS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let sextet = (
+            lcd_strength.min(100),
+            crosstalk.min(100),
+            boldness.min(100),
+            gamma.min(100),
+            damping.min(100),
+            filter_width.min(100),
+        );
+        if sextet == (0, 0, 0, 0, 0, 0) {
+            knobs.remove(&sig);
+        } else {
+            knobs.insert(sig, sextet);
+        }
+    }
+    write_state_table()?;
     invalidate_explorer_windows();
     broadcast_rendering_change();
     Ok(())
+}
+
+/// Assign a per-monitor custom subpixel layout: the R/G/B subpixel centers
+/// as fractions of a pixel (e.g. RGB stripe ≈ [-1/3, 0, 1/3]; the WOLED quad
+/// ≈ [-0.375, -0.125, 0.375]). Only used when the monitor's mode is
+/// "custom". All-zero clears the entry (falls back to the mode default).
+#[tauri::command]
+pub fn explorer_hook_set_monitor_custom(
+    sig: String,
+    r: f32,
+    g: f32,
+    b: f32,
+) -> Result<(), String> {
+    {
+        let mut custom = MONITOR_CUSTOM
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Sanity-bound the centers to ±1 pixel (the usable subpixel space).
+        let offsets = [r.clamp(-1.0, 1.0), g.clamp(-1.0, 1.0), b.clamp(-1.0, 1.0)];
+        if offsets == [0.0, 0.0, 0.0] {
+            custom.remove(&sig);
+        } else {
+            custom.insert(sig, offsets);
+        }
+    }
+    write_state_table()?;
+    invalidate_explorer_windows();
+    broadcast_rendering_change();
+    Ok(())
+}
+
+/// Apply the persisted Text-tab hook state at app startup, so the hook is
+/// installed (and per-monitor profiles loaded) without requiring the Text tab
+/// to be opened first. Mirrors what TabText.svelte pushes on mount: the
+/// global mode is the system effective text setting, per-monitor overrides
+/// come from the config, and the per-monitor flag derives from whether any
+/// assignment exists.
+pub fn apply_startup_state(
+    app: &tauri::AppHandle,
+    cfg: &crate::config::AppConfig,
+) -> Result<(), String> {
+    TOGGLE.store(cfg.explorer_hook_enabled, Ordering::Release);
+    if !cfg.explorer_hook_enabled {
+        return Ok(());
+    }
+    // Global mode = the system effective text setting (registry), the same
+    // value the Text tab syncs when it mounts.
+    LAST_STATE.store(
+        mode_id(&crate::text_rendering::system_effective_mode()),
+        Ordering::Release,
+    );
+    {
+        let mut modes = MONITOR_MODES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        modes.clear();
+        for (sig, mode) in &cfg.per_monitor_modes {
+            modes.insert(sig.clone(), mode_id(mode));
+        }
+    }
+    {
+        let mut knobs = MONITOR_KNOBS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        knobs.clear();
+        for (sig, k) in &cfg.per_monitor_knobs {
+            knobs.insert(
+                sig.clone(),
+                (k.lcd, k.crosstalk, k.boldness, k.gamma, k.damping, k.filter_width),
+            );
+        }
+    }
+    {
+        let mut custom = MONITOR_CUSTOM
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        custom.clear();
+        for (sig, offsets) in &cfg.per_monitor_custom {
+            custom.insert(sig.clone(), *offsets);
+        }
+    }
+    PER_MONITOR_ENABLED.store(
+        !cfg.per_monitor_modes.is_empty()
+            || !cfg.per_monitor_knobs.is_empty()
+            || !cfg.per_monitor_custom.is_empty(),
+        Ordering::Release,
+    );
+    apply_state(app)
 }
 
 /// Master toggle for the Explorer hook (Text tab). Off stops the hook and

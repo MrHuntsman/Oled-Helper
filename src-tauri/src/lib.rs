@@ -1188,7 +1188,6 @@ pub fn run() {
             text_rendering::text_rendering_get_state,
             text_rendering::text_rendering_set_mode,
             text_rendering::text_rendering_set_gamma,
-            text_rendering::text_rendering_set_contrast,
             text_rendering::text_rendering_set_cleartype_level,
             text_rendering::text_rendering_reset,
             text_rendering::text_rendering_restart_app,
@@ -1207,9 +1206,10 @@ pub fn run() {
             text_rendering::text_preview_render,
             explorer_hook::explorer_hook_set_mode,
             explorer_hook::explorer_hook_set_enabled,
-            explorer_hook::explorer_hook_set_render_knobs,
             explorer_hook::explorer_hook_set_per_monitor,
             explorer_hook::explorer_hook_set_monitor_mode,
+            explorer_hook::explorer_hook_set_monitor_knobs,
+            explorer_hook::explorer_hook_set_monitor_custom,
             explorer_hook::explorer_hook_monitors,
             explorer_hook::explorer_hook_status,
             flyout_window::set_flyout_hdr,
@@ -1324,6 +1324,14 @@ pub fn run() {
                     .fade_out_duration_ms
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_fade_out_duration_ms;
+            }
+
+            // Apply the persisted Explorer-hook state (Text tab) at startup
+            // so the hook installs without the Text tab having to be opened
+            // first. Failures are logged, never fatal: the watchdog retries
+            // the install, and the Text tab re-syncs on mount.
+            if let Err(error) = explorer_hook::apply_startup_state(app.handle(), &saved_config) {
+                log::warn!("[explorer-hook] startup apply failed: {error}");
             }
 
             // Start the screen protector watcher if a timeout was persisted,

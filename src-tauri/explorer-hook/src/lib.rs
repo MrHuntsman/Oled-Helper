@@ -62,24 +62,23 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 
-// Shared memory layout (192 bytes): the app writes the mode at offset 0 and
-// the three render knobs (filter strength, crosstalk, boldness) at 12/16/20;
+// Shared memory layout (512 bytes): the app writes the mode at offset 0 and
 // the DLL writes its own state back at offsets 4 and 8 so the app can verify
 // the hook is really installed in the CURRENT explorer.exe instead of
-// trusting that the module merely loaded. The per-monitor table lives at
-// 24/28/32+ (flag, count, up to 8 entries x 20 bytes) — see
-// resolve_draw_mode.
+// trusting that the module merely loaded. Slots 12/16/20 are unused padding
+// (the old global knob triplet). The per-monitor table lives at 24/28/32+
+// (flag, count, up to 8 entries x 60 bytes), each entry carrying the
+// monitor's mode, knob sextet (lcd filter, crosstalk, boldness, gamma,
+// damping, filter width), and custom subpixel offsets — see
+// resolve_draw_options.
 const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
-const STATE_LCD_STRENGTH: usize = 12;
-const STATE_CROSSTALK: usize = 16;
-const STATE_BOLDNESS: usize = 20;
 const STATE_PER_MONITOR: usize = 24;
 const STATE_MONITOR_COUNT: usize = 28;
 const STATE_MONITORS: usize = 32;
-const STATE_SIZE: usize = 192;
-const MONITOR_ENTRY_STRIDE: usize = 20;
+const STATE_SIZE: usize = 32 + 8 * 60;
+const MONITOR_ENTRY_STRIDE: usize = 60;
 const MAX_MONITORS: usize = 8;
 // Status bit written by the DLL once the ExtTextOutW detour is installed.
 const STATUS_HOOK_INSTALLED: u32 = 1;
@@ -160,29 +159,6 @@ fn state_mode() -> u32 {
     }
 }
 
-// Read a u32 knob from shared memory with a default, clamped to 0..=100.
-fn state_knob(offset: usize, default: u32) -> u8 {
-    // SAFETY: STATE is written once in map_state; the mapped view stays valid
-    // for the lifetime of the process.
-    let v = unsafe {
-        STATE.get()
-            .map(|addr| *((addr + offset) as *const u32))
-            .unwrap_or(default)
-    };
-    v.min(100) as u8
-}
-
-// Per-draw render options for the current draw. The LCD filter is applied at
-// its strength, where 0 = off; crosstalk and boldness pass straight through.
-// Defaults are all off/no-op when the app has not written the knobs yet.
-fn state_render_options() -> text_raster::RenderOptions {
-    text_raster::RenderOptions {
-        lcd_strength: state_knob(STATE_LCD_STRENGTH, 0),
-        crosstalk: state_knob(STATE_CROSSTALK, 0),
-        boldness: state_knob(STATE_BOLDNESS, 0),
-    }
-}
-
 // ── Per-monitor mode resolution ───────────────────────────────────────
 // The app writes a monitor table (system-wide HMONITOR handles + device-caps
 // signatures + per-monitor mode) into the shared memory. Each draw's DC is
@@ -215,9 +191,13 @@ fn state_monitor_count() -> usize {
     }
 }
 
-// Entry i as (hmonitor, resolution, physical size, dpi, mode | flags<<8).
-// Offsets within an entry are all 4-aligned (STATE_MONITORS is 32).
-fn state_monitor_entry(i: usize) -> Option<(u32, u32, u32, u32, u32)> {
+// Entry i as (hmonitor, resolution, physical size, dpi, mode | flags<<8,
+// lcd strength, crosstalk, boldness, gamma, damping, filter width, subpixel
+// r/g/b as u32 bit patterns). Offsets within an entry are all 4-aligned
+// (STATE_MONITORS is 32).
+fn state_monitor_entry(
+    i: usize,
+) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)> {
     if i >= state_monitor_count() {
         return None;
     }
@@ -231,6 +211,15 @@ fn state_monitor_entry(i: usize) -> Option<(u32, u32, u32, u32, u32)> {
             *((base + 8) as *const u32),
             *((base + 12) as *const u32),
             *((base + 16) as *const u32),
+            *((base + 20) as *const u32),
+            *((base + 24) as *const u32),
+            *((base + 28) as *const u32),
+            *((base + 32) as *const u32),
+            *((base + 36) as *const u32),
+            *((base + 40) as *const u32),
+            *((base + 44) as *const u32),
+            *((base + 48) as *const u32),
+            *((base + 52) as *const u32),
         ))
     }
 }
@@ -246,20 +235,38 @@ fn hdc_caps_sig(hdc: HDC) -> (u32, u32, u32) {
             (caps(LOGPIXELSX) & 0xFFFF) | (caps(LOGPIXELSY) << 16),
         )
     }
-}
-
-// Per-monitor mode for this draw's DC, when per-monitor is enabled and the
-// DC resolves to a monitor with an assigned mode. An entry with mode 0 means
-// "use global" → None; a monitor that cannot be attributed also yields None
-// (caller falls back to the global mode).
-fn resolve_draw_mode(hdc: HDC) -> Option<u32> {
+}// Per-monitor render options for this draw's DC, when per-monitor is enabled:
+// the attributed monitor's mode (0 = system default / passthrough), its knob
+// sextet (0 = no adjustment), and its custom subpixel centers (all-zero = no
+// custom offsets; only meaningful for mode 7, Custom). A monitor that cannot
+// be attributed yields None → the caller falls back to the global mode +
+// fallback knobs. Every connected monitor is in the table, so a successful
+// attribution is the normal path; the table entry's mode is 0 for monitors
+// left at the system default, which still resolves here so their knobs can
+// apply.
+fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, u8, u8, u8, [f32; 3])> {
     let count = state_monitor_count();
     if count == 0 {
         return None;
     }
-    let mode_of = |mode_flags: u32| -> Option<u32> {
-        let mode = mode_flags & 0xFF;
-        if mode == 0 { None } else { Some(mode) }
+    let knobs_of = |lcd: u32,
+                    crosstalk: u32,
+                    boldness: u32,
+                    gamma: u32,
+                    damping: u32,
+                    filter_width: u32|
+     -> (u8, u8, u8, u8, u8, u8) {
+        (
+            lcd.min(100) as u8,
+            crosstalk.min(100) as u8,
+            boldness.min(100) as u8,
+            gamma.min(100) as u8,
+            damping.min(100) as u8,
+            filter_width.min(100) as u8,
+        )
+    };
+    let offsets_of = |r: u32, g: u32, b: u32| -> [f32; 3] {
+        [f32::from_bits(r), f32::from_bits(g), f32::from_bits(b)]
     };
     // 1. Window DC: HWND → monitor → exact HMONITOR match.
     let hwnd = unsafe { WindowFromDC(hdc) };
@@ -268,10 +275,13 @@ fn resolve_draw_mode(hdc: HDC) -> Option<u32> {
         if !hmon.0.is_null() {
             let want = hmon.0 as usize as u32;
             for i in 0..count {
-                if let Some((h, _, _, _, mf)) = state_monitor_entry(i) {
+                if let Some((h, _, _, _, mf, lcd, ct, bd, gm, dm, fw, sr, sg, sb)) =
+                    state_monitor_entry(i)
+                {
                     if h == want {
                         MON_WINDOW.fetch_add(1, Ordering::Relaxed);
-                        return mode_of(mf);
+                        let (l, c, b, g, d, f) = knobs_of(lcd, ct, bd, gm, dm, fw);
+                        return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(sr, sg, sb)));
                     }
                 }
             }
@@ -280,13 +290,17 @@ fn resolve_draw_mode(hdc: HDC) -> Option<u32> {
     // 2. Memory DC: match the device-caps signature against the table.
     let (res, phys, dpi) = hdc_caps_sig(hdc);
     for i in 0..count {
-        if let Some((_, er, ep, ed, mf)) = state_monitor_entry(i) {
+        if let Some((_, er, ep, ed, mf, lcd, ct, bd, gm, dm, fw, sr, sg, sb)) =
+            state_monitor_entry(i)
+        {
             if er == res && ep == phys && ed == dpi {
                 MON_CAPS.fetch_add(1, Ordering::Relaxed);
-                return mode_of(mf);
+                let (l, c, b, g, d, f) = knobs_of(lcd, ct, bd, gm, dm, fw);
+                return Some((mf & 0xFF, l, c, b, g, d, f, offsets_of(sr, sg, sb)));
             }
         }
     }
+
     MON_NONE.fetch_add(1, Ordering::Relaxed);
     None
 }
@@ -720,21 +734,67 @@ unsafe extern "system" fn try_render_swash(
     dx: *const i32,
 ) -> bool {
     let global_mode = state_mode();
-    // Per-monitor mode selection: when enabled, attribute this draw's DC to
-    // a monitor and use its assigned mode; unassigned or unattributable
-    // draws fall back to the global mode.
-    let mode = if state_per_monitor_enabled() && global_mode != 0 {
-        resolve_draw_mode(hdc).unwrap_or(global_mode)
+    // Per-monitor render options: when enabled, attribute this draw's DC to
+    // a monitor and use its mode + knob triplet; unattributable draws (or
+    // per-monitor off) fall back to the global mode with NO knob adjustments
+    // (knobs are purely per-monitor now).
+    let fallback_opts = text_raster::RenderOptions {
+        lcd_strength: 0,
+        crosstalk: 0,
+        boldness: 0,
+        gamma: 0,
+        damping: 0,
+        filter_width: 0,
+        subpixel_offsets: None,
+    };
+    let (mode, opts) = if state_per_monitor_enabled() && global_mode != 0 {
+        match resolve_draw_options(hdc) {
+            Some((m, l, c, b, g, d, f, offs)) => {
+                // Mode 0 in the table = "no explicit mode" (Default): fall
+                // back to the global mode (the system effective mode, synced
+                // into slot 0 on load) so the monitor still renders the
+                // system text setting — but keep ITS knob sextet so knobs
+                // apply even on a Default monitor. Modes 5/6 (the fixed
+                // RGWB/RWBG WOLED presets) were removed from the product;
+                // a stale entry with one routes the same way. Mode 7
+                // (Custom) carries the user's subpixel centers.
+                let mode = if m == 0 || m == 5 || m == 6 { global_mode } else { m };
+                // Custom mode with all-zero centers means the user has not
+                // tuned offsets yet — render the mode's default layout
+                // (render_format falls back to the WOLED quad positions)
+                // rather than sampling all three channels at the same point.
+                let subpixel_offsets = if mode == 7 && offs != [0.0, 0.0, 0.0] {
+                    Some(offs)
+                } else {
+                    None
+                };
+                (
+                    mode,
+                    text_raster::RenderOptions {
+                        lcd_strength: l,
+                        crosstalk: c,
+                        boldness: b,
+                        gamma: g,
+                        damping: d,
+                        filter_width: f,
+                        subpixel_offsets,
+                    },
+                )
+            }
+            None => (global_mode, fallback_opts),
+        }
     } else {
-        global_mode
+        (global_mode, fallback_opts)
     };
     let render_mode = match mode {
         1 => text_raster::RenderMode::Grayscale,
         2 => text_raster::RenderMode::Crisp,
         3 => text_raster::RenderMode::SubpixelRgb,
         4 => text_raster::RenderMode::SubpixelBgr,
-        5 => text_raster::RenderMode::SubpixelRgwb,
-        6 => text_raster::RenderMode::SubpixelRwbg,
+        7 => text_raster::RenderMode::Custom,
+        // Modes 5/6 (the fixed RGWB/RWBG WOLED presets) were removed; a stale
+        // table entry with one of them is a legacy id and must not reach here
+        // (resolve_draw_options routes them to the global mode like Default).
         _ => return false,
     };
     // Only count attempts that actually reach the swash path (mode 1/2), so
@@ -757,7 +817,7 @@ unsafe extern "system" fn try_render_swash(
     }
     // ETO_GLYPH_INDEX: the string is an array of glyph indices, not UTF-16.
     if options.0 & ETO_GLYPH_INDEX.0 != 0 {
-        return try_render_glyph_indices(hdc, x, y, options, string, count, dx, render_mode);
+        return try_render_glyph_indices(hdc, x, y, options, string, count, dx, render_mode, opts);
     }
     if options.0 & ETO_PDY.0 != 0 {
         return fallback(&format!("ETO_PDY (options={:#x})", options.0));
@@ -776,7 +836,6 @@ unsafe extern "system" fn try_render_swash(
     };
 
     let text = String::from_utf16_lossy(std::slice::from_raw_parts(string.as_ptr(), count as usize));
-    let opts = state_render_options();
     let Some(run) = text_raster::rasterize(&font_data, 0, px, &text, render_mode, opts) else {
         return fallback("rasterize failed");
     };
@@ -843,6 +902,7 @@ unsafe fn try_render_glyph_indices(
     count: u32,
     dx: *const i32,
     mode: text_raster::RenderMode,
+    opts: text_raster::RenderOptions,
 ) -> bool {
     let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
     let verbose = n < 100 || n % 10000 == 0;
@@ -867,7 +927,6 @@ unsafe fn try_render_glyph_indices(
             .collect()
     };
 
-    let opts = state_render_options();
     let Some(run) = text_raster::rasterize_glyphs(
         &font_data,
         0,

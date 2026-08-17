@@ -29,6 +29,26 @@ pub struct FavoriteDisplayMode {
     pub hz: u32,
 }
 
+// A monitor's render knob sextet (Text tab): LCD filter strength, WOLED
+// crosstalk compensation, faux boldness, coverage gamma, fringe damping, and
+// filter width, all 0..=100 (0 = off). Stored per monitor alongside the
+// per-monitor mode.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorKnobs {
+    #[serde(default)]
+    pub lcd: u32,
+    #[serde(default)]
+    pub crosstalk: u32,
+    #[serde(default)]
+    pub boldness: u32,
+    #[serde(default)]
+    pub gamma: u32,
+    #[serde(default)]
+    pub damping: u32,
+    #[serde(default)]
+    pub filter_width: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     #[serde(default)]
@@ -55,15 +75,23 @@ pub struct AppConfig {
     pub explorer_hook_enabled: bool,
     // Per-monitor rendering for the Explorer hook (Text tab): master flag plus
     // per-monitor mode assignments keyed by the monitor's stable signature
-    // ("WxH|physWxphysH|dpiXxdpiY") → mode id string ("rgb", "rwbg", ...).
-    // Absent assignments = use the global mode.
-    #[serde(default)]
-    pub per_monitor_enabled: bool,
+    // ("WxH|physWxphysH|dpiXxdpiY") → mode id string ("rgb", "bgr", "custom",
+    // ...). Absent assignments = use the global mode.
     #[serde(default)]
     pub per_monitor_modes: HashMap<String, String>,
+    // Per-monitor render knob triplets keyed by the monitor's stable
+    // signature. Absent entries = no adjustment (the monitor's text is left
+    // at the system defaults).
+    #[serde(default)]
+    pub per_monitor_knobs: HashMap<String, MonitorKnobs>,
+    // Per-monitor custom subpixel centers (R/G/B fractions of a pixel) for
+    // the "custom" render mode, keyed by the monitor's stable signature.
+    // Absent entries = use the mode's default layout.
+    #[serde(default)]
+    pub per_monitor_custom: HashMap<String, [f32; 3]>,
     // The monitor selected in the app's per-monitor selector: its stable
-    // signature, or empty for Global. Restored so the selector keeps its
-    // position across restarts.
+    // signature, or empty when the selector is still loading. Restored so
+    // the selector keeps its position across restarts.
     #[serde(default)]
     pub active_monitor_sig: String,
     // Power tab screen protector: seconds of idle before the display fades
@@ -202,8 +230,9 @@ impl Default for AppConfig {
             hide_calibration_interface: false,
             black_strip_gap_enabled: true,
             explorer_hook_enabled: false,
-            per_monitor_enabled: false,
             per_monitor_modes: HashMap::new(),
+            per_monitor_knobs: HashMap::new(),
+            per_monitor_custom: HashMap::new(),
             active_monitor_sig: String::new(),
             screen_protector_seconds: default_screen_protector_seconds(),
             screen_protector_enabled: false,

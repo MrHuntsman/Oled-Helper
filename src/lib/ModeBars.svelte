@@ -1,22 +1,18 @@
 <script>
   // Small subpixel-layout indicator for the rendering mode buttons. Mirrors
   // the tab icon's bars: RGB = red/green/blue, BGR = reversed, Grayscale =
-  // three neutral bars, and the WOLED layouts show the white subpixel as a
-  // fourth white bar in its correct position. Full-strength, fully opaque
-  // colors so the subpixel order is easy to read even at 16-18px.
+  // three neutral bars. Full-strength, fully opaque colors so the subpixel
+  // order is easy to read even at 16-18px.
   let { mode = 'rgb', class: className = '' } = $props();
 
   const R = '#FF3B30';
   const G = '#34C759';
   const B = '#007AFF';
-  const W = '#FFFFFF';
 
   const palettes = {
     grayscale: ['#A3A3AD', '#A3A3AD', '#A3A3AD'],
     rgb: [R, G, B],
     bgr: [B, G, R],
-    rgwb: [R, G, W, B],
-    rwbg: [R, W, B, G],
   };
 
   const bars = $derived.by(() => {

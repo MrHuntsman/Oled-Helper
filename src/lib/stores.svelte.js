@@ -120,10 +120,34 @@ export function setActiveMonitor(mon) {
 // default and the hook stays on the cheap lazy path). Assignments are keyed
 // by the monitor's stable signature.
 export function syncTextPerMonitor() {
-  const enabled = Object.keys(textSettings.perMonitorModes).length > 0;
+  // Per-monitor resolution turns on only once ANY monitor has an explicit
+  // mode, knob, or custom-offset assignment; before that, every monitor
+  // uses the system defaults and the hook stays on the cheap lazy path.
+  const enabled = Object.keys(textSettings.perMonitorModes).length > 0
+    || Object.keys(textSettings.perMonitorKnobs).length > 0
+    || Object.keys(textSettings.perMonitorCustom).length > 0;
   invoke('explorer_hook_set_per_monitor', { enabled }).catch(() => {});
   for (const [sig, mode] of Object.entries(textSettings.perMonitorModes)) {
     invoke('explorer_hook_set_monitor_mode', { sig, mode }).catch(() => {});
+  }
+  for (const [sig, k] of Object.entries(textSettings.perMonitorKnobs)) {
+    invoke('explorer_hook_set_monitor_knobs', {
+      sig,
+      lcdStrength: k.lcd,
+      crosstalk: k.crosstalk,
+      boldness: k.boldness,
+      gamma: k.gamma,
+      damping: k.damping,
+      filterWidth: k.filterWidth,
+    }).catch(() => {});
+  }
+  for (const [sig, offs] of Object.entries(textSettings.perMonitorCustom)) {
+    invoke('explorer_hook_set_monitor_custom', {
+      sig,
+      r: offs.r,
+      g: offs.g,
+      b: offs.b,
+    }).catch(() => {});
   }
 }
 
@@ -228,14 +252,20 @@ export const taskbarDimmer = $state({
 // compensation, and faux boldness.
 export const textSettings = $state({
   explorerHookEnabled: false,
-  lcdFilterStrength: 0,
-  crosstalk: 0,
-  boldness: 0,
   // Per-monitor mode assignments keyed by the monitor's stable signature
-  // ("WxH|phys|dpi") → mode id ("rgb", "rwbg", ...). Absent = the system
-  // default ("Default" in the UI). Whether per-monitor resolution is active
-  // is derived from whether any assignment exists — no stored flag.
+  // ("WxH|phys|dpi") → mode id ("rgb", "bgr", "custom", ...). Absent = the
+  // system default ("Default" in the UI). Whether per-monitor resolution is
+  // active is derived from whether any assignment exists — no stored flag.
   perMonitorModes: {},
+  // Per-monitor render knob sextets, sig → { lcd, crosstalk, boldness,
+  // gamma, damping, filterWidth } (all 0..=100). Absent = no adjustment for
+  // that monitor. Like modes, the presence of any knob entry activates
+  // per-monitor resolution.
+  perMonitorKnobs: {},
+  // Per-monitor custom subpixel centers, sig → { r, g, b } (fractions of a
+  // pixel). Used when the monitor's mode is 'custom' — the live calibration
+  // controls. Absent = the mode's default layout.
+  perMonitorCustom: {},
 });
 
 // Screen Dimmer settings persisted in config. The backend needs these at
@@ -465,6 +495,8 @@ function profileKey(hz, info = crushInfo()) {
   return `${displayIdentity(info)}|${info.width}x${info.height}|${hzPart}`;
 }
 function clampAdjustment(value) { return Math.max(-150, Math.min(150, Math.round(Number(value) || 0))); }
+function clampKnob(value) { return Math.max(0, Math.min(100, Math.round(Number(value) || 0))); }
+function clampOffset(value) { const n = Number(value); return Number.isFinite(n) ? Math.max(-1, Math.min(1, n)) : 0; }
 function profileValue(key) {
   return key && Object.prototype.hasOwnProperty.call(crush.blackProfiles, key)
     ? clampAdjustment(crush.blackProfiles[key])
@@ -557,10 +589,43 @@ export async function loadConfig(prefetchedCfg = null) {
     clampHighNitsRange();
     if (cfg && typeof cfg.taskbar_dimmer_enabled === 'boolean') taskbarDimmer.enabled = cfg.taskbar_dimmer_enabled;
     if (cfg && typeof cfg.explorer_hook_enabled === 'boolean') textSettings.explorerHookEnabled = cfg.explorer_hook_enabled;
-    if (cfg && typeof cfg.lcd_filter_strength === 'number') textSettings.lcdFilterStrength = Math.max(0, Math.min(100, Math.round(cfg.lcd_filter_strength)));
-    if (cfg && typeof cfg.crosstalk === 'number') textSettings.crosstalk = Math.max(0, Math.min(100, Math.round(cfg.crosstalk)));
-    if (cfg && typeof cfg.boldness === 'number') textSettings.boldness = Math.max(0, Math.min(100, Math.round(cfg.boldness)));
-    if (cfg && typeof cfg.per_monitor_modes === 'object' && cfg.per_monitor_modes) textSettings.perMonitorModes = { ...cfg.per_monitor_modes };
+    if (cfg && typeof cfg.per_monitor_modes === 'object' && cfg.per_monitor_modes) {
+      // Drop mode ids that no longer exist. The fixed RGWB/RWBG presets were
+      // removed (the Custom mode covers those layouts); keeping a stale id
+      // would push it to the hook every sync for no effect.
+      const VALID_MODES = new Set(['off', 'grayscale', 'rgb', 'bgr', 'custom']);
+      textSettings.perMonitorModes = {};
+      for (const [sig, mode] of Object.entries(cfg.per_monitor_modes)) {
+        if (VALID_MODES.has(mode)) textSettings.perMonitorModes[sig] = mode;
+      }
+    }
+    if (cfg && typeof cfg.per_monitor_knobs === 'object' && cfg.per_monitor_knobs) {
+      textSettings.perMonitorKnobs = {};
+      for (const [sig, k] of Object.entries(cfg.per_monitor_knobs)) {
+        if (k && typeof k === 'object') {
+          textSettings.perMonitorKnobs[sig] = {
+            lcd: clampKnob(k.lcd),
+            crosstalk: clampKnob(k.crosstalk),
+            boldness: clampKnob(k.boldness),
+            gamma: clampKnob(k.gamma),
+            damping: clampKnob(k.damping),
+            filterWidth: clampKnob(k.filterWidth),
+          };
+        }
+      }
+    }
+    if (cfg && typeof cfg.per_monitor_custom === 'object' && cfg.per_monitor_custom) {
+      textSettings.perMonitorCustom = {};
+      for (const [sig, offs] of Object.entries(cfg.per_monitor_custom)) {
+        if (offs && Array.isArray(offs) && offs.length === 3) {
+          textSettings.perMonitorCustom[sig] = {
+            r: clampOffset(offs[0]),
+            g: clampOffset(offs[1]),
+            b: clampOffset(offs[2]),
+          };
+        }
+      }
+    }
     // Restore the per-monitor selector after the monitor list loads.
     // Default the selector to the primary monitor; a saved selection wins
     // when it still exists.
@@ -683,10 +748,11 @@ export function saveConfig() {
     high_nits_step: crush.highNitsStep,
     taskbar_dimmer_enabled: taskbarDimmer.enabled,
     explorer_hook_enabled: textSettings.explorerHookEnabled,
-    lcd_filter_strength: textSettings.lcdFilterStrength,
-    crosstalk: textSettings.crosstalk,
-    boldness: textSettings.boldness,
     per_monitor_modes: { ...textSettings.perMonitorModes },
+    per_monitor_knobs: { ...textSettings.perMonitorKnobs },
+    per_monitor_custom: Object.fromEntries(
+      Object.entries(textSettings.perMonitorCustom).map(([sig, o]) => [sig, [o.r, o.g, o.b]]),
+    ),
     active_monitor_sig: activeMonitor.mon ? activeMonitor.mon.sig : '',
     screen_protector_enabled: screenDimmer.enabled,
     screen_protector_seconds: screenDimmer.seconds,

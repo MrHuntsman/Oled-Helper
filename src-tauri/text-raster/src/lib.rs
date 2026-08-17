@@ -40,6 +40,28 @@ pub struct RenderOptions {
     /// Faux bold: swash's outline embolden, 0..=100 mapped to 0..1px of
     /// stroke thickening. Works on all modes.
     pub boldness: u8,
+    /// Coverage gamma (text weight), 0..=100 mapped to γ 1.0..2.0. Applies a
+    /// power curve to the coverage luminance while preserving per-pixel
+    /// chroma ratios, so it thickens/softens the text without shifting the
+    /// fringe colors. 0 = no change. Works on all modes.
+    pub gamma: u8,
+    /// Fringe damping, 0..=100: blends each subpixel pixel toward its
+    /// luminance (c → lerp(c, lum, t)). Reduces fringe chroma so colored
+    /// edges fade toward gray — the inverse of crosstalk, useful when
+    /// fringing is more distracting than the color loss. 0 = no damping.
+    /// Only affects subpixel modes.
+    pub damping: u8,
+    /// LCD filter width, 0..=100: interpolates the 5-tap FIR between
+    /// FreeType's lcddefault taps (0, current behavior) and a wider, softer
+    /// spread (100) that smears the fringe over more subpixels. 0 = the
+    /// historical lcddefault. Only affects subpixel modes.
+    pub filter_width: u8,
+    /// Custom subpixel centers (R, G, B) as fractions of a pixel, used only
+    /// when `mode == RenderMode::Custom`. None = the mode's default layout.
+    /// Lets the user tune a panel's physical subpixel geometry against the
+    /// live preview (the WOLED quad and QD-OLED layouts are just fixed
+    /// presets of the same mechanism).
+    pub subpixel_offsets: Option<[f32; 3]>,
 }
 
 impl Default for RenderOptions {
@@ -48,6 +70,10 @@ impl Default for RenderOptions {
             lcd_strength: 100,
             crosstalk: 0,
             boldness: 0,
+            gamma: 0,
+            damping: 0,
+            filter_width: 0,
+            subpixel_offsets: None,
         }
     }
 }
@@ -65,12 +91,11 @@ pub enum RenderMode {
     SubpixelRgb,
     /// Subpixel antialiasing for a BGR panel (per-channel coverage).
     SubpixelBgr,
-    /// WOLED RGBW stripe (R, G, W, B): R/G/B placed across a 4-subpixel pixel,
-    /// ignoring the white subpixel.
-    SubpixelRgwb,
-    /// WOLED RGBW stripe (R, W, B, G): R/G/B placed across a 4-subpixel pixel,
-    /// ignoring the white subpixel.
-    SubpixelRwbg,
+    /// User-tuned subpixel centers from `RenderOptions.subpixel_offsets`
+    /// (falls back to the WOLED quad positions when unset). The live
+    /// calibration mode: pick the offsets that make the fringing match the
+    /// panel.
+    Custom,
 }
 
 /// A single rasterized glyph, positioned relative to the run's baseline origin.
@@ -111,18 +136,26 @@ fn mode_format(mode: RenderMode) -> (Format, Content) {
         RenderMode::Grayscale | RenderMode::Crisp => (Format::Alpha, Content::Mask),
         RenderMode::SubpixelRgb => (Format::Subpixel, Content::SubpixelMask),
         RenderMode::SubpixelBgr => (Format::subpixel_bgra(), Content::SubpixelMask),
-        // WOLED RGBW: 4 subpixels per pixel, so the R/G/B subpixel centers sit
-        // at ±0.375/±0.125 instead of the RGB stripe's ±1/3. The white
-        // subpixel is not sampled (the panel's scaler derives it from RGB).
-        RenderMode::SubpixelRgwb => (
+        // Custom: the WOLED quad positions as a safe default when no offsets
+        // were supplied; rasterize()/rasterize_glyphs() override the format
+        // with the user's offsets before rendering.
+        RenderMode::Custom => (
             Format::CustomSubpixel([-0.375, -0.125, 0.375]),
             Content::SubpixelMask,
         ),
-        RenderMode::SubpixelRwbg => (
-            Format::CustomSubpixel([-0.375, 0.375, 0.125]),
-            Content::SubpixelMask,
-        ),
     }
+}
+
+/// The swash format for a render: the mode's layout, or the user's custom
+/// subpixel centers when mode is Custom and offsets are present.
+fn render_format(mode: RenderMode, opts: RenderOptions) -> Format {
+    let (format, _) = mode_format(mode);
+    if mode == RenderMode::Custom {
+        if let Some(offsets) = opts.subpixel_offsets {
+            return Format::CustomSubpixel(offsets);
+        }
+    }
+    format
 }
 
 /// FreeType's `lcddefault` filter weights (sum 272, slightly over-unity to
@@ -130,6 +163,10 @@ fn mode_format(mode: RenderMode) -> (Format, Content) {
 const LCD_FILTER_FULL: [f32; 5] = [16.0, 64.0, 112.0, 64.0, 16.0];
 /// The identity filter (strength 0): passes coverage through unchanged.
 const LCD_FILTER_IDENTITY: [f32; 5] = [0.0, 0.0, 256.0, 0.0, 0.0];
+/// A wider, softer spread (sum 272, same energy as lcddefault): pushes more
+/// weight onto the outer taps so the fringe smears across more subpixels.
+/// The width knob interpolates between lcddefault (0) and this (100).
+const LCD_FILTER_WIDE: [f32; 5] = [32.0, 80.0, 96.0, 80.0, 32.0];
 
 /// FreeType's `lcddefault` filter: a 5-tap horizontal FIR applied to the
 /// subpixel coverage stream (R, G, B interleaved), dividing by 256. The
@@ -140,15 +177,20 @@ const LCD_FILTER_IDENTITY: [f32; 5] = [0.0, 0.0, 256.0, 0.0, 0.0];
 /// are zero-padded.
 ///
 /// `strength` (0..=100) interpolates between the identity filter (raw
-/// coverage, harsher fringing) and the full lcddefault filter, so it doubles
-/// as the filter's on/off.
-fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
+/// coverage, harsher fringing) and the base filter, so it doubles as the
+/// filter's on/off. `width` (0..=100) picks the base filter between the
+/// historical lcddefault taps (0) and a wider, softer spread (100).
+fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8, filter_width: u8) {
     if strength == 0 {
         return;
     }
     let t = strength as f32 / 100.0;
+    let w = filter_width as f32 / 100.0;
+    let base: [f32; 5] = std::array::from_fn(|i| {
+        LCD_FILTER_FULL[i] * (1.0 - w) + LCD_FILTER_WIDE[i] * w
+    });
     let weights: [u32; 5] = std::array::from_fn(|i| {
-        (LCD_FILTER_FULL[i] * t + LCD_FILTER_IDENTITY[i] * (1.0 - t)).round() as u32
+        (base[i] * t + LCD_FILTER_IDENTITY[i] * (1.0 - t)).round() as u32
     });
     let w = width as usize;
     for y in 0..height as usize {
@@ -179,6 +221,57 @@ fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8) 
             coverage[row + x * 4 + 1] = flat[x * 3 + 1];
             coverage[row + x * 4 + 2] = flat[x * 3 + 2];
         }
+    }
+}
+
+/// Coverage gamma (text weight): applies a power curve to each pixel's
+/// luminance while preserving chroma ratios (all channels scale by the same
+/// factor), so the fringe colors stay put and only the ink weight changes.
+/// `strength` 0..=100 maps to γ 1.0..2.0 (0 = unchanged).
+fn apply_gamma(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
+    if strength == 0 {
+        return;
+    }
+    let gamma = 1.0 + strength as f32 / 100.0; // 1.0..2.0
+    let n = width as usize * height as usize;
+    for i in 0..n {
+        let p = i * 4;
+        let r = coverage[p] as f32;
+        let g = coverage[p + 1] as f32;
+        let b = coverage[p + 2] as f32;
+        let lum = (r + g + b) / 3.0;
+        if lum <= 0.0 {
+            continue;
+        }
+        // scale = lum^(γ-1) makes new_lum = lum^γ (in 0..1 space). Applying
+        // the same scale to all three channels preserves their ratios, so
+        // hue/saturation of the fringe is untouched.
+        let scale = (lum / 255.0).powf(gamma - 1.0);
+        coverage[p] = (r * scale).clamp(0.0, 255.0) as u8;
+        coverage[p + 1] = (g * scale).clamp(0.0, 255.0) as u8;
+        coverage[p + 2] = (b * scale).clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Fringe damping: blends each subpixel pixel toward its luminance so the
+/// colored fringe fades toward gray. `strength` 0..=100 is the blend factor
+/// (0 = untouched, 100 = fully gray fringe). Luminance-preserving by
+/// construction (the target is the pixel's own mean).
+fn apply_damping(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
+    if strength == 0 {
+        return;
+    }
+    let t = strength as f32 / 100.0;
+    let n = width as usize * height as usize;
+    for i in 0..n {
+        let p = i * 4;
+        let r = coverage[p] as f32;
+        let g = coverage[p + 1] as f32;
+        let b = coverage[p + 2] as f32;
+        let lum = (r + g + b) / 3.0;
+        coverage[p] = (r + (lum - r) * t).round().clamp(0.0, 255.0) as u8;
+        coverage[p + 1] = (g + (lum - g) * t).round().clamp(0.0, 255.0) as u8;
+        coverage[p + 2] = (b + (lum - b) * t).round().clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -241,6 +334,14 @@ struct GlyphCacheKey {
     lcd: u8,
     crosstalk: u8,
     boldness: u8,
+    gamma: u8,
+    damping: u8,
+    filter_width: u8,
+    /// Custom subpixel center bits (0 when unused) — tuned offsets must not
+    /// share cache entries with the fixed layouts.
+    sub_r: u32,
+    sub_g: u32,
+    sub_b: u32,
 }
 
 /// The rasterized bitmap for one glyph (position-independent).
@@ -328,7 +429,7 @@ pub fn glyph_cache_stats() -> (u64, u64, usize) {
 /// of one per glyph, which matters for Explorer's repaints (a 79-glyph run
 /// redrawn every frame).
 fn cache_get_batch(keys: &[GlyphCacheKey]) -> Vec<Option<Arc<CachedGlyph>>> {
-    let mut cache = glyph_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let cache = glyph_cache().lock().unwrap_or_else(|p| p.into_inner());
     keys.iter()
         .map(|k| match cache.map.get(k) {
             Some(g) => {
@@ -355,6 +456,10 @@ fn glyph_cache_key(
     mode: RenderMode,
     opts: RenderOptions,
 ) -> GlyphCacheKey {
+    let (sub_r, sub_g, sub_b) = match opts.subpixel_offsets {
+        Some([r, g, b]) => (r.to_bits(), g.to_bits(), b.to_bits()),
+        None => (0, 0, 0),
+    };
     GlyphCacheKey {
         font: font_ptr,
         font_index,
@@ -366,6 +471,12 @@ fn glyph_cache_key(
         lcd: opts.lcd_strength,
         crosstalk: opts.crosstalk,
         boldness: opts.boldness,
+        gamma: opts.gamma,
+        damping: opts.damping,
+        filter_width: opts.filter_width,
+        sub_r,
+        sub_g,
+        sub_b,
     }
 }
 
@@ -446,8 +557,16 @@ fn rasterize_glyph_uncached(
     }
     let mut data = image.data;
     if matches!(image.content, Content::SubpixelMask) {
-        apply_lcd_filter(&mut data, image.placement.width, image.placement.height, opts.lcd_strength);
+        apply_lcd_filter(
+            &mut data,
+            image.placement.width,
+            image.placement.height,
+            opts.lcd_strength,
+            opts.filter_width,
+        );
         apply_crosstalk(&mut data, image.placement.width, image.placement.height, opts.crosstalk);
+        apply_gamma(&mut data, image.placement.width, image.placement.height, opts.gamma);
+        apply_damping(&mut data, image.placement.width, image.placement.height, opts.damping);
     }
     let coverage: Arc<[u8]> = match mode {
         RenderMode::Crisp => data
@@ -530,7 +649,10 @@ pub fn rasterize(
         .build();
     shaper.add_str(text);
 
-    let (format, content) = mode_format(mode);
+    let (_, content) = mode_format(mode);
+    // Custom mode renders with the user's subpixel centers (see
+    // render_format); the fixed modes use their preset layouts.
+    let format = render_format(mode, opts);
 
     // One scale context/scaler for the whole run (same size + hinting).
     let mut scale_context = ScaleContext::new();
@@ -646,7 +768,10 @@ pub fn rasterize_glyphs(
         .materialize_glyph_metrics(&font, &[])
         .scale(pixel_size);
 
-    let (format, content) = mode_format(mode);
+    let (_, content) = mode_format(mode);
+    // Custom mode renders with the user's subpixel centers (see
+    // render_format); the fixed modes use their preset layouts.
+    let format = render_format(mode, opts);
 
     // Faux bold: 0..=100 maps to 0..1px of outline stroke thickening.
     let embolden = opts.boldness as f32 / 100.0;
@@ -900,17 +1025,43 @@ mod tests {
     }
 
     #[test]
+    fn custom_subpixel_offsets_are_honored() {
+        let Some(font) = load_test_font() else {
+            eprintln!("no system font available; skipping");
+            return;
+        };
+        // Custom mode with explicit offsets must rasterize as 4bpp subpixel
+        // and produce a different fringe than the default WOLED quad layout.
+        let default = rasterize(&font, 0, 16.0, "A", RenderMode::Custom, RenderOptions::default())
+            .expect("font parses");
+        let tuned = rasterize(
+            &font,
+            0,
+            16.0,
+            "A",
+            RenderMode::Custom,
+            RenderOptions {
+                subpixel_offsets: Some([-0.5, 0.0, 0.5]),
+                ..RenderOptions::default()
+            },
+        )
+        .expect("font parses");
+        assert_eq!(default.content, Content::SubpixelMask);
+        assert_eq!(tuned.content, Content::SubpixelMask);
+        assert!(!tuned.glyphs.is_empty());
+        let a = &tuned.glyphs[0].coverage;
+        let b = &default.glyphs[0].coverage;
+        assert!(a.len() == b.len(), "same glyph size at same px");
+        assert!(a != b, "different offsets must change the fringe");
+    }
+
+    #[test]
     fn subpixel_rasterizes_all_layouts() {
         let Some(font) = load_test_font() else {
             eprintln!("no system font available; skipping");
             return;
         };
-        for mode in [
-            RenderMode::SubpixelRgb,
-            RenderMode::SubpixelBgr,
-            RenderMode::SubpixelRgwb,
-            RenderMode::SubpixelRwbg,
-        ] {
+        for mode in [RenderMode::SubpixelRgb, RenderMode::SubpixelBgr] {
             let out = rasterize(&font, 0, 16.0, "Ag", mode, RenderOptions::default())
                 .expect("font parses");
             assert!(!out.glyphs.is_empty());
@@ -934,7 +1085,7 @@ mod tests {
     fn lcd_filter_spreads_impulse() {
         let mut buf = vec![0u8; 5 * 4];
         buf[2 * 4] = 255; // red-channel impulse at pixel 2
-        apply_lcd_filter(&mut buf, 5, 1, 100);
+        apply_lcd_filter(&mut buf, 5, 1, 100, 0);
         // The impulse spreads across neighboring SUBPIXELS (R/G/B boundaries),
         // not just the red channel of neighboring pixels.
         assert_eq!(buf[1 * 4 + 1], 15); // G of pixel 1
@@ -942,6 +1093,48 @@ mod tests {
         assert_eq!(buf[2 * 4], 111); // R of pixel 2 (peak)
         assert_eq!(buf[2 * 4 + 1], 63); // G of pixel 2
         assert_eq!(buf[2 * 4 + 2], 15); // B of pixel 2
+    }
+
+    #[test]
+    fn wide_filter_smears_farther_than_default() {
+        // Same impulse, but the wide filter pushes more weight onto the outer
+        // taps, so the neighbor subpixels receive more energy than lcddefault.
+        let mut buf = vec![0u8; 5 * 4];
+        buf[2 * 4] = 255;
+        apply_lcd_filter(&mut buf, 5, 1, 100, 100);
+        assert!(buf[1 * 4 + 1] > 15, "wide filter should spread more to neighbors");
+        assert!(buf[2 * 4] < 111, "wide filter should lower the peak");
+    }
+
+    #[test]
+    fn gamma_darkens_mid_tone_keeps_fringe_ratio() {
+        // A mid-gray fringe pixel: gamma raises contrast (darkens below 50%,
+        // lightens above) while preserving the R:G:B ratio so the fringe hue
+        // stays put.
+        let mut buf = vec![0u8; 1 * 4];
+        buf[0] = 128;
+        buf[1] = 64;
+        buf[2] = 32;
+        let before = buf.clone();
+        apply_gamma(&mut buf, 1, 1, 100);
+        assert!(buf[0] < before[0], "gamma should darken a sub-mid luminance");
+        let r = buf[0] as f32 / before[0] as f32;
+        let g = buf[1] as f32 / before[1] as f32;
+        let b = buf[2] as f32 / before[2] as f32;
+        let max_diff = (r - g).abs().max((r - b).abs()).max((g - b).abs());
+        assert!(max_diff < 0.05, "channel ratios should be preserved");
+    }
+
+    #[test]
+    fn damping_pulls_fringe_toward_gray() {
+        // A pure red fringe pixel: damping blends it toward its own luminance
+        // (r/3), so G and B rise toward r/3 and the chroma drops.
+        let mut buf = vec![0u8; 1 * 4];
+        buf[0] = 255;
+        apply_damping(&mut buf, 1, 1, 100);
+        assert_eq!(buf[0], 85);
+        assert_eq!(buf[1], 85);
+        assert_eq!(buf[2], 85);
     }
 
     #[test]

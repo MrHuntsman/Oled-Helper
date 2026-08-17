@@ -16,22 +16,25 @@
     { id: 'grayscale', label: 'Grayscale' },
     { id: 'rgb', label: 'RGB' },
     { id: 'bgr', label: 'BGR' },
-    { id: 'rgwb', label: 'RGWB' },
-    { id: 'rwbg', label: 'RWBG' },
+    { id: 'custom', label: 'Custom' },
   ];
+  // Custom subpixel center slider bounds (±1 pixel) and step. The preview
+  // updates live so tuning the offsets against the fringe is immediate.
+  const CUSTOM_OFFSET_MIN = -1;
+  const CUSTOM_OFFSET_MAX = 1;
+  const CUSTOM_OFFSET_STEP = 0.01;
+  // Sensible starting point for a fresh custom profile: the WOLED quad
+  // positions (R/G/B across a 4-subpixel pixel, white derived by the panel).
+  const CUSTOM_OFFSET_DEFAULT = { r: -0.375, g: -0.125, b: 0.375 };
   let state = $state({
     effective_mode: 'rgb',
     gamma: 1400,
-    contrast: 1400,
     cleartype_level: 100,
     smoothing_enabled: true,
   });
   let loaded = $state(false);
   let busy = $state(false);
   let error = $state('');
-
-  let contrastDragging = $state(false);
-  let contrastHovering = $state(false);
 
   // Explorer hook state from the backend's explorer_hook_status command
   // (polled while mounted): active = DLL verified in the running explorer.exe.
@@ -57,27 +60,46 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled }).catch(() => {});
   }
 
-  // Push the three render knobs (filter strength, crosstalk, boldness) to the
-  // backend so Explorer applies them live. Debounced at 33ms to match the
-  // preview render, so Explorer tracks the drag without repainting per event.
+  // The knob the sliders show: the selected monitor's per-monitor value.
+  // Knobs are part of each monitor's profile; before the selector has a
+  // monitor (pre-load) there is nothing to edit, so the value is 0.
+  function knobValue(field) {
+    if (!activeMonitor.mon) return 0;
+    const k = textSettings.perMonitorKnobs[activeMonitor.mon.sig];
+    if (k) return k[field];
+    return 0;
+  }
+
+  // Push the per-monitor knob assignments (and the mode assignments + enabled
+  // flag they belong to) to the backend so Explorer applies them live.
+  // Debounced at 33ms to match the preview render, so Explorer tracks the
+  // drag without repainting per event.
   let knobSyncTimer = null;
   function scheduleKnobSync() {
     clearTimeout(knobSyncTimer);
-    knobSyncTimer = setTimeout(() => {
-      invoke('explorer_hook_set_render_knobs', {
-        lcdStrength: textSettings.lcdFilterStrength,
-        crosstalk: textSettings.crosstalk,
-        boldness: textSettings.boldness,
-      }).catch((e) => console.warn('[text] render knobs sync failed', e));
-    }, 33);
+    knobSyncTimer = setTimeout(() => syncTextPerMonitor(), 33);
   }
 
-  // Shared handler for the three tuning sliders: update the value, persist,
-  // push to the hook (debounced), and re-render the preview (debounced — a
-  // drag fires dozens of input events, and each rasterization batch is a few
-  // backend calls, so rendering on the final value keeps the UI responsive).
+  // Shared handler for the tuning sliders: update the selected monitor's
+  // knob value, persist, push to the hook (debounced), and re-render the
+  // preview (debounced — a drag fires dozens of input events, and each
+  // rasterization batch is a few backend calls, so rendering on the final
+  // value keeps the UI responsive).
   function onKnobInput(field, value) {
-    textSettings[field] = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+    if (!activeMonitor.mon) return;
+    const v = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+    const sig = activeMonitor.mon.sig;
+    const k = textSettings.perMonitorKnobs[sig]
+      || { lcd: 0, crosstalk: 0, boldness: 0, gamma: 0, damping: 0, filterWidth: 0 };
+    k[field] = v;
+    // An all-zero sextet is "no adjustment" — drop the entry so it does
+    // not silently keep per-monitor resolution active.
+    if (k.lcd === 0 && k.crosstalk === 0 && k.boldness === 0
+      && k.gamma === 0 && k.damping === 0 && k.filterWidth === 0) {
+      delete textSettings.perMonitorKnobs[sig];
+    } else {
+      textSettings.perMonitorKnobs[sig] = k;
+    }
     saveConfig();
     scheduleKnobSync();
     schedulePreviewRender();
@@ -108,24 +130,57 @@
   // ── Per-monitor text modes (M3) ───────────────────────────────────────
   // Every monitor carries its own profile; the top-bar selector (stores
   // activeMonitor) picks which one the mode control edits. A monitor without
-  // an explicit mode uses 'default' — the system text setting (the hook's
-  // fallback slot, synced from text_rendering_get_state). The hook's
-  // per-monitor flag is derived in stores from whether any assignment exists.
+  // an explicit mode follows the system text setting (the hook's fallback
+  // slot, synced from text_rendering_get_state) — the base state, which the
+  // radios reflect directly. The hook's per-monitor flag is derived in
+  // stores from whether any assignment exists.
 
   // The mode the radios should show as active: the selected monitor's assigned
-  // mode, or 'default' when it follows the system text setting.
+  // mode, or the system text setting when it has no override (the base state —
+  // unconfigured monitors follow the system, which is RGB for most setups).
+  // Restore defaults (the tab's reset button) clears overrides back to this.
   function shownMode() {
-    if (activeMonitor.mon) return textSettings.perMonitorModes[activeMonitor.mon.sig] || 'default';
+    if (activeMonitor.mon) return textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode;
     return state.effective_mode;
   }
 
-  // Assign (or clear, via 'default') the selected monitor's mode override.
+  // Assign the selected monitor's mode override.
   function applyMonitorMode(mode) {
     const sig = activeMonitor.mon.sig;
-    if (mode === 'default') delete textSettings.perMonitorModes[sig];
-    else textSettings.perMonitorModes[sig] = mode;
+    textSettings.perMonitorModes[sig] = mode;
+    // A fresh custom profile starts at the WOLED quad positions so the
+    // preview renders something sane before the user drags the sliders.
+    if (mode === 'custom' && !textSettings.perMonitorCustom[sig]) {
+      textSettings.perMonitorCustom[sig] = { ...CUSTOM_OFFSET_DEFAULT };
+    }
     saveConfig();
     syncTextPerMonitor();
+    schedulePreviewRender();
+  }
+
+  // The custom subpixel centers for the selected monitor (or the defaults
+  // when it has none).
+  function customOffsets() {
+    if (!activeMonitor.mon) return { ...CUSTOM_OFFSET_DEFAULT };
+    return textSettings.perMonitorCustom[activeMonitor.mon.sig] || { ...CUSTOM_OFFSET_DEFAULT };
+  }
+
+  // One axis of the custom subpixel centers.
+  function customValue(axis) {
+    return customOffsets()[axis];
+  }
+
+  // Update one custom subpixel center, persist, push to the hook (debounced),
+  // and re-render the preview.
+  function onCustomInput(axis, value) {
+    if (!activeMonitor.mon) return;
+    const sig = activeMonitor.mon.sig;
+    const v = Math.max(CUSTOM_OFFSET_MIN, Math.min(CUSTOM_OFFSET_MAX, Number(value) || 0));
+    const offs = textSettings.perMonitorCustom[sig] || { ...CUSTOM_OFFSET_DEFAULT };
+    offs[axis] = v;
+    textSettings.perMonitorCustom[sig] = offs;
+    saveConfig();
+    scheduleKnobSync();
     schedulePreviewRender();
   }
 
@@ -147,7 +202,8 @@
   async function applyMode(mode) {
     if (busy) return;
     // A monitor selected in the top bar means the mode edit targets that
-    // monitor's profile; 'default' clears it back to the system setting.
+    // monitor's profile; before the monitor list loads, it falls through to
+    // the system-level mode below.
     if (activeMonitor.mon) {
       applyMonitorMode(mode);
       return;
@@ -167,13 +223,6 @@
     }
   }
 
-  // Contrast is parked: it is not wired to the swash rasterizer yet, so the
-  // preview does not reflect it. The slider keeps local state so it stays
-  // responsive for when the knob is added.
-  function applyContrast(value) {
-    state.contrast = value;
-  }
-
   async function resetDefaults() {
     busy = true;
     error = '';
@@ -184,8 +233,11 @@
         saveConfig();
         syncExplorerToggle();
       }
-      // Restore defaults also clears any per-monitor mode overrides.
+      // Restore defaults also clears any per-monitor mode, knob, and custom
+      // offset overrides.
       textSettings.perMonitorModes = {};
+      textSettings.perMonitorKnobs = {};
+      textSettings.perMonitorCustom = {};
       saveConfig();
       syncTextPerMonitor();
       await refreshState();
@@ -237,7 +289,8 @@
 
     const mode = previewMode();
     const zoom = previewZoom / 100;
-    const key = `${mode}|${textSettings.lcdFilterStrength}|${textSettings.crosstalk}|${textSettings.boldness}|${dpr}`;
+    const offs = customOffsets();
+    const key = `${mode}|${knobValue('lcd')}|${knobValue('crosstalk')}|${knobValue('boldness')}|${knobValue('gamma')}|${knobValue('damping')}|${knobValue('filterWidth')}|${mode === 'custom' ? `${offs.r}|${offs.g}|${offs.b}` : ''}|${dpr}`;
     const gen = ++previewGen;
 
     let left;
@@ -251,11 +304,24 @@
         // maps to exactly one physical pixel when drawn back at CSS size — the
         // 100% column is crisp on HiDPI instead of half-resolution. On a 1×
         // display dpr = 1 and this is identical to before.
+        const renderArgs = {
+          mode,
+          text: PREVIEW_TEXT,
+          lcdStrength: knobValue('lcd'),
+          crosstalk: knobValue('crosstalk'),
+          boldness: knobValue('boldness'),
+          gamma: knobValue('gamma'),
+          damping: knobValue('damping'),
+          filterWidth: knobValue('filterWidth'),
+          offsetR: mode === 'custom' ? offs.r : null,
+          offsetG: mode === 'custom' ? offs.g : null,
+          offsetB: mode === 'custom' ? offs.b : null,
+        };
         left = await Promise.all(
-          [8, 10, 12, 15].map((size) => invoke('text_preview_render', { mode, text: PREVIEW_TEXT, size: size * dpr, lcdStrength: textSettings.lcdFilterStrength, crosstalk: textSettings.crosstalk, boldness: textSettings.boldness })),
+          [8, 10, 12, 15].map((size) => invoke('text_preview_render', { ...renderArgs, size: size * dpr })),
         );
         right = await Promise.all(
-          [12, 15].map((size) => invoke('text_preview_render', { mode, text: PREVIEW_TEXT, size: size * dpr, lcdStrength: textSettings.lcdFilterStrength, crosstalk: textSettings.crosstalk, boldness: textSettings.boldness })),
+          [12, 15].map((size) => invoke('text_preview_render', { ...renderArgs, size: size * dpr })),
         );
       } catch (e) {
         console.warn('[text] preview render failed', e);
@@ -411,11 +477,6 @@
     </div>
     <div class="text-render-modes-row">
       <div class="text-render-inline-modes" role="radiogroup" aria-label="Preview subpixel mode">
-        {#if activeMonitor.mon}
-          <button type="button" class="text-render-inline-mode" class:active={shownMode() === 'default'} role="radio" aria-checked={shownMode() === 'default'} onclick={() => applyMode('default')} disabled={busy}>
-            Default
-          </button>
-        {/if}
         {#each MODES as m (m.id)}
           <button type="button" class="text-render-inline-mode" class:active={shownMode() === m.id} role="radio" aria-checked={shownMode() === m.id} onclick={() => applyMode(m.id)} disabled={busy}>
             {#if m.id !== 'off'}<ModeBars mode={m.id} class="text-render-mode-bars" />{/if}
@@ -424,23 +485,6 @@
           </button>
         {/each}
       </div>
-      {#if state.effective_mode === 'rgb' || state.effective_mode === 'bgr'}
-        <div class="text-render-mini-contrast">
-          <span class="text-render-mini-contrast-label">Contrast</span>
-          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-            <input type="range" class="slider-sm" min="1000" max="2200" step="100" value={state.contrast}
-              style="--fill:{((state.contrast - 1000) / 1200) * 100}%"
-              oninput={(e) => applyContrast(Math.round(Number(e.currentTarget.value) / 100) * 100)}
-              onpointerdown={() => contrastDragging = true}
-              onpointerup={() => contrastDragging = false}
-              onpointercancel={() => contrastDragging = false}
-              onpointerenter={() => contrastHovering = true}
-              onpointerleave={() => contrastHovering = false} />
-            <div class="slider-tooltip" class:visible={contrastDragging || contrastHovering} style="left:calc(9px + ({((state.contrast - 1000) / 1200)} * (100% - 18px)))">{state.contrast}</div>
-          </div>
-          <span class="slider-val">{state.contrast}</span>
-        </div>
-      {/if}
     </div>
   </div>
 
@@ -463,31 +507,90 @@
       <div class="text-render-knob-row">
         <span class="text-render-knob-label">LCD filter</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={textSettings.lcdFilterStrength}
-            style="--fill:{textSettings.lcdFilterStrength}%"
-            oninput={(e) => onKnobInput('lcdFilterStrength', e.currentTarget.value)} />
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('lcd')}
+            style="--fill:{knobValue('lcd')}%"
+            oninput={(e) => onKnobInput('lcd', e.currentTarget.value)} />
         </div>
-        <span class="slider-val">{textSettings.lcdFilterStrength}</span>
+        <span class="slider-val">{knobValue('lcd')}</span>
       </div>
       <div class="text-render-knob-row">
         <span class="text-render-knob-label">Crosstalk</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={textSettings.crosstalk}
-            style="--fill:{textSettings.crosstalk}%"
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('crosstalk')}
+            style="--fill:{knobValue('crosstalk')}%"
             oninput={(e) => onKnobInput('crosstalk', e.currentTarget.value)} />
         </div>
-        <span class="slider-val">{textSettings.crosstalk}</span>
+        <span class="slider-val">{knobValue('crosstalk')}</span>
       </div>
       <div class="text-render-knob-row">
         <span class="text-render-knob-label">Boldness</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={textSettings.boldness}
-            style="--fill:{textSettings.boldness}%"
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('boldness')}
+            style="--fill:{knobValue('boldness')}%"
             oninput={(e) => onKnobInput('boldness', e.currentTarget.value)} />
         </div>
-        <span class="slider-val">{textSettings.boldness}</span>
+        <span class="slider-val">{knobValue('boldness')}</span>
+      </div>
+      <div class="text-render-knob-row">
+        <span class="text-render-knob-label">Weight</span>
+        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('gamma')}
+            style="--fill:{knobValue('gamma')}%"
+            oninput={(e) => onKnobInput('gamma', e.currentTarget.value)} />
+        </div>
+        <span class="slider-val">{knobValue('gamma')}</span>
+      </div>
+      <div class="text-render-knob-row">
+        <span class="text-render-knob-label">Fringe damp</span>
+        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('damping')}
+            style="--fill:{knobValue('damping')}%"
+            oninput={(e) => onKnobInput('damping', e.currentTarget.value)} />
+        </div>
+        <span class="slider-val">{knobValue('damping')}</span>
+      </div>
+      <div class="text-render-knob-row">
+        <span class="text-render-knob-label">Filter width</span>
+        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('filterWidth')}
+            style="--fill:{knobValue('filterWidth')}%"
+            oninput={(e) => onKnobInput('filterWidth', e.currentTarget.value)} />
+        </div>
+        <span class="slider-val">{knobValue('filterWidth')}</span>
       </div>
     </div>
+    {#if shownMode() === 'custom'}
+      <div class="text-render-custom-offsets">
+        <div class="text-render-custom-heading">Subpixel centers</div>
+        <div class="text-render-knob-row">
+          <span class="text-render-knob-label">R</span>
+          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+            <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue('r')}
+              style="--fill:{((customValue('r') - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
+              oninput={(e) => onCustomInput('r', e.currentTarget.value)} />
+          </div>
+          <span class="slider-val">{customValue('r').toFixed(3)}</span>
+        </div>
+        <div class="text-render-knob-row">
+          <span class="text-render-knob-label">G</span>
+          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+            <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue('g')}
+              style="--fill:{((customValue('g') - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
+              oninput={(e) => onCustomInput('g', e.currentTarget.value)} />
+          </div>
+          <span class="slider-val">{customValue('g').toFixed(3)}</span>
+        </div>
+        <div class="text-render-knob-row">
+          <span class="text-render-knob-label">B</span>
+          <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
+            <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue('b')}
+              style="--fill:{((customValue('b') - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
+              oninput={(e) => onCustomInput('b', e.currentTarget.value)} />
+          </div>
+          <span class="slider-val">{customValue('b').toFixed(3)}</span>
+        </div>
+      </div>
+    {/if}
   </div>
 
   <div class="dimmer-control">

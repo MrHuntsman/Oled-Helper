@@ -222,8 +222,9 @@ fn display_devices_by_position() -> HashMap<(i32, i32), (String, String)> {
                 continue;
             }
             // DEVMODEW models the union-typed fields through Anonymous1/2;
-            // dmPosition lives in the second anonymous member.
-            let pos = unsafe { dm.Anonymous1.Anonymous2.dmPosition };
+            // dmPosition lives in the second anonymous member. The unsafe
+            // union read is already covered by the enclosing unsafe block.
+            let pos = dm.Anonymous1.Anonymous2.dmPosition;
             map.insert((pos.x, pos.y), (name, trim_utf16(&dev.DeviceID)));
         }
     }

@@ -3812,21 +3812,6 @@ button {
 .text-render-modes-row .text-render-inline-modes {
   margin: 0;
 }
-/* Mini contrast slider next to the mode buttons (RGB/BGR only). */
-.text-render-mini-contrast {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-}
-.text-render-mini-contrast-label {
-  font-size: 12px;
-  color: var(--text-weak);
-  white-space: nowrap;
-}
-.text-render-mini-contrast .slider-val {
-  font-size: 12px;
-  min-width: 34px;
-}
 .text-render-explorer-desc {
   margin: 4px 0 10px;
   font-size: 12px;
@@ -3930,6 +3915,26 @@ button {
   margin: 2px 0 8px;
   /* Half the tab width, leaving the right half free for a second group of
      sliders (e.g. per-mode tweaks) later. */
+  width: 50%;
+}
+.text-render-custom-offsets {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 8px;
+  padding: 8px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.text-render-custom-heading {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-weak);
+  letter-spacing: 0.3px;
+  margin-bottom: 2px;
+}
+.text-render-custom-offsets .text-render-knob-row {
   width: 50%;
 }
 .text-render-knob-row {

@@ -31,7 +31,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SystemParametersInfoW, FE_FONTSMOOTHINGCLEARTYPE,
     FE_FONTSMOOTHINGORIENTATIONBGR, FE_FONTSMOOTHINGORIENTATIONRGB, FE_FONTSMOOTHINGSTANDARD,
-    HWND_BROADCAST, SPI_SETFONTSMOOTHING, SPI_SETFONTSMOOTHINGCONTRAST,
+    HWND_BROADCAST, SPI_SETFONTSMOOTHING,
     SPI_SETFONTSMOOTHINGORIENTATION, SPI_SETFONTSMOOTHINGTYPE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE, WM_FONTCHANGE,
     WM_SETTINGCHANGE,
@@ -297,25 +297,6 @@ fn set_orientation(rgb: bool) -> Result<(), String> {
     }
 }
 
-fn set_contrast(contrast: u32) -> Result<(), String> {
-    unsafe {
-        SystemParametersInfoW(
-            SPI_SETFONTSMOOTHINGCONTRAST,
-            0,
-            Some(contrast as usize as *mut core::ffi::c_void),
-            update_flags(),
-        )
-        .map_err(|e| format!("SPI_SETFONTSMOOTHINGCONTRAST failed: {e}"))?;
-    }
-    // DirectWrite uses this separate Avalon.Graphics value for its gamma.
-    // Keep it on the same slider as the GDI contrast to give users one
-    // consistent lightness control across both rendering paths.
-    write_dword(AVALON_SUBKEY, "GammaLevel", contrast)?;
-    broadcast_settings_change();
-    log_smoothing_state(&format!("contrast set to {contrast}"));
-    Ok(())
-}
-
 fn apply_directwrite(mode: &str) -> Result<(), String> {
     // PixelStructure: 0 = flat (grayscale), 1 = RGB, 2 = BGR.
     // ClearTypeLevel: 0 = grayscale edges, 50 = medium, 100 = full color.
@@ -363,6 +344,26 @@ fn apply_mode(mode: &str) -> Result<(), String> {
     broadcast_font_change();
     log_smoothing_state(&format!("mode '{mode}' applied"));
     Ok(())
+}
+
+/// The system's effective text-smoothing mode as a mode string ("off",
+/// "grayscale", "rgb", "bgr"). The Explorer hook uses this at startup for
+/// its global mode, mirroring what the Text tab reads on mount.
+pub fn system_effective_mode() -> String {
+    let smoothing_enabled = read_string(DESKTOP_SUBKEY, "FontSmoothing")
+        .ok()
+        .flatten()
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true);
+    let smoothing_type = read_dword(DESKTOP_SUBKEY, "FontSmoothingType")
+        .ok()
+        .flatten()
+        .unwrap_or(2);
+    let orientation = read_dword(DESKTOP_SUBKEY, "FontSmoothingOrientation")
+        .ok()
+        .flatten()
+        .unwrap_or(1);
+    derive_effective_mode(smoothing_enabled, smoothing_type, orientation)
 }
 
 fn derive_effective_mode(smoothing_enabled: bool, smoothing_type: u32, orientation: u32) -> String {
@@ -984,24 +985,43 @@ pub fn text_preview_render(
     lcd_strength: u32,
     crosstalk: u32,
     boldness: u32,
+    gamma: u32,
+    damping: u32,
+    filter_width: u32,
+    offset_r: Option<f32>,
+    offset_g: Option<f32>,
+    offset_b: Option<f32>,
 ) -> Result<PreviewRender, String> {
     let render_mode = match mode.as_str() {
         "off" => RenderMode::Crisp,
         "grayscale" => RenderMode::Grayscale,
         "rgb" => RenderMode::SubpixelRgb,
         "bgr" => RenderMode::SubpixelBgr,
-        "rgwb" => RenderMode::SubpixelRgwb,
-        "rwbg" => RenderMode::SubpixelRwbg,
+        "custom" => RenderMode::Custom,
         _ => return Err(format!("unknown mode: {mode}")),
     };
     if size <= 0.0 || size > 512.0 {
         return Err(format!("size out of range: {size}"));
     }
     let font = preview_font().ok_or_else(|| "no system font available for the preview".to_string())?;
+    // Custom mode: the user's subpixel centers. Missing/invalid values fall
+    // back to the mode default (render_format does this in the rasterizer).
+    let subpixel_offsets = match (offset_r, offset_g, offset_b) {
+        (Some(r), Some(g), Some(b))
+            if r.is_finite() && g.is_finite() && b.is_finite() && mode == "custom" =>
+        {
+            Some([r.clamp(-1.0, 1.0), g.clamp(-1.0, 1.0), b.clamp(-1.0, 1.0)])
+        }
+        _ => None,
+    };
     let opts = text_raster::RenderOptions {
         lcd_strength: lcd_strength.min(100) as u8,
         crosstalk: crosstalk.min(100) as u8,
         boldness: boldness.min(100) as u8,
+        gamma: gamma.min(100) as u8,
+        damping: damping.min(100) as u8,
+        filter_width: filter_width.min(100) as u8,
+        subpixel_offsets,
     };
     let run = rasterize(&font, 0, size, &text, render_mode, opts)
         .ok_or_else(|| "preview rasterization failed".to_string())?;
@@ -1242,17 +1262,6 @@ pub fn text_rendering_set_gamma(gamma: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn text_rendering_set_contrast(contrast: u32) -> Result<(), String> {
-    if !REGISTRY_METHOD_ENABLED {
-        return Ok(());
-    }
-    if !(1000..=2200).contains(&contrast) {
-        return Err(format!("contrast out of range: {contrast}"));
-    }
-    set_contrast(contrast)
-}
-
 // DirectWrite/WPF-only: controls the color intensity of subpixel antialiasing
 // (0 = grayscale edges, 100 = full color). GDI ignores it, so the native
 // preview does not change; DirectWrite apps read it at startup.
@@ -1276,7 +1285,6 @@ pub fn text_rendering_reset() -> Result<(), String> {
     }
     apply_mode("rgb")?;
     write_dword(DESKTOP_SUBKEY, "FontSmoothingGamma", DEFAULT_GAMMA)?;
-    set_contrast(DEFAULT_CONTRAST)?;
     Ok(())
 }
 
