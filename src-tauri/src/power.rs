@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use serde::Serialize;
-use windows::core::{GUID, PCWSTR};
+use windows::core::{BOOL, GUID, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, FillRect, GetStockObject, InvalidateRect, BLACK_BRUSH, HBRUSH,
@@ -36,14 +36,16 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateCursor, CreateWindowExW, DefWindowProcW, GetSystemMetrics, PostMessageW, RegisterClassW,
-    SetLayeredWindowAttributes, SetSystemCursor, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    CreateCursor, CreateWindowExW, DefWindowProcW, EnumWindows, GetClassNameW, GetSystemMetrics,
+    GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowTextW, IsWindowVisible, PostMessageW,
+    RegisterClassW, SetLayeredWindowAttributes, SetSystemCursor, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, SystemParametersInfoW,
     HTTRANSPARENT, HWND_BROADCAST, HWND_TOPMOST, LWA_ALPHA, SC_MONITORPOWER,
     SPI_GETSCREENSAVEACTIVE, SPI_GETSCREENSAVETIMEOUT, SPI_SETSCREENSAVEACTIVE,
-    SPI_SETSCREENSAVETIMEOUT, SPI_SETCURSORS, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE, WM_ERASEBKGND, WM_NCHITTEST,
-    WM_PAINT, WM_SYSCOMMAND, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    HCURSOR, SYSTEM_CURSOR_ID,
+    SPI_SETSCREENSAVETIMEOUT, SPI_SETCURSORS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE,
+    WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_SYSCOMMAND, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, GW_HWNDNEXT, GWLP_HWNDPARENT, HCURSOR, SYSTEM_CURSOR_ID,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_ICON, OCR_NO, OCR_NORMAL,
@@ -583,6 +585,60 @@ fn overlay_class_name() -> &'static [u16] {
     NAME.get_or_init(|| overlay_wide("OledHelperScreenProtector"))
 }
 
+struct ShellFlyoutSearch {
+    found: Option<HWND>,
+}
+
+unsafe extern "system" fn enum_shell_flyout(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = &mut *(lparam.0 as *mut ShellFlyoutSearch);
+    if search.found.is_some() || !IsWindowVisible(hwnd).as_bool() {
+        return BOOL(1);
+    }
+    let mut class_buf = [0u16; 128];
+    let class_len = GetClassNameW(hwnd, &mut class_buf);
+    if class_len <= 0 {
+        return BOOL(1);
+    }
+    let class = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+    let mut title_buf = [0u16; 256];
+    let title_len = GetWindowTextW(hwnd, &mut title_buf);
+    let title = if title_len > 0 {
+        String::from_utf16_lossy(&title_buf[..title_len as usize])
+    } else {
+        String::new()
+    };
+    let taskbar_owner = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
+    let shell_flyout = class == "TaskListThumbnailWnd"
+        || class == "XamlExplorerHostIslandWindow"
+        || (class == "Windows.UI.Core.CoreWindow"
+            && (taskbar_owner != 0
+                || title.contains("Notification Center")
+                || title.contains("Control Center")
+                || title.contains("Quick Settings")
+                || title.contains("Calendar")));
+    if shell_flyout {
+        search.found = Some(hwnd);
+        return BOOL(0);
+    }
+    BOOL(1)
+}
+
+// Windows 11 shell flyouts can be above the ordinary topmost band. Detect the
+// real HWND and temporarily make the screen protector its owned popup; owned
+// popups are ordered above their owner. The fallback leaves the protector
+// unowned, avoiding the taskbar dimmer's deliberate "behind shell menus"
+// relationship.
+fn shell_flyout_hwnd() -> Option<HWND> {
+    let mut search = ShellFlyoutSearch { found: None };
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_shell_flyout),
+            LPARAM((&mut search as *mut ShellFlyoutSearch) as isize),
+        );
+    }
+    search.found
+}
+
 unsafe extern "system" fn overlay_window_proc(
     hwnd: HWND,
     message: u32,
@@ -706,6 +762,71 @@ fn apply_dim_level(level: u32) {
     }
 }
 
+// Windows shell flyouts (notification center, taskbar previews, ...) are
+// topmost popups that can appear AFTER the dim starts. The overlay only
+// re-asserts topmost while the dim level is changing, so a flyout opened
+// during the hold phase would sit above the veil. While the dim is active a
+// periodic repair re-inserts the overlay at the front of the topmost band,
+// yielding to the app's own mode-change flyout (like the taskbar dimmer).
+const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
+
+fn overlay_needs_zorder_repair(hwnd: HWND) -> bool {
+    let flyout = crate::taskbar_dimmer::active_flyout_hwnd();
+    unsafe {
+        let Ok(top) = GetTopWindow(None) else {
+            return true;
+        };
+        if top == hwnd {
+            // Already at the front of the band.
+            return false;
+        }
+        // The mode-change flyout at the very top is correct only when the
+        // overlay sits directly below it.
+        if flyout != 0 && top == HWND(flyout as *mut c_void) {
+            return !matches!(GetWindow(top, GW_HWNDNEXT), Ok(next) if next == hwnd);
+        }
+    }
+    true
+}
+
+fn repair_overlay_zorder() {
+    let raw = OVERLAY_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut c_void);
+    // When a shell flyout is open, make the protector an owned popup of that
+    // exact HWND. When it closes, remove the owner again; keeping Shell_TrayWnd
+    // as a permanent owner is what makes the taskbar dimmer intentionally
+    // yield to shell-owned popups.
+    let desired_owner = shell_flyout_hwnd().map(|flyout| flyout.0 as isize).unwrap_or(0);
+    unsafe {
+        if GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT) != desired_owner {
+            let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, desired_owner);
+        }
+    }
+    if !overlay_needs_zorder_repair(hwnd) {
+        return;
+    }
+    let insert_after = match crate::taskbar_dimmer::active_flyout_hwnd() {
+        0 => Some(HWND_TOPMOST),
+        raw => Some(HWND(raw as *mut c_void)),
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(
+                SWP_NOMOVE.0 | SWP_NOSIZE.0 | SWP_NOACTIVATE.0 | SWP_SHOWWINDOW.0,
+            ),
+        );
+    }
+}
+
 // ── Cursor hiding ───────────────────────────────────────────────────
 // The overlay is a window, so the system cursor still renders on top of it at
 // full brightness — a static bright cursor on the dimmed screen is exactly the
@@ -798,7 +919,18 @@ fn ensure_cursor_visible() {
 }
 
 fn dim_watcher_loop() {
+    let mut last_zorder_repair = std::time::Instant::now();
     while !DIM_SHUTDOWN.load(Ordering::Acquire) {
+        // While the overlay is visible, periodically re-assert the front of
+        // the topmost band so Windows flyouts (notification center, taskbar
+        // previews) that opened after the dim started stay covered.
+        if DIM_LEVEL.load(Ordering::Acquire) < 1000
+            && last_zorder_repair.elapsed()
+                >= std::time::Duration::from_millis(ZORDER_REPAIR_INTERVAL_MS)
+        {
+            repair_overlay_zorder();
+            last_zorder_repair = std::time::Instant::now();
+        }
         let enabled = DIM_ENABLED.load(Ordering::Acquire);
         let timeout = DIM_TIMEOUT_SECONDS.load(Ordering::Acquire);
         let idle = idle_seconds();
@@ -1015,8 +1147,10 @@ pub fn power_dim_preview() -> Result<(), String> {
             }
             log::info!("[power] screen protector preview dimmed; waiting for input");
             // Hold dimmed until any input arrives, then restore at the same
-            // ~1 s pace as the real protector.
+            // ~1 s pace as the real protector. Keep the overlay above any
+            // flyout that opens while the preview holds.
             while last_input_ms().wrapping_sub(start_input) <= 150 {
+                repair_overlay_zorder();
                 sync_cursor(DIM_TARGET_LEVEL.load(Ordering::Acquire));
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }

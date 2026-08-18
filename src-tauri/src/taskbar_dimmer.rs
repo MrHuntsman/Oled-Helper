@@ -964,6 +964,12 @@ mod platform {
         unsafe { IsWindowVisible(hwnd).as_bool() }.then_some(hwnd)
     }
 
+    // HWND of the visible mode-change flyout (0 when none), for other
+    // fullscreen overlays (the screen protector) that must stay behind it.
+    pub fn active_flyout_hwnd() -> isize {
+        active_flyout_window().map(|h| h.0 as isize).unwrap_or(0)
+    }
+
     pub fn available() -> bool {
         // A single FindWindowW snapshot can miss Shell_TrayWnd for a few
         // hundred ms right after a tray restart while the shell settles ,  and
@@ -2235,6 +2241,9 @@ mod platform {
     pub fn set_poll_interval_ms(_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
     pub fn set_flyout_hwnd(_raw: isize) {}
+    pub fn active_flyout_hwnd() -> isize {
+        0
+    }
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
@@ -2351,4 +2360,11 @@ pub fn shutdown() {
 // z-order repair never fights the flyout for the front of the topmost band.
 pub fn set_flyout_hwnd(raw: isize) {
     platform::set_flyout_hwnd(raw);
+}
+
+// HWND of the visible mode-change flyout (0 when none or hidden). The screen
+// protector's z-order repair uses this to insert itself below the flyout
+// instead of covering the app's own confirmation dialog.
+pub(crate) fn active_flyout_hwnd() -> isize {
+    platform::active_flyout_hwnd()
 }
