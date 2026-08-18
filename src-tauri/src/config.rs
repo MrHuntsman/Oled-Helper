@@ -116,8 +116,9 @@ pub struct AppConfig {
     // before this flag existed are migrated (a non-zero timeout meant on).
     #[serde(default)]
     pub screen_protector_enabled: bool,
-    // Screen Dimmer overlay opacity and transition durations. Opacity is the
-    // black-overlay amount (0.0 = no dim, 1.0 = black); durations are ms.
+    // Screen Dimmer strength and transition durations. The field keeps its
+    // historical opacity name for config compatibility (0.0 = no dim,
+    // 1.0 = black); durations are ms.
     #[serde(default = "default_screen_protector_opacity")]
     pub screen_protector_opacity: f64,
     #[serde(default = "default_screen_protector_fade_in_duration")]
@@ -128,6 +129,17 @@ pub struct AppConfig {
     // drag drives both). Persisted so the link state survives restarts.
     #[serde(default = "default_true")]
     pub screen_protector_fade_linked: bool,
+    // Whether a fullscreen app on a monitor suppresses the dim on that
+    // monitor (per-monitor fullscreen detection). On by default so games and
+    // fullscreen video stay bright; toggling it off lets the dim run over
+    // fullscreen content too.
+    #[serde(default = "default_true")]
+    pub screen_protector_fullscreen_detection: bool,
+    // Whether the app relaunches itself elevated at startup (Settings tab
+    // "Always open as administrator"). On by user choice only; a UAC prompt
+    // appears before any window when set and the process isn't elevated.
+    #[serde(default)]
+    pub always_elevated: bool,
     // High Nits strip range: the grid is a fixed 3×7 (21 cells) with no
     // zoom; the user picks Min and Max directly (independently of each
     // other) and Step (nits between neighboring cells) is derived on the
@@ -284,6 +296,8 @@ impl Default for AppConfig {
             screen_protector_fade_in_duration_ms: default_screen_protector_fade_in_duration(),
             screen_protector_fade_out_duration_ms: default_screen_protector_fade_out_duration(),
             screen_protector_fade_linked: true,
+            screen_protector_fullscreen_detection: true,
+            always_elevated: false,
             high_nits_min: default_high_nits_min(),
             high_nits_max: None,
             high_nits_step: default_high_nits_step(),
@@ -431,6 +445,123 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
     {
         config.taskbar_dimmer_fade_out_duration_ms = legacy;
     }
+}
+
+// Pre-Tauri startup probe used by run() so the Screen Dimmer can request
+// elevation BEFORE any window exists (no open-then-restart flash). Mirrors
+// local_app_dir's %LOCALAPPDATA%/<identifier> path without needing an
+// AppHandle; the identifier is baked in from the embedded tauri.conf.json.
+// Returns true when the persisted config enables the dimmer (including the
+// legacy pre-toggle shape where a non-zero timeout meant on), so the caller
+// can decide whether a UAC relaunch is warranted.
+pub fn screen_protector_enabled_on_disk() -> bool {
+    let direct = read_config_bool("screen_protector_enabled");
+    if direct {
+        return true;
+    }
+    // Legacy pre-toggle configs used a non-zero timeout to mean on.
+    read_config_raw(|obj| {
+        obj.get("screen_protector_seconds")
+            .and_then(|v| v.as_u64())
+            .map_or(false, |seconds| seconds > 0)
+    })
+}
+
+// "Always open as administrator" startup probe: whether the Settings tab's
+// flag is set in the on-disk config, checked before any window exists.
+pub fn always_elevated_on_disk() -> bool {
+    read_config_bool("always_elevated")
+}
+
+fn read_config_bool(key: &str) -> bool {
+    read_config_raw(|obj| obj.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+// Resolves %LOCALAPPDATA%/<identifier>/config.json (identifier baked in from
+// the embedded tauri.conf.json) and hands the parsed object to `f`. Any
+// missing/unreadable/invalid config yields false via the caller's fallback.
+fn read_config_raw(f: impl FnOnce(&serde_json::Map<String, serde_json::Value>) -> bool) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Conf {
+        identifier: String,
+    }
+    let Ok(conf) = serde_json::from_str::<Conf>(include_str!("../tauri.conf.json")) else {
+        return false;
+    };
+    let Ok(localappdata) = std::env::var("LOCALAPPDATA") else {
+        return false;
+    };
+    let path = PathBuf::from(localappdata)
+        .join(conf.identifier)
+        .join("config.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    f(obj)
+}
+
+// Pre-Tauri companion to screen_protector_enabled_on_disk(): when the startup
+// UAC relaunch is declined, the Screen Dimmer is switched off on disk so the
+// app never runs in the silent half-state (dimming on, media detection off).
+// Writes the explicit false flag even for legacy configs whose non-zero
+// timeout implied "on", so the migrate-on-load logic cannot flip it back.
+// Returns true when the config was changed (was enabled and is now disabled).
+pub fn screen_protector_disable_on_disk() -> bool {
+    #[derive(serde::Deserialize)]
+    struct Conf {
+        identifier: String,
+    }
+    let Ok(conf) = serde_json::from_str::<Conf>(include_str!("../tauri.conf.json")) else {
+        return false;
+    };
+    let Ok(localappdata) = std::env::var("LOCALAPPDATA") else {
+        return false;
+    };
+    let path = PathBuf::from(localappdata)
+        .join(conf.identifier)
+        .join("config.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let was_enabled = obj
+        .get("screen_protector_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| {
+            obj.get("screen_protector_seconds")
+                .and_then(|v| v.as_u64())
+                .map_or(false, |seconds| seconds > 0)
+        });
+    if !was_enabled {
+        return false;
+    }
+    obj.insert(
+        "screen_protector_enabled".to_string(),
+        serde_json::Value::Bool(false),
+    );
+    let Ok(out_text) = serde_json::to_string_pretty(&value) else {
+        return false;
+    };
+    let temp = path.with_extension("json.tmp");
+    if fs::write(&temp, out_text).is_err() {
+        return false;
+    }
+    if replace_config_file(&temp, &path).is_err() {
+        let _ = fs::remove_file(&temp);
+        return false;
+    }
+    true
 }
 
 struct PendingConfigWrite {

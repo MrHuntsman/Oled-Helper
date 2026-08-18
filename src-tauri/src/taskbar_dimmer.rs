@@ -989,7 +989,10 @@ mod platform {
     // Returns true when another application occupies the entire monitor in
     // exclusive fullscreen or borderless fullscreen mode. Normal maximized
     // windows retain caption/frame styles and are intentionally excluded.
-    fn fullscreen_app_active_for_monitor(overlay: Option<HWND>) -> bool {
+    fn fullscreen_app_active_for_monitor(
+        overlay: Option<HWND>,
+        target_monitor: Option<u32>,
+    ) -> bool {
         unsafe {
             let foreground = GetForegroundWindow();
             if foreground.0.is_null()
@@ -1018,7 +1021,11 @@ mod platform {
             if foreground_monitor.0.is_null() {
                 return false;
             }
-            if let Some(overlay) = overlay {
+            if let Some(target_monitor) = target_monitor {
+                if foreground_monitor.0 as usize as u32 != target_monitor {
+                    return false;
+                }
+            } else if let Some(overlay) = overlay {
                 let overlay_monitor = MonitorFromWindow(overlay, MONITOR_DEFAULTTONEAREST);
                 if overlay_monitor.0.is_null() || foreground_monitor != overlay_monitor {
                     return false;
@@ -1071,12 +1078,9 @@ mod platform {
         }
     }
 
-    // Shared by the Screen Dimmer so it follows the exact same fullscreen
-    // geometry/style test as the Taskbar Dimmer, but checks any monitor rather
-    // than comparing the foreground window with one taskbar overlay.
-    pub fn fullscreen_active_for_screen() -> bool {
+    pub fn fullscreen_active_on_monitor(hmonitor: u32) -> bool {
         FULLSCREEN_DETECTION.load(Ordering::Relaxed)
-            && fullscreen_app_active_for_monitor(None)
+            && fullscreen_app_active_for_monitor(None, Some(hmonitor))
     }
 
     fn cursor_over_rect(rect: RECT) -> (bool, windows::Win32::Foundation::POINT) {
@@ -1571,7 +1575,7 @@ mod platform {
             // `SUSPENDED` is requested by the app's own monitor-fullscreen
             // calibration mode. Resolve it through the same monitor-local
             // detector instead of hiding every overlay globally.
-            fullscreen_app_active_for_monitor(Some(hwnd))
+            fullscreen_app_active_for_monitor(Some(hwnd), None)
         } else {
             let mut fade = state.lock().unwrap_or_else(|e| e.into_inner());
             // Event mode: the WinEvent hook is the sole fullscreen detector.
@@ -1598,7 +1602,7 @@ mod platform {
                 drop(fade);
                 let active =
                     FULLSCREEN_DETECTION.load(Ordering::Relaxed)
-                        && fullscreen_app_active_for_monitor(Some(hwnd));
+                        && fullscreen_app_active_for_monitor(Some(hwnd), None);
                 state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2248,7 +2252,7 @@ mod platform {
     pub fn set_poll_interval_ms(_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
     pub fn set_flyout_hwnd(_raw: isize) {}
-    pub fn fullscreen_active_for_screen() -> bool {
+    pub fn fullscreen_active_on_monitor(_hmonitor: u32) -> bool {
         false
     }
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
@@ -2369,6 +2373,7 @@ pub fn set_flyout_hwnd(raw: isize) {
     platform::set_flyout_hwnd(raw);
 }
 
-pub(crate) fn fullscreen_active_for_screen() -> bool {
-    platform::fullscreen_active_for_screen()
+
+pub(crate) fn fullscreen_active_on_monitor(hmonitor: u32) -> bool {
+    platform::fullscreen_active_on_monitor(hmonitor)
 }

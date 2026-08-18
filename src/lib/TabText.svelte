@@ -612,7 +612,8 @@
       <TabTextIcon class="tab-icon" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
-          <h2>Text rendering</h2>
+          <h2>Text Rendering</h2>
+          <span class="text-render-experimental-badge">Experimental</span>
         </div>
         <span class="subtitle">ClearType &amp; font smoothing</span>
       </div>

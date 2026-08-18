@@ -18,6 +18,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::collections::HashMap;
+use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -30,7 +31,6 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
     REG_SZ, REG_VALUE_TYPE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, SystemParametersInfoW,
     HWND_BROADCAST, SC_MONITORPOWER,
@@ -116,6 +116,7 @@ pub struct PowerState {
     pub screen_protector_opacity: f64,
     pub screen_protector_fade_in_duration_ms: u64,
     pub screen_protector_fade_out_duration_ms: u64,
+    pub screen_protector_fullscreen_detection: bool,
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -440,11 +441,13 @@ pub fn power_turn_off_display() -> Result<(), String> {
 }
 
 // ── Screen protector (dim on idle) ──────────────────────────────────
-// A background watcher polls the input-idle time (GetLastInputInfo) against a
-// user-configured timeout; once the user has been idle that long, the display
-// fades to black and stays dimmed until any input arrives, which fades it
-// back up. Unlike the old "dim before off", this is its own protector: it
-// does not depend on Windows' display-off timeout.
+// A background watcher polls the input-idle time against a user-configured
+// timeout; once the user has been idle that long, the display fades to black
+// and stays dimmed until any input arrives, which fades it back up. Unlike
+// the old "dim before off", this is its own protector: it does not depend on
+// Windows' display-off timeout. Keyboard/mouse idle comes from a low-level
+// hook (input_monitor) rather than GetLastInputInfo, because gamepad/HID
+// reports reset GetLastInputInfo on some systems.
 //
 // The fade is rendered through per-monitor gamma ramps rather than a window
 // overlay. This covers Windows shell flyouts and taskbar previews as well as
@@ -455,6 +458,16 @@ pub fn power_turn_off_display() -> Result<(), String> {
 // avoiding the coarse 20 Hz stepping that was visible during the transition.
 const POLL_MS: u64 = 16;
 const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
+// Windows does not broadcast notifications when another process creates or
+// clears a display power request. We only query powercfg while the dimmer is
+// close to activating or already dimmed, so normal bright idle time does not
+// spawn a process every tick. One-second resolution is sufficient because the
+// shortest Screen Dimmer timeout is five seconds.
+const DISPLAY_REQUEST_CHECK_INTERVAL_MS: u64 = 1000;
+// Gamepad polling cadence while the dimmer is enabled. Controllers are polled
+// at a low rate (not every 16 ms tick) so the DirectInput enumeration stays
+// cheap; 100 ms keeps the idle timer accurate without a busy loop.
+const GAMEPAD_CHECK_INTERVAL_MS: u64 = 100;
 const MIN_SCREEN_PROTECTOR_SECONDS: u32 = 5;
 const MAX_SCREEN_PROTECTOR_SECONDS: u32 = 180;
 const DEFAULT_SCREEN_PROTECTOR_OPACITY: u32 = 800;
@@ -462,8 +475,8 @@ const DEFAULT_SCREEN_PROTECTOR_FADE_IN_MS: u32 = 1000;
 const DEFAULT_SCREEN_PROTECTOR_FADE_OUT_MS: u32 = 200;
 
 // The screen protector rests at a partial dim by default. The target is stored
-// as the inverse dim-factor level so opacity remains a simple 0..100% setting
-// while the existing eased brightness curve stays unchanged.
+// as the inverse dim-factor level so dim strength remains a simple 0..100%
+// setting while the existing eased brightness curve stays unchanged.
 static DIM_TARGET_LEVEL: AtomicU32 = AtomicU32::new(290);
 static DIM_OPACITY: AtomicU32 = AtomicU32::new(DEFAULT_SCREEN_PROTECTOR_OPACITY);
 static DIM_FADE_IN_MS: AtomicU32 = AtomicU32::new(DEFAULT_SCREEN_PROTECTOR_FADE_IN_MS);
@@ -471,40 +484,151 @@ static DIM_FADE_OUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_SCREEN_PROTECTOR_FADE
 
 static DIM_ENABLED: AtomicBool = AtomicBool::new(false);
 static DIM_TIMEOUT_SECONDS: AtomicU32 = AtomicU32::new(30);
-// Current dim level, DIM_TARGET_LEVEL (dimmed) .. 1000 (full). Stays 1000
-// while idle is below the timeout, so the overlay stays transparent.
-static DIM_LEVEL: AtomicU32 = AtomicU32::new(1000);
+// Whether a fullscreen app on a monitor suppresses the dim there. Mirrors
+// config screen_protector_fullscreen_detection; the watcher skips its
+// per-monitor fullscreen check while this is off.
+static DIM_FULLSCREEN_DETECTION: AtomicBool = AtomicBool::new(true);
 static DIM_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+// Tick count of the most recent gamepad input. GetLastInputInfo does not see
+// controllers, so the watcher records its own timestamp whenever a polled
+// device reports non-neutral input; idle_seconds() takes the earlier of the
+// keyboard/mouse clock and this one.
+static LAST_GAMEPAD_INPUT: AtomicU32 = AtomicU32::new(0);
 
 struct GammaDimContext {
     // Fallback for the primary monitor while the frontend is still loading
     // the selected monitor's profile into the per-monitor table.
     desired: Arc<AtomicI32>,
     per_monitor: Arc<Mutex<HashMap<String, i32>>>,
-    brightness: Arc<AtomicU32>,
+    brightness: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 static GAMMA_DIM_CONTEXT: OnceLock<GammaDimContext> = OnceLock::new();
 static DIM_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 
-fn last_input_ms() -> u32 {
-    unsafe {
-        let mut lii = LASTINPUTINFO {
-            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-            dwTime: 0,
-        };
-        if !GetLastInputInfo(&mut lii).as_bool() {
-            return 0;
-        }
-        lii.dwTime
-    }
-}
-
-fn idle_seconds() -> u32 {
+// Returns (keyboard/mouse idle, gamepad idle) in seconds. Both clocks are the
+// 32-bit GetTickCount wrap-safe difference against their last-input tick. The
+// keyboard/mouse clock comes from the low-level hook in input_monitor, not
+// GetLastInputInfo, because a connected gamepad resets the system idle clock.
+fn idle_breakdown() -> (u32, u32) {
     let now = unsafe { GetTickCount64() } as u32;
     // dwTime and GetTickCount64 both wrap at ~49.7 days; wrapping_sub
     // makes the difference correct across the wrap.
-    now.wrapping_sub(last_input_ms()) / 1000
+    let kb_mouse_idle = now.wrapping_sub(crate::input_monitor::last_kb_mouse_input_ms()) / 1000;
+    let gamepad_idle = now.wrapping_sub(LAST_GAMEPAD_INPUT.load(Ordering::Acquire)) / 1000;
+    (kb_mouse_idle, gamepad_idle)
+}
+
+fn idle_seconds() -> u32 {
+    let (kb_mouse_idle, gamepad_idle) = idle_breakdown();
+    kb_mouse_idle.min(gamepad_idle)
+}
+
+// Parse the stable DISPLAY section emitted by powercfg /requests. The section
+// headings remain English even on localized Windows, while the reason text
+// (for example "Video Wake Lock") and some other headings may be localized.
+// Any process or driver entry in DISPLAY means Windows is being asked to keep
+// the display available, regardless of which app made the request.
+fn display_request_from_powercfg_output(output: &str) -> bool {
+    let mut in_display = false;
+    for line in output.lines() {
+        let trimmed = line.trim().trim_start_matches('\u{feff}');
+        if let Some(header) = trimmed.strip_suffix(':') {
+            in_display = header.trim().eq_ignore_ascii_case("DISPLAY");
+            continue;
+        }
+        if in_display && trimmed.starts_with('[') && trimmed.contains(']') {
+            return true;
+        }
+    }
+    false
+}
+
+fn decode_powercfg_output(bytes: &[u8]) -> String {
+    // powercfg normally writes the console code page, but some Windows
+    // configurations return UTF-16 when stdout is redirected. Handle both so
+    // the detector does not depend on the user's console/output settings.
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(bytes).replace('\0', "")
+}
+
+// There is no documented event that notifies an unrelated process when it
+// creates or clears a power request. `powercfg /requests` is the supported
+// diagnostic surface, so use it as a conditional, low-rate fallback rather
+// than polling continuously. Capturing output and suppressing the console
+// window keeps this invisible to the user.
+fn display_power_request_active() -> bool {
+    // /requests and the native request-list query both require elevation on
+    // current Windows builds. The Screen Dimmer asks for elevation before it
+    // can be enabled, so reaching this branch as a standard-user process is
+    // only possible for a legacy config; fail quietly instead of spawning a
+    // command that can never succeed.
+    if !crate::process_is_elevated() {
+        return false;
+    }
+    let executable = std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("powercfg.exe"))
+        .unwrap_or_else(|| PathBuf::from("powercfg.exe"));
+    let output = std::process::Command::new(&executable)
+        .args(["/requests"])
+        .creation_flags(0x0800_0000)
+        .output();
+    let Ok(output) = output else {
+        log::debug!("[power] could not execute powercfg /requests");
+        return false;
+    };
+    let stdout = decode_powercfg_output(&output.stdout);
+    let stderr = decode_powercfg_output(&output.stderr);
+    let mut active = display_request_from_powercfg_output(&stdout)
+        || display_request_from_powercfg_output(&stderr);
+    if !output.status.success() {
+        log::debug!(
+            "[power] powercfg /requests exited with {}; stdout={:?}; stderr={:?}",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+
+    // Some vendor-customized powercfg builds accept the dash spelling but
+    // return exit code 1 for the slash spelling. Only retry when the first
+    // invocation did not produce a display match, so the normal path still
+    // launches at most one process per check.
+    if !active && !output.status.success() {
+        let fallback = std::process::Command::new(&executable)
+            .args(["-requests"])
+            .creation_flags(0x0800_0000)
+            .output();
+        if let Ok(fallback) = fallback {
+            let fallback_stdout = decode_powercfg_output(&fallback.stdout);
+            let fallback_stderr = decode_powercfg_output(&fallback.stderr);
+            active = display_request_from_powercfg_output(&fallback_stdout)
+                || display_request_from_powercfg_output(&fallback_stderr);
+            if !fallback.status.success() {
+                log::debug!(
+                    "[power] powercfg -requests exited with {}; stdout={:?}; stderr={:?}",
+                    fallback.status,
+                    fallback_stdout.trim(),
+                    fallback_stderr.trim()
+                );
+            }
+        }
+    }
+    active
 }
 
 // Map the linear dim level (0..1000) to an eased brightness factor. The raw
@@ -516,9 +640,9 @@ fn dim_factor(level: u32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-// Convert the requested black-overlay opacity to the level used by the eased
+// Convert the requested dim strength to the level used by the eased
 // brightness curve. A short binary search avoids introducing a second easing
-// curve and keeps the displayed opacity numerically consistent.
+// curve and keeps the displayed percentage numerically consistent.
 fn dim_level_for_opacity(opacity: f64) -> u32 {
     let target_brightness = (1.0 - opacity.clamp(0.0, 1.0)) as f32;
     let mut low = 0u32;
@@ -551,6 +675,7 @@ fn configure_screen_protector(
     opacity: f64,
     fade_in_duration_ms: u64,
     fade_out_duration_ms: u64,
+    fullscreen_detection: bool,
 ) {
     let opacity = opacity.clamp(0.0, 1.0);
     DIM_ENABLED.store(enabled, Ordering::Release);
@@ -562,6 +687,7 @@ fn configure_screen_protector(
     DIM_TARGET_LEVEL.store(dim_level_for_opacity(opacity), Ordering::Release);
     DIM_FADE_IN_MS.store(fade_in_duration_ms.min(5000) as u32, Ordering::Release);
     DIM_FADE_OUT_MS.store(fade_out_duration_ms.min(5000) as u32, Ordering::Release);
+    DIM_FULLSCREEN_DETECTION.store(fullscreen_detection, Ordering::Release);
 }
 
 /*
@@ -723,17 +849,31 @@ fn virtual_screen_rect() -> RECT {
 // Apply the current screen-protector level through the per-monitor gamma
 // ramps. 1000 is full brightness; lower values multiply the existing Black
 // Crush ramp so the calibration is preserved while every monitor is dimmed.
-fn apply_dim_level(level: u32) {
-    let brightness = (dim_factor(level) * 1000.0).round().clamp(0.0, 1000.0) as u32;
+fn apply_dim_levels(levels: &HashMap<String, u32>, restore_unconfigured: bool) {
     if let Some(context) = GAMMA_DIM_CONTEXT.get() {
-        context.brightness.store(brightness, Ordering::Release);
+        if let Ok(mut brightness) = context.brightness.lock() {
+            *brightness = levels.clone();
+        }
         crate::apply_screen_gamma_ramps(
             &context.desired,
             &context.per_monitor,
-            brightness,
-            brightness == 1000,
+            levels,
+            restore_unconfigured,
         );
     }
+}
+
+fn uniform_dim_levels(level: u32) -> HashMap<String, u32> {
+    crate::monitors::all_monitors()
+        .into_iter()
+        .filter(|monitor| !monitor.device_name.is_empty())
+        .map(|monitor| (monitor.sig(), level))
+        .collect()
+}
+
+fn apply_uniform_dim_level(level: u32) {
+    let levels = uniform_dim_levels(level);
+    apply_dim_levels(&levels, true);
 }
 
 /*
@@ -869,65 +1009,161 @@ fn ensure_cursor_visible() {
 
 */
 fn dim_watcher_loop() {
-    let mut transition_target = 1000u32;
-    let mut transition_from = 1000u32;
-    let mut transition_started = std::time::Instant::now();
-    let mut fullscreen_active = false;
+    let mut levels: HashMap<String, u32> = HashMap::new();
+    let mut transitions: HashMap<String, (u32, u32, std::time::Instant)> = HashMap::new();
+    let mut monitors: Vec<crate::monitors::AppMonitor> = Vec::new();
+    let mut fullscreen_by_monitor: HashMap<String, bool> = HashMap::new();
+    let mut display_request_active = false;
+    let mut last_monitor_refresh =
+        std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut last_fullscreen_check =
         std::time::Instant::now() - std::time::Duration::from_millis(FULLSCREEN_CHECK_INTERVAL_MS);
+    let mut last_display_request_check =
+        std::time::Instant::now() - std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS);
+    let mut last_gamepad_check =
+        std::time::Instant::now() - std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS);
+    let mut last_idle_diag =
+        std::time::Instant::now() - std::time::Duration::from_secs(5);
+    let mut gamepad_active = false;
 
     while !DIM_SHUTDOWN.load(Ordering::Acquire) {
         let enabled = DIM_ENABLED.load(Ordering::Acquire);
+        let now = std::time::Instant::now();
+        if monitors.is_empty() || last_monitor_refresh.elapsed() >= std::time::Duration::from_secs(1) {
+            monitors = crate::monitors::all_monitors();
+            last_monitor_refresh = now;
+            fullscreen_by_monitor.clear();
+        }
+
+        if enabled && last_gamepad_check.elapsed() >= std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS) {
+            let active = crate::gamepad::gamepad_input_active();
+            if active != gamepad_active {
+                log::debug!(
+                    "[power] gamepad input {}",
+                    if active { "active" } else { "cleared" }
+                );
+                gamepad_active = active;
+            }
+            if active {
+                LAST_GAMEPAD_INPUT.store(unsafe { GetTickCount64() } as u32, Ordering::Release);
+            }
+            last_gamepad_check = now;
+        }
+
         if enabled
             && last_fullscreen_check.elapsed().as_millis() as u64
                 >= FULLSCREEN_CHECK_INTERVAL_MS
         {
-            // Reuse the Taskbar Dimmer's fullscreen geometry/style detector.
-            // The check is cached between calls so the gamma fade can still
-            // run at 60 Hz without repeating the Win32 window inspection.
-            fullscreen_active = crate::taskbar_dimmer::fullscreen_active_for_screen();
-            last_fullscreen_check = std::time::Instant::now();
+            // Reuse the Taskbar Dimmer's fullscreen geometry/style detector,
+            // but evaluate it independently for every connected monitor.
+            // When fullscreen detection is disabled the map stays cleared,
+            // so no monitor ever reports fullscreen and the dim runs over
+            // fullscreen content like any other.
+            fullscreen_by_monitor.clear();
+            if DIM_FULLSCREEN_DETECTION.load(Ordering::Acquire) {
+                for monitor in &monitors {
+                    fullscreen_by_monitor.insert(
+                        monitor.sig(),
+                        crate::taskbar_dimmer::fullscreen_active_on_monitor(monitor.hmonitor),
+                    );
+                }
+            }
+            last_fullscreen_check = now;
         }
+
         let timeout = DIM_TIMEOUT_SECONDS.load(Ordering::Acquire);
         let idle = idle_seconds();
-        // Fully bright until idle reaches the timeout, then dim to the floor.
-        // Input resets idle, and fullscreen content also forces the bright
-        // target so the screen dimmer never darkens a fullscreen app.
-        let target = if enabled && !fullscreen_active && idle >= timeout {
-            DIM_TARGET_LEVEL.load(Ordering::Acquire)
-        } else {
-            1000
-        };
-        let current = DIM_LEVEL.load(Ordering::Acquire);
+        let currently_dimmed = levels.values().any(|level| *level < 1000);
 
-        // If input interrupts a fade, continue smoothly from the exact level
-        // already displayed instead of restarting from either endpoint.
-        if target != transition_target {
-            transition_from = current;
-            transition_target = target;
-            transition_started = std::time::Instant::now();
+        // Low-rate diagnostic so a stuck-bright dimmer can be traced to the
+        // keyboard/mouse clock vs the gamepad clock vs fullscreen/requests.
+        if enabled && last_idle_diag.elapsed() >= std::time::Duration::from_secs(5) {
+            let (kb_mouse_idle, gamepad_idle) = idle_breakdown();
+            log::debug!(
+                "[power] idle={}s kb/mouse={}s gamepad={}s gamepad_active={} fullscreen={} request={}",
+                idle,
+                kb_mouse_idle,
+                gamepad_idle,
+                gamepad_active,
+                fullscreen_by_monitor.values().any(|f| *f),
+                display_request_active
+            );
+            last_idle_diag = now;
+        }
+        let request_check_needed = enabled
+            && (idle.saturating_add(1) >= timeout || currently_dimmed);
+        if !enabled {
+            display_request_active = false;
+            last_display_request_check = now
+                - std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS);
+        } else if request_check_needed
+            && last_display_request_check.elapsed()
+                >= std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS)
+        {
+            let request_active = display_power_request_active();
+            if request_active != display_request_active {
+                log::info!(
+                    "[power] display power request {}",
+                    if request_active { "active" } else { "cleared" }
+                );
+            }
+            display_request_active = request_active;
+            last_display_request_check = now;
         }
 
-        if current != target {
-            // A falling level makes the dimmer fade in; a rising level fades
-            // it out. The gamma curve itself is smoothstep-shaped, so a
-            // time-linear level produces a smooth visual fade without adding
-            // a second, overly sluggish easing curve.
-            let duration = if target < transition_from {
-                DIM_FADE_IN_MS.load(Ordering::Acquire)
-            } else {
-                DIM_FADE_OUT_MS.load(Ordering::Acquire)
-            };
-            let next = interpolated_level(
-                transition_from,
-                transition_target,
-                transition_started.elapsed().as_millis(),
-                duration,
-            );
-            if next != current {
-                DIM_LEVEL.store(next, Ordering::Release);
-                apply_dim_level(next);
+        let mut next_levels = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for monitor in &monitors {
+            if monitor.device_name.is_empty() {
+                continue;
             }
+            let sig = monitor.sig();
+            seen.insert(sig.clone());
+            let current = levels.get(&sig).copied().unwrap_or(1000);
+            let fullscreen = fullscreen_by_monitor.get(&sig).copied().unwrap_or(false);
+            let target = if enabled
+                && !fullscreen
+                && !display_request_active
+                && idle >= timeout
+            {
+                DIM_TARGET_LEVEL.load(Ordering::Acquire)
+            } else {
+                1000
+            };
+
+            let transition = transitions
+                .entry(sig.clone())
+                .or_insert((current, target, now));
+            if transition.1 != target {
+                // A fullscreen transition or input interruption reverses from
+                // the exact level already displayed on this monitor.
+                *transition = (current, target, now);
+            }
+            let next = if current == target {
+                target
+            } else {
+                let duration = if target < transition.0 {
+                    DIM_FADE_IN_MS.load(Ordering::Acquire)
+                } else {
+                    DIM_FADE_OUT_MS.load(Ordering::Acquire)
+                };
+                interpolated_level(
+                    transition.0,
+                    transition.1,
+                    transition.2.elapsed().as_millis(),
+                    duration,
+                )
+            };
+            next_levels.insert(sig, next);
+        }
+
+        transitions.retain(|sig, _| seen.contains(sig));
+        if next_levels != levels {
+            levels = next_levels;
+            // `true` restores all monitors whose fullscreen suppression just
+            // ended, while each monitor still receives its own brightness.
+            apply_dim_levels(&levels, true);
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
@@ -954,9 +1190,10 @@ pub fn init(
     screen_protector_opacity: f64,
     screen_protector_fade_in_duration_ms: u64,
     screen_protector_fade_out_duration_ms: u64,
+    screen_protector_fullscreen_detection: bool,
     gamma_desired: Arc<AtomicI32>,
     gamma_per_monitor: Arc<Mutex<HashMap<String, i32>>>,
-    gamma_brightness: Arc<AtomicU32>,
+    gamma_brightness: Arc<Mutex<HashMap<String, u32>>>,
 ) {
     let _ = GAMMA_DIM_CONTEXT.set(GammaDimContext {
         desired: gamma_desired,
@@ -969,8 +1206,10 @@ pub fn init(
         screen_protector_opacity,
         screen_protector_fade_in_duration_ms,
         screen_protector_fade_out_duration_ms,
+        screen_protector_fullscreen_detection,
     );
     if screen_protector_enabled {
+        crate::input_monitor::start();
         ensure_watcher();
     }
 }
@@ -981,8 +1220,21 @@ pub fn set_screen_protector(
     opacity: f64,
     fade_in_duration_ms: u64,
     fade_out_duration_ms: u64,
+    fullscreen_detection: bool,
 ) {
-    configure_screen_protector(enabled, seconds, opacity, fade_in_duration_ms, fade_out_duration_ms);
+    configure_screen_protector(
+        enabled,
+        seconds,
+        opacity,
+        fade_in_duration_ms,
+        fade_out_duration_ms,
+        fullscreen_detection,
+    );
+    if enabled {
+        crate::input_monitor::start();
+    } else {
+        crate::input_monitor::stop();
+    }
     // The watcher is cheap (one idle poll per tick) and handles the disabled
     // case by fading back up, so just make sure it is running.
     ensure_watcher();
@@ -1000,8 +1252,8 @@ pub fn shutdown() {
     // Restore gamma before the process exits, in case shutdown occurs while
     // the protector is dimmed. The GammaState teardown also resets its normal
     // Black Crush ramps immediately afterward.
-    DIM_LEVEL.store(1000, Ordering::Release);
-    apply_dim_level(1000);
+    crate::input_monitor::stop();
+    apply_uniform_dim_level(1000);
 }
 
 // ── Tauri commands ──────────────────────────────────────────────────
@@ -1030,6 +1282,7 @@ pub fn power_get_state() -> Result<PowerState, String> {
         screen_protector_opacity: DIM_OPACITY.load(Ordering::Acquire) as f64 / 1000.0,
         screen_protector_fade_in_duration_ms: DIM_FADE_IN_MS.load(Ordering::Acquire) as u64,
         screen_protector_fade_out_duration_ms: DIM_FADE_OUT_MS.load(Ordering::Acquire) as u64,
+        screen_protector_fullscreen_detection: DIM_FULLSCREEN_DETECTION.load(Ordering::Acquire),
     })
 }
 
@@ -1072,8 +1325,16 @@ pub fn power_set_screen_protector(
     opacity: f64,
     fade_in_duration_ms: u64,
     fade_out_duration_ms: u64,
+    fullscreen_detection: bool,
 ) -> Result<(), String> {
-    set_screen_protector(enabled, seconds, opacity, fade_in_duration_ms, fade_out_duration_ms);
+    set_screen_protector(
+        enabled,
+        seconds,
+        opacity,
+        fade_in_duration_ms,
+        fade_out_duration_ms,
+        fullscreen_detection,
+    );
     Ok(())
 }
 
@@ -1084,16 +1345,26 @@ pub fn power_dim_preview() -> Result<(), String> {
     std::thread::Builder::new()
         .name("dim-preview".to_string())
         .spawn(move || {
+            // Make sure the hook-based input clock is running even if the
+            // dimmer itself is disabled, and stop it again afterward if we
+            // were the ones who started it.
+            let owned_hooks = !crate::input_monitor::is_active();
+            if owned_hooks {
+                crate::input_monitor::start();
+            }
             // The click itself is input; give the mouse-up a short grace so it
             // does not instantly cancel the preview.
-            let start_input = last_input_ms();
+            let start_input = crate::input_monitor::last_kb_mouse_input_ms();
             let target_level = DIM_TARGET_LEVEL.load(Ordering::Acquire);
             let fade_in_duration = DIM_FADE_IN_MS.load(Ordering::Acquire);
             let fade_started = std::time::Instant::now();
 
             loop {
-                if last_input_ms().wrapping_sub(start_input) > 150 {
-                    apply_dim_level(1000);
+                if crate::input_monitor::last_kb_mouse_input_ms().wrapping_sub(start_input) > 150 {
+                    apply_uniform_dim_level(1000);
+                    if owned_hooks {
+                        crate::input_monitor::stop();
+                    }
                     log::info!("[power] screen protector preview cancelled by input");
                     return;
                 }
@@ -1103,7 +1374,7 @@ pub fn power_dim_preview() -> Result<(), String> {
                     fade_started.elapsed().as_millis(),
                     fade_in_duration,
                 );
-                apply_dim_level(level);
+                apply_uniform_dim_level(level);
                 if level == target_level {
                     break;
                 }
@@ -1112,7 +1383,7 @@ pub fn power_dim_preview() -> Result<(), String> {
             log::info!("[power] screen protector preview dimmed; waiting for input");
 
             // Hold dimmed until any input arrives.
-            while last_input_ms().wrapping_sub(start_input) <= 150 {
+            while crate::input_monitor::last_kb_mouse_input_ms().wrapping_sub(start_input) <= 150 {
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             }
 
@@ -1125,14 +1396,53 @@ pub fn power_dim_preview() -> Result<(), String> {
                     restore_started.elapsed().as_millis(),
                     fade_out_duration,
                 );
-                apply_dim_level(level);
+                apply_uniform_dim_level(level);
                 if level == 1000 {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             }
+            if owned_hooks {
+                crate::input_monitor::stop();
+            }
             log::info!("[power] screen protector preview restored");
         })
         .map_err(|e| format!("could not spawn dim preview thread: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_request_from_powercfg_output;
+
+    #[test]
+    fn detects_display_process_request() {
+        let output = "DISPLAY:\n[PROCESS]\\Device\\HarddiskVolume2\\msedge.exe\nVideo Wake Lock\n\nSYSTEM:\nNone\n";
+        assert!(display_request_from_powercfg_output(output));
+    }
+
+    #[test]
+    fn detects_utf16_display_request() {
+        let units: Vec<u16> = "DISPLAY:\n[PROCESS] msedge.exe\nVideo Wake Lock\n"
+            .encode_utf16()
+            .collect();
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let decoded = super::decode_powercfg_output(&bytes);
+        assert!(display_request_from_powercfg_output(&decoded));
+    }
+
+    #[test]
+    fn detects_display_driver_request() {
+        let output = "DISPLAY:\n[DRIVER] Example display driver\nReason\n";
+        assert!(display_request_from_powercfg_output(output));
+    }
+
+    #[test]
+    fn ignores_empty_display_section() {
+        let output = "DISPLAY:\nNinguna\n\nSYSTEM:\n[PROCESS]\\foo.exe\n";
+        assert!(!display_request_from_powercfg_output(output));
+    }
 }

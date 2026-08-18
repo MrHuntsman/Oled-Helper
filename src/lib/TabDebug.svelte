@@ -1,4 +1,5 @@
 <script>
+  import { onDestroy } from 'svelte';
   import { gpuLogVersion, gpuLogSnapshot, clearGpuLog, runtimeLogSettings, setVerbosePeriodicLogging, setDimmerVerboseLogging, dimmerDetections, setDimmerDetection, debugSettings, setContextMenuEnabled } from './stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import tabDebugIcon from './icons/tab_debug.png?inline';
@@ -9,6 +10,9 @@
   let configFolderError = $state('');
   let noticeReset = $state(false);
   let dimPreviewState = $state('');
+  let gamepadTestEnabled = $state(false);
+  let gamepadActive = $state(false);
+  let gamepadPollTimer = null;
 
   async function openConfigFolder() {
     configFolderError = '';
@@ -19,6 +23,34 @@
       setTimeout(() => { configFolderError = ''; }, 2500);
     }
   }
+
+  // Live-tests the backend XInput/DirectInput detector: while enabled, polls
+  // the current controller state so the user can move a gamepad and watch the
+  // readout flip between idle and active.
+  async function pollGamepad() {
+    if (!gamepadTestEnabled) return;
+    try {
+      gamepadActive = await invoke('gamepad_input_active');
+    } catch (e) {
+      console.warn('[debug] gamepad detection poll failed', e);
+      gamepadActive = false;
+    }
+    gamepadPollTimer = setTimeout(pollGamepad, 250);
+  }
+
+  function toggleGamepadTest(enabled) {
+    gamepadTestEnabled = enabled;
+    if (gamepadPollTimer) {
+      clearTimeout(gamepadPollTimer);
+      gamepadPollTimer = null;
+    }
+    gamepadActive = false;
+    if (enabled) pollGamepad();
+  }
+
+  onDestroy(() => {
+    if (gamepadPollTimer) clearTimeout(gamepadPollTimer);
+  });
 
   // Re-derive off the version counter so this stays in sync without deep-watching
   // the whole log array (which caused a startup hang ,  see stores.svelte.js).
@@ -175,6 +207,13 @@
         <input type="checkbox" checked={dimmerDetections.mouseHook} onchange={(e) => setDimmerDetection('mouseHook', e.currentTarget.checked)} />
         <span>Mouse hook</span>
       </label>
+      <label class="diag-detection-toggle">
+        <input type="checkbox" checked={gamepadTestEnabled} onchange={(e) => toggleGamepadTest(e.currentTarget.checked)} />
+        <span>Gamepad test</span>
+      </label>
+      {#if gamepadTestEnabled}
+        <span class="diag-gamepad-status" class:diag-gamepad-active={gamepadActive}>{gamepadActive ? 'ACTIVE' : 'IDLE'}</span>
+      {/if}
     </div>
 
     <div class="diag-log-wrap">

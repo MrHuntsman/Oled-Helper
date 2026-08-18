@@ -224,7 +224,7 @@
       <TabPowerIcon class="tab-icon" />
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
-          <h2>Power</h2>
+          <h2>Power Saving</h2>
         </div>
         <span class="subtitle">Display &amp; screensaver power saving</span>
       </div>

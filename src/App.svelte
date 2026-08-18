@@ -1,9 +1,10 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
+  import ShieldBadge from './lib/ShieldBadge.svelte';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
@@ -871,6 +872,25 @@
     emit('black-level-main-changed', { adjustment: crush.adjustment, enabled: crush.blackEnabled }).catch(() => {});
   }
 
+  // Sidebar mini-switches: each tab with a master toggle gets a small switch
+  // at the right edge of its nav item so the state is visible and flippable
+  // without opening the tab. Each mirrors the tab's own toggle path.
+  function toggleBlackCrushFromNav() {
+    crush.blackEnabled = !crush.blackEnabled;
+    applyGammaForHotkey();
+    scheduleHotkeyConfigSave();
+    emitBlackLevelMainChanged();
+  }
+
+  function toggleTaskbarDimmerFromNav() {
+    setTaskbarDimmer(!taskbarDimmer.enabled);
+  }
+
+  function toggleScreenDimmerFromNav() {
+    setScreenDimmerEnabled(!screenDimmer.enabled, app.activeTab)
+      .catch((e) => console.warn('[sidebar] screen dimmer toggle failed', e));
+  }
+
   function handleHotkeyAction(action) {
     switch (action) {
       case 'toggle_black_crush':
@@ -895,15 +915,8 @@
         setTaskbarDimmer(!taskbarDimmer.enabled);
         break;
       case 'toggle_screen_dimmer':
-        screenDimmer.enabled = !screenDimmer.enabled;
-        invoke('power_set_screen_protector', {
-          enabled: screenDimmer.enabled,
-          seconds: screenDimmer.seconds,
-          opacity: screenDimmer.opacity,
-          fadeInDurationMs: screenDimmer.fadeInDurationMs,
-          fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
-        }).catch((e) => console.warn('[hotkey] screen dimmer toggle failed', e));
-        saveConfig();
+        setScreenDimmerEnabled(!screenDimmer.enabled, app.activeTab)
+          .catch((e) => console.warn('[hotkey] screen dimmer toggle failed', e));
         break;
       case 'toggle_hdr':
         toggleWindowsHdr();
@@ -1253,23 +1266,40 @@
   </div>
 
   <nav class="sidebar">
-    <button class="nav-btn" class:active={app.activeTab === 'crush'} onclick={() => app.activeTab = 'crush'}>
-      <img class="nav-icon" src={tabCrushIcon} alt="" /> Black Crush Tweak
-    </button>
-    <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
-      <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
-    </button>
-    <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} onclick={() => app.activeTab = 'screen-dimmer'}>
-      <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> Screen Dimmer
-    </button>
+    <div class="nav-item">
+      <button class="nav-btn" class:active={app.activeTab === 'crush'} onclick={() => app.activeTab = 'crush'}>
+        <img class="nav-icon" src={tabCrushIcon} alt="" /> Black Crush Tweak
+      </button>
+      <button type="button" class="nav-switch" class:on={crush.blackEnabled} aria-pressed={crush.blackEnabled} onclick={toggleBlackCrushFromNav} title="Toggle Black Crush Tweak" aria-label="Toggle Black Crush Tweak">
+        <span class="nav-switch-thumb" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div class="nav-item">
+      <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
+        <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
+      </button>
+      <button type="button" class="nav-switch" class:on={taskbarDimmer.enabled} aria-pressed={taskbarDimmer.enabled} onclick={toggleTaskbarDimmerFromNav} title="Toggle Taskbar Dimmer" aria-label="Toggle Taskbar Dimmer">
+        <span class="nav-switch-thumb" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div class="nav-item">
+      <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} onclick={() => app.activeTab = 'screen-dimmer'}>
+        <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> Screen Dimmer
+      </button>
+      <button type="button" class="nav-switch" class:on={screenDimmer.enabled} aria-pressed={screenDimmer.enabled} onclick={toggleScreenDimmerFromNav} title="Toggle Screen Dimmer" aria-label="Toggle Screen Dimmer">
+        <span class="nav-switch-thumb" aria-hidden="true"></span>
+      </button>
+      <span class="nav-item-shield"><ShieldBadge size={14} text="Screen Dimmer requires administrator rights." /></span>
+    </div>
+    <div class="sidebar-sep" role="separator"></div>
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
-      <TabTextIcon class="nav-icon" /> Text rendering
+      <TabTextIcon class="nav-icon" /> Text Rendering
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'power'} onclick={() => app.activeTab = 'power'}>
-      <TabPowerIcon class="nav-icon" /> Power
+      <TabPowerIcon class="nav-icon" /> Power Saving
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys

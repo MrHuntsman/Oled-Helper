@@ -3,7 +3,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
-  import { taskbarDimmer, screenDimmer, saveConfig, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs, SCREEN_DIMMER_DEFAULTS } from './stores.svelte.js';
+  import ShieldBadge from './ShieldBadge.svelte';
+  import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs, SCREEN_DIMMER_DEFAULTS } from './stores.svelte.js';
 
   let { screen = false } = $props();
   let screenError = $state('');
@@ -30,6 +31,7 @@
       opacity: screenDimmer.opacity,
       fadeInDurationMs: screenDimmer.fadeInDurationMs,
       fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+      fullscreenDetection: screenDimmer.fullscreenDetection,
     }).catch((e) => {
       screenError = String(e);
       console.warn('[screen-dimmer] apply failed', e);
@@ -47,6 +49,7 @@
       if (!screenOpacityDragging) screenDimmer.opacity = state.screen_protector_opacity;
       if (!screenFadeInDragging) screenDimmer.fadeInDurationMs = state.screen_protector_fade_in_duration_ms;
       if (!screenFadeOutDragging) screenDimmer.fadeOutDurationMs = state.screen_protector_fade_out_duration_ms;
+      screenDimmer.fullscreenDetection = state.screen_protector_fullscreen_detection === true;
       screenError = '';
     } catch (e) {
       screenError = String(e);
@@ -61,12 +64,23 @@
     screenDimmer.fadeInDurationMs = SCREEN_DIMMER_DEFAULTS.fadeInDurationMs;
     screenDimmer.fadeOutDurationMs = SCREEN_DIMMER_DEFAULTS.fadeOutDurationMs;
     screenDimmer.fadeLinked = SCREEN_DIMMER_DEFAULTS.fadeLinked;
+    screenDimmer.fullscreenDetection = SCREEN_DIMMER_DEFAULTS.fullscreenDetection;
     applyScreenDimmer(true);
   }
 
-  function toggleScreenDimmer() {
-    screenDimmer.enabled = !screenDimmer.enabled;
+  function toggleFullscreenDetection() {
+    screenDimmer.fullscreenDetection = !screenDimmer.fullscreenDetection;
     applyScreenDimmer(true);
+  }
+
+  async function toggleScreenDimmer() {
+    try {
+      await setScreenDimmerEnabled(!screenDimmer.enabled, app.activeTab);
+      screenError = '';
+    } catch (e) {
+      screenError = String(e);
+      console.warn('[screen-dimmer] toggle failed', e);
+    }
   }
 
   let screenDimmerMasterAttention = $state(false);
@@ -334,6 +348,7 @@
           <span class="subtitle">Dims the display after inactivity to reduce static OLED content.</span>
         </div>
         <div class="tab-heading-spacer"></div>
+        <ShieldBadge size={24} text="Admin required." />
         <span class={`pill${screenDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
       </div>
       <button class="restore-defaults-btn" onclick={restoreScreenDimmerDefaults}>↻ Restore Tab Defaults</button>
@@ -365,7 +380,7 @@
 
     <div class="dimmer-control">
       <div class="dimmer-control-heading">
-        <span class="settings-row-label">Overlay opacity</span>
+        <span class="settings-row-label">Dim strength</span>
         <span class="slider-val">{Math.round(screenDimmer.opacity * 100)}%</span>
       </div>
       <div class="slider-track-wrap dimmer-slider-track">
@@ -424,6 +439,16 @@
         </div>
         <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
       </div>
+    </div>
+
+    <div class="dimmer-control">
+      <label class="dimmer-check-toggle">
+        <input type="checkbox" checked={screenDimmer.fullscreenDetection} onchange={toggleFullscreenDetection} disabled={!screenDimmer.enabled} />
+        <span class="dimmer-check-text">
+          <span class="settings-row-label">Pause during fullscreen apps</span>
+          <span class="settings-row-desc dimmer-section-desc">Skips dimming while a fullscreen app or game is active on a monitor.</span>
+        </span>
+      </label>
     </div>
     </div>
   </div>

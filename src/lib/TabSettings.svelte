@@ -4,7 +4,7 @@
   import tabDebugIcon from './icons/tab_debug.png?inline';
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
-  import { app, restoreAllDefaults } from './stores.svelte.js';
+  import { app, appSettings, setAlwaysElevated, restoreAllDefaults } from './stores.svelte.js';
 
   let startOnBoot = $state(false);
   let ready = $state(false);
@@ -34,6 +34,26 @@
     } catch (e) {
       console.warn('[settings] toggle autostart failed', e);
       startOnBoot = !next;
+    }
+  }
+
+  // Always open as administrator: enabling from a non-elevated session saves
+  // the flag and relaunches elevated via UAC (the whole app restarts), so the
+  // toggle only flips back if the prompt is declined.
+  let alwaysElevatedBusy = $state(false);
+  let alwaysElevatedError = $state('');
+  async function toggleAlwaysElevated() {
+    if (alwaysElevatedBusy) return;
+    const next = !appSettings.alwaysElevated;
+    alwaysElevatedBusy = true;
+    alwaysElevatedError = '';
+    try {
+      await setAlwaysElevated(next, 'settings');
+    } catch (e) {
+      alwaysElevatedError = String(e);
+      console.warn('[settings] always elevated toggle failed', e);
+    } finally {
+      alwaysElevatedBusy = false;
     }
   }
 
@@ -143,6 +163,19 @@
       {/if}
     </div>
   </button>
+
+  <button class="settings-row" disabled={alwaysElevatedBusy} onclick={toggleAlwaysElevated}>
+    <div class="settings-row-text">
+      <span class="settings-row-label">Always open as administrator</span>
+      <span class="settings-row-desc">Start OLED Helper as administrator (UAC prompt on launch).</span>
+    </div>
+    <div class="pill-wrap">
+      <span class={`pill${appSettings.alwaysElevated ? '' : ' off'}`} aria-hidden="true"></span>
+    </div>
+  </button>
+  {#if alwaysElevatedError}
+    <p class="reset-all-error" role="status">{alwaysElevatedError}</p>
+  {/if}
 
   <button class="settings-row reset-all-row" bind:this={resetAllBtnEl} onclick={openResetAllConfirm}>
     <div class="settings-row-text">

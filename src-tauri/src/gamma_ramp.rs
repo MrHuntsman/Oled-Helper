@@ -69,8 +69,13 @@ pub fn build_linear_ramp() -> GammaRamp {
 /// `brightness = 0.0` produces black while keeping the ramp shape available
 /// for a smooth restore. This is the screen protector's gamma-based dim path.
 pub fn build_dimmed_ramp(black_lift: i32, brightness: f32) -> GammaRamp {
-    let mut ramp = build_ramp(black_lift);
     let brightness = brightness.clamp(0.0, 1.0) as f64;
+    // Keep the endpoint exact: a 100% dim strength request must produce a
+    // genuinely black ramp rather than relying on floating-point scaling.
+    if brightness <= 0.0 {
+        return GammaRamp::zeroed();
+    }
+    let mut ramp = build_ramp(black_lift);
     for channel in [&mut ramp.red, &mut ramp.green, &mut ramp.blue] {
         for value in channel.iter_mut() {
             *value = (*value as f64 * brightness).round().clamp(0.0, 65535.0) as u16;
@@ -205,5 +210,11 @@ mod tests {
         assert!(dimmed.red[32] < base.red[32]);
         assert_eq!(dimmed.red[0], 0);
         assert!((dimmed.red[255] as i32 - 16384).abs() <= 1);
+    }
+
+    #[test]
+    fn full_dim_strength_is_black() {
+        let ramp = build_dimmed_ramp(150, 0.0);
+        assert_eq!(ramp, GammaRamp::zeroed());
     }
 }

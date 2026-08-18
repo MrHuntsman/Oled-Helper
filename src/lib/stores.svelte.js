@@ -264,6 +264,8 @@ export const SCREEN_DIMMER_DEFAULTS = Object.freeze({
   fadeOutDurationMs: 200,
   // Whether the fade-in/fade-out sliders are chained (one drag drives both).
   fadeLinked: true,
+  // Whether a fullscreen app on a monitor suppresses the dim there.
+  fullscreenDetection: true,
 });
 
 export const TASKBAR_DIMMER_DEFAULTS = Object.freeze({
@@ -318,6 +320,13 @@ export const textSettings = $state({
 // startup so the idle watcher and overlay use the saved values immediately.
 export const screenDimmer = $state({
   ...SCREEN_DIMMER_DEFAULTS,
+});
+
+// App-level settings (Settings tab). alwaysElevated relaunches the app
+// elevated at startup; the backend probes the on-disk config before any
+// window exists, so this just needs to persist the flag.
+export const appSettings = $state({
+  alwaysElevated: false,
 });
 
 // Debug-tab logging switches, independent of each other:
@@ -726,6 +735,12 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.screen_protector_fade_linked === 'boolean') {
       screenDimmer.fadeLinked = cfg.screen_protector_fade_linked;
     }
+    if (cfg && typeof cfg.screen_protector_fullscreen_detection === 'boolean') {
+      screenDimmer.fullscreenDetection = cfg.screen_protector_fullscreen_detection;
+    }
+    if (cfg && typeof cfg.always_elevated === 'boolean') {
+      appSettings.alwaysElevated = cfg.always_elevated;
+    }
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
     if (cfg && typeof cfg.taskbar_dimmer_fade_out_duration_ms === 'number') taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_out_duration_ms)));
@@ -799,10 +814,10 @@ export async function initTaskbarDimmerRuntime() {
 }
 
 export function saveConfig() {
-  if (!configLoaded.v) return;
+  if (!configLoaded.v) return Promise.resolve();
   persistCurrentBlackLevelProfile();
   const blackLiftProfiles = Object.fromEntries(Object.entries(crush.blackProfiles).map(([key, value]) => [key, clampAdjustment(value) / 10]));
-  invoke('save_config', { config: {
+  return invoke('save_config', { config: {
     black_lift: crush.adjustment / 10,
     black_lift_profiles: blackLiftProfiles,
     black_enabled: crush.blackEnabled,
@@ -827,6 +842,8 @@ export function saveConfig() {
     screen_protector_fade_in_duration_ms: screenDimmer.fadeInDurationMs,
     screen_protector_fade_out_duration_ms: screenDimmer.fadeOutDurationMs,
     screen_protector_fade_linked: screenDimmer.fadeLinked,
+    screen_protector_fullscreen_detection: screenDimmer.fullscreenDetection,
+    always_elevated: appSettings.alwaysElevated,
     taskbar_dimmer_opacity: taskbarDimmer.opacity,
     taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
     taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,
@@ -839,7 +856,83 @@ export function saveConfig() {
     display_menu_refresh_rate_sort: displayMenuPrefs.refreshRateSort,
     hotkeys: { ...hotkeys },
     favorite_display_modes: displayFavorites.map((f) => ({ width: f.width, height: f.height, hz: f.hz })),
-  } }).catch((e) => console.warn('[config] save failed', e));
+  } }).catch((e) => {
+    console.warn('[config] save failed', e);
+    return undefined;
+  });
+}
+
+export async function setScreenDimmerEnabled(enabled, tab = app.activeTab) {
+  if (!enabled) {
+    screenDimmer.enabled = false;
+    await invoke('power_set_screen_protector', {
+      enabled: false,
+      seconds: screenDimmer.seconds,
+      opacity: screenDimmer.opacity,
+      fadeInDurationMs: screenDimmer.fadeInDurationMs,
+      fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+      fullscreenDetection: screenDimmer.fullscreenDetection,
+    });
+    await saveConfig();
+    return;
+  }
+
+  const elevated = await invoke('is_process_elevated');
+  screenDimmer.enabled = true;
+  if (elevated) {
+    await invoke('power_set_screen_protector', {
+      enabled: true,
+      seconds: screenDimmer.seconds,
+      opacity: screenDimmer.opacity,
+      fadeInDurationMs: screenDimmer.fadeInDurationMs,
+      fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+      fullscreenDetection: screenDimmer.fullscreenDetection,
+    });
+    await saveConfig();
+    return;
+  }
+
+  // Save before the UAC relaunch so the elevated replacement has the same
+  // settings even if the old frontend closes before its normal save cycle.
+  await saveConfig();
+  try {
+    await invoke('relaunch_elevated', {
+      rtxHdrFlags: null,
+      rtxHdrEnabled: null,
+      hdrMode: null,
+      screenDimmerEnabled: true,
+      tab,
+    });
+  } catch (error) {
+    screenDimmer.enabled = false;
+    await saveConfig();
+    throw error;
+  }
+}
+
+// Settings-tab "Always open as administrator": persist the flag, then
+// relaunch elevated immediately when turning it on from a non-elevated
+// session so it takes effect right away (same handoff the Screen Dimmer
+// toggle uses). A declined prompt reverts the flag.
+export async function setAlwaysElevated(enabled, tab = app.activeTab) {
+  appSettings.alwaysElevated = enabled;
+  await saveConfig();
+  if (!enabled) return;
+  const elevated = await invoke('is_process_elevated');
+  if (elevated) return;
+  try {
+    await invoke('relaunch_elevated', {
+      rtxHdrFlags: null,
+      rtxHdrEnabled: null,
+      hdrMode: null,
+      screenDimmerEnabled: null,
+      tab,
+    });
+  } catch (error) {
+    appSettings.alwaysElevated = false;
+    await saveConfig();
+    throw error;
+  }
 }
 
 let pendingTaskbarDimmerUpdate = null;

@@ -10,7 +10,8 @@
   // Props:
   //   label – accessible name for the icon
   //   text  – tooltip content shown on hover/focus
-  let { label = 'Requires administrator rights', text = '' } = $props();
+  //   size  – icon size in px (inline style so it beats the scoped CSS)
+  let { label = 'Requires administrator rights', text = '', size = 18 } = $props();
 
   let badgeEl = $state(null);
   let tooltipEl = $state(null);
@@ -75,7 +76,7 @@
     onmouseleave={hideTooltip}
     onfocus={showTooltip}
     onblur={hideTooltip}></button>
-  <svg viewBox="0 0 24 24" fill="currentColor" role="img" aria-label={label}>
+  <svg viewBox="0 0 24 24" fill="currentColor" role="img" aria-label={label} style="width:{size}px;height:{size}px">
     <path fill-rule="evenodd" clip-rule="evenodd" d="M6.2 4.2L12 2.8L17.8 4.2V9.4C17.8 12.4 15.8 14.9 12 16C8.2 14.9 6.2 12.4 6.2 9.4V4.2Z"/>
     <path d="M9.8 10.1L10.9 11.2L14.3 7.8L15.3 8.8L10.9 13.3L8.8 11.2L9.8 10.1Z"/>
   </svg>
