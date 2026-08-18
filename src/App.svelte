@@ -26,6 +26,7 @@
   import tabAboutIcon from './lib/icons/tab_about.png?inline';
   import tabCrushIcon from './lib/icons/tab_crush.png?inline';
   import tabDimmerIcon from './lib/icons/tab_dimmer.png?inline';
+  import tabScreenDimmerIcon from './lib/icons/tab_screen_dimmer.png?inline';
   import tabHdrIcon from './lib/icons/tab_hdr.png?inline';
   import tabDebugIcon from './lib/icons/tab_debug.png?inline';
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
@@ -1259,7 +1260,7 @@
       <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} onclick={() => app.activeTab = 'screen-dimmer'}>
-      <img class="nav-icon" src={tabDimmerIcon} alt="" /> Screen Dimmer
+      <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> Screen Dimmer
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR

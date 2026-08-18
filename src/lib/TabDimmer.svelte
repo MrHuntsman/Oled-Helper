@@ -2,7 +2,8 @@
   // Inlined data URI ,  see App.svelte for why icons never hit the network.
   import { invoke } from '@tauri-apps/api/core';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
-  import { taskbarDimmer, screenDimmer, saveConfig, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs } from './stores.svelte.js';
+  import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
+  import { taskbarDimmer, screenDimmer, saveConfig, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs, SCREEN_DIMMER_DEFAULTS } from './stores.svelte.js';
 
   let { screen = false } = $props();
   let screenError = $state('');
@@ -54,12 +55,12 @@
   }
 
   function restoreScreenDimmerDefaults() {
-    screenDimmer.enabled = false;
-    screenDimmer.seconds = 30;
-    screenDimmer.opacity = 0.8;
-    screenDimmer.fadeInDurationMs = 2000;
-    screenDimmer.fadeOutDurationMs = 500;
-    screenDimmer.fadeLinked = false;
+    screenDimmer.enabled = SCREEN_DIMMER_DEFAULTS.enabled;
+    screenDimmer.seconds = SCREEN_DIMMER_DEFAULTS.seconds;
+    screenDimmer.opacity = SCREEN_DIMMER_DEFAULTS.opacity;
+    screenDimmer.fadeInDurationMs = SCREEN_DIMMER_DEFAULTS.fadeInDurationMs;
+    screenDimmer.fadeOutDurationMs = SCREEN_DIMMER_DEFAULTS.fadeOutDurationMs;
+    screenDimmer.fadeLinked = SCREEN_DIMMER_DEFAULTS.fadeLinked;
     applyScreenDimmer(true);
   }
 
@@ -325,7 +326,7 @@
   <div class="tab-body">
     <div class="tab-heading tab-heading-2line">
       <div class="tab-heading-toggle" class:attention-pulse={screenDimmerMasterAttention} role="button" tabindex="0" onclick={toggleScreenDimmer} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleScreenDimmer(); } }} title="Enable Screen Dimmer" aria-label="Enable Screen Dimmer" aria-pressed={screenDimmer.enabled}>
-        <img class="tab-icon" src={tabDimmerIcon} alt="" />
+        <img class="tab-icon" src={tabScreenDimmerIcon} alt="" />
         <div class="tab-heading-titles">
           <div class="tab-heading-title-row">
             <h2>Screen Dimmer</h2>

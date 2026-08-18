@@ -243,16 +243,38 @@ let legacyBlackLift = null;
 // to upgrade without losing their calibration.
 let legacyBlackProfiles = {};
 
-export const taskbarDimmer = $state({
+// Canonical dimmer defaults — the single source the state initializers and
+// the "restore defaults" handlers read from, so changing a default can't
+// leave the restore out of sync. The Rust serde defaults in
+// src-tauri/src/config.rs (default_screen_protector_*, default_dimmer_*,
+// default_hover_detection, default_poll_interval) must match these: they
+// only apply to config files missing the fields, but a mismatch would make
+// a fresh install disagree with the UI.
+export const SCREEN_DIMMER_DEFAULTS = Object.freeze({
+  enabled: false,
+  seconds: 30,
+  opacity: 0.8,
+  fadeInDurationMs: 1000,
+  fadeOutDurationMs: 200,
+  // Whether the fade-in/fade-out sliders are chained (one drag drives both).
+  fadeLinked: true,
+});
+
+export const TASKBAR_DIMMER_DEFAULTS = Object.freeze({
   enabled: false,
   opacity: 0.95,
   fadeInDurationMs: 300,
   fadeOutDurationMs: 300,
   // Whether the fade-in/fade-out sliders are chained (one drag drives both).
   fadeLinked: true,
-  available: true,
   hoverDetection: 'event',
   pollIntervalMs: 100,
+});
+
+export const taskbarDimmer = $state({
+  ...TASKBAR_DIMMER_DEFAULTS,
+  // Runtime-only: whether the overlay is available (not a persisted default).
+  available: true,
 });
 
 // Text rendering tab settings persisted in config. The Explorer hook toggle
@@ -289,13 +311,7 @@ export const textSettings = $state({
 // Screen Dimmer settings persisted in config. The backend needs these at
 // startup so the idle watcher and overlay use the saved values immediately.
 export const screenDimmer = $state({
-  enabled: false,
-  seconds: 30,
-  opacity: 0.8,
-  fadeInDurationMs: 2000,
-  fadeOutDurationMs: 500,
-  // Whether the fade-in/fade-out sliders are chained (one drag drives both).
-  fadeLinked: true,
+  ...SCREEN_DIMMER_DEFAULTS,
 });
 
 // Debug-tab logging switches, independent of each other:
@@ -892,7 +908,16 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
   pendingTaskbarDimmerUpdate = { enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, persist, immediate, version: taskbarDimmerUpdateVersion };
   flushTaskbarDimmerUpdate();
 }
-export function restoreTaskbarDimmerDefaults() { setTaskbarDimmer(false, 0.95, 300, 300, true, true); setHoverDetection('event'); setPollIntervalMs(100); }
+export function restoreTaskbarDimmerDefaults() {
+  taskbarDimmer.enabled = TASKBAR_DIMMER_DEFAULTS.enabled;
+  taskbarDimmer.opacity = TASKBAR_DIMMER_DEFAULTS.opacity;
+  taskbarDimmer.fadeInDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs;
+  taskbarDimmer.fadeOutDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs;
+  taskbarDimmer.fadeLinked = TASKBAR_DIMMER_DEFAULTS.fadeLinked;
+  setHoverDetection(TASKBAR_DIMMER_DEFAULTS.hoverDetection);
+  setPollIntervalMs(TASKBAR_DIMMER_DEFAULTS.pollIntervalMs);
+  setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeOutDurationMs, true, true);
+}
 
 // Rust retries overlay creation in the background if it fails at startup
 // (e.g. the taskbar/shell hadn't settled yet) and emits this event once that

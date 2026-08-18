@@ -550,8 +550,19 @@ pub fn tray_menu_set_expanded(
 /// selection) to populate the Resolution submenu.
 #[tauri::command]
 pub fn tray_menu_get_display_info() -> Result<crate::display_info::DisplayInfo, String> {
-    crate::display_info::query_current_display()
-        .ok_or_else(|| "could not query display info".to_string())
+    let mut info = crate::display_info::query_current_display()
+        .ok_or_else(|| "could not query display info".to_string())?;
+    // Black Crush profiles are keyed by the monitor identity the main app
+    // resolves (monitors.rs: the adapter-level device id). display_info.rs's
+    // monitor_id is the EDID MONITOR\... id; returning that here would make
+    // the tray read a different profile entry than the main app for the same
+    // display. Substitute the main app's identity so both agree.
+    if let Some(primary) = crate::monitors::all_monitors().into_iter().find(|m| m.primary) {
+        if !primary.monitor_id.is_empty() {
+            info.monitor_id = primary.monitor_id.clone();
+        }
+    }
+    Ok(info)
 }
 
 /// Frontend command: apply a resolution pick from the custom menu, same

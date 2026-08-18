@@ -23,10 +23,11 @@
   const CUSTOM_OFFSET_MIN = -1;
   const CUSTOM_OFFSET_MAX = 1;
   const CUSTOM_OFFSET_STEP = 0.01;
-  // Sensible starting point for a fresh custom profile: the WOLED quad
-  // positions (R/G/B across a 4-subpixel pixel, white derived by the panel),
-  // horizontal-only so every y = 0.
-  const CUSTOM_OFFSET_DEFAULT = { rx: -0.375, ry: 0, gx: -0.125, gy: 0, bx: 0.375, by: 0 };
+  // Starting point for a fresh custom profile: all subpixel centers at 0
+  // (every channel sampled at the pixel center). An all-zero set means
+  // "not tuned" — the hook rasterizes the mode's default layout — so the
+  // sliders start neutral and tuning one axis activates the full set.
+  const CUSTOM_OFFSET_DEFAULT = { rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0 };
   // The six Subpixel center axes (R/G/B × x/y) in slider order.
   const CUSTOM_AXES = [
     { key: 'rx', label: 'Red X' },
@@ -197,8 +198,8 @@
   function applyMonitorMode(mode) {
     const sig = activeMonitor.mon.sig;
     textSettings.perMonitorModes[sig] = mode;
-    // A fresh custom profile starts at the WOLED quad positions so the
-    // preview renders something sane before the user drags the sliders.
+    // A fresh custom profile starts with all subpixel centers at 0 so the
+    // preview renders the mode's default layout until the user tunes them.
     if (mode === 'custom' && !textSettings.perMonitorCustom[sig]) {
       textSettings.perMonitorCustom[sig] = { ...CUSTOM_OFFSET_DEFAULT };
     }
@@ -247,9 +248,9 @@
     schedulePreviewRender();
   }
 
-  // Restore the six subpixel centers to the seeded default (the WOLED quad
-  // positions) for the selected monitor: persist, push to the hook
-  // (debounced), and re-render the preview.
+  // Restore the six subpixel centers to the seeded default (all zeros) for
+  // the selected monitor: persist, push to the hook (debounced), and
+  // re-render the preview.
   function resetCustomOffsets() {
     if (!activeMonitor.mon) return;
     const sig = activeMonitor.mon.sig;

@@ -233,10 +233,10 @@ fn default_screen_protector_opacity() -> f64 {
     0.8
 }
 fn default_screen_protector_fade_in_duration() -> u64 {
-    2000
+    1000
 }
 fn default_screen_protector_fade_out_duration() -> u64 {
-    500
+    200
 }
 fn default_high_nits_min() -> u32 {
     100

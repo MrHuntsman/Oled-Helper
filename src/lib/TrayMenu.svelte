@@ -217,10 +217,35 @@
     queueBlackLevelApply();
   }
 
+  // The tray is narrow, so user interaction moves in 0.5 steps (5 raw
+  // units) — coarse enough to resolve on a ~170px drag across the full
+  // ±15.0 range. The input itself keeps step=1 so values set by the main
+  // app (any 0.1 increment) render exactly; only drag/wheel/arrow input is
+  // snapped to 0.5 here.
   function handleTrayBlackLevelInput(event) {
     if (!trayBlack.enabled) return;
     quickInteractionVersion++;
-    trayBlack.adjustment = Math.max(-150, Math.min(150, Math.round(Number(event.currentTarget.value))));
+    const value = Math.round(Number(event.currentTarget.value));
+    trayBlack.adjustment = Math.max(-150, Math.min(150, Math.round(value / 5) * 5));
+    queueBlackLevelApply();
+  }
+
+  function handleTrayBlackWheel(event) {
+    if (!trayBlack.enabled) return;
+    event.preventDefault();
+    quickInteractionVersion++;
+    const dir = event.deltaY < 0 ? 1 : -1;
+    trayBlack.adjustment = Math.max(-150, Math.min(150, trayBlack.adjustment + dir * 5));
+    queueBlackLevelApply();
+  }
+
+  function handleTrayBlackKeydown(event) {
+    if (!trayBlack.enabled) return;
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+    event.preventDefault();
+    quickInteractionVersion++;
+    const dir = (event.key === 'ArrowRight' || event.key === 'ArrowUp') ? 1 : -1;
+    trayBlack.adjustment = Math.max(-150, Math.min(150, trayBlack.adjustment + dir * 5));
     queueBlackLevelApply();
   }
 
@@ -1110,21 +1135,22 @@
       >
         <img src={tabCrushIcon} alt="" aria-hidden="true" />
       </button>
-      <div class="tray-quick-slider-wrap">
-        <input
-          class="tray-quick-slider"
-          type="range"
-          min="-150"
-          max="150"
-          step="1"
-          value={trayBlack.adjustment}
-          style="--fill:{((trayBlack.adjustment + 150) / 300) * 100}%"
-          disabled={!trayBlack.enabled}
-          aria-label="Black Level"
-          title={trayBlack.enabled ? `Black Level ${formatTrayBlackLevel()}` : 'Enable Black Level to adjust'}
-          oninput={handleTrayBlackLevelInput}
-          onclick={(event) => event.stopPropagation()}
-        />
+      <div class="tray-quick-slider-wrap">          <input
+            class="tray-quick-slider"
+            type="range"
+            min="-150"
+            max="150"
+            step="1"
+            value={trayBlack.adjustment}
+            style="--fill:{Math.max(0, Math.min(100, ((trayBlack.adjustment + 150) / 300) * 100))}%"
+            disabled={!trayBlack.enabled}
+            aria-label="Black Level"
+            title={trayBlack.enabled ? `Black Level ${formatTrayBlackLevel()}` : 'Enable Black Level to adjust'}
+            oninput={handleTrayBlackLevelInput}
+            onwheel={handleTrayBlackWheel}
+            onkeydown={handleTrayBlackKeydown}
+            onclick={(event) => event.stopPropagation()}
+          />
         <span class="tray-quick-value">{formatTrayBlackLevel()}</span>
       </div>
     </div>

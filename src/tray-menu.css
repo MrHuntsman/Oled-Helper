@@ -623,7 +623,9 @@
 }
 
 .tray-dimmer-value {
-  flex: 0 0 29px;
+  /* Same fixed width as the other tray value labels, so every slider in
+     the menu spans the same width regardless of its unit text. */
+  flex: 0 0 48px;
   color: var(--text-weak);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -785,7 +787,9 @@
 }
 
 .tray-quick-value {
-  flex: 0 0 34px;
+  /* Same fixed width as the other tray value labels, so every slider in
+     the menu spans the same width regardless of its unit text. */
+  flex: 0 0 48px;
   color: var(--text-weak);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -794,7 +798,7 @@
 }
 
 .tray-sdr-value {
-  flex-basis: 48px;
+  /* Fits "480 nits"; the base .tray-quick-value width already matches. */
 }
 
 .tray-submenu {

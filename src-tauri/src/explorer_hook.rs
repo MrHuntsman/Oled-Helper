@@ -428,26 +428,49 @@ static EMBEDDED_HOOK_DLL: &[u8] =
 
 // Layout-generation marker. MUST match explorer-hook's HOOK_LAYOUT_MARKER
 // (explorer-hook/src/lib.rs); bump both whenever STATE_SIZE / the
-// shared-memory layout changes. Lets us tell a locked previous-build DLL
-// whose layout is still compatible (safe to serve) from one that would
-// misread the current shared memory (must not be served).
+// shared-memory layout changes. With per-build DLL names the app only ever
+// loads its own build, so this is no longer a serve gate — it is a
+// diagnostic: a stale copy on disk that lacks the marker means a running
+// process holds a build predating the current layout and will keep
+// misreading the shared memory until it restarts.
 const HOOK_LAYOUT_MARKER: &[u8] = b"OH2-SMEM-1124";
 
-// Two fixed slot names, so at most two distinct hook DLL paths can ever be
-// active — the Windows limit on distinct global-hook DLL names (historically
-// 32) is untouched — while still letting a fresh build install even when the
-// primary slot is locked by running processes. When a slot's file can be
-// replaced, the stale copy is deleted; locked copies are scheduled for
-// deletion at the next boot (best effort; the pending-rename list is in HKLM,
-// so this may need elevation, and the rotation works without it).
-const HOOK_DLL_SLOTS: [&str; 2] = ["explorer_hook.dll", "explorer_hook_b.dll"];
+// Hook DLL naming: one file per build, named by an FNV-1a hash of the
+// embedded bytes (explorer_hook-<hash>.dll). A new build is always a NEW
+// file name, so it can never collide with a copy still mapped by running
+// processes (os error 32) — deployment never needs a free slot or a reboot,
+// and the app never has to serve a previous build. Stale copies are deleted
+// as soon as their last holder exits; locked ones are scheduled for deletion
+// at the next boot, so the directory converges to the current build. This
+// replaces the retired two-slot scheme, whose fixed names deadlocked once
+// two different builds were held by different processes. (The Windows limit
+// on distinct global-hook DLL names — historically 32 — only counts builds
+// still alive in a boot session; release users accumulate one per update,
+// so it is not reachable in practice.)
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+static HOOK_DLL_HASH: OnceLock<u64> = OnceLock::new();
+
+fn hook_dll_name() -> String {
+    let hash = *HOOK_DLL_HASH.get_or_init(|| fnv1a64(EMBEDDED_HOOK_DLL));
+    format!("explorer_hook-{hash:016x}.dll")
+}
 
 fn dll_matches_current(path: &std::path::Path) -> bool {
     matches!(fs::read(path), Ok(bytes) if bytes == EMBEDDED_HOOK_DLL)
 }
 
-// Whether a (possibly locked) on-disk DLL was built against the current
-// shared-memory layout, by searching for the layout marker in its bytes.
+// Whether an on-disk DLL was built against the current shared-memory
+// layout, by searching for the layout marker in its bytes. Diagnostic only:
+// a locked copy that predates the current layout means a running process
+// keeps the old build until it restarts.
 fn dll_has_current_layout(path: &std::path::Path) -> bool {
     matches!(
         fs::read(path),
@@ -458,29 +481,38 @@ fn dll_has_current_layout(path: &std::path::Path) -> bool {
     )
 }
 
-// fs::write succeeds only when no process has the file mapped; a lock means
-// running processes (Explorer, injected apps) still hold the old build. A
-// matching file short-circuits so we never rewrite unnecessarily.
-fn write_hook_dll(path: &std::path::Path) -> Result<(), String> {
-    if dll_matches_current(path) {
-        return Ok(());
-    }
-    fs::write(path, EMBEDDED_HOOK_DLL).map_err(|e| {
-        format!("{} is still in use by running processes ({e})", path.display())
-    })
-}
-
-// Best-effort removal of the legacy hash-named copies from older builds. A
-// live Explorer may still have one mapped, so deletion is intentionally
-// best effort; the fixed slots are not affected (their names have no dash).
-fn remove_legacy_hook_dlls(dir: &std::path::Path) {
+// Delete every stale hook DLL in the config dir — previous hash-named
+// builds and the retired fixed slots (explorer_hook.dll / explorer_hook_b.dll)
+// — except the build in use. A file still mapped by a running process cannot
+// be deleted; those are scheduled for deletion at the next boot, so the
+// directory converges to the current build without ever blocking a deploy.
+fn cleanup_hook_dlls(dir: &std::path::Path, keep: Option<&std::path::Path>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("explorer_hook-") && name.ends_with(".dll") {
-                let _ = fs::remove_file(entry.path());
+            let path = entry.path();
+            let fname = entry.file_name();
+            let Some(name) = fname.to_str() else {
+                continue;
+            };
+            if !(name.starts_with("explorer_hook") && name.ends_with(".dll")) {
+                continue;
             }
+            if keep == Some(path.as_path()) {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                continue;
+            }
+            // Still mapped by a running process. Gone at the next boot; warn
+            // when the held build predates the current shared-memory layout
+            // (that build only fully applies after the process restarts).
+            if !dll_has_current_layout(&path) {
+                log::warn!(
+                    "[explorer-hook] a running process holds {} (previous shared-memory layout); it will pick up the new build after restarting",
+                    path.display()
+                );
+            }
+            schedule_delete_at_boot(&path);
         }
     }
 }
@@ -496,15 +528,13 @@ fn schedule_delete_at_boot(path: &std::path::Path) {
     }
 }
 
-// Get a usable on-disk hook DLL, installing the embedded build if possible.
-// The crash-resilience story: when the app dies (or is updated), the hook
-// handle dies with it, but Windows does NOT force-unload the DLL from
-// processes that already loaded it — Explorer and injected apps keep the old
-// file mapped for the whole session, so a plain overwrite fails (os error
-// 32). Instead of failing forever, this serves the locked-but-compatible
-// previous build (LoadLibraryW works on a locked file, so the hook installs
-// and works this run), prefers the second slot with the CURRENT bytes when
-// the primary is locked, and only errors when neither slot is usable.
+// Get the on-disk hook DLL for this build, writing the embedded copy under
+// its build-unique name if needed. The name derives from the bytes, so the
+// write can never hit a file a running process has mapped — Explorer and
+// injected apps keep the previous build mapped for the whole session, but
+// that is handled by cleanup_hook_dlls: old files die when their last
+// holder exits or at the next boot, and newly started processes always load
+// the current build.
 fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -512,57 +542,13 @@ fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| format!("could not resolve config dir: {e}"))?;
     fs::create_dir_all(&dir).map_err(|e| format!("could not create config dir: {e}"))?;
 
-    let primary = dir.join(HOOK_DLL_SLOTS[0]);
-    let alternate = dir.join(HOOK_DLL_SLOTS[1]);
-
-    // 1. A slot already carrying the current bytes (a previous run wrote
-    //    it): use it and tidy the other slot. A matching-but-mapped copy is
-    //    fine to serve — loading a mapped file is exactly what the hook does.
-    for (path, other) in [(&primary, &alternate), (&alternate, &primary)] {
-        if dll_matches_current(path) {
-            let _ = fs::remove_file(other);
-            remove_legacy_hook_dlls(&dir);
-            return Ok(path.clone());
-        }
+    let path = dir.join(hook_dll_name());
+    if !dll_matches_current(&path) {
+        fs::write(&path, EMBEDDED_HOOK_DLL)
+            .map_err(|e| format!("could not write the explorer hook DLL: {e}"))?;
     }
-
-    // 2. Primary slot, current bytes.
-    if write_hook_dll(&primary).is_ok() {
-        let _ = fs::remove_file(&alternate);
-        remove_legacy_hook_dlls(&dir);
-        return Ok(primary);
-    }
-
-    // 3. Primary is locked. If it holds a COMPATIBLE previous build, prefer
-    //    the alternate slot with the CURRENT bytes so this run gets the new
-    //    build; fall back to serving the locked compatible copy.
-    if dll_has_current_layout(&primary) {
-        if write_hook_dll(&alternate).is_ok() {
-            schedule_delete_at_boot(&primary);
-            remove_legacy_hook_dlls(&dir);
-            return Ok(alternate);
-        }
-        log::warn!(
-            "[explorer-hook] serving previous hook build (locked by running processes, same layout); current build deferred"
-        );
-        remove_legacy_hook_dlls(&dir);
-        return Ok(primary);
-    }
-
-    // 4. Primary locked AND incompatible — only the alternate slot can carry
-    //    the current layout this run.
-    if write_hook_dll(&alternate).is_ok() {
-        schedule_delete_at_boot(&primary);
-        remove_legacy_hook_dlls(&dir);
-        return Ok(alternate);
-    }
-
-    // 5. Both slots unusable: keep the watchdog retrying, and schedule the
-    //    locked files for deletion at the next boot so a future run starts
-    //    clean.
-    schedule_delete_at_boot(&primary);
-    schedule_delete_at_boot(&alternate);
-    Err("the previous hook DLL is still loaded in running processes; the new build will be applied once those processes exit (restart Explorer or reboot)".to_string())
+    cleanup_hook_dlls(&dir, Some(&path));
+    Ok(path)
 }
 
 // Load the DLL into this process (so SetWindowsHookExW can resolve its hook
