@@ -108,6 +108,12 @@ export async function loadMonitors() {
 
 export function setActiveMonitor(mon) {
   activeMonitor.mon = mon || null;
+  // Black Crush profiles use the same selected-monitor model. Re-apply the
+  // current mode's profile immediately so the gamma backend's per-monitor
+  // table follows the selector, even when the Crush tab is not mounted.
+  if (configLoaded.v && app.displayInfo.refreshRateHz) {
+    applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
+  }
   saveConfig();
   // Keep the hook's per-monitor table in sync from any tab.
   syncTextPerMonitor();

@@ -1,6 +1,6 @@
 // power.rs — power saving controls: display/sleep timeouts, the screen saver,
 // an instant "turn off display" action, and a screen protector that fades the
-// display to black via a fullscreen overlay after a configurable idle timeout
+// display output after a configurable idle timeout
 // (a burn-in protection nicety no other tool offers).
 //
 // Timeouts are read/written through powrprof.dll (PowerGetActiveScheme +
@@ -17,18 +17,14 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use serde::Serialize;
-use windows::core::{BOOL, GUID, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, FillRect, GetStockObject, InvalidateRect, BLACK_BRUSH, HBRUSH,
-    PAINTSTRUCT,
-};
+use windows::core::{GUID, PCWSTR};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
@@ -36,20 +32,11 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateCursor, CreateWindowExW, DefWindowProcW, EnumWindows, GetClassNameW, GetSystemMetrics,
-    GetTopWindow, GetWindow, GetWindowLongPtrW, GetWindowTextW, IsWindowVisible, PostMessageW,
-    RegisterClassW, SetLayeredWindowAttributes, SetSystemCursor, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, SystemParametersInfoW,
-    HTTRANSPARENT, HWND_BROADCAST, HWND_TOPMOST, LWA_ALPHA, SC_MONITORPOWER,
+    PostMessageW, SystemParametersInfoW,
+    HWND_BROADCAST, SC_MONITORPOWER,
     SPI_GETSCREENSAVEACTIVE, SPI_GETSCREENSAVETIMEOUT, SPI_SETSCREENSAVEACTIVE,
-    SPI_SETSCREENSAVETIMEOUT, SPI_SETCURSORS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE,
-    WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_SYSCOMMAND, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, GW_HWNDNEXT, GWLP_HWNDPARENT, HCURSOR, SYSTEM_CURSOR_ID,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    OCR_APPSTARTING, OCR_CROSS, OCR_HAND, OCR_HELP, OCR_IBEAM, OCR_ICON, OCR_NO, OCR_NORMAL,
-    OCR_SIZENS, OCR_SIZENESW, OCR_SIZENWSE, OCR_SIZE, OCR_SIZEALL, OCR_SIZEWE, OCR_UP, OCR_WAIT,
+    SPI_SETSCREENSAVETIMEOUT, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE,
+    WM_SYSCOMMAND,
 };
 
 // powercfg GUIDs (the same constants powercfg uses internally). Data4 is the
@@ -459,18 +446,20 @@ pub fn power_turn_off_display() -> Result<(), String> {
 // back up. Unlike the old "dim before off", this is its own protector: it
 // does not depend on Windows' display-off timeout.
 //
-// The fade is rendered with a fullscreen always-on-top click-through native
-// overlay window (alpha via SetLayeredWindowAttributes), NOT a gamma ramp:
-// SetDeviceGammaRamp does not apply under Windows HDR, and the overlay works
-// in HDR. Black crush's gamma lift lives underneath the overlay, so the two
-// features coexist with no interaction.
+// The fade is rendered through per-monitor gamma ramps rather than a window
+// overlay. This covers Windows shell flyouts and taskbar previews as well as
+// ordinary windows. Black Crush values are composed into the same ramps so the
+// screen protector restores the selected per-monitor calibration correctly.
 
-const POLL_MS: u64 = 50;
+// 60 Hz keeps the gamma fade aligned with normal display frame cadence while
+// avoiding the coarse 20 Hz stepping that was visible during the transition.
+const POLL_MS: u64 = 16;
+const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
 const MIN_SCREEN_PROTECTOR_SECONDS: u32 = 5;
 const MAX_SCREEN_PROTECTOR_SECONDS: u32 = 180;
 const DEFAULT_SCREEN_PROTECTOR_OPACITY: u32 = 800;
-const DEFAULT_SCREEN_PROTECTOR_FADE_IN_MS: u32 = 2000;
-const DEFAULT_SCREEN_PROTECTOR_FADE_OUT_MS: u32 = 1000;
+const DEFAULT_SCREEN_PROTECTOR_FADE_IN_MS: u32 = 1000;
+const DEFAULT_SCREEN_PROTECTOR_FADE_OUT_MS: u32 = 200;
 
 // The screen protector rests at a partial dim by default. The target is stored
 // as the inverse dim-factor level so opacity remains a simple 0..100% setting
@@ -486,6 +475,16 @@ static DIM_TIMEOUT_SECONDS: AtomicU32 = AtomicU32::new(30);
 // while idle is below the timeout, so the overlay stays transparent.
 static DIM_LEVEL: AtomicU32 = AtomicU32::new(1000);
 static DIM_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+struct GammaDimContext {
+    // Fallback for the primary monitor while the frontend is still loading
+    // the selected monitor's profile into the per-monitor table.
+    desired: Arc<AtomicI32>,
+    per_monitor: Arc<Mutex<HashMap<String, i32>>>,
+    brightness: Arc<AtomicU32>,
+}
+
+static GAMMA_DIM_CONTEXT: OnceLock<GammaDimContext> = OnceLock::new();
 static DIM_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 
 fn last_input_ms() -> u32 {
@@ -535,16 +534,15 @@ fn dim_level_for_opacity(opacity: f64) -> u32 {
     low.min(1000)
 }
 
-fn transition_steps(duration_ms: u32) -> u32 {
-    ((duration_ms as u64 + POLL_MS - 1) / POLL_MS).max(1) as u32
-}
-
-fn transition_step(current: u32, target: u32, duration_ms: u32) -> u32 {
-    if current == target || duration_ms == 0 {
-        return current.abs_diff(target);
+// Interpolate the level against elapsed time rather than advancing by a
+// fixed integer step. This keeps the configured duration accurate and avoids
+// visible stalls/jumps when the scheduler wakes a little late.
+fn interpolated_level(from: u32, target: u32, elapsed_ms: u128, duration_ms: u32) -> u32 {
+    if from == target || duration_ms == 0 {
+        return target;
     }
-    let ticks = transition_steps(duration_ms);
-    ((current.abs_diff(target) + ticks - 1) / ticks).max(1)
+    let progress = (elapsed_ms as f64 / duration_ms as f64).clamp(0.0, 1.0);
+    (from as f64 + (target as f64 - from as f64) * progress).round() as u32
 }
 
 fn configure_screen_protector(
@@ -566,7 +564,7 @@ fn configure_screen_protector(
     DIM_FADE_OUT_MS.store(fade_out_duration_ms.min(5000) as u32, Ordering::Release);
 }
 
-// ── Overlay window ──────────────────────────────────────────────────
+/*
 // A fullscreen WS_POPUP window with WS_EX_LAYERED (alpha-driven), plus
 // WS_EX_TRANSPARENT + WS_EX_NOACTIVATE + HTTRANSPARENT so it never steals
 // input — any physical mouse/keyboard input still updates the system idle
@@ -721,72 +719,27 @@ fn virtual_screen_rect() -> RECT {
     }
 }
 
-// Render the given dim level through the overlay: alpha = 255 × (1 − eased
-// brightness). Level 1000 makes the overlay fully transparent. The window is
-// kept alive at alpha 0 instead of hidden, preserving the topmost z-order and
-// avoiding a taskbar-dimmer flash when the protector restores. The
-// The default 80% overlay opacity is an ~80%-opaque black veil (≈20%
-// visible brightness).
+*/
+// Apply the current screen-protector level through the per-monitor gamma
+// ramps. 1000 is full brightness; lower values multiply the existing Black
+// Crush ramp so the calibration is preserved while every monitor is dimmed.
 fn apply_dim_level(level: u32) {
-    let raw = OVERLAY_HWND.load(Ordering::Acquire);
-    if raw == 0 {
-        return;
-    }
-    let hwnd = HWND(raw as *mut c_void);
-    let alpha = (255.0 * (1.0 - dim_factor(level)))
-        .round()
-        .clamp(0.0, 255.0) as u8;
-    unsafe {
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-        if alpha == 0 {
-            // Do not hide the window. Removing a topmost window from the z-order
-            // can trigger the taskbar dimmer's repair path and briefly flash its
-            // overlay. An alpha-zero layered window is visually and functionally
-            // inert while keeping the z-order stable.
-        } else {
-            let rect = virtual_screen_rect();
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(
-                    SWP_NOACTIVATE.0 | SWP_SHOWWINDOW.0,
-                ),
-            );
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = InvalidateRect(Some(hwnd), None, true);
-        }
+    let brightness = (dim_factor(level) * 1000.0).round().clamp(0.0, 1000.0) as u32;
+    if let Some(context) = GAMMA_DIM_CONTEXT.get() {
+        context.brightness.store(brightness, Ordering::Release);
+        crate::apply_screen_gamma_ramps(
+            &context.desired,
+            &context.per_monitor,
+            brightness,
+            brightness == 1000,
+        );
     }
 }
 
-// Windows shell flyouts (notification center, taskbar previews, ...) are
-// topmost popups that can appear AFTER the dim starts. The overlay only
-// re-asserts topmost while the dim level is changing, so a flyout opened
-// during the hold phase would sit above the veil. While the dim is active a
-// periodic repair re-inserts the overlay at the front of the topmost band,
-// yielding to the app's own mode-change flyout (like the taskbar dimmer).
-const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
+/*
 
 fn overlay_needs_zorder_repair(hwnd: HWND) -> bool {
-    let flyout = crate::taskbar_dimmer::active_flyout_hwnd();
-    unsafe {
-        let Ok(top) = GetTopWindow(None) else {
-            return true;
-        };
-        if top == hwnd {
-            // Already at the front of the band.
-            return false;
-        }
-        // The mode-change flyout at the very top is correct only when the
-        // overlay sits directly below it.
-        if flyout != 0 && top == HWND(flyout as *mut c_void) {
-            return !matches!(GetWindow(top, GW_HWNDNEXT), Ok(next) if next == hwnd);
-        }
-    }
-    true
+    unsafe { GetTopWindow(None).map(|top| top != hwnd).unwrap_or(true) }
 }
 
 fn repair_overlay_zorder() {
@@ -808,14 +761,10 @@ fn repair_overlay_zorder() {
     if !overlay_needs_zorder_repair(hwnd) {
         return;
     }
-    let insert_after = match crate::taskbar_dimmer::active_flyout_hwnd() {
-        0 => Some(HWND_TOPMOST),
-        raw => Some(HWND(raw as *mut c_void)),
-    };
     unsafe {
         let _ = SetWindowPos(
             hwnd,
-            insert_after,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
@@ -918,58 +867,67 @@ fn ensure_cursor_visible() {
     CURSOR_LAST_REFRESH_MS.store(0, Ordering::Release);
 }
 
+*/
 fn dim_watcher_loop() {
-    let mut last_zorder_repair = std::time::Instant::now();
+    let mut transition_target = 1000u32;
+    let mut transition_from = 1000u32;
+    let mut transition_started = std::time::Instant::now();
+    let mut fullscreen_active = false;
+    let mut last_fullscreen_check =
+        std::time::Instant::now() - std::time::Duration::from_millis(FULLSCREEN_CHECK_INTERVAL_MS);
+
     while !DIM_SHUTDOWN.load(Ordering::Acquire) {
-        // While the overlay is visible, periodically re-assert the front of
-        // the topmost band so Windows flyouts (notification center, taskbar
-        // previews) that opened after the dim started stay covered.
-        if DIM_LEVEL.load(Ordering::Acquire) < 1000
-            && last_zorder_repair.elapsed()
-                >= std::time::Duration::from_millis(ZORDER_REPAIR_INTERVAL_MS)
-        {
-            repair_overlay_zorder();
-            last_zorder_repair = std::time::Instant::now();
-        }
         let enabled = DIM_ENABLED.load(Ordering::Acquire);
+        if enabled
+            && last_fullscreen_check.elapsed().as_millis() as u64
+                >= FULLSCREEN_CHECK_INTERVAL_MS
+        {
+            // Reuse the Taskbar Dimmer's fullscreen geometry/style detector.
+            // The check is cached between calls so the gamma fade can still
+            // run at 60 Hz without repeating the Win32 window inspection.
+            fullscreen_active = crate::taskbar_dimmer::fullscreen_active_for_screen();
+            last_fullscreen_check = std::time::Instant::now();
+        }
         let timeout = DIM_TIMEOUT_SECONDS.load(Ordering::Acquire);
         let idle = idle_seconds();
         // Fully bright until idle reaches the timeout, then dim to the floor.
-        // Input resets idle, so the next tick starts fading back up.
-        let target = if enabled && idle >= timeout {
+        // Input resets idle, and fullscreen content also forces the bright
+        // target so the screen dimmer never darkens a fullscreen app.
+        let target = if enabled && !fullscreen_active && idle >= timeout {
             DIM_TARGET_LEVEL.load(Ordering::Acquire)
         } else {
             1000
         };
         let current = DIM_LEVEL.load(Ordering::Acquire);
-        if target == 1000 && current < 1000 {
-            // Restore the cursor as soon as input resets the idle timer. Do not
-            // wait for the overlay fade to finish.
-            sync_cursor(1000);
+
+        // If input interrupts a fade, continue smoothly from the exact level
+        // already displayed instead of restarting from either endpoint.
+        if target != transition_target {
+            transition_from = current;
+            transition_target = target;
+            transition_started = std::time::Instant::now();
         }
+
         if current != target {
-            // Use the configured transition duration while preserving the
-            // smooth eased brightness curve.
-            let duration = if current < target {
-                DIM_FADE_OUT_MS.load(Ordering::Acquire)
-            } else {
+            // A falling level makes the dimmer fade in; a rising level fades
+            // it out. The gamma curve itself is smoothstep-shaped, so a
+            // time-linear level produces a smooth visual fade without adding
+            // a second, overly sluggish easing curve.
+            let duration = if target < transition_from {
                 DIM_FADE_IN_MS.load(Ordering::Acquire)
-            };
-            let step = transition_step(current, target, duration);
-            let next = if current < target {
-                current.saturating_add(step).min(target)
             } else {
-                current.saturating_sub(step).max(target)
+                DIM_FADE_OUT_MS.load(Ordering::Acquire)
             };
-            DIM_LEVEL.store(next, Ordering::Release);
-            apply_dim_level(next);
-        }
-        // During restoration the cursor must remain visible even while the
-        // overlay is still fading. During dimming/holding, keep it hidden.
-        if target == 1000 {
-            sync_cursor(1000);
-        } else {
-            sync_cursor(DIM_LEVEL.load(Ordering::Acquire));
+            let next = interpolated_level(
+                transition_from,
+                transition_target,
+                transition_started.elapsed().as_millis(),
+                duration,
+            );
+            if next != current {
+                DIM_LEVEL.store(next, Ordering::Release);
+                apply_dim_level(next);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
@@ -996,7 +954,15 @@ pub fn init(
     screen_protector_opacity: f64,
     screen_protector_fade_in_duration_ms: u64,
     screen_protector_fade_out_duration_ms: u64,
+    gamma_desired: Arc<AtomicI32>,
+    gamma_per_monitor: Arc<Mutex<HashMap<String, i32>>>,
+    gamma_brightness: Arc<AtomicU32>,
 ) {
+    let _ = GAMMA_DIM_CONTEXT.set(GammaDimContext {
+        desired: gamma_desired,
+        per_monitor: gamma_per_monitor,
+        brightness: gamma_brightness,
+    });
     configure_screen_protector(
         screen_protector_enabled,
         screen_protector_seconds,
@@ -1004,10 +970,6 @@ pub fn init(
         screen_protector_fade_in_duration_ms,
         screen_protector_fade_out_duration_ms,
     );
-    // The overlay is created eagerly (hidden) so the debug preview works even
-    // while the protector is disabled. Must run on the main thread (setup),
-    // which it does: the app's message loop pumps its WM_PAINT.
-    let _ = create_overlay();
     if screen_protector_enabled {
         ensure_watcher();
     }
@@ -1035,12 +997,11 @@ pub fn shutdown() {
             }
         }
     }
-    // The overlay window is intentionally not destroyed here: DestroyWindow
-    // must run on the creating (main) thread, and the process is exiting
-    // anyway — Windows cleans it up. Restore the cursor before the counters
-    // are torn down, in case we are exiting while dimmed.
+    // Restore gamma before the process exits, in case shutdown occurs while
+    // the protector is dimmed. The GammaState teardown also resets its normal
+    // Black Crush ramps immediately afterward.
     DIM_LEVEL.store(1000, Ordering::Release);
-    ensure_cursor_visible();
+    apply_dim_level(1000);
 }
 
 // ── Tauri commands ──────────────────────────────────────────────────
@@ -1117,9 +1078,7 @@ pub fn power_set_screen_protector(
 }
 
 // Debug helper: preview the screen protector without waiting out the real idle
-// timeout. Mirrors the watcher exactly — fade to black over ~2 s, HOLD dimmed
-// until any input arrives (the click itself gets a short grace), then fade
-// back up. Runs on a background thread so the command returns instantly.
+// timeout. Uses the same time-based interpolation and cadence as the watcher.
 #[tauri::command]
 pub fn power_dim_preview() -> Result<(), String> {
     std::thread::Builder::new()
@@ -1129,43 +1088,48 @@ pub fn power_dim_preview() -> Result<(), String> {
             // does not instantly cancel the preview.
             let start_input = last_input_ms();
             let target_level = DIM_TARGET_LEVEL.load(Ordering::Acquire);
-            let fade_in_steps = transition_steps(DIM_FADE_IN_MS.load(Ordering::Acquire));
-            // Fade down using the current Screen Dimmer opacity and duration.
-            for step in 0..=fade_in_steps {
+            let fade_in_duration = DIM_FADE_IN_MS.load(Ordering::Acquire);
+            let fade_started = std::time::Instant::now();
+
+            loop {
                 if last_input_ms().wrapping_sub(start_input) > 150 {
                     apply_dim_level(1000);
-                    sync_cursor(1000);
                     log::info!("[power] screen protector preview cancelled by input");
                     return;
                 }
-                let t = 1.0 - (step as f32 / fade_in_steps as f32);
-                let level =
-                    (t * (1000 - target_level) as f32 + target_level as f32).round() as u32;
+                let level = interpolated_level(
+                    1000,
+                    target_level,
+                    fade_started.elapsed().as_millis(),
+                    fade_in_duration,
+                );
                 apply_dim_level(level);
-                sync_cursor(level);
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                if level == target_level {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             }
             log::info!("[power] screen protector preview dimmed; waiting for input");
-            // Hold dimmed until any input arrives, then restore at the same
-            // ~1 s pace as the real protector. Keep the overlay above any
-            // flyout that opens while the preview holds.
+
+            // Hold dimmed until any input arrives.
             while last_input_ms().wrapping_sub(start_input) <= 150 {
-                repair_overlay_zorder();
-                sync_cursor(DIM_TARGET_LEVEL.load(Ordering::Acquire));
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             }
-            // Restore the cursor immediately when input is detected, before
-            // beginning the overlay's brightness fade.
-            sync_cursor(1000);
-            let restore_steps = transition_steps(DIM_FADE_OUT_MS.load(Ordering::Acquire));
-            for step in 0..=restore_steps {
-                let t = step as f32 / restore_steps as f32;
-                let level =
-                    (t * (1000 - target_level) as f32 + target_level as f32).round() as u32;
+
+            let fade_out_duration = DIM_FADE_OUT_MS.load(Ordering::Acquire);
+            let restore_started = std::time::Instant::now();
+            loop {
+                let level = interpolated_level(
+                    target_level,
+                    1000,
+                    restore_started.elapsed().as_millis(),
+                    fade_out_duration,
+                );
                 apply_dim_level(level);
-                // Keep the cursor visible throughout the overlay fade.
-                sync_cursor(1000);
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                if level == 1000 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             }
             log::info!("[power] screen protector preview restored");
         })

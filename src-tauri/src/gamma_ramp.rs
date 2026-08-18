@@ -64,6 +64,21 @@ pub fn build_linear_ramp() -> GammaRamp {
     ramp
 }
 
+/// Builds the existing Black Crush ramp with an additional per-channel
+/// brightness multiplier. `brightness = 1.0` preserves the normal ramp;
+/// `brightness = 0.0` produces black while keeping the ramp shape available
+/// for a smooth restore. This is the screen protector's gamma-based dim path.
+pub fn build_dimmed_ramp(black_lift: i32, brightness: f32) -> GammaRamp {
+    let mut ramp = build_ramp(black_lift);
+    let brightness = brightness.clamp(0.0, 1.0) as f64;
+    for channel in [&mut ramp.red, &mut ramp.green, &mut ramp.blue] {
+        for value in channel.iter_mut() {
+            *value = (*value as f64 * brightness).round().clamp(0.0, 65535.0) as u16;
+        }
+    }
+    ramp
+}
+
 /// Applies a ramp to the PRIMARY display only (`GetDC(None)` targets the
 /// desktop DC of the primary monitor). The Black Crush profile keys in the
 /// frontend are scoped per-monitor, but the gamma write always lands on the
@@ -180,5 +195,15 @@ mod tests {
             let ramp = build_ramp(lift);
             assert_eq!(ramp.red[255], 65535, "lift {lift}");
         }
+    }
+
+    #[test]
+    fn dimmed_ramp_scales_existing_calibration() {
+        let base = build_ramp(100);
+        let dimmed = build_dimmed_ramp(100, 0.25);
+        assert_eq!(build_dimmed_ramp(100, 1.0), base);
+        assert!(dimmed.red[32] < base.red[32]);
+        assert_eq!(dimmed.red[0], 0);
+        assert!((dimmed.red[255] as i32 - 16384).abs() <= 1);
     }
 }

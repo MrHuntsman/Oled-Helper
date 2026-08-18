@@ -23,7 +23,7 @@ use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 use std::sync::{
-    atomic::{AtomicBool, AtomicI32, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
@@ -218,8 +218,11 @@ struct GammaState {
     // Per-monitor black-lift values keyed by the monitor's stable signature
     // (see monitors::AppMonitor::sig). The safety thread re-applies these to
     // their own devices alongside the global value, and shutdown resets every
-    // affected monitor. Zero entries are removed (linear = OS default).
+    // affected monitor. Entries may contain an explicit zero so the screen
+    // protector can distinguish it from an uninitialized profile.
     per_monitor: Arc<Mutex<HashMap<String, i32>>>,
+    // Current screen-protector gamma brightness: 1000 = unmodified.
+    screen_dim_brightness: Arc<AtomicU32>,
     shutdown: Arc<GammaShutdown>,
     safety_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -258,27 +261,47 @@ fn reset_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
     }
 }
 
-// Re-applies every non-zero per-monitor lift to its own device. Called from
-// the safety loop so external resets are corrected on secondary displays too.
-fn reapply_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
-    let lifts: Vec<(String, i32)> = {
-        let Ok(map) = per_monitor.lock() else {
-            return;
-        };
-        map.iter()
-            .filter(|(_, &v)| v != 0)
-            .map(|(sig, &v)| (sig.clone(), v))
-            .collect()
-    };
-    if lifts.is_empty() {
+// Applies the current Black Crush profiles with an additional screen-level
+// brightness multiplier. The screen protector uses this instead of a window
+// overlay, so every connected monitor (including shell flyouts) is dimmed by
+// the display gamma path.
+pub(crate) fn apply_screen_gamma_ramps(
+    desired: &AtomicI32,
+    per_monitor: &Mutex<HashMap<String, i32>>,
+    brightness_thousandths: u32,
+    restore_unconfigured: bool,
+) {
+    if crate::vendor_info::nvidia_reference_mode_enabled() {
         return;
     }
-    let devices = crate::monitors::monitor_device_names();
-    for (sig, lift) in lifts {
-        if let Some(device) = devices.get(&sig) {
-            let ramp = gamma_ramp::build_ramp(lift);
+    let _gamma_guard = crate::hotkeys::gamma_write_guard();
+    let brightness = (brightness_thousandths.min(1000) as f32) / 1000.0;
+    let dimmed = brightness_thousandths < 1000;
+    let values: HashMap<String, i32> = per_monitor
+        .lock()
+        .map(|map| map.clone())
+        .unwrap_or_default();
+    let primary_fallback = desired.load(Ordering::Relaxed);
+    for monitor in crate::monitors::all_monitors() {
+        if monitor.device_name.is_empty() {
+            continue;
+        }
+        let sig = monitor.sig();
+        // The primary fallback preserves the existing global Black Crush
+        // value during startup. Every write below is still per-monitor; the
+        // global SetDeviceGammaRamp path is never used for screen dimming.
+        let lift = values.get(&sig).copied().unwrap_or_else(|| {
+            if monitor.primary { primary_fallback } else { 0 }
+        });
+        let has_profile = values.contains_key(&sig);
+        if (has_profile && (lift != 0 || dimmed || restore_unconfigured))
+            || (!has_profile && monitor.primary && primary_fallback != 0)
+            || dimmed
+            || restore_unconfigured
+        {
+            let ramp = gamma_ramp::build_dimmed_ramp(lift, brightness);
             unsafe {
-                gamma_ramp::set_monitor_ramp(device, &ramp);
+                let _ = gamma_ramp::set_monitor_ramp(&monitor.device_name, &ramp);
             }
         }
     }
@@ -287,6 +310,7 @@ fn reapply_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
 fn gamma_safety_loop(
     desired: Arc<AtomicI32>,
     per_monitor: Arc<Mutex<HashMap<String, i32>>>,
+    screen_dim_brightness: Arc<AtomicU32>,
     shutdown: Arc<GammaShutdown>,
 ) {
     loop {
@@ -317,20 +341,16 @@ fn gamma_safety_loop(
         if crate::vendor_info::nvidia_reference_mode_enabled() {
             continue;
         }
-        // Per-monitor entries re-apply regardless of the global value (a
-        // secondary monitor's lift must survive even when the primary is at
-        // zero); the helper skips zero entries and empty maps cheaply.
-        reapply_per_monitor_ramps(&per_monitor);
-        let value = desired.load(Ordering::Relaxed);
-        // When black lift is zero the system ramp is linear (OS default) ,
-        // nothing to restore. Skip the GDI call to keep the thread truly
-        // idle while black crush is disabled.
-        if value == 0 {
-            continue;
-        }
-        let ramp = gamma_ramp::build_ramp(value);
-        unsafe {
-            gamma_ramp::set_display_ramp(&ramp);
+        let brightness = screen_dim_brightness.load(Ordering::Acquire);
+        // Re-apply only through each monitor's own GDI device. At full
+        // brightness with no Black Crush values the helper remains a no-op.
+        apply_screen_gamma_ramps(&desired, &per_monitor, brightness, false);
+        let global_lift = desired.load(Ordering::Relaxed);
+        if global_lift != 0 {
+            let ramp = gamma_ramp::build_ramp(global_lift);
+            unsafe {
+                let _ = gamma_ramp::set_display_ramp(&ramp);
+            }
         }
     }
 }
@@ -451,7 +471,7 @@ fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), Str
 // Same as apply_gamma_ramp but targets a specific monitor (by stable
 // signature) instead of the primary. Used by per-monitor Black Crush when the
 // frontend has a monitor selected; the primary monitor goes through the global
-// path above. A zero lift removes the entry (linear ramp, no safety re-apply).
+// path above. The per-monitor table keeps explicit zero values too.
 #[tauri::command]
 fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i32) -> Result<(), String> {
     let black_lift = black_lift.clamp(-150, 150);
@@ -464,7 +484,8 @@ fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i32) 
             .get(&sig)
             .cloned()
             .ok_or_else(|| format!("no display device for monitor {sig}"))?;
-        let ramp = gamma_ramp::build_ramp(black_lift);
+        let brightness = state.screen_dim_brightness.load(Ordering::Acquire).min(1000) as f32 / 1000.0;
+        let ramp = gamma_ramp::build_dimmed_ramp(black_lift, brightness);
         let applied = unsafe { gamma_ramp::set_monitor_ramp(&device, &ramp) };
         if !applied {
             return Err("SetDeviceGammaRamp failed".into());
@@ -475,11 +496,10 @@ fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i32) 
             .per_monitor
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if black_lift == 0 {
-            map.remove(&sig);
-        } else {
-            map.insert(sig, black_lift);
-        }
+        // Keep zero as an explicit per-monitor value. Removing it would make
+        // the screen protector fall back to the primary/global profile and
+        // could reintroduce an old lift on a monitor intentionally set to 0.
+        map.insert(sig, black_lift);
     }
     Ok(())
 }
@@ -612,6 +632,7 @@ pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
             let _ = handle.join();
         }
     }
+    state.screen_dim_brightness.store(1000, Ordering::Release);
     unsafe {
         gamma_ramp::reset_display_ramp();
         reset_per_monitor_ramps(&state.per_monitor);
@@ -1133,6 +1154,7 @@ pub fn run() {
         .manage(GammaState {
             desired: gamma_desired,
             per_monitor: Arc::new(Mutex::new(HashMap::new())),
+            screen_dim_brightness: Arc::new(AtomicU32::new(1000)),
             shutdown: Arc::new(GammaShutdown {
                 requested: AtomicBool::new(false),
                 wake: Condvar::new(),
@@ -1265,10 +1287,16 @@ pub fn run() {
                 let state = app.state::<GammaState>();
                 let desired = state.desired.clone();
                 let per_monitor = state.per_monitor.clone();
+                let screen_dim_brightness = state.screen_dim_brightness.clone();
                 let shutdown = state.shutdown.clone();
                 let handle = std::thread::Builder::new()
                     .name("gamma-safety".into())
-                    .spawn(move || gamma_safety_loop(desired, per_monitor, shutdown))
+                    .spawn(move || gamma_safety_loop(
+                        desired,
+                        per_monitor,
+                        screen_dim_brightness,
+                        shutdown,
+                    ))
                     .map_err(|error| format!("could not start gamma safety thread: {error}"))?;
                 state
                     .safety_thread
@@ -1325,6 +1353,19 @@ pub fn run() {
             // must see the saved values, not the state defaults.
             let saved_config = config::load_config(app.handle().clone());
 
+            // Seed the backend's global gamma fallback before the screen-
+            // protector worker starts. Per-monitor Black Crush profiles are
+            // keyed by display identity + mode and are resolved by the
+            // frontend's existing monitor-profile path immediately afterward;
+            // the backend map is populated by apply_gamma_ramp_for.
+            {
+                let state = app.state::<GammaState>();
+                state.desired.store(
+                    (saved_config.black_lift * 10.0).round().clamp(-150.0, 150.0) as i32,
+                    Ordering::Release,
+                );
+            }
+
             // Seed the taskbar dimmer state from the persisted config. The
             // main window's frontend applies these to the overlay shortly
             // after launch, but the pre-warmed tray menu reads status before
@@ -1360,13 +1401,19 @@ pub fn run() {
 
             // Start the screen protector watcher if a timeout was persisted,
             // so the dim works even before the frontend loads its config.
-            crate::power::init(
-                saved_config.screen_protector_enabled,
-                saved_config.screen_protector_seconds,
-                saved_config.screen_protector_opacity,
-                saved_config.screen_protector_fade_in_duration_ms,
-                saved_config.screen_protector_fade_out_duration_ms,
-            );
+            {
+                let state = app.state::<GammaState>();
+                crate::power::init(
+                    saved_config.screen_protector_enabled,
+                    saved_config.screen_protector_seconds,
+                    saved_config.screen_protector_opacity,
+                    saved_config.screen_protector_fade_in_duration_ms,
+                    saved_config.screen_protector_fade_out_duration_ms,
+                    state.desired.clone(),
+                    state.per_monitor.clone(),
+                    state.screen_dim_brightness.clone(),
+                );
+            }
 
             flyout_window::prewarm(app.handle());
             log::info!("[tray] mode flyout window ready");
