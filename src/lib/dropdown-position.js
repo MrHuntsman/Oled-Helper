@@ -46,7 +46,14 @@ export function updateDropdownPlacement(triggerEl, menuEl, options = {}) {
     && triggerRect.right <= viewportWidth - viewportMargin;
   const leftFits = triggerRect.left >= viewportMargin
     && leftAlignedRight <= viewportWidth - viewportMargin;
-  const alignment = rightFits ? 'right' : leftFits ? 'left' : 'center';
+  // A forced alignment (`options.align`) anchors the menu to a specific side
+  // of its trigger regardless of the fit check. Used by controls whose
+  // dropdown is expected to hang off a particular edge (e.g. a right-side
+  // trigger whose menu should stay right-aligned even when the free space
+  // to its left is narrower than the menu).
+  const alignment = options.align === 'right' || options.align === 'left'
+    ? options.align
+    : rightFits ? 'right' : leftFits ? 'left' : 'center';
 
   const availableSpace = opensUp ? aboveSpace : belowSpace;
   menuEl.style.maxHeight = `${Math.max(1, Math.min(maximumHeight, Math.floor(availableSpace)))}px`;

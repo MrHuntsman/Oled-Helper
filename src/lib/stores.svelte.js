@@ -139,7 +139,6 @@ export function syncTextPerMonitor() {
   for (const [sig, k] of Object.entries(textSettings.perMonitorKnobs)) {
     invoke('explorer_hook_set_monitor_knobs', {
       sig,
-      lcdStrength: k.lcd,
       boldness: k.boldness,
       damping: k.damping,
     }).catch(() => {});
@@ -287,10 +286,9 @@ export const taskbarDimmer = $state({
 
 // Text rendering tab settings persisted in config. The Explorer hook toggle
 // decides whether the hook DLL fixes Explorer's text (Grayscale/Off
-// modes) or leaves it at system ClearType. The three render knobs (all
-// 0..100, boldness capped at 30) tune LCD filter strength (0 = no filter,
-// 100 = the crisp FreeType lcdlight filter — the default), faux boldness,
-// and fringe damping.
+// modes) or leaves it at system ClearType. The two render knobs (all
+// 0..100, boldness capped at 30) tune faux boldness and fringe damping.
+// (The LCD filter knob was removed.)
 export const textSettings = $state({
   explorerHookEnabled: false,
   // Hook scope: whether the swash detour applies to every GUI process
@@ -304,10 +302,9 @@ export const textSettings = $state({
   // system default ("Default" in the UI). Whether per-monitor resolution is
   // active is derived from whether any assignment exists — no stored flag.
   perMonitorModes: {},
-  // Per-monitor render knob triplets, sig → { lcd, boldness, damping } (all
-  // 0..=100). Absent = the defaults (full light filter, no bold, no
-  // damping). Like modes, the presence of any knob entry activates
-  // per-monitor resolution.
+  // Per-monitor render knob pairs, sig → { boldness, damping } (all
+  // 0..=100). Absent = the defaults (no bold, no damping). Like modes, the
+  // presence of any knob entry activates per-monitor resolution.
   perMonitorKnobs: {},
   // Per-monitor custom subpixel centers, sig → { rx, ry, gx, gy, bx, by }
   // (per-channel x/y fractions of a pixel). Used when the monitor's mode is
@@ -684,9 +681,6 @@ export async function loadConfig(prefetchedCfg = null) {
       for (const [sig, k] of Object.entries(cfg.per_monitor_knobs)) {
         if (k && typeof k === 'object') {
           textSettings.perMonitorKnobs[sig] = {
-            // Missing lcd in an old config means it was saved before the
-            // knob existed — default to the full light filter.
-            lcd: k.lcd == null ? 100 : clampKnob(k.lcd),
             boldness: clampBoldness(k.boldness),
             damping: clampKnob(k.damping),
           };

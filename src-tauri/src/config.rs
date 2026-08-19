@@ -29,24 +29,16 @@ pub struct FavoriteDisplayMode {
     pub hz: u32,
 }
 
-// A monitor's render knob triplet (Text tab): LCD filter strength, faux
-// boldness, and fringe damping, all 0..=100. The LCD filter interpolates
-// the subpixel FIR between identity (0, sharpest) and FreeType's light
-// filter (100, the crisp default — also the value when the knob is absent
-// in an old config). (The crosstalk / gamma / filter-width knobs were
-// removed; stale fields in old configs are ignored by serde.)
+// A monitor's render knob pair (Text tab): faux boldness and fringe
+// damping, all 0..=100. The LCD filter knob was removed; its stale field
+// in old configs is ignored by serde (as are the removed crosstalk /
+// gamma / filter-width knobs).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct MonitorKnobs {
-    #[serde(default = "default_lcd_strength")]
-    pub lcd: u32,
     #[serde(default)]
     pub boldness: u32,
     #[serde(default)]
     pub damping: u32,
-}
-
-fn default_lcd_strength() -> u32 {
-    100
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -455,12 +447,16 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
 // legacy pre-toggle shape where a non-zero timeout meant on), so the caller
 // can decide whether a UAC relaunch is warranted.
 pub fn screen_protector_enabled_on_disk() -> bool {
-    let direct = read_config_bool("screen_protector_enabled");
-    if direct {
-        return true;
-    }
-    // Legacy pre-toggle configs used a non-zero timeout to mean on.
     read_config_raw(|obj| {
+        // The explicit toggle wins whenever it is present — including an
+        // explicit false. (Falling through to the legacy heuristic on a
+        // present-but-false toggle re-enabled elevation on every launch for
+        // users who turned the dimmer off but kept a non-zero timeout.)
+        if let Some(value) = obj.get("screen_protector_enabled") {
+            return value.as_bool().unwrap_or(false);
+        }
+        // Legacy pre-toggle configs (no enabled key at all) used a non-zero
+        // timeout to mean on.
         obj.get("screen_protector_seconds")
             .and_then(|v| v.as_u64())
             .map_or(false, |seconds| seconds > 0)

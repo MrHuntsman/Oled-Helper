@@ -68,9 +68,9 @@ use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 // trusting that the module merely loaded. Offset 12 holds the hook-scope
 // flags (bit 0 = "apply to all apps"; 13..23 padding). The per-monitor table
 // lives at 24/28/32+ (flag, count, up to 8 entries x 72 bytes), each entry
-// carrying the monitor's mode, knob triplet (lcd filter strength, boldness,
-// damping; the crosstalk / gamma / filter-width slots are reserved, always
-// 0), and custom subpixel centers as six (x, y) f32 bit patterns — see
+// carrying the monitor's mode, knob pair (boldness, damping; the lcd
+// filter / crosstalk / gamma / filter-width slots are reserved, always 0),
+// and custom subpixel centers as six (x, y) f32 bit patterns — see
 // resolve_draw_options. The blocklist follows the
 // table at 608+ (count, up to 8 entries x 64 bytes = 32 UTF-16 chars): exe
 // names excluded from the detour while "all apps" scope is on.
@@ -217,7 +217,7 @@ fn state_monitor_count() -> usize {
 }
 
 // Entry i as (hmonitor, resolution, physical size, dpi, mode | flags<<8,
-// lcd filter strength, crosstalk (reserved), boldness, gamma (reserved),
+// lcd filter (reserved), crosstalk (reserved), boldness, gamma (reserved),
 // damping, filter width (reserved), subpixel r/g/b x/y as u32 bit patterns).
 // The reserved slots are kept at 0 by the app (removed filters) to keep the
 // layout stable. Offsets within an entry are all 4-aligned (STATE_MONITORS
@@ -267,26 +267,22 @@ fn hdc_caps_sig(hdc: HDC) -> (u32, u32, u32) {
     }
 }// Per-monitor render options for this draw's DC, when per-monitor is enabled:
 // the attributed monitor's mode (0 = system default / passthrough), its knob
-// triplet (0 = no adjustment), and its custom subpixel centers as per-channel
-// (x, y) pairs (all-zero = no custom offsets; only meaningful for mode 7,
-// Custom). A monitor that cannot be attributed yields None → the caller falls
-// back to the global mode + fallback knobs. Every connected monitor is in the
-// table, so a successful attribution is the normal path; the table entry's
-// mode is 0 for monitors left at the system default, which still resolves
-// here so their knobs can apply.
-fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, [[f32; 2]; 3])> {
+// pair (boldness, damping; 0 = no adjustment), and its custom subpixel
+// centers as per-channel (x, y) pairs (all-zero = no custom offsets; only
+// meaningful for mode 7, Custom). A monitor that cannot be attributed yields
+// None → the caller falls back to the global mode + fallback knobs. Every
+// connected monitor is in the table, so a successful attribution is the
+// normal path; the table entry's mode is 0 for monitors left at the system
+// default, which still resolves here so their knobs can apply.
+fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, [[f32; 2]; 3])> {
     let count = state_monitor_count();
     if count == 0 {
         return None;
     }
     // Boldness is capped at 30 by the app (≈0.3px of stroke thickening);
     // the clamp here is defense-in-depth for stale shared-memory values.
-    let knobs_of = |lcd: u32, boldness: u32, damping: u32| -> (u8, u8, u8) {
-        (
-            lcd.min(100) as u8,
-            boldness.min(30) as u8,
-            damping.min(100) as u8,
-        )
+    let knobs_of = |boldness: u32, damping: u32| -> (u8, u8) {
+        (boldness.min(30) as u8, damping.min(100) as u8)
     };
     let offsets_of = |rx: u32, ry: u32, gx: u32, gy: u32, bx: u32, by: u32| -> [[f32; 2]; 3] {
         [
@@ -302,13 +298,13 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, [[f32; 2]; 3])> {
         if !hmon.0.is_null() {
             let want = hmon.0 as usize as u32;
             for i in 0..count {
-                if let Some((h, _, _, _, mf, lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
+                if let Some((h, _, _, _, mf, _lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
                     state_monitor_entry(i)
                 {
                     if h == want {
                         MON_WINDOW.fetch_add(1, Ordering::Relaxed);
-                        let (l, b, d) = knobs_of(lcd, bd, dm);
-                        return Some((mf & 0xFF, l, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
+                        let (b, d) = knobs_of(bd, dm);
+                        return Some((mf & 0xFF, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
                     }
                 }
             }
@@ -317,13 +313,13 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, u8, [[f32; 2]; 3])> {
     // 2. Memory DC: match the device-caps signature against the table.
     let (res, phys, dpi) = hdc_caps_sig(hdc);
     for i in 0..count {
-        if let Some((_, er, ep, ed, mf, lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
+        if let Some((_, er, ep, ed, mf, _lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
             state_monitor_entry(i)
         {
             if er == res && ep == phys && ed == dpi {
                 MON_CAPS.fetch_add(1, Ordering::Relaxed);
-                let (l, b, d) = knobs_of(lcd, bd, dm);
-                return Some((mf & 0xFF, l, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
+                let (b, d) = knobs_of(bd, dm);
+                return Some((mf & 0xFF, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
             }
         }
     }
@@ -823,14 +819,13 @@ unsafe extern "system" fn try_render_swash(
     // per-monitor off) fall back to the global mode with NO knob adjustments
     // (knobs are purely per-monitor now).
     let fallback_opts = text_raster::RenderOptions {
-        lcd_strength: 100,
         boldness: 0,
         damping: 0,
         subpixel_offsets: None,
     };
     let (mode, opts) = if state_per_monitor_enabled() && global_mode != 0 {
         match resolve_draw_options(hdc) {
-            Some((m, l, b, d, offs)) => {
+            Some((m, b, d, offs)) => {
                 // Mode 0 in the table = "no explicit mode" (Default): fall
                 // back to the global mode (the system effective mode, synced
                 // into slot 0 on load) so the monitor still renders the
@@ -853,7 +848,6 @@ unsafe extern "system" fn try_render_swash(
                 (
                     mode,
                     text_raster::RenderOptions {
-                        lcd_strength: l,
                         boldness: b,
                         damping: d,
                         subpixel_offsets,
@@ -865,22 +859,20 @@ unsafe extern "system" fn try_render_swash(
     } else {
         (global_mode, fallback_opts)
     };
-    // Filter knobs are mode-scoped: a mode that can't use a filter must not
-    // inherit it from another mode's settings. Crisp ("No filter") applies
-    // NO filters at all — boldness included, so a boldness tuned in
-    // grayscale does not show up on a No-filter monitor. Grayscale applies
-    // only boldness (the LCD filter and fringe damping are subpixel-only;
-    // the rasterizer already ignores them for mask content, this keeps it
-    // explicit). RGB/BGR/Custom use the full knob triplet.
+    // Knobs are mode-scoped: a mode that can't use a knob must not inherit
+    // it from another mode's settings. Crisp ("No filter") applies NO knobs
+    // at all — boldness included, so a boldness tuned in grayscale does not
+    // show up on a No-filter monitor. Grayscale applies only boldness
+    // (fringe damping is subpixel-only; the rasterizer already ignores it
+    // for mask content, this keeps it explicit). RGB/BGR/Custom use the
+    // full knob pair.
     let opts = match mode {
         2 => text_raster::RenderOptions {
-            lcd_strength: 100,
             boldness: 0,
             damping: 0,
             subpixel_offsets: None,
         },
         1 => text_raster::RenderOptions {
-            lcd_strength: 0,
             boldness: opts.boldness,
             damping: 0,
             subpixel_offsets: None,

@@ -416,6 +416,27 @@ fn turn_off_display_now() -> Result<(), String> {
     }
 }
 
+/// Restart Windows immediately. Used after a system font replacement, which
+/// only takes effect at the next boot. Requires elevation (SeShutdownPrivilege
+/// is granted to the elevated app, and the font apply already enforces admin).
+/// EWX_FORCE skips the per-app close handshake because the frontend shows a
+/// confirmation dialog first; the reason is logged as "application, planned".
+#[tauri::command]
+pub fn system_restart() -> Result<(), String> {
+    use windows::Win32::System::Shutdown::{
+        ExitWindowsEx, EWX_FORCE, EWX_REBOOT, SHTDN_REASON_FLAG_PLANNED,
+        SHTDN_REASON_MAJOR_APPLICATION,
+    };
+    unsafe {
+        ExitWindowsEx(
+            EWX_REBOOT | EWX_FORCE,
+            SHTDN_REASON_MAJOR_APPLICATION | SHTDN_REASON_FLAG_PLANNED,
+        )
+        .map_err(|e| format!("ExitWindowsEx failed: {e}"))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn power_turn_off_display() -> Result<(), String> {
     // One pending turn-off at a time: repeated triggers while one is already

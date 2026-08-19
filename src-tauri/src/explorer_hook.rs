@@ -62,9 +62,9 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //       u32 physical size (horzsize | vertsize<<16)
 //       u32 dpi (logpixelsx | logpixelsy<<16)
 //       u32 mode | primary<<8  (mode 0 = system default, 7 = custom)
-//       u32 lcd filter strength, boldness, damping (all 0..=100; the
-//           crosstalk / gamma / filter-width slots reserved at 0 — removed
-//           filters)
+//       u32 lcd filter (reserved at 0 — removed filter), boldness,
+//           damping (all 0..=100; the crosstalk / gamma / filter-width
+//           slots likewise reserved at 0 — removed filters)
 //       u32 custom subpixel centers r/g/b x/y (f32 bits; all-zero = not set)
 // After the table, the hook-scope blocklist (count + up to 8 exe names x 32
 // UTF-16 units); offset 12 holds the hook-scope flags (bit 0 = all apps).
@@ -108,14 +108,15 @@ static TOGGLE: AtomicBool = AtomicBool::new(false);
 // Last mode-state from the Text tab (0..7), gated by TOGGLE in apply_state.
 static LAST_STATE: AtomicU32 = AtomicU32::new(0);
 // Per-monitor rendering (Text tab): master flag plus per-monitor mode
-// assignments and knob triplets keyed by the monitor's stable signature
+// assignments and knob pairs keyed by the monitor's stable signature
 // (see MonitorEntry::sig). Mode values match the DLL: 1..=7 as in
-// explorer_hook_set_mode; absent = "system default". Knobs are the LCD
-// filter strength / boldness / damping triplets (0..=100); absent = the
-// defaults (full light filter, no bold, no damping).
+// explorer_hook_set_mode; absent = "system default". Knobs are the
+// boldness / damping pairs (0..=100); absent = the defaults (no bold,
+// no damping). The LCD filter knob was removed — its shared-memory slot
+// stays reserved at 0.
 static PER_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static MONITOR_MODES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
-static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32, u32)>>> = OnceLock::new();
+static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::new();
 // Custom subpixel centers per monitor (mode 7): sig → [[r, g, b] x (x, y)]
 // as f32 fractions of a pixel. All-zero pairs are treated as unset (the
 // entry writes 0, and the DLL only uses them when the mode is 7).
@@ -227,7 +228,7 @@ fn write_state_table() -> Result<(), String> {
         std::ptr::write_volatile(base.add(STATE_MONITOR_COUNT_OFFSET) as *mut u32, count);
         for (i, e) in entries.iter().take(MAX_MONITORS).enumerate() {
             let entry = base.add(STATE_MONITORS_OFFSET + i * MONITOR_ENTRY_STRIDE);
-            let (lcd, bd, dm) = knobs.get(&e.sig()).copied().unwrap_or((100, 0, 0));
+            let (bd, dm) = knobs.get(&e.sig()).copied().unwrap_or((0, 0));
             let [[srx, sry], [sgx, sgy], [sbx, sby]] = custom
                 .get(&e.sig())
                 .copied()
@@ -249,10 +250,12 @@ fn write_state_table() -> Result<(), String> {
                 entry.add(16) as *mut u32,
                 modes.get(&e.sig()).copied().unwrap_or(0).min(7) | ((e.primary as u32) << 8),
             );
-            std::ptr::write_volatile(entry.add(20) as *mut u32, lcd.min(100));
+            // Slot 20 (LCD filter) is reserved at 0 — the filter was removed.
+            std::ptr::write_volatile(entry.add(20) as *mut u32, 0);
             // Slots 24 (crosstalk), 32 (gamma), and 40 (filter width) are
-            // reserved: the filters were removed, but the slots stay at 0 so
-            // the shared-memory layout (and HOOK_LAYOUT_MARKER) is unchanged.
+            // likewise reserved: the filters were removed, but the slots stay
+            // at 0 so the shared-memory layout (and HOOK_LAYOUT_MARKER) is
+            // unchanged.
             std::ptr::write_volatile(entry.add(24) as *mut u32, 0);
             std::ptr::write_volatile(entry.add(28) as *mut u32, bd.min(30));
             std::ptr::write_volatile(entry.add(32) as *mut u32, 0);
@@ -618,8 +621,8 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
     let enabled = TOGGLE.load(Ordering::Acquire) && last != 0;
     ENABLED.store(enabled, Ordering::Release);
     // When disabled, write passthrough so an already-loaded Explorer stops
-    // rewriting fonts immediately (no restart needed for that). Keep the LCD
-    // filter flag in sync regardless, so the DLL never reads a stale value.
+    // rewriting fonts immediately (no restart needed for that). Keep the
+    // monitor table in sync regardless, so the DLL never reads a stale value.
     write_state(if enabled { last } else { 0 })?;
     write_state_table()?;
     if enabled {
@@ -765,17 +768,13 @@ pub fn explorer_hook_monitors() -> Result<Vec<ExplorerMonitorInfo>, String> {
         .collect())
 }
 
-/// Assign a per-monitor render knob triplet (LCD filter strength, faux
-/// boldness, fringe damping; 0..=100, boldness capped at 30). The LCD
-/// filter interpolates the subpixel FIR between identity (0, sharpest) and
-/// the light filter (100, the crisp default). Written into the monitor
-/// table so the DLL applies them to that monitor's draws on the next
-/// repaint (live). An entry equal to the defaults (100, 0, 0) — "no
-/// adjustment" — clears the entry.
+/// Assign a per-monitor render knob pair (faux boldness, fringe damping;
+/// 0..=100, boldness capped at 30). Written into the monitor table so the
+/// DLL applies them to that monitor's draws on the next repaint (live). An
+/// entry equal to the defaults (0, 0) — "no adjustment" — clears the entry.
 #[tauri::command]
 pub fn explorer_hook_set_monitor_knobs(
     sig: String,
-    lcd_strength: u32,
     boldness: u32,
     damping: u32,
 ) -> Result<(), String> {
@@ -784,15 +783,11 @@ pub fn explorer_hook_set_monitor_knobs(
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let triplet = (
-            lcd_strength.min(100),
-            boldness.min(30),
-            damping.min(100),
-        );
-        if triplet == (100, 0, 0) {
+        let pair = (boldness.min(30), damping.min(100));
+        if pair == (0, 0) {
             knobs.remove(&sig);
         } else {
-            knobs.insert(sig, triplet);
+            knobs.insert(sig, pair);
         }
     }
     write_state_table()?;
@@ -890,7 +885,7 @@ pub fn apply_startup_state(
             .unwrap_or_else(|p| p.into_inner());
         knobs.clear();
         for (sig, k) in &cfg.per_monitor_knobs {
-            knobs.insert(sig.clone(), (k.lcd, k.boldness, k.damping));
+            knobs.insert(sig.clone(), (k.boldness, k.damping));
         }
     }
     {

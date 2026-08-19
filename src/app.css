@@ -79,6 +79,17 @@ button {
   cursor: pointer;
 }
 
+/* Buttons and dropdowns are interactive chrome, not text: never allow
+   dragging a selection highlight across them. Custom .dd-menu lists already
+   opt out individually; this covers every button, select, and list role in
+   one place (including the dropdown trigger buttons). */
+button,
+select,
+[role='listbox'],
+[role='option'] {
+  user-select: none;
+}
+
 /* ── Layout grid ──────────────────────────────────────────────────── */
 .app-shell {
   display: grid;
@@ -234,6 +245,26 @@ button {
 .top-bar .top-monitor-select-control:hover,
 .top-bar .top-monitor-select-control:focus-visible {
   border-color: var(--accent);
+}
+/* Custom monitor dropdown trigger: the button version of the select above,
+   hosting the collision-aware .dd-menu. The label ellipsizes at the
+   max-width instead of growing the top bar. */
+.top-bar .top-monitor-select-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.top-bar .top-monitor-select-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  text-align: left;
+  font-family: inherit;
+}
+.top-bar .top-monitor-select-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Nav buttons ──────────────────────────────────────────────────── */
@@ -518,6 +549,10 @@ button {
   background: var(--hover);
   border-color: var(--accent);
   outline: none;
+}
+.restore-defaults-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .settings-row-inline {
   flex: 1 1 auto;
@@ -1360,6 +1395,215 @@ button {
 }
 .reset-all-error {
   margin: 6px 12px 0;
+  font-size: 12px;
+  color: #ff6b6b;
+}
+
+/* System font replacement (Settings) */
+.font-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.font-section-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.font-section-heading .settings-row-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+.font-warning {
+  margin: 0;
+  font-size: 12px;
+  color: #e0a84b;
+}
+.font-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-select {
+  flex: 0 0 auto;
+  width: fit-content;
+  min-width: 0;
+  max-width: 100%;
+  background: #1c1c22;
+  color: #fff;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+.settings-select:hover:not(:disabled),
+.settings-select:focus-visible {
+  border-color: var(--accent);
+}
+.settings-select:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.settings-select option {
+  color: #fff;
+}
+/* The Windows Font dropdowns are custom .dd-menu triggers (native <select>
+   popups can't animate), styled like the old select and hosting a
+   collision-aware menu. The label ellipsizes so long family names don't
+   stretch the trigger; the caret matches the other custom dropdowns. */
+.font-select-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.font-select-trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+.font-select-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.font-select-caret,
+.top-monitor-caret {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  opacity: 0.7;
+}
+.font-btn {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--divider);
+  transition: background 0.08s, border-color 0.08s, color 0.08s;
+}
+.font-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.font-btn-apply {
+  color: #0d0d0f;
+  background: var(--accent);
+  border-color: transparent;
+}
+.font-btn-apply:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+.font-btn-restore {
+  color: var(--text-weak);
+  background: transparent;
+}
+.font-btn-restore:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+/* The Restart System button, next to Apply in the action row: amber like the
+   font warnings so it reads as the system-level action it is, distinct from
+   the neutral apply/restore buttons around it. */
+.font-btn-restart {
+  color: #e0a84b;
+}
+.font-btn-restart:hover:not(:disabled) {
+  color: #fff;
+  border-color: var(--accent);
+}
+.font-applied {
+  font-size: 12px;
+  color: var(--text-weak);
+}
+.font-applied-top {
+  margin: 0 0 10px;
+  color: var(--accent);
+}
+.font-preview-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--divider);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.08);
+}
+.font-preview-label {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-weak);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding-top: 2px;
+}
+.font-preview-sizes {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.font-preview-size-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.font-preview-size-label {
+  flex-shrink: 0;
+  width: 18px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-weak);
+  font-variant-numeric: tabular-nums;
+}
+.font-preview-text {
+  color: #fff;
+  line-height: 1.4;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.font-progress {
+  margin: 0;
+  font-size: 12px;
+  color: var(--accent);
+}
+.font-progress::before {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 2px solid var(--accent);
+  border-top-color: transparent;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: font-progress-spin 0.8s linear infinite;
+}
+@keyframes font-progress-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.font-message {
+  margin: 0;
+  font-size: 12px;
+  color: #4CD964;
+}
+.font-error {
+  margin: 0;
   font-size: 12px;
   color: #ff6b6b;
 }
@@ -2672,7 +2916,7 @@ button {
    no wheel handling at all, opens/closes only via click, outside click, or
    Escape, so an incidental page scroll elsewhere doesn't touch it. */
 .refresh-rate-wrap { position: relative; }
-.hz-menu {
+.dd-menu {
   position: absolute;
   bottom: calc(100% + 6px);
   right: 0;
@@ -2701,7 +2945,7 @@ button {
   transform-origin: bottom right;
   will-change: opacity, transform;
 }
-.hz-menu-item {
+.dd-menu-item {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -2722,7 +2966,7 @@ button {
   text-overflow: ellipsis;
   transition: background 0.08s, color 0.08s, transform 0.08s;
 }
-.hz-check {
+.dd-check {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2733,15 +2977,15 @@ button {
   font-size: 12px;
   line-height: 1;
 }
-.hz-menu-item:hover:not(.active) { background: var(--hover); color: #fff; transform: translateX(2px); }
-.hz-menu-item.active { color: var(--accent); font-weight: 400; background: color-mix(in srgb, var(--accent) 10%, transparent); }
-.hz-profile-value {
+.dd-menu-item:hover:not(.active) { background: var(--hover); color: #fff; transform: translateX(2px); }
+.dd-menu-item.active { color: var(--accent); font-weight: 400; background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.dd-profile-value {
   color: var(--text-weak);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
-.hz-menu-item.active .hz-profile-value { color: var(--accent); }
-.hz-menu-group-label {
+.dd-menu-item.active .dd-profile-value { color: var(--accent); }
+.dd-menu-group-label {
   font-size: 10px;
   font-weight: 600;
   color: var(--text-weak);
@@ -2758,7 +3002,7 @@ button {
   display: flex;
   /* Fill the 20px row (flex-basis) with the picker button + star instead
      of centering fixed-height children; keeps this row the same height as
-     the plain .hz-menu-item refresh-rate rows. min-height: 0 stops the
+     the plain .dd-menu-item refresh-rate rows. min-height: 0 stops the
      flex item's automatic content minimum from flooring the row taller. */
   align-items: stretch;
   min-height: 0;
@@ -2767,7 +3011,7 @@ button {
   border-radius: 5px;
   transition: background 0.08s, transform 0.08s;
 }
-/* Row-level hover, same highlight + slide as a plain .hz-menu-item (Hz
+/* Row-level hover, same highlight + slide as a plain .dd-menu-item (Hz
    dropdown), applied to the whole row (text + star move together) instead
    of just the picker button, so hovering anywhere on the row, including the
    star, gives the same feedback the Hz list has. */
@@ -2776,9 +3020,9 @@ button {
   transform: translateX(2px);
 }
 /* Selected (current) resolution row: the same accent tint + accent text as
-   the active .hz-menu-item refresh rows. The wrapper carries the tint across
+   the active .dd-menu-item refresh rows. The wrapper carries the tint across
    the full row (star slot included) while the inner picker button goes
-   transparent so the tint doesn't stack with its own .hz-menu-item.active. */
+   transparent so the tint doesn't stack with its own .dd-menu-item.active. */
 .res-item.active {
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 10%, transparent);
@@ -2790,14 +3034,14 @@ button {
 .res-item .res-item-main {
   flex: 1 1 auto;
   min-width: 0;
-  /* Drop the .hz-menu-item height: 32px so the button stretches to the
+  /* Drop the .dd-menu-item height: 32px so the button stretches to the
      row instead of forcing it taller. */
   height: auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* The base .hz-menu-item's own hover (background + its own translateX) is
+/* The base .dd-menu-item's own hover (background + its own translateX) is
    redundant now that the row itself carries both, and would double up the
    slide. Neutralize it here so only the row-level hover above applies. */
 .res-item .res-item-main:hover {
@@ -2843,7 +3087,7 @@ button {
   color: #e87575;
   background: color-mix(in srgb, #e87575 12%, transparent);
 }
-.res-menu .hz-menu-group-label:not(:first-child) {
+.res-menu .dd-menu-group-label:not(:first-child) {
   margin-top: 4px;
 }
 .res-item-tag {
@@ -2867,8 +3111,8 @@ button {
   color: var(--accent);
   vertical-align: middle;
 }
-.hz-menu-item:hover .ultrawide-icon { color: #fff; }
-.hz-menu-item.active .ultrawide-icon { color: var(--accent); }
+.dd-menu-item:hover .ultrawide-icon { color: #fff; }
+.dd-menu-item.active .ultrawide-icon { color: var(--accent); }
 
 /* Compact display-mode pickers in the bottom status panel. Native selects
    preserve keyboard navigation and accessibility while the styling makes
@@ -3456,7 +3700,7 @@ button {
 .auto-hdr-desc { font-size: 12px; color: var(--text-weak); margin: 2px 0 0; }
 
 /* RTX HDR mode dropdown (Windows HDR tab, NVIDIA only), reuses the app's
-   .hz-menu popup pattern; the menu opens downward, right-aligned. */
+   .dd-menu popup pattern; the menu opens downward, right-aligned. */
 .auto-hdr-detail-row {
   display: flex;
   align-items: center;
@@ -3526,7 +3770,7 @@ button {
   border-right: 4px solid transparent;
   border-top: 5px solid currentColor;
 }
-/* Generic collision-aware placement classes. Any anchored .hz-menu can use
+/* Generic collision-aware placement classes. Any anchored .dd-menu can use
    `dropdown-menu-position-{placement}` where placement is returned by
    updateDropdownPlacement() in dropdown-position.js. */
 .dropdown-menu-position-down-right {
@@ -3773,7 +4017,7 @@ button {
   cursor: default;
 }
 .favorites-menu {
-  /* Right-align with the icon (base .hz-menu is right:0), the menu opens
+  /* Right-align with the icon (base .dd-menu is right:0), the menu opens
      upward from the star's bottom-right corner. */
   max-width: 280px;
 }
@@ -4365,7 +4609,7 @@ button {
 }
 /* Custom screensaver dropdown: a native <select> popup opens downward and gets
    clipped by the bottom of the tab, so this uses a trigger button + a
-   collision-aware .hz-menu that flips upward when there is no room below. */
+   collision-aware .dd-menu that flips upward when there is no room below. */
 .power-select-wrap { position: relative; display: inline-flex; max-width: 280px; }
 .power-select-trigger {
   display: inline-flex;

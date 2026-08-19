@@ -616,14 +616,14 @@
                 </span>
                 {#if rtxHdrMenuOpen}
                   <div
-                    class="hz-menu rtx-hdr-menu dropdown-menu-position-{rtxHdrMenuPlacement}"
+                    class="dd-menu rtx-hdr-menu dropdown-menu-position-{rtxHdrMenuPlacement}"
                     bind:this={rtxHdrMenuEl}
                     role="listbox"
                     aria-label="RTX HDR mode options">
                     {#each RTX_HDR_OPTIONS as rtxOption (rtxOption.value)}
                       <button
                         type="button"
-                        class="hz-menu-item"
+                        class="dd-menu-item"
                         class:active={rtxHdrFlags === rtxOption.value}
                         role="option"
                         aria-selected={rtxHdrFlags === rtxOption.value}

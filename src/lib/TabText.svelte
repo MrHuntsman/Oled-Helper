@@ -74,13 +74,12 @@
   // The knob the sliders show: the selected monitor's per-monitor value.
   // Knobs are part of each monitor's profile; before the selector has a
   // monitor (pre-load) there is nothing to edit, so the value is 0. An
-  // absent entry means "the defaults": lcd = 100 (full light filter),
-  // boldness/damping = 0.
+  // absent entry means "the defaults": boldness/damping = 0.
   function knobValue(field) {
     if (!activeMonitor.mon) return 0;
     const k = textSettings.perMonitorKnobs[activeMonitor.mon.sig];
     if (k) return k[field];
-    return field === 'lcd' ? 100 : 0;
+    return 0;
   }
 
   // Push the per-monitor knob assignments (and the mode assignments + enabled
@@ -111,21 +110,18 @@
     const v = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
     const sig = activeMonitor.mon.sig;
     const k = textSettings.perMonitorKnobs[sig]
-      || { lcd: 100, boldness: 0, damping: 0 };
+      || { boldness: 0, damping: 0 };
     k[field] = v;
-    // An all-default triplet (lcd 100 = full light filter, no bold, no
-    // damping) is "no adjustment" — drop the entry so it does not silently
-    // keep per-monitor resolution active. Note lcd 0 (no filter) is a real
-    // setting, not "off": only the defaults clear.
-    if (k.lcd === 100 && k.boldness === 0 && k.damping === 0) {
+    // An all-default pair (no bold, no damping) is "no adjustment" — drop
+    // the entry so it does not silently keep per-monitor resolution active.
+    if (k.boldness === 0 && k.damping === 0) {
       delete textSettings.perMonitorKnobs[sig];
       // Dropping the local entry means the debounced sync loop won't iterate
-      // it, so push an explicit all-default triplet to clear the hook's copy
+      // it, so push an explicit all-default pair to clear the hook's copy
       // too. Without this, a fast drag to 0 would leave Explorer at the old
       // value while the preview (driven by the store) already shows 0.
       invoke('explorer_hook_set_monitor_knobs', {
         sig,
-        lcdStrength: 100,
         boldness: 0,
         damping: 0,
       }).catch(() => {});
@@ -185,10 +181,10 @@
     return applicableMode(state.effective_mode);
   }
 
-  // LCD filter and fringe reduction only affect subpixel rendering (see
-  // text-raster RenderOptions); grayscale and No filter ignore them, so
-  // those sliders only show for the subpixel modes. Boldness emboldens the
-  // outline and works on every mode.
+  // Fringe damping only affects subpixel rendering (see text-raster
+  // RenderOptions); grayscale and No filter ignore it, so that slider only
+  // shows for the subpixel modes. Boldness emboldens the outline and works
+  // on every mode.
   function isSubpixelMode() {
     const m = shownMode();
     return m === 'rgb' || m === 'bgr' || m === 'custom';
@@ -228,18 +224,16 @@
     return customOffsets()[axis];
   }
 
-  // Restore the filter knobs to "no adjustment" (the defaults: full light
-  // filter, no bold, no damping) for the selected monitor. The debounced
-  // sync only iterates existing entries, so an explicit all-default triplet
-  // is pushed to clear the hook's copy too (same as the fast-drag-to-0 fix
-  // in onKnobInput).
+  // Restore the knobs to "no adjustment" (the defaults: no bold, no
+  // damping) for the selected monitor. The debounced sync only iterates
+  // existing entries, so an explicit all-default pair is pushed to clear the
+  // hook's copy too (same as the fast-drag-to-0 fix in onKnobInput).
   function resetKnobs() {
     if (!activeMonitor.mon) return;
     const sig = activeMonitor.mon.sig;
     delete textSettings.perMonitorKnobs[sig];
     invoke('explorer_hook_set_monitor_knobs', {
       sig,
-      lcdStrength: 100,
       boldness: 0,
       damping: 0,
     }).catch(() => {});
@@ -283,17 +277,17 @@
   }
 
   // The knobs the preview must render with for the current mode — the same
-  // mode-scoping rule the hook DLL applies. A mode that can't use a filter
+  // mode-scoping rule the hook DLL applies. A mode that can't use a knob
   // must not inherit it from another mode's settings: "No filter" applies
-  // NO filters (boldness included, so a boldness tuned in grayscale does
-  // not show up on a No-filter preview), grayscale applies only boldness,
-  // and RGB/BGR/Custom use the full triplet. This keeps the preview cache
-  // key and the rendered output identical to what Explorer shows.
+  // NO knobs (boldness included, so a boldness tuned in grayscale does not
+  // show up on a No-filter preview), grayscale applies only boldness, and
+  // RGB/BGR/Custom use the full pair. This keeps the preview cache key and
+  // the rendered output identical to what Explorer shows.
   function effectiveKnobs() {
     const m = previewMode();
-    if (m === 'off') return { lcd: 100, boldness: 0, damping: 0 };
-    if (m === 'grayscale') return { lcd: 0, boldness: knobValue('boldness'), damping: 0 };
-    return { lcd: knobValue('lcd'), boldness: knobValue('boldness'), damping: knobValue('damping') };
+    if (m === 'off') return { boldness: 0, damping: 0 };
+    if (m === 'grayscale') return { boldness: knobValue('boldness'), damping: 0 };
+    return { boldness: knobValue('boldness'), damping: knobValue('damping') };
   }
 
   // Coverage levels: registry-only (no hook), shell hosts, or every GUI
@@ -452,7 +446,7 @@
     const zoom = previewZoom / 100;
     const offs = customOffsets();
     const knobs = effectiveKnobs();
-    const key = `${mode}|${knobs.lcd}|${knobs.boldness}|${knobs.damping}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
+    const key = `${mode}|${knobs.boldness}|${knobs.damping}|${mode === 'custom' ? `${offs.rx}|${offs.ry}|${offs.gx}|${offs.gy}|${offs.bx}|${offs.by}` : ''}|${dpr}`;
     const gen = ++previewGen;
 
     let left;
@@ -469,7 +463,6 @@
         const renderArgs = {
           mode,
           text: PREVIEW_TEXT,
-          lcdStrength: knobs.lcd,
           boldness: knobs.boldness,
           damping: knobs.damping,
           offsetRX: mode === 'custom' ? offs.rx : null,
@@ -735,17 +728,6 @@
           <div class="text-render-custom-heading">Filters</div>
           <button type="button" class="text-render-custom-reset" onclick={resetKnobs}>↻ Reset</button>
         </div>
-      {#if isSubpixelMode()}
-      <div class="text-render-knob-row">
-        <span class="text-render-knob-label">LCD filter</span>
-        <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
-          <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('lcd')}
-            style="--fill:{knobValue('lcd')}%"
-            oninput={(e) => onKnobInput('lcd', e.currentTarget.value)} />
-        </div>
-        <span class="slider-val">{knobValue('lcd')}</span>
-      </div>
-      {/if}
       <div class="text-render-knob-row">
         <span class="text-render-knob-label">Boldness</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">

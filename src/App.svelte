@@ -17,6 +17,8 @@
   import TabAbout from './lib/TabAbout.svelte';
   import TabText from './lib/TabText.svelte';
   import TabTextIcon from './lib/TabTextIcon.svelte';
+  import TabWindowsFont from './lib/TabWindowsFont.svelte';
+  import TabWindowsFontIcon from './lib/TabWindowsFontIcon.svelte';
 
   // Icons are inlined as data URIs (?inline) instead of /icons/*.png URLs so
   // they never depend on the dev server or asset protocol at runtime, a tray
@@ -32,6 +34,7 @@
   import tabDebugIcon from './lib/icons/tab_debug.png?inline';
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
   import { dropdownCloseEffect, ctxMenuCloseEffect } from './lib/dropdown.js';
+  import { createDropdownPositionController } from './lib/dropdown-position.js';
   import { fmtNits } from './lib/calibration.js';
   import UpdateModal from './lib/UpdateModal.svelte';
 
@@ -134,6 +137,56 @@
   $effect(() => {
     if (!hzMenuOpen) return;
     return dropdownCloseEffect(hzMenuEl, hzButtonEl, hzCtxMenuEl, closeHzMenu, hzButtonEl);
+  });
+
+  // Custom click-only dropdown for the top-bar Monitor selector, replacing
+  // the native <select> for the same reason as the resolution/Hz dropdowns:
+  // the OS popup can't animate and opens/closes with the page's scroll
+  // behavior. A collision-aware .dd-menu anchored to the trigger keeps the
+  // entrance animation and flips direction when there's no room below.
+  let monitorMenuOpen = $state(false);
+  let monitorMenuEl = $state(null);
+  let monitorWrapEl = $state(null);
+  let monitorTriggerEl = $state(null);
+  let monitorMenuPlacement = $state('down-right');
+  let monitorPositionController = null;
+
+  // Label of the active monitor, or '' for Global (no per-monitor selection).
+  const activeMonitorLabel = $derived(
+    activeMonitor.mon
+      ? activeMonitor.mon.friendly_name || `Monitor ${monitors.indexOf(activeMonitor.mon) + 1}`
+      : ''
+  );
+
+  function toggleMonitorMenu() {
+    monitorMenuOpen = !monitorMenuOpen;
+    if (monitorMenuOpen) {
+      monitorPositionController?.stop();
+      monitorPositionController = createDropdownPositionController({
+        getTrigger: () => monitorWrapEl?.querySelector('.top-monitor-select-trigger'),
+        getMenu: () => monitorMenuEl,
+        onPlacement: (placement) => { monitorMenuPlacement = placement; },
+        options: { gap: 6, viewportMargin: 14, maxHeight: 320 },
+      });
+      monitorPositionController.start();
+    } else {
+      monitorPositionController?.stop();
+      monitorPositionController = null;
+    }
+  }
+  function closeMonitorMenu() {
+    monitorMenuOpen = false;
+    monitorPositionController?.stop();
+    monitorPositionController = null;
+  }
+  function pickMonitor(sig) {
+    closeMonitorMenu();
+    if (sig) setActiveMonitor(monitors.find((m) => m.sig === sig) || null);
+  }
+
+  $effect(() => {
+    if (!monitorMenuOpen) return;
+    return dropdownCloseEffect(monitorMenuEl, monitorTriggerEl, null, closeMonitorMenu, monitorTriggerEl);
   });
 
   // ── Right-click context menus for the resolution and refresh-rate
@@ -1232,22 +1285,41 @@
       </div>
     </div>
     <div class="spacer"></div>
-    <label class="top-monitor-select">
+    <span class="top-monitor-select">
       <span class="top-monitor-label">Monitor</span>
-      <select
-        class="top-monitor-select-control"
-        value={activeMonitor.mon ? activeMonitor.mon.sig : ''}
-        onchange={(e) => {
-          const sig = e.currentTarget.value;
-          if (sig) setActiveMonitor(monitors.find((m) => m.sig === sig) || null);
-        }}
-        aria-label="Active monitor for per-monitor settings"
-      >
-        {#each monitors as mon (mon.sig)}
-          <option value={mon.sig}>{mon.friendly_name || `Monitor ${monitors.indexOf(mon) + 1}`}{mon.primary ? ' · Primary' : ''} · {mon.width}×{mon.height}</option>
-        {/each}
-      </select>
-    </label>
+      <span class="top-monitor-select-wrap" bind:this={monitorWrapEl}>
+        <button
+          type="button"
+          class="top-monitor-select-control top-monitor-select-trigger"
+          bind:this={monitorTriggerEl}
+          aria-haspopup="listbox"
+          aria-expanded={monitorMenuOpen}
+          aria-label="Active monitor for per-monitor settings"
+          onclick={toggleMonitorMenu}>
+          <span class="top-monitor-select-label">{activeMonitorLabel}</span>
+          <span class="top-monitor-caret" aria-hidden="true"></span>
+        </button>
+        {#if monitorMenuOpen}
+          <div
+            class="dd-menu top-monitor-menu dropdown-menu-position-{monitorMenuPlacement}"
+            bind:this={monitorMenuEl}
+            role="listbox"
+            aria-label="Active monitor for per-monitor settings">
+            {#each monitors as mon (mon.sig)}
+              <button
+                type="button"
+                class="dd-menu-item"
+                class:active={activeMonitor.mon?.sig === mon.sig}
+                role="option"
+                aria-selected={activeMonitor.mon?.sig === mon.sig}
+                onclick={() => pickMonitor(mon.sig)}>
+                {mon.friendly_name || `Monitor ${monitors.indexOf(mon) + 1}`}{mon.primary ? ' · Primary' : ''} · {mon.width}×{mon.height}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </span>
+    </span>
     <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabSystemIcon} alt="" /> Settings</span>
     </button>
@@ -1295,9 +1367,14 @@
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
     </button>
+    <div class="sidebar-sep" role="separator"></div>
     <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
       <TabTextIcon class="nav-icon" /> Text Rendering
     </button>
+    <button class="nav-btn" class:active={app.activeTab === 'windows-font'} onclick={() => app.activeTab = 'windows-font'}>
+      <TabWindowsFontIcon class="nav-icon" /> Windows Font
+    </button>
+    <div class="sidebar-sep" role="separator"></div>
     <button class="nav-btn" class:active={app.activeTab === 'power'} onclick={() => app.activeTab = 'power'}>
       <TabPowerIcon class="nav-icon" /> Power Saving
     </button>
@@ -1321,6 +1398,8 @@
         <TabHotkeys />
       {:else if app.activeTab === 'text'}
         <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} menuOpen={resMenuOpen || hzMenuOpen || favoritesMenuOpen || resCtxMenu.open || hzCtxMenu.open} />
+      {:else if app.activeTab === 'windows-font'}
+        <TabWindowsFont />
       {:else if app.activeTab === 'power'}
         <TabPower />
       {:else if app.activeTab === 'windows-hdr'}
@@ -1385,13 +1464,13 @@
           </svg>
         </button>
         {#if favoritesMenuOpen}
-          <div class="hz-menu favorites-menu" bind:this={favoritesMenuEl} role="listbox" aria-label="Favorite display modes" tabindex="-1">
+          <div class="dd-menu favorites-menu" bind:this={favoritesMenuEl} role="listbox" aria-label="Favorite display modes" tabindex="-1">
             <div class="favorites-title">Favorites</div>
             {#if currentComboLabel && !isCurrentFavorited}
               <div class="favorites-item favorites-current">
                 <button
                   type="button"
-                  class="hz-menu-item favorites-apply"
+                  class="dd-menu-item favorites-apply"
                   role="option"
                   aria-selected={false}
                   onclick={saveCurrentFavorite}>
@@ -1416,7 +1495,7 @@
                 <div class="favorites-item" class:active={isFavoriteCurrent(fav)}>
                   <button
                     type="button"
-                    class="hz-menu-item favorites-apply"
+                    class="dd-menu-item favorites-apply"
                     role="option"
                     aria-selected={isFavoriteCurrent(fav)}
                     onclick={() => applyFavorite(fav)}>
@@ -1476,10 +1555,10 @@
           {@const hz = app.displayInfo.refreshRateHz || 0}
           {@const favored = hz > 0 && isDisplayModeFavorited(resolution.width, resolution.height, hz)}
           <div class="res-item" class:active={current}>
-            <button type="button" class="hz-menu-item res-item-main" class:active={current}
+            <button type="button" class="dd-menu-item res-item-main" class:active={current}
               role="option" aria-selected={current}
               onclick={() => pickResolution(resolution.width, resolution.height)}>
-              <span class="hz-check" aria-hidden="true">{current ? '✓' : ''}</span>
+              <span class="dd-check" aria-hidden="true">{current ? '✓' : ''}</span>
               {resolution.width}×{resolution.height}
               {#if displayMenuPrefs.showTags}
                 {#if ultrawide}<span class="ultrawide-tag"><span class="ultrawide-separator">·</span><svg class="ultrawide-icon" viewBox="0 0 32 16" fill="none" aria-label="Ultrawide"><rect x="0.9" y="0.9" width="30.2" height="14.2" rx="2" stroke="currentColor" stroke-width="1.1"/><text x="16" y="10.8" text-anchor="middle" fill="currentColor" font-size="9" font-family="Inter, sans-serif" font-weight="700" letter-spacing="0.2">UW</text></svg></span>{/if}
@@ -1503,15 +1582,15 @@
           </div>
         {/snippet}
         {#if resMenuOpen}
-          <div class="hz-menu res-menu" bind:this={resMenuEl} role="listbox" aria-label="Resolution options" tabindex="-1" oncontextmenu={openResContextMenu}>
+          <div class="dd-menu res-menu" bind:this={resMenuEl} role="listbox" aria-label="Resolution options" tabindex="-1" oncontextmenu={openResContextMenu}>
             {#if app.displayInfo.resolutions.length === 0}
-              <div class="hz-menu-item active">
-                <span class="hz-check" aria-hidden="true">✓</span>
+              <div class="dd-menu-item active">
+                <span class="dd-check" aria-hidden="true">✓</span>
                 {app.displayInfo.width && app.displayInfo.height ? `${app.displayInfo.width}×${app.displayInfo.height}` : '-- × --'}
               </div>
             {:else if displayMenuPrefs.resolutionGroupBy === 'aspectRatio'}
               {#each groupedResolutions() as group}
-                <div class="hz-menu-group-label">{group.label}</div>
+                <div class="dd-menu-group-label">{group.label}</div>
                 {#each group.list as resolution}
                   {@render resItem(resolution)}
                 {/each}
@@ -1551,14 +1630,14 @@
           {app.displayInfo.refreshRateHz ? `${app.displayInfo.refreshRateHz} Hz` : '-- Hz'}{#if app.displayInfo.refreshRateHz && blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)}<span class="refresh-rate-select-value"> ({blackLevelDisplayForRefreshRate(app.displayInfo.refreshRateHz)})</span>{/if}
         </button>
         {#if hzMenuOpen}
-          <div class="hz-menu" bind:this={hzMenuEl} role="listbox" aria-label="Refresh rate options" tabindex="-1" oncontextmenu={openHzContextMenu}>
+          <div class="dd-menu" bind:this={hzMenuEl} role="listbox" aria-label="Refresh rate options" tabindex="-1" oncontextmenu={openHzContextMenu}>
             {#each [...app.displayInfo.refreshRates].sort((a, b) => (displayMenuPrefs.resolutionSort === 'asc' ? a - b : b - a)) as hz}
-              <button type="button" class="hz-menu-item" class:active={hz === app.displayInfo.refreshRateHz}
+              <button type="button" class="dd-menu-item" class:active={hz === app.displayInfo.refreshRateHz}
                 role="option" aria-selected={hz === app.displayInfo.refreshRateHz}
                 onclick={() => pickHz(hz)}>
-                <span class="hz-check" aria-hidden="true">{hz === app.displayInfo.refreshRateHz ? '✓' : ''}</span>
+                <span class="dd-check" aria-hidden="true">{hz === app.displayInfo.refreshRateHz ? '✓' : ''}</span>
                 <span>{hz} Hz</span>
-                {#if blackLevelDisplayForRefreshRate(hz)}<span class="hz-profile-value">{blackLevelDisplayForRefreshRate(hz)}</span>{/if}
+                {#if blackLevelDisplayForRefreshRate(hz)}<span class="dd-profile-value">{blackLevelDisplayForRefreshRate(hz)}</span>{/if}
               </button>
             {/each}
           </div>

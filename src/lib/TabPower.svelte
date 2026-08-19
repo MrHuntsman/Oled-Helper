@@ -51,7 +51,7 @@
   // ── Screensaver dropdown ───────────────────────────────────────────
   // Custom dropdown instead of a native <select>: the OS popup opens downward
   // and gets clipped at the bottom of the tab. Mirrors the RTX HDR menu — a
-  // trigger button + a collision-aware .hz-menu that flips upward when there
+  // trigger button + a collision-aware .dd-menu that flips upward when there
   // is no room below.
   let screensaverMenuOpen = $state(false);
   let screensaverMenuEl = $state(null);
@@ -290,14 +290,14 @@
         </button>
         {#if screensaverMenuOpen}
           <div
-            class="hz-menu power-screensaver-menu dropdown-menu-position-{screensaverMenuPlacement}"
+            class="dd-menu power-screensaver-menu dropdown-menu-position-{screensaverMenuPlacement}"
             bind:this={screensaverMenuEl}
             role="listbox"
             aria-label="Choose a screensaver">
             {#each screensaverOptions as ss (ss.path)}
               <button
                 type="button"
-                class="hz-menu-item"
+                class="dd-menu-item"
                 class:active={isScreensaverOptionActive(ss)}
                 role="option"
                 aria-selected={isScreensaverOptionActive(ss)}

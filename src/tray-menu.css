@@ -812,7 +812,7 @@
   border-radius: 10px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   /* Same container padding and 2px inter-item gap as the main app's
-     dropdowns (.hz-menu), so the tray submenus share their spacing too. */
+     dropdowns (.dd-menu), so the tray submenus share their spacing too. */
   padding: 4px;
   display: flex;
   flex-direction: column;
@@ -820,7 +820,7 @@
 }
 
 /* Use the exact same row sizing as the main app's dropdown items
-   (.hz-menu-item: height 32px + flex-basis 20px, 11px font) so the tray
+   (.dd-menu-item: height 32px + flex-basis 20px, 11px font) so the tray
    submenus render at the same pitch as the app dropdowns, whatever the
    browser's flexbox resolution does with that pair. */
 .tray-submenu .tray-item {
@@ -833,7 +833,7 @@
   transition: background 0.08s, color 0.08s, transform 0.08s;
 }
 
-/* Same hover ease as the main app's status-bar dropdowns (.hz-menu-item):
+/* Same hover ease as the main app's status-bar dropdowns (.dd-menu-item):
    a small rightward slide on top of the highlight, applied to the whole
    row so Resolution and Refresh Rate submenu items move together with
    their favorite star. Current-mode rows are excluded, they're disabled
@@ -850,7 +850,7 @@
 }
 
 /* Aspect-ratio group headers inside the resolution submenu, matching the
-   main app's .hz-menu-group-label dropdown style. */
+   main app's .dd-menu-group-label dropdown style. */
 .tray-submenu-group-label {
   font-size: 10px;
   font-weight: 600;

@@ -2,6 +2,7 @@ mod config;
 mod display_info;
 mod explorer_hook;
 mod flyout_window;
+mod font_replacement;
 mod gamepad;
 mod gamma_ramp;
 mod hdr_toggle;
@@ -802,13 +803,14 @@ fn apply_pending_hdr_mode(mode: &str) -> Result<(), String> {
 
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
 // used to validate --open-tab forwarding on restart.
-const KNOWN_TABS: [&str; 10] = [
+const KNOWN_TABS: [&str; 11] = [
     "crush",
     "dimmer",
     "screen-dimmer",
     "windows-hdr",
     "hotkeys",
     "text",
+    "windows-font",
     "debug",
     "system",
     "settings",
@@ -1337,9 +1339,17 @@ pub fn run() {
             power::power_set_sleep_timeout,
             power::power_set_screensaver,
             power::power_turn_off_display,
+            power::system_restart,
             power::power_set_screen_protector,
             power::power_dim_preview,
             gamepad::gamepad_input_active,
+            font_replacement::font_list_installed,
+            font_replacement::font_apply,
+            font_replacement::font_restore,
+            font_replacement::font_get_status,
+            font_replacement::font_download_catalog,
+            font_replacement::font_download_apply,
+            font_replacement::font_preview_sources,
             text_rendering::text_preview_show,
             text_rendering::text_preview_update,
             text_rendering::text_preview_set_bounds,

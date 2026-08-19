@@ -21,7 +21,7 @@ export function dropdownCloseEffect(menuEl, buttonEl, ctxMenuEl, closeFn, focusE
   document.addEventListener('keydown', onKeydown);
   // Centre on the selected option like a native <select> popup,
   // with behaviour:'instant' (no animation) to match the OS snap.
-  menuEl?.querySelector('.hz-menu-item.active')?.scrollIntoView({ block: 'center', behavior: 'instant' });
+  menuEl?.querySelector('.dd-menu-item.active')?.scrollIntoView({ block: 'center', behavior: 'instant' });
   return () => {
     document.removeEventListener('pointerdown', onPointerDown);
     document.removeEventListener('keydown', onKeydown);

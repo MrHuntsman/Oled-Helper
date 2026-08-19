@@ -24,15 +24,9 @@ use swash::zeno::{Format, Vector};
 use swash::FontRef;
 
 /// Per-draw tuning knobs shared by the preview and the Explorer hook. All
-/// values are 0..=100; defaults match the historical behavior (full light
-/// filter, no faux bold, no damping).
+/// values are 0..=100; defaults are no faux bold, no damping.
 #[derive(Clone, Copy, Debug)]
 pub struct RenderOptions {
-    /// LCD filter strength: interpolates the 5-tap FIR between the identity
-    /// filter (0, raw coverage — sharpest, harshest fringing) and FreeType's
-    /// `lcdlight` taps (100, the crisp default that still averages down the
-    /// fringe). Only affects subpixel modes.
-    pub lcd_strength: u8,
     /// Faux bold: swash's outline embolden, 0..=100 mapped to 0..1px of
     /// stroke thickening. Works on all modes.
     pub boldness: u8,
@@ -56,7 +50,6 @@ pub struct RenderOptions {
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
-            lcd_strength: 100,
             boldness: 0,
             damping: 0,
             subpixel_offsets: None,
@@ -181,66 +174,6 @@ fn quantize_phase(v: f32) -> f32 {
     }
 }
 
-/// FreeType's `lcdlight` filter taps: a 5-tap horizontal FIR over the
-/// subpixel stream, dividing by 256. The zero outer taps keep the filter
-/// within one pixel, so glyph edges stay sharp (the lcddefault outer taps
-/// are what smear ink across ~1.7px), while the center taps still average
-/// down the color fringing at glyph edges — the canonical "less blur" LCD
-/// filter. This is the strength knob's top end (100).
-const LCD_FILTER_LIGHT: [f32; 5] = [0.0, 85.0, 86.0, 85.0, 0.0];
-/// The identity filter (strength 0): passes coverage through unchanged —
-/// the sharpest end of the strength knob (raw coverage, harsher fringing).
-const LCD_FILTER_IDENTITY: [f32; 5] = [0.0, 0.0, 256.0, 0.0, 0.0];
-
-/// FreeType's `lcdlight` filter applied to subpixel coverage: a 5-tap
-/// horizontal FIR over the interleaved R, G, B stream, dividing by 256. Each
-/// tap advances one SUBPIXEL rather than one pixel; the zero outer taps keep
-/// the span at one pixel, so only the color fringing at glyph edges is
-/// averaged down while the glyph shape stays sharp.
-///
-/// `strength` (0..=100) interpolates between the identity filter (raw
-/// coverage — sharpest, harshest fringing) and the light taps (the crisp
-/// default). 0 returns without touching the buffer. Edges are zero-padded.
-fn apply_lcd_filter(coverage: &mut [u8], width: u32, height: u32, strength: u8) {
-    if strength == 0 {
-        return;
-    }
-    let t = strength as f32 / 100.0;
-    let weights: [u32; 5] = std::array::from_fn(|i| {
-        (LCD_FILTER_LIGHT[i] * t + LCD_FILTER_IDENTITY[i] * (1.0 - t)).round() as u32
-    });
-    let w = width as usize;
-    for y in 0..height as usize {
-        let row = y * w * 4;
-        // Flatten this row's three color channels into a subpixel stream so the
-        // FIR operates across R/G/B boundaries (that is what reduces fringing).
-        let mut flat = Vec::with_capacity(w * 3);
-        for x in 0..w {
-            flat.push(coverage[row + x * 4]);
-            flat.push(coverage[row + x * 4 + 1]);
-            flat.push(coverage[row + x * 4 + 2]);
-        }
-        // Read taps from an unmodified snapshot so earlier writes do not feed
-        // back into later taps (the filter must be a true FIR).
-        let original = flat.clone();
-        for i in 0..flat.len() {
-            let mut acc: u32 = 0;
-            for (tap, &wt) in weights.iter().enumerate() {
-                let idx = i as isize + tap as isize - 2;
-                if idx >= 0 && (idx as usize) < original.len() {
-                    acc += wt * original[idx as usize] as u32;
-                }
-            }
-            flat[i] = (acc / 256).min(255) as u8;
-        }
-        for x in 0..w {
-            coverage[row + x * 4] = flat[x * 3];
-            coverage[row + x * 4 + 1] = flat[x * 3 + 1];
-            coverage[row + x * 4 + 2] = flat[x * 3 + 2];
-        }
-    }
-}
-
 /// Fringe damping: blends each subpixel pixel toward its luminance so the
 /// colored fringe fades toward gray. `strength` 0..=100 is the blend factor
 /// (0 = untouched, 100 = fully gray fringe). Luminance-preserving by
@@ -289,7 +222,6 @@ struct GlyphCacheKey {
     phase_x: u32,
     phase_y: u32,
     mode: u8,
-    lcd: u8,
     boldness: u8,
     damping: u8,
     /// Custom subpixel center bits (0 when unused) — tuned offsets must not
@@ -429,7 +361,6 @@ fn glyph_cache_key(
         phase_x: offset.x.to_bits(),
         phase_y: offset.y.to_bits(),
         mode: mode as u8,
-        lcd: opts.lcd_strength,
         boldness: opts.boldness,
         damping: opts.damping,
         sub_rx,
@@ -450,9 +381,9 @@ enum GlyphResult {
     Unsupported,
 }
 
-/// Rasterize one glyph (or reuse the cached bitmap), applying the LCD filter
-/// and crisp threshold so the cache stores the FINAL coverage. The caller
-/// supplies the run-local offset (subpixel phase).
+/// Rasterize one glyph (or reuse the cached bitmap), applying the subpixel
+/// knobs and crisp threshold so the cache stores the FINAL coverage. The
+/// caller supplies the run-local offset (subpixel phase).
 fn rasterize_glyph_cached(
     scaler: &mut swash::scale::Scaler,
     font_ptr: usize,
@@ -534,7 +465,6 @@ fn rasterize_glyph_uncached(
 /// operate on a 4-byte-per-pixel RGBA buffer and only affect subpixel
 /// coverage (callers gate on `Content::SubpixelMask`).
 fn postprocess_subpixel(data: &mut [u8], width: u32, height: u32, opts: RenderOptions) {
-    apply_lcd_filter(data, width, height, opts.lcd_strength);
     apply_damping(data, width, height, opts.damping);
 }
 
@@ -648,8 +578,8 @@ fn rasterize_glyph_2d(
 ///
 /// `font_data` is the raw bytes of the font file and `font_index` selects the
 /// face within a TTC. `mode` controls grayscale vs crisp output and `opts`
-/// carries the per-draw knobs (LCD filter strength, faux bold, fringe
-/// damping, filter width). Returns `None` if the font cannot be parsed.
+/// carries the per-draw knobs (faux boldness, fringe damping). Returns `None`
+/// if the font cannot be parsed.
 pub fn rasterize(
     font_data: &[u8],
     font_index: u32,
@@ -1213,43 +1143,6 @@ mod tests {
                     .any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0));
             }
         }
-    }
-
-    #[test]
-    fn light_filter_spreads_within_one_pixel() {
-        let mut buf = vec![0u8; 5 * 4];
-        buf[2 * 4] = 255; // red-channel impulse at pixel 2
-        apply_lcd_filter(&mut buf, 5, 1, 100);
-        // The light filter (zero outer taps) spreads the impulse only to the
-        // ADJACENT subpixels in the interleaved stream — B of pixel 1 (tap
-        // -1) and G of pixel 2 (tap +1) — while the ±2 taps (G of pixel 1,
-        // B of pixel 2) stay zero. Edges stay sharp, the fringe is still
-        // averaged down.
-        assert_eq!(buf[1 * 4 + 1], 0); // G of pixel 1 (tap -2 is zero)
-        assert_eq!(buf[1 * 4 + 2], 84); // B of pixel 1 (tap -1)
-        assert_eq!(buf[2 * 4], 85); // R of pixel 2 (peak)
-        assert_eq!(buf[2 * 4 + 1], 84); // G of pixel 2 (tap +1)
-        assert_eq!(buf[2 * 4 + 2], 0); // B of pixel 2 (tap +2 is zero)
-        // No energy spills beyond the impulse's pixel ± 1 subpixel.
-        assert_eq!(buf[0 * 4 + 2], 0);
-        assert_eq!(buf[3 * 4], 0);
-    }
-
-    #[test]
-    fn zero_strength_is_identity() {
-        // Strength 0 = the identity filter: the buffer is untouched, so the
-        // sharpest setting really is raw coverage.
-        let mut buf = vec![0u8; 5 * 4];
-        buf[2 * 4] = 255;
-        let before = buf.clone();
-        apply_lcd_filter(&mut buf, 5, 1, 0);
-        assert_eq!(buf, before);
-        // Half strength blends: the impulse still stays within ±1 subpixel.
-        let mut half = vec![0u8; 5 * 4];
-        half[2 * 4] = 255;
-        apply_lcd_filter(&mut half, 5, 1, 50);
-        assert_eq!(half[1 * 4 + 2], 42); // (85 * 0.5) of 255, /256
-        assert_eq!(half[2 * 4], 170); // (86 * 0.5 + 256 * 0.5) of 255, /256
     }
 
     #[test]

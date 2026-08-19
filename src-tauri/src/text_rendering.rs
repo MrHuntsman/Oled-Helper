@@ -970,8 +970,7 @@ fn preview_font() -> Option<std::sync::Arc<[u8]>> {
 /// the Explorer hook uses) and return its flattened coverage bitmap, so the
 /// preview shows the actual fringing for the selected mode instead of the
 /// browser's own font rasterizer. The knobs (all 0..=100) mirror the hook's
-/// shared-memory state so the preview matches what Explorer renders; LCD
-/// filter strength 0 means no filtering (the filter is off).
+/// shared-memory state so the preview matches what Explorer renders.
 #[derive(serde::Serialize)]
 pub struct PreviewRender {
     pub width: u32,
@@ -987,7 +986,6 @@ pub fn text_preview_render(
     mode: String,
     text: String,
     size: f32,
-    lcd_strength: u32,
     boldness: u32,
     damping: u32,
     offset_r_x: Option<f32>,
@@ -1032,27 +1030,24 @@ pub fn text_preview_render(
         }
         _ => None,
     };
-    // Filter knobs are mode-scoped (same rule as the hook DLL): a mode that
-    // can't use a filter must not inherit it from another mode's settings.
-    // "No filter" (crisp) applies NO filters — boldness included — and
-    // grayscale applies only boldness (the LCD filter and fringe damping
-    // are subpixel-only; the rasterizer ignores them for mask content, this
-    // keeps it explicit). RGB/BGR/Custom use the full knob triplet.
+    // Knobs are mode-scoped (same rule as the hook DLL): a mode that can't
+    // use a knob must not inherit it from another mode's settings. "No
+    // filter" (crisp) applies NO knobs — boldness included — and grayscale
+    // applies only boldness (fringe damping is subpixel-only; the rasterizer
+    // ignores it for mask content, this keeps it explicit). RGB/BGR/Custom
+    // use the full knob pair.
     let opts = match render_mode {
         RenderMode::Crisp => text_raster::RenderOptions {
-            lcd_strength: 100,
             boldness: 0,
             damping: 0,
             subpixel_offsets: None,
         },
         RenderMode::Grayscale => text_raster::RenderOptions {
-            lcd_strength: 0,
             boldness: boldness.min(30) as u8,
             damping: 0,
             subpixel_offsets: None,
         },
         _ => text_raster::RenderOptions {
-            lcd_strength: lcd_strength.min(100) as u8,
             boldness: boldness.min(30) as u8,
             damping: damping.min(100) as u8,
             subpixel_offsets,
