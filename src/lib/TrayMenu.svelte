@@ -1,12 +1,12 @@
 <script>
-  // Custom CSS tray popup — replacement for the native menu (tray_menu.rs).
+  // Custom CSS tray popup, replacement for the native menu (tray_menu.rs).
   // Rendered in its own small always-on-top WebviewWindow (see
   // src-tauri/src/tray_menu_window.rs), anchored to the tray icon.
   //
   // Mirrors tray_menu.rs's native menu structure: Resolution, Refresh Rate,
   // and Favorites submenus, then Restart/Exit. This window is a separate
   // WebView from the main app window, so it cannot reach into
-  // stores.svelte.js's in-memory state — favorites are read/written directly
+  // stores.svelte.js's in-memory state, favorites are read/written directly
   // through load_config/save_config, the same way tray_menu.rs's native
   // Favorites submenu does.
   import { onMount, tick } from 'svelte';
@@ -218,7 +218,7 @@
   }
 
   // The tray is narrow, so user interaction moves in 0.5 steps (5 raw
-  // units) — coarse enough to resolve on a ~170px drag across the full
+  // units), coarse enough to resolve on a ~170px drag across the full
   // ±15.0 range. The input itself keeps step=1 so values set by the main
   // app (any 0.1 increment) render exactly; only drag/wheel/arrow input is
   // snapped to 0.5 here.
@@ -345,7 +345,7 @@
     } finally {
       windowsHdrBusy = false;
       // The SDR row mounts/unmounts with the mode, changing the base menu's
-      // height — re-measure so the native click-through region matches the
+      // height, re-measure so the native click-through region matches the
       // visible card (syncHitRegion awaits tick internally).
       syncHitRegion();
     }
@@ -704,7 +704,7 @@
       ? {
           // The submenu pane is auto-sized now (max-content, up to 334px
           // outer), so this preinstalled bridge only needs a conservative
-          // left region — the exact DOM measurement replaces it a tick
+          // left region, the exact DOM measurement replaces it a tick
           // later. 244px covers the collapsed/minimum-width case; keep the
           // base menu's height since the submenu is no taller.
           x: Math.max(0, preBase.x - 244),
@@ -736,7 +736,7 @@
       // Bottom-aligned panes: push the shorter submenu up so both cards
       // share a top edge while the base menu stays anchored to the taskbar.
       // For the short Favorites submenu that top edge sits far above the
-      // Favorites row, out of the cursor's path — align its top to the
+      // Favorites row, out of the cursor's path, align its top to the
       // anchor row instead so the pointer can cross straight from the row
       // into the card. (Resolution/Refresh Rate rows sit near the top, so
       // their existing top-edge alignment is kept.)
@@ -1207,7 +1207,7 @@
             oninput={handleTraySdrBrightnessInput}
             onclick={(event) => event.stopPropagation()}
           />
-          <span class="tray-quick-value tray-sdr-value">{traySdrBrightness.available ? `${Math.round(traySdrBrightness.nits)} nits` : '—'}</span>
+          <span class="tray-quick-value tray-sdr-value">{traySdrBrightness.available ? `${Math.round(traySdrBrightness.nits)} nits` : '-'}</span>
         </div>
       </div>
     {/if}

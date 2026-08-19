@@ -1,5 +1,5 @@
 <script>
-  // Inlined data URI ,  see App.svelte for why icons never hit the network.
+  // Inlined data URI, see App.svelte for why icons never hit the network.
   import { invoke } from '@tauri-apps/api/core';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
@@ -261,9 +261,9 @@
 
   // Integer slider values map 1:1 to distinct alpha levels in the Rust
   // curve (100%→255, 99%→254, … 50%→205; below 50% the curve skips levels
-  // to stay increasing), so every displayed percentage is unique ,  no two
+  // to stay increasing), so every displayed percentage is unique, no two
   // slider positions repeat a readout. Snap to the nearest tick (every 10,
-  // 10–90) when the raw value lands within a few points of one, mirroring
+  // 10-90) when the raw value lands within a few points of one, mirroring
   // the Black Level slider's snap-to-zero (normalizeBlackLevel in
   // TabCrush.svelte). 0 and 100 aren't included since the track's own ends
   // already act as a natural stop there.
@@ -279,7 +279,7 @@
   function handleOpacityInput(event) {
     const raw = +event.currentTarget.value;
     // Snap to nearby ticks only while actually dragging with the pointer.
-    // Keyboard arrows don't fire pointerdown, so they bypass the snap , 
+    // Keyboard arrows don't fire pointerdown, so they bypass the snap;
     // otherwise pressing an arrow from a snapped position (e.g. 50) lands on
     // 51, which is inside the tolerance band, and gets pulled straight back.
     const normalized = opacityDragging ? normalizeOpacityValue(raw) : raw;
@@ -316,11 +316,11 @@
   // waiting for the next drag.
   //
   // The cursor is still physically over the button right after a click, so
-  // :hover immediately re-applies ,  but now against the OTHER state's hover
+  // :hover immediately re-applies, but now against the OTHER state's hover
   // rule, causing a visible extra jump right after the toggle's own
   // transition plays. chainSuppressHover pins the hooks back to their plain
   // rest-state transform (see .just-toggled in app.css) until the pointer
-  // actually leaves the button ,  no guessed timeout, driven by the real
+  // actually leaves the button, no guessed timeout, driven by the real
   // pointerleave event so it can never desync from what the cursor is doing.
   let chainSuppressHover = $state(false);
   function toggleFadeLinked() {

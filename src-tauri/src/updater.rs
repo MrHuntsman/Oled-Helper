@@ -287,7 +287,7 @@ pub fn handle_apply_update_mode() -> bool {
     // failed wait is a safe abort: the old instance is likely still running,
     // so leave its exe untouched and just exit.
     #[cfg(target_os = "windows")]
-    if !crate::wait_for_restart_parent(parent_pid) {
+    if !crate::process::wait_for_restart_parent(parent_pid) {
         log::error!("[updater] old instance did not exit cleanly; aborting update");
         std::process::exit(1);
     }

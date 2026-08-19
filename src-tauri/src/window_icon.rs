@@ -1,4 +1,4 @@
-// window_icon.rs ,  forces Windows to load crisp small/large icons via WM_SETICON,
+// window_icon.rs, forces Windows to load crisp small/large icons via WM_SETICON,
 // working around a Tauri bug where the runtime window icon (titlebar + taskbar while
 // running) is blurry because Tauri sets HICON from raw RGBA data instead of letting
 // Windows pick the correctly-sized frame out of the .ico the way Explorer does.

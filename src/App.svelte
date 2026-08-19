@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import ShieldBadge from './lib/ShieldBadge.svelte';
@@ -614,8 +614,8 @@
   }
   // Close every open dropdown/context menu in one go. Called when the window
   // hides to the tray or loses focus (minimize, backgrounded): a dropdown
-  // left open would otherwise still be open — stale and floating over the
-  // restored window — when the user comes back.
+  // left open would otherwise still be open, stale and floating over the
+  // restored window, when the user comes back.
   function closeAllMenus() {
     resMenuOpen = false;
     hzMenuOpen = false;
@@ -1053,8 +1053,8 @@
     // Central handler for the window's shown/hidden state. Rust's
     // window-visibility event is the fast path for tray show/hide, but a
     // restore that happens outside that path (taskbar click after minimize,
-    // or a dropped event) never emits it, so `windowVisible` — the flag that
-    // gates the active tab's markup — can go stale and leave the tab area
+    // or a dropped event) never emits it, so `windowVisible`, the flag that
+    // gates the active tab's markup, can go stale and leave the tab area
     // blank. Routing the state change through here (and re-checking the real
     // state on window focus below) makes the flag self-heal.
     function applyWindowVisible(visible, animated = false) {
@@ -1112,7 +1112,7 @@
     }
     window.addEventListener('focus', reconcileWindowVisible);
     // A dropdown left open when the window is minimized or backgrounded
-    // (another app focused) would still be open — and stale — when the user
+    // (another app focused) would still be open, and stale, when the user
     // comes back. The window-visibility event covers the close-to-tray path
     // (applyWindowVisible above); blur and visibilitychange cover minimize
     // and backgrounding, where no Rust event is emitted.
@@ -1197,7 +1197,16 @@
   $effect(() => {
     if (!windowVisible) return;
     const tab = app.activeTab;
-    if (tab === 'crush') refreshVendorDisplayInfo();
+    if (tab === 'crush') {
+      refreshVendorDisplayInfo();
+      // Reference Mode is a driver setting that can be toggled while the tab
+      // is open with no display notification. Poll the cheap registry-backed
+      // flag so the warning clears and gamma resumes without running the full
+      // NVAPI probe on every tick (and without needing a tab switch). The
+      // poll stops when the tab (or window) is left, matching the system tab.
+      startReferenceModePolling();
+      return () => stopReferenceModePolling();
+    }
     if (tab === 'system') {
       refreshVendorDisplayInfo();
       const timer = setInterval(() => refreshVendorDisplayInfo(), 5000);

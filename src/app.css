@@ -859,10 +859,10 @@ select,
     linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
 }
 
-/* Boldness slider ticks (0–30 step 5 → 5 ticks at 1/6..5/6). Unlike the
+/* Boldness slider ticks (0-30 step 5 → 5 ticks at 1/6..5/6). Unlike the
    shared .has-ticks rule, the positions account for thumb travel: the
    .slider-sm thumb is 12px wide, so its center travels [6px, 100% - 6px]
-   rather than [0, 100%] — calc((100% - 12px) * f + 6px) is the thumb-center
+   rather than [0, 100%], calc((100% - 12px) * f + 6px) is the thumb-center
    x for fraction f (same pattern as .has-ticks-dimmer with its 18px thumb).
    Without the offset the outer ticks drift from the thumb's actual stops
    (only the center tick aligns, hence the perceived misalignment). */
@@ -1162,7 +1162,7 @@ select,
 }
 
 /* Fade sliders use half the tick density of the opacity slider (4 ticks at
-   20/40/60/80% instead of 9 at 10–90%), same valid calc() pattern as
+   20/40/60/80% instead of 9 at 10-90%), same valid calc() pattern as
    .has-ticks-dimmer above. */
 .dimmer-slider-track input[type=range].has-ticks-dimmer-fade {
   background:
@@ -4392,7 +4392,7 @@ select,
   margin: 0;
 }
 /* Each caption centers over its own column: the preview splits at the
-   halfway point, so both halves get a centered label — "100% zoom" over the
+   halfway point, so both halves get a centered label, "100% zoom" over the
    native-size rows on the left, "{previewZoom}% zoom" over the zoomed rows
    on the right (the zoom is fixed, there is no slider). */
 .text-render-preview-caption-left,
@@ -4408,7 +4408,7 @@ select,
 }
 
 /* Tuning controls under the preview canvas. Custom mode shows two
-   side-by-side columns — filters left, subpixel centers right — boxed as a
+   side-by-side columns, filters left, subpixel centers right, boxed as a
    matching pair; other modes show only the filters column at full width. */
 .text-render-knobs-columns {
   display: flex;

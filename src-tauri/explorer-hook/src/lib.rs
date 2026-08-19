@@ -1,10 +1,10 @@
-//! explorer-hook.dll — inject a GDI text-rendering replacement into the shell
+//! explorer-hook.dll, inject a GDI text-rendering replacement into the shell
 //! and the classic Control Panel hosts via a global WH_CBT hook.
 //!
 //! Instead of rewriting the font-quality flag at CreateFontIndirectW (which
 //! only affected fonts created after a window was built), we hook the text
-//! OUTPUT path (ExtTextOutW) and rasterize each draw with `swash` — a pure-Rust
-//! glyph rasterizer — so a mode change is picked up on the very next repaint
+//! OUTPUT path (ExtTextOutW) and rasterize each draw with `swash`, a pure-Rust
+//! glyph rasterizer, so a mode change is picked up on the very next repaint
 //! (live). Mode 0 forwards straight to GDI (RGB/BGR keep Windows ClearType);
 //! modes 1/2 resolve the selected font, rasterize the run with swash, and
 //! alpha-blend the coverage into the HDC using the current text color.
@@ -70,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 // lives at 24/28/32+ (flag, count, up to 8 entries x 72 bytes), each entry
 // carrying the monitor's mode, knob pair (boldness, damping; the lcd
 // filter / crosstalk / gamma / filter-width slots are reserved, always 0),
-// and custom subpixel centers as six (x, y) f32 bit patterns — see
+// and custom subpixel centers as six (x, y) f32 bit patterns, see
 // resolve_draw_options. The blocklist follows the
 // table at 608+ (count, up to 8 entries x 64 bytes = 32 UTF-16 chars): exe
 // names excluded from the detour while "all apps" scope is on.
@@ -145,7 +145,7 @@ static LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 static LOG_START: OnceLock<Instant> = OnceLock::new();
 static PROC_NAME: OnceLock<String> = OnceLock::new();
 static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
-// Count of draws that took the opaque (ETO_OPAQUE) fast path — the plain
+// Count of draws that took the opaque (ETO_OPAQUE) fast path, the plain
 // buffer + SetDIBitsToDevice route. Exposed in the verbose log so we can see
 // how much of Explorer's text is opaque (list views etc.).
 static OPAQUE_DRAWS: AtomicU32 = AtomicU32::new(0);
@@ -382,7 +382,7 @@ fn is_explorer() -> bool {
 // Everything the app wants the detour in: Explorer plus the classic Control
 // Panel host processes and the MMC admin consoles. SystemProperties is a
 // family of executables, matched by prefix. Third-party apps (7-Zip, ...)
-// are intentionally NOT here — they're covered by the all-apps scope stop
+// are intentionally NOT here, they're covered by the all-apps scope stop
 // instead, so the shell stop stays a shell-only list.
 fn is_target() -> bool {
     let lower = proc_name().to_ascii_lowercase();
@@ -538,7 +538,7 @@ unsafe fn create_dib_section(hdc: HDC, w: i32, h: i32) -> Option<(HBITMAP, *mut 
 // honoring the HDC's text alignment. Two paths:
 //  - ETO_OPAQUE: the destination under the text is guaranteed to be the solid
 //    background color, so the run is composited over GetBkColor into a plain
-//    heap buffer and written with a single SetDIBitsToDevice — no DIB, no DC,
+//    heap buffer and written with a single SetDIBitsToDevice, no DIB, no DC,
 //    no AlphaBlend, and (for subpixel) no destination read-back.
 //  - transparent: per-run DIB + AlphaBlend (Mask) / background read-back
 //    blend (Subpixel).
@@ -678,7 +678,7 @@ unsafe fn blit_run(
 
 // Opaque fast path (ETO_OPAQUE): the destination under the text is the solid
 // background color, so composite over GetBkColor into a plain heap buffer and
-// write it with one SetDIBitsToDevice call. The result is fully opaque —
+// write it with one SetDIBitsToDevice call. The result is fully opaque -
 // nothing to alpha-blend, and no DIB/DC objects to create or destroy. For
 // subpixel this also skips the destination read-back entirely: the background
 // is known, not read.
@@ -700,7 +700,7 @@ unsafe fn blit_opaque(
     let bk_b = ((bk >> 16) & 0xFF) as u8;
 
     let mut buf = vec![0u8; (w * h * 4) as usize];
-    // Base layer = the solid background color, fully opaque — exactly what GDI
+    // Base layer = the solid background color, fully opaque, exactly what GDI
     // paints for an ETO_OPAQUE fill before the text.
     for px in buf.chunks_exact_mut(4) {
         px[0] = bk_b;
@@ -738,7 +738,7 @@ unsafe fn blit_opaque(
             true
         }
         // Subpixel: blend each color channel against its own coverage over the
-        // solid background — no destination read-back needed.
+        // solid background, no destination read-back needed.
         Content::SubpixelMask => {
             for g in &run.glyphs {
                 let dst_left = g.x.floor() as i32 + g.bitmap_left - min_left;
@@ -829,14 +829,14 @@ unsafe extern "system" fn try_render_swash(
                 // Mode 0 in the table = "no explicit mode" (Default): fall
                 // back to the global mode (the system effective mode, synced
                 // into slot 0 on load) so the monitor still renders the
-                // system text setting — but keep ITS knob triplet so knobs
+                // system text setting, but keep ITS knob triplet so knobs
                 // apply even on a Default monitor. Modes 5/6 (the fixed
                 // RGWB/RWBG WOLED presets) were removed from the product;
                 // a stale entry with one routes the same way. Mode 7
                 // (Custom) carries the user's subpixel centers.
                 let mode = if m == 0 || m == 5 || m == 6 { global_mode } else { m };
                 // Custom mode with all-zero centers means the user has not
-                // tuned offsets yet — render the mode's default layout
+                // tuned offsets yet, render the mode's default layout
                 // (render_format falls back to the WOLED quad positions)
                 // rather than sampling all three channels at the same point.
                 let all_zero = offs.iter().all(|&[x, y]| x == 0.0 && y == 0.0);
@@ -861,7 +861,7 @@ unsafe extern "system" fn try_render_swash(
     };
     // Knobs are mode-scoped: a mode that can't use a knob must not inherit
     // it from another mode's settings. Crisp ("No filter") applies NO knobs
-    // at all — boldness included, so a boldness tuned in grayscale does not
+    // at all, boldness included, so a boldness tuned in grayscale does not
     // show up on a No-filter monitor. Grayscale applies only boldness
     // (fringe damping is subpixel-only; the rasterizer already ignores it
     // for mask content, this keeps it explicit). RGB/BGR/Custom use the
@@ -1199,7 +1199,7 @@ fn install_detour() -> bool {
     // Resolve the entry point BEFORE suspending threads: GetModuleHandleW /
     // GetProcAddress acquire the loader lock, and a suspended thread could be
     // holding it (e.g. a shell-extension DLL being loaded while a window is
-    // created) — that would deadlock the whole shell.
+    // created), that would deadlock the whole shell.
     let Some(original) = find_ext_text_out_w() else {
         debug("[explorer-hook] ExtTextOutW not found; no hook installed");
         return false;
@@ -1403,7 +1403,7 @@ pub unsafe extern "system" fn DllMain(
             BOOL(1)
         }
         DLL_PROCESS_DETACH => {
-            // Disable whenever the detour was actually installed — a process
+            // Disable whenever the detour was actually installed, a process
             // hooked via all-apps scope has IS_TARGET false but still carries
             // the patch, and leaving it in place as the DLL unloads would
             // jump into unmapped memory on the next ExtTextOutW call.

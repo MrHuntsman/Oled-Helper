@@ -1,13 +1,13 @@
-// monitors.rs — shared per-monitor enumeration for the whole app.
+// monitors.rs, shared per-monitor enumeration for the whole app.
 //
 // One list of connected monitors with everything a tab or the Explorer hook
 // needs:
-//   • friendly_name — the CCD/EDID name (e.g. "LG OLED C4") for UI labels
-//   • sig — the device-caps signature (resolution + physical size + DPI), the
+//   • friendly_name, the CCD/EDID name (e.g. "LG OLED C4") for UI labels
+//   • sig, the device-caps signature (resolution + physical size + DPI), the
 //     stable key per-monitor assignments are persisted against and what the
 //     hook matches at draw time
-//   • rect + primary — desktop geometry and role
-//   • hmonitor — the system-wide monitor handle the hook matches window DCs
+//   • rect + primary, desktop geometry and role
+//   • hmonitor, the system-wide monitor handle the hook matches window DCs
 //
 // The CCD helpers (query_active_paths, target_device_name, target_monitor_name)
 // were moved here from hdr_toggle.rs so future per-monitor tabs share one
@@ -52,10 +52,10 @@ pub struct AppMonitor {
     /// CCD/EDID friendly name (e.g. "LG OLED C4"); empty when CCD is
     /// unavailable.
     pub friendly_name: String,
-    /// GDI display device name (e.g. r"\\.\DISPLAY1") — what CreateDCW needs
+    /// GDI display device name (e.g. r"\\.\DISPLAY1"), what CreateDCW needs
     /// for per-monitor gamma. Empty when the device could not be matched.
     pub device_name: String,
-    /// EDID device ID (e.g. r"MONITOR\LGD05XX\{...}") — the frontend's
+    /// EDID device ID (e.g. r"MONITOR\LGD05XX\{...}"), the frontend's
     /// per-monitor profile keys use this. Empty when unavailable.
     pub monitor_id: String,
 }
@@ -63,7 +63,7 @@ pub struct AppMonitor {
 impl AppMonitor {
     /// Stable across sessions so config assignments survive restarts and
     /// monitor reconnects: resolution + physical size + DPI identify a panel.
-    /// The format is load-bearing — persisted per-monitor keys use it.
+    /// The format is load-bearing, persisted per-monitor keys use it.
     pub fn sig(&self) -> String {
         format!(
             "{}x{}|{}x{}|{}x{}",
@@ -82,7 +82,7 @@ unsafe extern "system" fn monitor_enum_proc(
         return BOOL(1);
     }
     // With hdc = NULL passed to EnumDisplayMonitors the callback's hdc is
-    // ALSO NULL (documented), so GetDeviceCaps here would be meaningless —
+    // ALSO NULL (documented), so GetDeviceCaps here would be meaningless -
     // the caller must pass the screen DC (see all_monitors).
     let list = &mut *(lparam.0 as *mut Vec<AppMonitor>);
     let caps = |index: GET_DEVICE_CAPS_INDEX| GetDeviceCaps(Some(hdc), index).max(0) as u32;
@@ -191,44 +191,98 @@ pub fn monitor_device_names() -> HashMap<String, String> {
         .collect()
 }
 
-// GDI display devices (device name + EDID id) keyed by the device's
-// current-mode desktop position, so they can be joined to the monitor rects:
-// the position from EnumDisplaySettingsW is the same virtual-desktop space as
-// the EnumDisplayMonitors rect, so (left, top) pins each monitor to its device.
+// GDI display devices (adapter device name + monitor EDID id) keyed by the
+// monitor's current-mode desktop position, so they can be joined to the
+// monitor rects: the position from EnumDisplaySettingsW is the same
+// virtual-desktop space as the EnumDisplayMonitors rect, so (left, top) pins
+// each monitor to its device. The adapter's DeviceName is what CreateDCW
+// needs for gamma writes; only the monitor devices carry the EDID id
+// (MONITOR\...) the frontend persists per-monitor profiles against, the
+// adapter's own DeviceID is its PCI instance id, not a monitor identity.
 fn display_devices_by_position() -> HashMap<(i32, i32), (String, String)> {
     let mut map = HashMap::new();
-    // SAFETY: EnumDisplayDevicesW(NULL) enumerates the display devices; only
-    // attached devices (those on the desktop) get their current-mode position.
+    // SAFETY: EnumDisplayDevicesW(NULL) enumerates the display adapters, then
+    // each attached adapter enumerates the monitors attached to it. Per the
+    // docs the monitor loop starts at iDevNum 0 and DeviceName changes on
+    // each call, so the adapter name is saved separately. Only attached
+    // devices (those on the desktop) get their current-mode position.
     unsafe {
         let mut index = 0u32;
         loop {
-            let mut dev = DISPLAY_DEVICEW {
+            let mut adapter = DISPLAY_DEVICEW {
                 cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
                 ..Default::default()
             };
-            if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut dev, 0).as_bool() {
+            if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut adapter, 0).as_bool() {
                 break;
             }
             index += 1;
-            if (dev.StateFlags.0 & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP.0) == 0 {
+            if (adapter.StateFlags.0 & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP.0) == 0 {
                 continue;
             }
-            let name = trim_utf16(&dev.DeviceName);
-            let mut dm = DEVMODEW::default();
-            let name_wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            if !EnumDisplaySettingsW(PCWSTR(name_wide.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm)
+            let adapter_name = trim_utf16(&adapter.DeviceName);
+            let adapter_name_wide: Vec<u16> =
+                adapter_name.encode_utf16().chain(std::iter::once(0)).collect();
+            for monitor_index in 0u32.. {
+                let mut monitor = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                if !EnumDisplayDevicesW(
+                    PCWSTR(adapter_name_wide.as_ptr()),
+                    monitor_index,
+                    &mut monitor,
+                    0,
+                )
                 .as_bool()
-            {
-                continue;
+                {
+                    break;
+                }
+                if (monitor.StateFlags.0 & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP.0) == 0 {
+                    continue;
+                }
+                // The monitor's own device name (e.g. \\.\DISPLAY1\Monitor0)
+                // resolves its per-monitor current-mode position; fall back to
+                // the adapter's position (identical for the usual
+                // one-monitor-per-adapter case) when the monitor name is not
+                // queryable.
+                let monitor_name = trim_utf16(&monitor.DeviceName);
+                let pos = current_mode_position(&monitor_name)
+                    .or_else(|| current_mode_position(&adapter_name));
+                let Some((x, y)) = pos else { continue };
+                map.insert((x, y), (adapter_name.clone(), trim_utf16(&monitor.DeviceID)));
             }
-            // DEVMODEW models the union-typed fields through Anonymous1/2;
-            // dmPosition lives in the second anonymous member. The unsafe
-            // union read is already covered by the enclosing unsafe block.
-            let pos = dm.Anonymous1.Anonymous2.dmPosition;
-            map.insert((pos.x, pos.y), (name, trim_utf16(&dev.DeviceID)));
         }
     }
     map
+}
+
+// Current-mode desktop position (virtual-desktop coordinates, the same space
+// as the EnumDisplayMonitors rects) of a display device, an adapter name
+// (\\.\DISPLAY1) or a monitor device name (\\.\DISPLAY1\Monitor0).
+fn current_mode_position(device_name: &str) -> Option<(i32, i32)> {
+    // EnumDisplaySettingsW expects dmSize set to sizeof(DEVMODEW), matching
+    // display_info.rs's fresh_devmode.
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let name_wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let ok = unsafe {
+        EnumDisplaySettingsW(PCWSTR(name_wide.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
+    };
+    if !ok {
+        return None;
+    }
+    // DEVMODEW models the union-typed fields through Anonymous1/2;
+    // dmPosition lives in the second anonymous member. The unsafe union read
+    // is valid after EnumDisplaySettingsW filled the struct.
+    // SAFETY: the union member is read only after a successful call that
+    // populates it.
+    unsafe {
+        let pos = dm.Anonymous1.Anonymous2.dmPosition;
+        Some((pos.x, pos.y))
+    }
 }
 
 fn trim_utf16(raw: &[u16]) -> String {

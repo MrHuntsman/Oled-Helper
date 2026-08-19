@@ -4,19 +4,17 @@ mod explorer_hook;
 mod flyout_window;
 mod font_replacement;
 mod gamepad;
+mod gamma;
 mod gamma_ramp;
 mod hdr_toggle;
 mod hotkeys;
 mod input_monitor;
 mod monitors;
 mod power;
+mod process;
 mod taskbar_dimmer;
 mod text_rendering;
 mod tray_balloon;
-// Kept (with dead_code allowed) because the native muda menu is retired but
-// may be reinstated as a fallback: see the DISABLED blocks in setup().
-#[allow(dead_code)]
-mod tray_menu;
 mod tray_menu_window;
 mod updater;
 mod vendor_info;
@@ -29,22 +27,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Condvar, Mutex,
 };
-use std::thread::JoinHandle;
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager,
 };
-
-// Only consumed by the disabled native tray menu listener (see the DISABLED
-// block in setup), kept around in case that menu is reinstated.
-#[allow(dead_code)]
-#[derive(serde::Deserialize)]
-struct DisplayMenuSortingEvent {
-    #[serde(rename = "resolutionSort")]
-    resolution_sort: Option<String>,
-    #[serde(rename = "refreshRateSort")]
-    refresh_rate_sort: Option<String>,
-}
 
 // Shared by the Debug tab's "Detailed logging" toggle. Diagnostic info from
 // the vendor/EDID paths is intentionally quiet by default because those paths
@@ -83,7 +69,7 @@ mod display_change_events {
     // True while the main window is minimized (between SIZE_MINIMIZED and the
     // next SIZE_RESTORED). SIZE_RESTORED also fires for ordinary resizes, so
     // this flag is what lets us tell a genuine restore-from-minimized apart
-    // from a plain resize — only the former replays the restore animation.
+    // from a plain resize, only the former replays the restore animation.
     static WAS_MINIMIZED: AtomicBool = AtomicBool::new(false);
 
     unsafe extern "system" fn window_proc(
@@ -169,7 +155,7 @@ mod display_change_events {
         // the system changing any setting), so it is noise at Debug: log it
         // only when detailed logging is enabled.
         if crate::detailed_logging_enabled() {
-            log::debug!("[display] change notification ({source})");
+            log::debug!("[display-info] change notification ({source})");
         }
         // The CCD SDR white level write broadcasts a settings-change message
         // on some systems. Reacting to the app's own write as if it were a
@@ -187,7 +173,7 @@ mod display_change_events {
         // re-enumerate promptly.
         vendor_info::invalidate_display_caches();
         // The cached primary-HDR target used by get/set_sdr_white_level is
-        // also derived from the display topology ,  a change can move it to a
+        // also derived from the display topology, a change can move it to a
         // different adapter/target, so invalidate it too.
         hdr_toggle::invalidate_hdr_target_cache();
     }
@@ -204,175 +190,14 @@ mod display_change_events {
     }
 }
 
-// Gamma state ,  synchronous apply + periodic safety restore.
-// The frontend calls apply_gamma_ramp on every slider change; the ramp is
-// applied immediately (no polling thread, no IPC round-trip delay). A
-// lightweight safety thread re-applies every 5 seconds so another app
-// resetting the system gamma (fullscreen games, driver updates) is
-// corrected without user interaction.
-struct GammaShutdown {
-    requested: AtomicBool,
-    wake: Condvar,
-    lock: Mutex<()>,
-}
 
-struct GammaState {
-    desired: Arc<AtomicI32>,
-    // Per-monitor black-lift values keyed by the monitor's stable signature
-    // (see monitors::AppMonitor::sig). The safety thread re-applies these to
-    // their own devices alongside the global value, and shutdown resets every
-    // affected monitor. Entries may contain an explicit zero so the screen
-    // protector can distinguish it from an uninitialized profile.
-    per_monitor: Arc<Mutex<HashMap<String, i32>>>,
-    // Current screen-protector gamma brightness per monitor: 1000 = unmodified.
-    screen_dim_brightness: Arc<Mutex<HashMap<String, u32>>>,
-    shutdown: Arc<GammaShutdown>,
-    safety_thread: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl Drop for GammaState {
-    fn drop(&mut self) {
-        self.shutdown.requested.store(true, Ordering::Release);
-        self.shutdown.wake.notify_one();
-        if let Ok(mut guard) = self.safety_thread.lock() {
-            if let Some(handle) = guard.take() {
-                let _ = handle.join();
-            }
-        }
-        unsafe {
-            gamma_ramp::reset_display_ramp();
-            reset_per_monitor_ramps(&self.per_monitor);
-        }
-    }
-}
-
-// Restores every monitor that has a per-monitor lift entry to the linear ramp.
-fn reset_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
-    let Ok(map) = per_monitor.lock() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let devices = crate::monitors::monitor_device_names();
-    for sig in map.keys() {
-        if let Some(device) = devices.get(sig) {
-            unsafe {
-                gamma_ramp::reset_monitor_ramp(device);
-            }
-        }
-    }
-}
-
-// Applies the current Black Crush profiles with an additional screen-level
-// brightness multiplier. The screen protector uses this instead of a window
-// overlay, so every connected monitor (including shell flyouts) is dimmed by
-// the display gamma path.
-pub(crate) fn apply_screen_gamma_ramps(
-    desired: &AtomicI32,
-    per_monitor: &Mutex<HashMap<String, i32>>,
-    brightness_by_monitor: &HashMap<String, u32>,
-    restore_unconfigured: bool,
-) {
-    if crate::vendor_info::nvidia_reference_mode_enabled() {
-        return;
-    }
-    let _gamma_guard = crate::hotkeys::gamma_write_guard();
-    let values: HashMap<String, i32> = per_monitor
-        .lock()
-        .map(|map| map.clone())
-        .unwrap_or_default();
-    let primary_fallback = desired.load(Ordering::Relaxed);
-    for monitor in crate::monitors::all_monitors() {
-        if monitor.device_name.is_empty() {
-            continue;
-        }
-        let sig = monitor.sig();
-        let brightness_thousandths = brightness_by_monitor.get(&sig).copied().unwrap_or(1000);
-        let brightness = (brightness_thousandths.min(1000) as f32) / 1000.0;
-        let dimmed = brightness_thousandths < 1000;
-        // The primary fallback preserves the existing global Black Crush
-        // value during startup. Every write below is still per-monitor; the
-        // global SetDeviceGammaRamp path is never used for screen dimming.
-        let lift = values.get(&sig).copied().unwrap_or_else(|| {
-            if monitor.primary { primary_fallback } else { 0 }
-        });
-        let has_profile = values.contains_key(&sig);
-        if (has_profile && (lift != 0 || dimmed || restore_unconfigured))
-            || (!has_profile && monitor.primary && primary_fallback != 0)
-            || dimmed
-            || restore_unconfigured
-        {
-            let ramp = gamma_ramp::build_dimmed_ramp(lift, brightness);
-            unsafe {
-                let _ = gamma_ramp::set_monitor_ramp(&monitor.device_name, &ramp);
-            }
-        }
-    }
-}
-
-fn gamma_safety_loop(
-    desired: Arc<AtomicI32>,
-    per_monitor: Arc<Mutex<HashMap<String, i32>>>,
-    screen_dim_brightness: Arc<Mutex<HashMap<String, u32>>>,
-    shutdown: Arc<GammaShutdown>,
-) {
-    loop {
-        let guard = shutdown
-            .lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (_guard, _timeout) = shutdown
-            .wake
-            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |_| {
-                !shutdown.requested.load(Ordering::Acquire)
-            })
-            .unwrap_or_else(|error| error.into_inner());
-        if shutdown.requested.load(Ordering::Acquire) {
-            break;
-        }
-        // A timeout is the normal five-second safety tick. The predicate also
-        // closes the lost-notification race during shutdown.
-        // Hold-to-compare applies neutral gamma directly on the hardware
-        // without updating `desired`. Don't overwrite its comparison view.
-        if crate::hotkeys::is_hold_compare_active() {
-            if crate::vendor_info::nvidia_reference_mode_enabled() {
-                continue;
-            }
-            crate::hotkeys::recover_hold_restore();
-            continue;
-        }
-        if crate::vendor_info::nvidia_reference_mode_enabled() {
-            continue;
-        }
-        let brightness = screen_dim_brightness
-            .lock()
-            .map(|map| map.clone())
-            .unwrap_or_default();
-        // Re-apply only through each monitor's own GDI device. At full
-        // brightness with no Black Crush values the helper remains a no-op.
-        apply_screen_gamma_ramps(&desired, &per_monitor, &brightness, false);
-        let global_lift = desired.load(Ordering::Relaxed);
-        if global_lift != 0 {
-            let ramp = gamma_ramp::build_ramp(global_lift);
-            unsafe {
-                let _ = gamma_ramp::set_display_ramp(&ramp);
-            }
-        }
-    }
-}
-
-// Applies the gamma ramp synchronously ,  the display update happens on the
-// caller's thread (the Tauri command thread) and returns immediately. No
-// background polling, no IPC delay. A separate safety thread re-applies at
-// 5-second intervals to recover from external gamma resets.
 // ── Pre-WebView log history ────────────────────────────────────────────────
 // tauri-plugin-log's Webview target only forwards records while the frontend
 // listener is attached; records logged before then (setup, config load, tray
 // and dimmer initialization) are emitted as events with no listener and
 // dropped. This extra Dispatch target captures those early records into a
 // bounded ring buffer, and the frontend drains them via take_log_history
-// right after it attaches the listener ,  so the terminal, file, Debug tab,
+// right after it attaches the listener, so the terminal, file, Debug tab,
 // and DevTools stay 1:1 even for startup records.
 mod log_history {
     use serde::Serialize;
@@ -450,71 +275,6 @@ mod log_history {
     }
 }
 
-#[tauri::command]
-fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(), String> {
-    // Frontend clamps to ±150 already; clamp here too so a stray caller can
-    // never drive the ramp math with an extreme value.
-    let black_lift = black_lift.clamp(-150, 150);
-    if crate::vendor_info::nvidia_reference_mode_enabled() {
-        return Err("NVIDIA Override to reference mode is enabled; disable it in your NVIDIA driver settings under System → Displays to use Black Crush Tweak".into());
-    }
-    // Hold the same gamma lock across the state check, desired-value update,
-    // and possible write. If release completes just before this command gets
-    // the lock, this path applies the newest value instead of leaving the
-    // linear compare ramp or an older restore value behind.
-    let _gamma_guard = crate::hotkeys::gamma_write_guard();
-    if !crate::hotkeys::is_hold_compare_active() {
-        let ramp = gamma_ramp::build_ramp(black_lift);
-        let applied = unsafe { gamma_ramp::set_display_ramp(&ramp) };
-        if !applied {
-            return Err("SetDeviceGammaRamp failed".into());
-        }
-    }
-    state.desired.store(black_lift, Ordering::Relaxed);
-    crate::hotkeys::update_hold_restore_locked(black_lift);
-    Ok(())
-}
-
-// Same as apply_gamma_ramp but targets a specific monitor (by stable
-// signature) instead of the primary. Used by per-monitor Black Crush when the
-// frontend has a monitor selected; the primary monitor goes through the global
-// path above. The per-monitor table keeps explicit zero values too.
-#[tauri::command]
-fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i32) -> Result<(), String> {
-    let black_lift = black_lift.clamp(-150, 150);
-    if crate::vendor_info::nvidia_reference_mode_enabled() {
-        return Err("NVIDIA Override to reference mode is enabled; disable it in your NVIDIA driver settings under System → Displays to use Black Crush Tweak".into());
-    }
-    let _gamma_guard = crate::hotkeys::gamma_write_guard();
-    if !crate::hotkeys::is_hold_compare_active() {
-        let device = crate::monitors::monitor_device_names()
-            .get(&sig)
-            .cloned()
-            .ok_or_else(|| format!("no display device for monitor {sig}"))?;
-        let brightness = state
-            .screen_dim_brightness
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&sig).copied())
-            .unwrap_or(1000);
-        let ramp = gamma_ramp::build_dimmed_ramp(black_lift, brightness as f32 / 1000.0);
-        let applied = unsafe { gamma_ramp::set_monitor_ramp(&device, &ramp) };
-        if !applied {
-            return Err("SetDeviceGammaRamp failed".into());
-        }
-    }
-    {
-        let mut map = state
-            .per_monitor
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        // Keep zero as an explicit per-monitor value. Removing it would make
-        // the screen protector fall back to the primary/global profile and
-        // could reintroduce an old lift on a monitor intentionally set to 0.
-        map.insert(sig, black_lift);
-    }
-    Ok(())
-}
 
 // Bridge for frontend warnings/errors and uncaught JS errors, so the
 // on-disk log captures actionable failures even if the app hangs or crashes
@@ -542,9 +302,18 @@ fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
     vendor_info::query_vendor_display_info_fresh()
 }
 
+// Cheap NVIDIA reference-mode probe for the Black Crush tab. Unlike
+// refresh_vendor_display_info this does not run the full NVAPI color/VRR
+// query chain; it reads the cached driver-registry flag (5 s TTL), so the tab
+// can poll it without a per-tick NVAPI session.
+#[tauri::command]
+fn get_nvidia_reference_mode() -> bool {
+    vendor_info::nvidia_reference_mode_enabled()
+}
+
 // Async (not sync) commands: the apply now persists the mode to the registry
 // in the same ChangeDisplaySettingsExW call (CDS_UPDATEREGISTRY, ~245ms on
-// some driver stacks ,  the same cost the confirm used to carry). A sync
+// some driver stacks, the same cost the confirm used to carry). A sync
 // command would block the Tauri main thread for that duration while the mode
 // switch is happening. The async runtime keeps the main thread responsive.
 // The tray path already runs set_resolution/set_refresh_rate on its own
@@ -567,7 +336,7 @@ async fn set_resolution(
 // mode, which writes the user profile registry and can take hundreds of ms on
 // some driver stacks. A sync command runs on the Tauri main thread and would
 // freeze the whole app (tray, dimmer z-order repairs, WebView) for that
-// duration ,  the "hitch" seen after clicking Keep. Moving them onto the async
+// duration, the "hitch" seen after clicking Keep. Moving them onto the async
 // runtime keeps the main thread responsive.
 #[tauri::command]
 async fn confirm_display_mode_change() -> Result<(), String> {
@@ -636,7 +405,7 @@ fn show_main_window(app: &AppHandle) {
 }
 
 pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
-    let state = app.state::<GammaState>();
+    let state = app.state::<gamma::GammaState>();
     state.shutdown.requested.store(true, Ordering::Release);
     state.shutdown.wake.notify_one();
     if let Ok(mut guard) = state.safety_thread.lock() {
@@ -649,7 +418,7 @@ pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
     }
     unsafe {
         gamma_ramp::reset_display_ramp();
-        reset_per_monitor_ramps(&state.per_monitor);
+        gamma::reset_per_monitor_ramps(&state.per_monitor);
     }
     // app.exit(0) bypasses Rust Drop, so explicitly close the process-lifetime
     // NVAPI DRS session/context before Tauri terminates. Flush afterward so
@@ -721,24 +490,37 @@ fn take_startup_tab() -> Option<String> {
     guard.take()
 }
 
-#[tauri::command]
-fn set_hdr_enhancement_mode(mode: String) -> Result<(), String> {
-    match mode.as_str() {
+// Applies a single HDR enhancement mode so exactly one of {RTX HDR, Auto HDR,
+// Off} is active. Shared by the interactive command (set_hdr_enhancement_mode)
+// and the elevated-restart pending apply in run(): the transition and its
+// rollback must stay identical in both paths, or a failed transition could
+// leave RTX and Auto HDR enabled together.
+fn apply_hdr_mode(mode: &str) -> Result<(), String> {
+    match mode {
         "rtx" => {
             if !vendor_info::is_nvidia_primary_gpu() {
                 return Err("NVIDIA RTX HDR is unavailable on this GPU".into());
             }
-            // The admin-gated RTX write happens before touching Auto HDR. If
-            // UAC is required, the current mode is left intact. If the second
-            // operation fails, roll RTX back so both modes cannot remain on.
+            // Configure RTX first. If the driver rejects the elevated write
+            // (UAC), Auto HDR is left untouched. Only disable Auto HDR after
+            // RTX is known to be enabled, and roll RTX back if that second
+            // operation fails so the transition never leaves both paths active.
             vendor_info::enable_rtx_hdr_for_mode()?;
             if let Err(error) = hdr_toggle::set_auto_hdr_enabled(false) {
-                let _ = vendor_info::set_rtx_hdr_enabled(false);
-                return Err(error);
+                let rollback = vendor_info::set_rtx_hdr_enabled(false);
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(format!(
+                        "{error}; RTX HDR rollback also failed: {rollback_error}"
+                    )),
+                };
             }
         }
         "auto" | "off" => {
             let want_auto = mode == "auto";
+            // Disable RTX HDR only on NVIDIA machines (non-NVIDIA systems
+            // expose only Off and Windows Auto HDR). Remember whether RTX was
+            // on so a failed Auto HDR write can restore it.
             let was_rtx_enabled = if vendor_info::is_nvidia_primary_gpu() {
                 vendor_info::get_rtx_hdr_settings()
                     .map(|settings| settings.enabled)
@@ -761,332 +543,13 @@ fn set_hdr_enhancement_mode(mode: String) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_pending_hdr_mode(mode: &str) -> Result<(), String> {
-    match mode {
-        "rtx" => {
-            if !vendor_info::is_nvidia_primary_gpu() {
-                return Err("NVIDIA RTX HDR is unavailable on this GPU".into());
-            }
-            // Configure RTX first. If the driver rejects the elevated write,
-            // Auto HDR remains untouched. Only disable Auto HDR after RTX is
-            // known to be enabled, and roll RTX back if that second operation
-            // fails so the transition never leaves both paths active.
-            vendor_info::enable_rtx_hdr_for_mode()?;
-            if let Err(error) = hdr_toggle::set_auto_hdr_enabled(false) {
-                let rollback = vendor_info::set_rtx_hdr_enabled(false);
-                return match rollback {
-                    Ok(()) => Err(error),
-                    Err(rollback_error) => Err(format!(
-                        "{error}; RTX HDR rollback also failed: {rollback_error}"
-                    )),
-                };
-            }
-        }
-        "auto" => {
-            // Disable RTX HDR only when this machine has NVIDIA RTX HDR.
-            // Non-NVIDIA systems expose only Off and Windows Auto HDR.
-            if vendor_info::is_nvidia_primary_gpu() {
-                vendor_info::set_rtx_hdr_enabled(false)?;
-            }
-            hdr_toggle::set_auto_hdr_enabled(true)?;
-        }
-        "off" => {
-            if vendor_info::is_nvidia_primary_gpu() {
-                vendor_info::set_rtx_hdr_enabled(false)?;
-            }
-            hdr_toggle::set_auto_hdr_enabled(false)?;
-        }
-        _ => return Err(format!("unknown HDR enhancement mode '{mode}'")),
-    }
-    Ok(())
+#[tauri::command]
+fn set_hdr_enhancement_mode(mode: String) -> Result<(), String> {
+    apply_hdr_mode(&mode)
 }
 
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
 // used to validate --open-tab forwarding on restart.
-const KNOWN_TABS: [&str; 11] = [
-    "crush",
-    "dimmer",
-    "screen-dimmer",
-    "windows-hdr",
-    "hotkeys",
-    "text",
-    "windows-font",
-    "debug",
-    "system",
-    "settings",
-    "about",
-];
-
-fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
-    // Always perform a real process restart, including when launched through
-    // `tauri dev`. Spawn first so a failure leaves the current instance fully
-    // functional rather than closing the app.
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            log::error!("failed to locate replacement executable: {error}");
-            return;
-        }
-    };
-    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    args.push("--restart-parent".into());
-    args.push(std::process::id().to_string().into());
-    if let Some(tab) = open_tab {
-        if KNOWN_TABS.contains(&tab) {
-            args.push(format!("--open-tab={tab}").into());
-        }
-    }
-    if let Err(error) = std::process::Command::new(exe).args(args).spawn() {
-        log::error!("failed to spawn replacement instance: {error}");
-        return;
-    }
-
-    taskbar_dimmer::shutdown();
-    shutdown_gamma_worker(app);
-    // Spawn the replacement before leaving the event loop so the next process
-    // has a guaranteed handoff path. The child waits for this PID to exit
-    // (--restart-parent) before initializing WebView2, preventing overlapping
-    // browser/profile lifetimes during a tray restart.
-    app.exit(0);
-}
-
-// Opens an external URL in the user's default browser via ShellExecuteW.
-// Without this the WebView would navigate to the link in-place; the
-// frontend intercepts anchor clicks and routes them through here instead.
-#[tauri::command]
-fn open_url(url: String) -> Result<(), String> {
-    // Only allow http/https. ShellExecuteW would otherwise happily launch
-    // arbitrary protocols (file:, cmd:, ms-settings:, javascript:, ...) with
-    // whatever string the webview passes, so constrain the scheme here.
-    let scheme = url.trim().to_ascii_lowercase();
-    if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
-        return Err("only http and https links can be opened".into());
-    }
-    let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-    let result = unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            None,
-            windows::core::w!("open"),
-            windows::core::PCWSTR(url_w.as_ptr()),
-            windows::core::PCWSTR::null(),
-            windows::core::PCWSTR::null(),
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-        )
-    };
-    // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
-    // are failures (same convention as relaunch_elevated above).
-    let code = result.0 as isize;
-    if code <= 32 {
-        return Err(format!("could not open link (error code {code})"));
-    }
-    Ok(())
-}
-
-// The native power-request list and powercfg /requests both require admin
-// rights on current Windows builds. The Screen Dimmer uses this check before
-// deciding whether to request a UAC relaunch.
-#[cfg(target_os = "windows")]
-pub(crate) fn process_is_elevated() -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_ACCESS_MASK,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    unsafe {
-        let mut token = windows::Win32::Foundation::HANDLE::default();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ACCESS_MASK(0x0008),
-            &mut token,
-        )
-        .is_err()
-        {
-            return false;
-        }
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut returned = 0u32;
-        let result = GetTokenInformation(
-            token,
-            TOKEN_INFORMATION_CLASS(20),
-            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut std::ffi::c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        );
-        let _ = CloseHandle(token);
-        result.is_ok() && elevation.TokenIsElevated != 0
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn process_is_elevated() -> bool {
-    false
-}
-
-#[tauri::command]
-fn is_process_elevated() -> bool {
-    process_is_elevated()
-}
-
-// Launches a copy of the current executable elevated (ShellExecuteW "runas",
-// UAC prompt). Forwards the current command-line arguments plus
-// --restart-parent <pid> so the replacement waits for this process to exit
-// (the same handoff the in-app relaunch uses), then appends the given extra
-// args. Returns Err on failure or when the user dismisses the UAC prompt —
-// the caller keeps running in that case.
-fn spawn_elevated(extra_args: &[String]) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    args.push("--restart-parent".into());
-    args.push(std::process::id().to_string().into());
-    args.extend(extra_args.iter().map(|arg| arg.into()));
-    // Quote each argument so a path with spaces survives the command line.
-    let params: Vec<u16> = args
-        .iter()
-        .map(|arg| {
-            let text = arg.to_string_lossy().replace('"', "\\\"");
-            format!("\"{text}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let exe_w: Vec<u16> = exe
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let result = unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            None,
-            windows::core::w!("runas"),
-            windows::core::PCWSTR(exe_w.as_ptr()),
-            windows::core::PCWSTR(params.as_ptr()),
-            windows::core::PCWSTR::null(),
-            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-        )
-    };
-    // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
-    // are failures. The one exception is ERROR_CANCELLED (1223): dismissing
-    // the UAC prompt also yields > 32, so it must be checked explicitly ,
-    // otherwise cancelling the elevation would look like success and kill
-    // this instance. Keep the app fully functional whenever the launch did
-    // not actually happen.
-    let code = result.0 as isize;
-    if code <= 32 || code == 1223 {
-        // Translate the handful of codes users can actually hit into plain
-        // language instead of surfacing the raw Win32/ShellExecuteW value ,
-        // "ShellExecuteW returned 5" means nothing to someone who just wanted
-        // to change an HDR setting.
-        let message = match code {
-            1223 => "Elevation cancelled ,  no changes made.".to_string(),
-            5 => "Administrator access denied.".to_string(),
-            2 | 3 => "App not found to restart. Try reinstalling.".to_string(),
-            8 => "Out of memory during restart. Close some programs and retry.".to_string(),
-            26 => "A required file is in use. Close other app instances and retry.".to_string(),
-            31 => "No program is associated with the restart. Try reinstalling.".to_string(),
-            _ => format!("Restart with administrator access failed (error {code}). Restart manually as Administrator."),
-        };
-        return Err(message);
-    }
-    Ok(())
-}
-
-// RTX HDR and Screen Dimmer request elevation through the same UAC relaunch
-// path. The pending operation is forwarded to the replacement process.
-#[tauri::command]
-fn relaunch_elevated(
-    app: AppHandle,
-    rtx_hdr_flags: Option<u32>,
-    rtx_hdr_enabled: Option<bool>,
-    hdr_mode: Option<String>,
-    screen_dimmer_enabled: Option<bool>,
-    tab: Option<String>,
-) -> Result<(), String> {
-    let mut extra: Vec<String> = Vec::new();
-    if let Some(flags) = rtx_hdr_flags {
-        extra.push(format!("--rtx-hdr-flags={flags}"));
-    }
-    if let Some(enabled) = rtx_hdr_enabled {
-        extra.push(format!("--rtx-hdr-enabled={}", u8::from(enabled)));
-    }
-    if let Some(mode) = hdr_mode
-        .as_deref()
-        .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
-    {
-        extra.push(format!("--hdr-mode={mode}"));
-    }
-    if let Some(enabled) = screen_dimmer_enabled {
-        extra.push(format!("--screen-dimmer-enabled={}", u8::from(enabled)));
-    }
-    // Only forward tab ids the app actually has; anything else is ignored
-    // rather than carried into the command line.
-    if let Some(tab) = tab {
-        if KNOWN_TABS.contains(&tab.as_str()) {
-            extra.push(format!("--open-tab={tab}"));
-        }
-    }
-    spawn_elevated(&extra)?;
-    taskbar_dimmer::shutdown();
-    shutdown_gamma_worker(&app);
-    app.exit(0);
-    Ok(())
-}
-
-// When this instance was spawned by a tray Restart, --restart-parent carries
-// the old process's PID. Wait for it to fully exit before creating the
-// WebView2 environment. A vanished parent is success; a live parent remains
-// polled with low-frequency warnings until it exits. Also used by the
-// updater's --apply-update mode to wait for the old process to release the
-// exe file before swapping it.
-#[cfg(target_os = "windows")]
-pub(crate) fn wait_for_restart_parent(parent_pid: u32) -> bool {
-    use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
-    };
-    use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    unsafe {
-        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) {
-            Ok(handle) => handle,
-            Err(error) => {
-                // ERROR_INVALID_PARAMETER means the PID no longer exists;
-                // other failures (for example, an access restriction) do not
-                // prove that the parent released the WebView2 profile.
-                if GetLastError() == ERROR_INVALID_PARAMETER {
-                    log::info!("restart parent {parent_pid} is already gone");
-                    return true;
-                }
-                log::error!(
-                    "could not inspect restart parent {parent_pid}: {error}; aborting replacement"
-                );
-                return false;
-            }
-        };
-        let mut last_warning = std::time::Instant::now();
-        loop {
-            let mut exit_code = 0u32;
-            if GetExitCodeProcess(handle, &mut exit_code).is_err() {
-                let _ = CloseHandle(handle);
-                log::error!(
-                    "could not read restart parent {parent_pid} status; aborting replacement"
-                );
-                return false;
-            }
-            if exit_code != STILL_ACTIVE.0 as u32 {
-                let _ = CloseHandle(handle);
-                return true;
-            }
-            if last_warning.elapsed() >= std::time::Duration::from_secs(5) {
-                log::warn!("restart parent {parent_pid} is still shutting down; replacement remains waiting");
-                last_warning = std::time::Instant::now();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1105,17 +568,17 @@ pub fn run() {
     // Tray-restart child: let the old instance release the user-data folder
     // before we start WebView2. If the parent remains alive or its state cannot
     // be verified, abort this child rather than competing for the profile.
-    let is_restart_child = std::env::args().any(|arg| arg == "--restart-parent");
+    let is_restart_child = std::env::args().any(|arg| arg == process::ARG_RESTART_PARENT);
     #[cfg(target_os = "windows")]
     {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        if let Some(pos) = args.iter().position(|arg| arg == "--restart-parent") {
+        if let Some(pos) = args.iter().position(|arg| arg == process::ARG_RESTART_PARENT) {
             if let Some(pid) = args
                 .get(pos + 1)
                 .and_then(|arg| arg.to_str())
                 .and_then(|text| text.parse::<u32>().ok())
             {
-                if !wait_for_restart_parent(pid) {
+                if !process::wait_for_restart_parent(pid) {
                     return;
                 }
             }
@@ -1124,14 +587,14 @@ pub fn run() {
 
     // An elevated relaunch (RTX HDR write) can carry the mode the user tried
     // to apply before the restart. Apply it once, shortly after startup, on a
-    // background thread ,  this instance is elevated, so the DRS write that
+    // background thread, this instance is elevated, so the DRS write that
     // failed before now succeeds.
     let pending_rtx_hdr_flags: Option<u32> = std::env::args().find_map(|arg| {
-        arg.strip_prefix("--rtx-hdr-flags=")
+        arg.strip_prefix(process::ARG_RTX_HDR_FLAGS_PREFIX)
             .and_then(|value| value.parse().ok())
     });
     let pending_rtx_hdr_enabled: Option<bool> = std::env::args().find_map(|arg| {
-        arg.strip_prefix("--rtx-hdr-enabled=")
+        arg.strip_prefix(process::ARG_RTX_HDR_ENABLED_PREFIX)
             .and_then(|value| match value {
                 "1" | "true" => Some(true),
                 "0" | "false" => Some(false),
@@ -1139,12 +602,12 @@ pub fn run() {
             })
     });
     let pending_hdr_mode: Option<String> = std::env::args().find_map(|arg| {
-        arg.strip_prefix("--hdr-mode=")
+        arg.strip_prefix(process::ARG_HDR_MODE_PREFIX)
             .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
             .map(str::to_string)
     });
     let pending_screen_dimmer_enabled: Option<bool> = std::env::args().find_map(|arg| {
-        arg.strip_prefix("--screen-dimmer-enabled=")
+        arg.strip_prefix(process::ARG_SCREEN_DIMMER_ENABLED_PREFIX)
             .and_then(|value| match value {
                 "1" | "true" => Some(true),
                 "0" | "false" => Some(false),
@@ -1155,7 +618,7 @@ pub fn run() {
     // (--open-tab=<tab>); take_startup_tab hands it to the frontend once so
     // the UI opens on the same tab after the UAC restart.
     let startup_tab: Option<String> =
-        std::env::args().find_map(|arg| arg.strip_prefix("--open-tab=").map(str::to_string));
+        std::env::args().find_map(|arg| arg.strip_prefix(process::ARG_OPEN_TAB_PREFIX).map(str::to_string));
     if let Some(tab) = startup_tab {
         if let Ok(mut guard) = STARTUP_TAB.get_or_init(|| Mutex::new(None)).lock() {
             *guard = Some(tab);
@@ -1174,7 +637,7 @@ pub fn run() {
                 // active path before enabling the requested one, so an elevated
                 // restart cannot leave Auto HDR and RTX HDR enabled together.
                 if let Some(mode) = pending_hdr_mode.as_deref() {
-                    match apply_pending_hdr_mode(mode) {
+                    match apply_hdr_mode(mode) {
                         Ok(()) => log::info!(
                             "applied pending HDR enhancement mode '{mode}' after elevated restart"
                         ),
@@ -1218,14 +681,29 @@ pub fn run() {
     // before any window when the flag is set and this process isn't
     // elevated. Runs first so a single UAC prompt also covers the Screen
     // Dimmer check below. If the user dismisses the prompt the app continues
-    // non-elevated and asks again on the next launch — the flag is their
+    // non-elevated and asks again on the next launch, the flag is their
     // explicit choice, so it stays set. The elevated replacement never
-    // re-enters this branch (process_is_elevated).
+    // re-enters this branch (process_is_elevated). A dismissed prompt also
+    // skips the Screen Dimmer elevation below: one prompt per launch. The
+    // dimmer is disabled on disk in that case (same as its own decline path)
+    // so a non-elevated session never runs a half-degraded version of it.
     #[cfg(target_os = "windows")]
-    if !process_is_elevated() && config::always_elevated_on_disk() {
-        let extra = ["--open-tab=settings".to_string()];
-        if spawn_elevated(&extra).is_ok() {
+    let mut elevation_declined = false;
+    #[cfg(target_os = "windows")]
+    if !process::process_is_elevated() && config::always_elevated_on_disk() {
+        let extra = [format!("{}settings", process::ARG_OPEN_TAB_PREFIX)];
+        if process::spawn_elevated(&extra).is_ok() {
             std::process::exit(0);
+        }
+        elevation_declined = true;
+        // The dimmer can't run non-elevated either. Disable it on disk now
+        // (before the frontend loads config, so the tab shows it off) instead
+        // of asking a second time for its own elevation.
+        if config::screen_protector_enabled_on_disk() {
+            log::warn!("[power] elevation declined; disabling screen dimmer");
+            if config::screen_protector_disable_on_disk() {
+                log::info!("[power] screen dimmer disabled on disk");
+            }
         }
     }
 
@@ -1238,13 +716,15 @@ pub fn run() {
     // plain non-elevated startup: the feature is admin-only, so a
     // non-elevated session never runs a half-degraded version of it. The
     // elevated replacement never re-enters this branch (process_is_elevated).
+    // Skipped entirely when the always-elevated prompt above was declined
+    // (which already disabled the dimmer on disk).
     #[cfg(target_os = "windows")]
-    if !process_is_elevated() && config::screen_protector_enabled_on_disk() {
+    if !elevation_declined && !process::process_is_elevated() && config::screen_protector_enabled_on_disk() {
         let extra = [
-            "--screen-dimmer-enabled=1".to_string(),
-            "--open-tab=screen-dimmer".to_string(),
+            format!("{}1", process::ARG_SCREEN_DIMMER_ENABLED_PREFIX),
+            format!("{}screen-dimmer", process::ARG_OPEN_TAB_PREFIX),
         ];
-        match spawn_elevated(&extra) {
+        match process::spawn_elevated(&extra) {
             Ok(()) => std::process::exit(0),
             Err(error) => {
                 log::warn!(
@@ -1271,11 +751,11 @@ pub fn run() {
     let gamma_desired = Arc::new(AtomicI32::new(0));
     crate::hotkeys::set_current_lift(gamma_desired.clone());
     builder
-        .manage(GammaState {
+        .manage(gamma::GammaState {
             desired: gamma_desired,
             per_monitor: Arc::new(Mutex::new(HashMap::new())),
             screen_dim_brightness: Arc::new(Mutex::new(HashMap::new())),
-            shutdown: Arc::new(GammaShutdown {
+            shutdown: Arc::new(gamma::GammaShutdown {
                 requested: AtomicBool::new(false),
                 wake: Condvar::new(),
                 lock: Mutex::new(()),
@@ -1284,18 +764,19 @@ pub fn run() {
         })
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
         .invoke_handler(tauri::generate_handler![
-            apply_gamma_ramp,
-            apply_gamma_ramp_for,
+            gamma::apply_gamma_ramp,
+            gamma::apply_gamma_ramp_for,
             monitors::list_monitors,
             log_frontend,
             get_display_info,
             refresh_vendor_display_info,
+            get_nvidia_reference_mode,
             vendor_info::get_rtx_hdr_settings_state,
             set_hdr_enhancement_mode,
             vendor_info::set_rtx_hdr_state,
-            relaunch_elevated,
-            is_process_elevated,
-            open_url,
+            process::relaunch_elevated,
+            process::is_process_elevated,
+            process::open_url,
             updater::check_for_update,
             updater::download_update,
             updater::apply_update,
@@ -1387,12 +868,12 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_positioner::init())
         // Persist and restore the main window's geometry (size, position,
-        // maximized) across launches — the official window-state plugin.
+        // maximized) across launches, the official window-state plugin.
         // Registered at the BUILDER level, not in .setup(): Tauri creates the
         // config-defined windows (and fires the plugin's window_created hook
         // synchronously) before the user setup callback runs, so a plugin
         // registered there never sees the main window and its cache stays
-        // empty (state file written as {} — neither saves nor restores).
+        // empty (state file written as {}, neither saves nor restores).
         // Scoped to the "main" window only: the flyout and tray-menu popups
         // are positioned programmatically every time and must not be
         // restored. Flags exclude VISIBLE/DECORATIONS/FULLSCREEN so a
@@ -1414,14 +895,14 @@ pub fn run() {
             // seconds so another app resetting the system gamma (fullscreen
             // games, driver mode switches) is corrected automatically.
             {
-                let state = app.state::<GammaState>();
+                let state = app.state::<gamma::GammaState>();
                 let desired = state.desired.clone();
                 let per_monitor = state.per_monitor.clone();
                 let screen_dim_brightness = state.screen_dim_brightness.clone();
                 let shutdown = state.shutdown.clone();
                 let handle = std::thread::Builder::new()
                     .name("gamma-safety".into())
-                    .spawn(move || gamma_safety_loop(
+                    .spawn(move || gamma::gamma_safety_loop(
                         desired,
                         per_monitor,
                         screen_dim_brightness,
@@ -1435,7 +916,7 @@ pub fn run() {
                     .replace(handle);
             }
 
-            // Always-on rotating file log (not just debug builds) ,  GPU-init
+            // Always-on rotating file log (not just debug builds), GPU-init
             // hangs/crashes can happen in release builds too, and without a
             // persistent log the only evidence is whatever DevTools happened
             // to be open and scrolled to at the time. See log_frontend above
@@ -1443,9 +924,9 @@ pub fn run() {
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     // The app's own modules keep full Trace (the Debug tab
-                    // and file log stay detailed), but everything else —
+                    // and file log stay detailed), but everything else -
                     // reqwest, hyper, tao's event-loop diagnostics, and the
-                    // rest of the dependency tree — is capped at Info so
+                    // rest of the dependency tree, is capped at Info so
                     // library internals can't flood the log with per-request
                     // noise. That flood was filling files to the rotation cap
                     // in minutes during dev ("just a few lines" repeated
@@ -1477,7 +958,7 @@ pub fn run() {
             // same Svelte modal markup as the in-app confirmation. Pre-warmed
             // here (rather than lazily on first show()) so its WebView2
             // controller exists well before any display-mode change can race
-            // its creation ,  see flyout_window::prewarm for why.
+            // its creation, see flyout_window::prewarm for why.
             // Load the persisted config before the flyout/tray webviews are
             // pre-warmed: their first status reads (taskbar dimmer, etc.)
             // must see the saved values, not the state defaults.
@@ -1497,7 +978,7 @@ pub fn run() {
             // frontend's existing monitor-profile path immediately afterward;
             // the backend map is populated by apply_gamma_ramp_for.
             {
-                let state = app.state::<GammaState>();
+                let state = app.state::<gamma::GammaState>();
                 state.desired.store(
                     (saved_config.black_lift * 10.0).round().clamp(-150.0, 150.0) as i32,
                     Ordering::Release,
@@ -1507,7 +988,7 @@ pub fn run() {
             // Seed the taskbar dimmer state from the persisted config. The
             // main window's frontend applies these to the overlay shortly
             // after launch, but the pre-warmed tray menu reads status before
-            // that — without the seed it paints the default opacity (95%) on
+            // that, without the seed it paints the default opacity (95%) on
             // the first open and then jumps to the real value.
             {
                 let dimmer_state = app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
@@ -1540,7 +1021,7 @@ pub fn run() {
             // Start the screen protector watcher if a timeout was persisted,
             // so the dim works even before the frontend loads its config.
             {
-                let state = app.state::<GammaState>();
+                let state = app.state::<gamma::GammaState>();
                 crate::power::init(
                     saved_config.screen_protector_enabled,
                     saved_config.screen_protector_seconds,
@@ -1567,18 +1048,10 @@ pub fn run() {
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
 
-            // Native dark-mode init kept for now in case tray_menu.rs's
-            // build_menu is reinstated as a fallback later.
-            //
-            // DISABLED: the custom CSS tray popup (tray_menu_window) fully
-            // replaces the older native muda menu, so the native dark-mode
-            // init is intentionally not called.
-            // tray_menu::init_dark_mode();
-
             // TEST: right-click now opens the custom CSS popup
             // (tray_menu_window) instead of the native muda menu. No native
             // menu is attached to the tray icon, so Tauri/muda won't show its
-            // own popup on right-click ,  we handle Click ourselves for both
+            // own popup on right-click, we handle Click ourselves for both
             // buttons.
             TrayIconBuilder::with_id("main-tray")
                 .icon(tray_image)
@@ -1601,44 +1074,6 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
-
-            // DISABLED: the older native muda tray menu is retired in favor of
-            // the custom CSS popup (tray_menu_window). The menu-event handler
-            // and the display/tag/sort listeners below were only used to
-            // handle clicks on and refresh that native menu; they are kept in
-            // the codebase (commented out) so the native menu can be
-            // reinstated as a fallback later. The custom popup updates itself
-            // from the same events on the frontend side.
-            //
-            // // Handle native tray menu item clicks.
-            // let menu_app = app.handle().clone();
-            // app.on_menu_event(move |_app, event| {
-            //     tray_menu::handle_menu_event(&menu_app, event);
-            // });
-            //
-            // // Refresh the tray menu when display info changes so the
-            // // resolution / refresh-rate submenus stay current.
-            // let refresh_app = app.handle().clone();
-            // app.handle().listen("display-changed", move |_| {
-            //     tray_menu::refresh_menu(&refresh_app).ok();
-            // });
-            // let refresh_tag_app = app.handle().clone();
-            // app.handle().listen("display-menu-tags-changed", move |event| {
-            //     if let Ok(show_tags) = event.payload().parse::<bool>() {
-            //         tray_menu::refresh_menu_with_tag_override(&refresh_tag_app, show_tags).ok();
-            //     }
-            // });
-            // let refresh_sort_app = app.handle().clone();
-            // app.handle().listen("display-menu-sorting-changed", move |event| {
-            //     if let Ok(prefs) = serde_json::from_str::<DisplayMenuSortingEvent>(event.payload()) {
-            //         tray_menu::refresh_menu_with_sort_overrides(
-            //             &refresh_sort_app,
-            //             prefs.resolution_sort.as_deref(),
-            //             prefs.refresh_rate_sort.as_deref(),
-            //         )
-            //         .ok();
-            //     }
-            // });
 
             let dimmer_state = app.state::<taskbar_dimmer::TaskbarDimmerState>();
             if let Err(error) = taskbar_dimmer::create_overlay(app.handle(), &dimmer_state) {
@@ -1686,7 +1121,7 @@ pub fn run() {
             }
 
             // Tauri's runtime window icon (titlebar/taskbar while running) is blurry
-            // on Windows ,  it sets HICON from raw RGBA instead of reading per-size
+            // on Windows, it sets HICON from raw RGBA instead of reading per-size
             // frames from icon.ico like Explorer does. Fix it manually.
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {

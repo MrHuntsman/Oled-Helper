@@ -1,8 +1,8 @@
-// System font replacement (milestone M5) — backend.
+// System font replacement (milestone M5), backend.
 //
 // The eventual goal is to let the user pick a UI font and apply it
 // system-wide by impersonating the Segoe UI family (see
-// the text-rendering milestones plan, "M5 — System font replacement"). This module
+// the text-rendering milestones plan, "M5, System font replacement"). This module
 // is built in steps:
 //
 //   Step 1 (this file): enumerate + inspect installed TrueType fonts so the
@@ -49,7 +49,7 @@ pub struct InstalledFont {
 
 /// Directories scanned for user-selectable fonts: the system font store plus
 /// the per-user store. `%WINDIR%\Fonts` may contain `.fon`/`.otf`/collections
-/// we deliberately skip for now — only `.ttf` is supported (matches
+/// we deliberately skip for now, only `.ttf` is supported (matches
 /// FontWizard, and keeps the later name-table rewrite simple).
 fn windows_font_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -65,7 +65,7 @@ fn windows_font_dirs() -> Vec<PathBuf> {
 
 /// The family name of a parsed face: prefer the typographic family (name ID
 /// 16) and fall back to the legacy family (ID 1). Google Fonts statics and the
-/// Segoe variants split this way — e.g. `Roboto-Light.ttf` reports ID1
+/// Segoe variants split this way, e.g. `Roboto-Light.ttf` reports ID1
 /// "Roboto Light" with the real family "Roboto" only in ID16, and the core
 /// weights (Regular/Bold/…) have no ID16 at all. Matching siblings by ID1
 /// alone silently misses every non-core weight.
@@ -119,7 +119,7 @@ fn inspect_font_file(path: &Path) -> Option<InstalledFont> {
 /// `family`.
 /// Fonts the picker can offer. Variable fonts are excluded until the
 /// auto-instantiate feature lands (a single variable file can't fill the 12
-/// static weight slots correctly — every weight collapses to its default
+/// static weight slots correctly, every weight collapses to its default
 /// instance), and monospace fonts are excluded because they'd render the whole
 /// proportional UI monospaced.
 fn is_compatible(font: &InstalledFont) -> bool {
@@ -129,7 +129,7 @@ fn is_compatible(font: &InstalledFont) -> bool {
 /// True when a face's cmap is symbol-only: a Windows (platform 3) subtable
 /// with encoding 0 (symbol) and no Unicode-compatible subtable. That is how
 /// icon/symbol fonts (Wingdings, Webdings, Marlett, Segoe UI Symbol, …)
-/// register — replacing the UI font with one would turn every letter into a
+/// register, replacing the UI font with one would turn every letter into a
 /// glyph from the private-use area.
 fn is_symbol_font(face: &ttf_parser::Face) -> bool {
     let Some(cmap) = face.tables().cmap else {
@@ -207,7 +207,7 @@ pub fn font_list_installed() -> Vec<InstalledFont> {
 /// head.checksumAdjustment, so the result is a valid font even though the
 /// name table came from a different file. Weight/style metadata (OS/2
 /// usWeightClass/fsSelection, head.macStyle, post.italicAngle) is preserved
-/// from the source — correct when the source's weight/style matches the slot
+/// from the source, correct when the source's weight/style matches the slot
 /// it fills, which the weight auto-detection in step 3 guarantees.
 pub fn build_impersonated_font(source: &[u8], donor: &[u8]) -> Result<Vec<u8>, String> {
     let donor_font = FontRef::new(donor).map_err(|e| format!("donor font parse failed: {e}"))?;
@@ -249,7 +249,7 @@ struct SystemFontSlot {
     weight_class: u16,
     italic: bool,
     /// True for the monospace (Consolas) slots. These are NOT replaced with the
-    /// chosen proportional font — putting a proportional font into a monospace
+    /// chosen proportional font, putting a proportional font into a monospace
     /// slot breaks column alignment in terminals/VS Code, which reads as huge
     /// gaps. A mono companion is a future option; for now they stay untouched.
     mono: bool,
@@ -414,7 +414,7 @@ pub fn build_all_artifacts(primary: &Path, staging: &Path) -> Result<Vec<Artifac
             .map_err(|e| format!("could not read source {}: {e}", source_path.display()))?;
 
         // Warn when a slot is filled by a weight-mismatched source (the
-        // primary fallback) — e.g. no Bold sibling exists, so the Regular
+        // primary fallback), e.g. no Bold sibling exists, so the Regular
         // file ends up filling the "bold" slot. Useful for diagnosing why a
         // chosen family's bold looks like its regular.
         if let Some(face) = ttf_parser::Face::parse(&source, 0).ok() {
@@ -506,7 +506,7 @@ fn backup_original(slot: &SystemFontSlot) -> Result<PathBuf, String> {
 
 /// Scan `%WINDIR%\WinSxS` once for the authentic Microsoft copies of the
 /// canonical font files. WinSxS is a huge tree, so walking it per slot (as the
-/// original code did) made each backup take ~6s and froze the shell — hence a
+/// original code did) made each backup take ~6s and froze the shell, hence a
 /// single cached walk, indexed by lowercased filename with the parsed family
 /// name stored alongside.
 fn winsxs_index() -> &'static std::collections::HashMap<String, Vec<(u64, PathBuf, Option<String>)>> {
@@ -604,7 +604,7 @@ fn staging_root() -> PathBuf {
 /// rename list in order at boot and moves each source file exactly once, so
 /// two runs sharing a staged filename (the old code reused `segoeui.ttf`)
 /// meant an earlier pending entry could consume the source file a later
-/// entry still needed — Apply → Restore → Apply ended with the Restore's
+/// entry still needed, Apply → Restore → Apply ended with the Restore's
 /// original font winning at boot even though Apply was the last action. A
 /// per-run unique name means every pending entry has its own source file and
 /// the LAST scheduled run always wins, regardless of history.
@@ -640,7 +640,7 @@ fn clear_staging() {
 /// Take ownership of a canonical font file and grant Administrators full
 /// control. Segoe files are owned by TrustedInstaller, so even an elevated
 /// process can't overwrite them without this (matches FontWizard's recipe).
-/// Best effort: failures are logged, not fatal — the boot-time replace by
+/// Best effort: failures are logged, not fatal, the boot-time replace by
 /// Session Manager may still succeed because it runs as SYSTEM.
 fn take_ownership(path: &Path) {
     let p = path.to_string_lossy().into_owned();
@@ -653,7 +653,7 @@ fn take_ownership(path: &Path) {
         Err(e) => log::warn!("[font] takeown {} failed: {e}", path.display()),
         _ => {}
     }
-    // *S-1-5-32-544 is BUILTIN\Administrators as a SID — the literal name
+    // *S-1-5-32-544 is BUILTIN\Administrators as a SID, the literal name
     // "Administrators" fails on non-English Windows ("No mapping between
     // account names and security IDs"), which is why the grant must use the SID.
     match run_hidden("icacls", &[&p, "/grant", "*S-1-5-32-544:F"]) {
@@ -740,7 +740,7 @@ fn save_state(state: &ReplaceState) -> Result<(), String> {
 /// Delete the on-disk font cache files so Windows re-parses the rebuilt fonts
 /// instead of serving stale cache entries. `net stop/start FontCache` needs
 /// elevation. Only the real font caches are touched: `FNTCACHE.DAT` in
-/// System32 and the `FontCache-*.dat` files in the service's cache dir — never
+/// System32 and the `FontCache-*.dat` files in the service's cache dir, never
 /// the unrelated .dat files (perf counters, NOISE.DAT, dssec.dat, …) that also
 /// live in System32.
 fn purge_font_cache() {
@@ -941,7 +941,7 @@ pub async fn font_preview_sources() -> Vec<FontPreviewSource> {
 
 /// Google Fonts `download/list` manifest. The response is JSON with a `)]}'`
 /// anti-hijacking prefix; the fonts themselves are binary, referenced by URL
-/// in `manifest.fileRefs` (no zip, no base64 — the `files` array only carries
+/// in `manifest.fileRefs` (no zip, no base64, the `files` array only carries
 /// the small text license/readme files).
 #[derive(Deserialize)]
 struct GfManifest {
@@ -1077,7 +1077,7 @@ pub async fn font_download_apply(
 // ── Step 7: apply/restore orchestration + commands ──────────────────
 
 fn ensure_elevated() -> Result<(), String> {
-    if crate::process_is_elevated() {
+    if crate::process::process_is_elevated() {
         Ok(())
     } else {
         Err("font replacement requires administrator rights".to_string())
@@ -1125,7 +1125,7 @@ pub fn apply_replacement(primary: &Path, app: Option<&tauri::AppHandle>) -> Resu
         .map_err(|_| "the selected file is not a valid TrueType font".to_string())?;
     if face.is_variable() {
         return Err(
-            "variable fonts are not supported yet — install the static weight files of this font (e.g. Inter-Regular.ttf, Inter-Bold.ttf)"
+            "variable fonts are not supported yet; install the static weight files of this font (e.g. Inter-Regular.ttf, Inter-Bold.ttf)"
                 .to_string(),
         );
     }
@@ -1233,7 +1233,7 @@ pub struct FontStatus {
 /// stages its sources in OledHelperStaging and schedules them onto the live
 /// fonts via Session Manager's pending-file-operations list; at boot the
 /// staged files are moved away. Their presence therefore means the scheduled
-/// swap has NOT run yet — the applied font isn't live, so a restart is
+/// swap has NOT run yet, the applied font isn't live, so a restart is
 /// required. Unreadable staging (permissions) errs toward "needs restart".
 fn restart_pending() -> bool {
     let Ok(entries) = std::fs::read_dir(staging_root()) else {
@@ -1256,7 +1256,7 @@ pub fn font_restore(app: tauri::AppHandle) -> Result<(), String> {
 pub fn font_get_status() -> FontStatus {
     let applied = load_state();
     FontStatus {
-        elevated: crate::process_is_elevated(),
+        elevated: crate::process::process_is_elevated(),
         needs_restart: restart_pending(),
         applied,
     }

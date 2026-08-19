@@ -1,11 +1,11 @@
 <script>
-  // Vendor-exclusivity tag ,  a small pill shown next to settings that only
+  // Vendor-exclusivity tag, a small pill shown next to settings that only
   // work on one GPU vendor (e.g. "RTX HDR mode" → NVIDIA).
   //
   //   <VendorTag vendor="nvidia" />
   //
   // Props:
-  //   vendor – 'nvidia' | 'amd' | 'intel' (unknown values render nothing)
+  //   vendor, 'nvidia' | 'amd' | 'intel' (unknown values render nothing)
   export let vendor = '';
 
   const META = {

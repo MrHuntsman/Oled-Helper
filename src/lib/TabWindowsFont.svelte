@@ -103,7 +103,7 @@
   // render real glyphs without downloading anything. The font is registered
   // under a unique `GF-<key>` name rather than the family's real name: a
   // catalog family that is also installed (e.g. Roboto) must never override
-  // the system Roboto app-wide — the preview name only applies where we use
+  // the system Roboto app-wide, the preview name only applies where we use
   // it. Offline/preview failures just leave those options in the default font.
   function registerFontPreviews(previews) {
     for (const p of previews ?? []) {
@@ -237,8 +237,8 @@
   });
 
   // The family currently selected in either dropdown, for the sample line.
-  // The two dropdowns are mutually exclusive — picking an installed font
-  // clears the download selection and vice versa — so exactly one can drive
+  // The two dropdowns are mutually exclusive, picking an installed font
+  // clears the download selection and vice versa, so exactly one can drive
   // the preview (and an installed font never silently overrides a downloaded
   // one, since both can't be selected at once). `fontPreviewCss` is the CSS
   // font-family value for the preview line: the real family name for installed
@@ -299,7 +299,7 @@
   async function restoreFont() {
     if (fontBusy) return;
     // Restoring schedules a boot-time swap back to the originals, which needs
-    // admin like the apply — prompt for a UAC relaunch instead of hitting a
+    // admin like the apply, prompt for a UAC relaunch instead of hitting a
     // disabled button.
     if (!fontStatus.elevated) {
       requestFontElevation();

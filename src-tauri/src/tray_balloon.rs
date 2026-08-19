@@ -1,4 +1,4 @@
-// tray_balloon.rs — classic Windows tray balloon tip (Shell_NotifyIcon
+// tray_balloon.rs, classic Windows tray balloon tip (Shell_NotifyIcon
 // NIF_INFO), used for the one-time "still running in the tray" notice on the
 // first close-to-tray.
 //
@@ -6,7 +6,7 @@
 // WinRT toasts through a registered AppUserModelID, which only installed apps
 // have; this app ships as a portable exe, so those toasts silently fail for
 // most users. The classic balloon needs no AUMID, no installation and no
-// permission — it is the notification that actually displays for a portable
+// permission, it is the notification that actually displays for a portable
 // tray app.
 //
 // The balloon is attached to the app's REAL tray icon (the one Tauri/tray-icon
@@ -104,11 +104,11 @@ unsafe fn show_on_real_icon(title: &str, message: &str) -> Result<(), String> {
     // with (tested empirically): a small icon without NIIF_LARGE_ICON must be
     // SM_CXSMICON-sized (16px at 100% DPI), and anything larger is rejected
     // with ERROR_INCORRECT_SIZE (1462). With NIIF_LARGE_ICON, larger sources
-    // are accepted — 32/64/256 all work. So use the large-icon balloon with
+    // are accepted, 32/64/256 all work. So use the large-icon balloon with
     // the biggest ICO frame (256×256): the shell downscales it to the
     // balloon's large-icon slot, which stays crisp at any display DPI. The
     // old small-icon balloon handed the shell a 16px source that it upscaled
-    // into that slot — that is what looked blurry.
+    // into that slot, that is what looked blurry.
     let icon = crate::window_icon::materialize_icon_file().and_then(|icon_path| {
         crate::window_icon::load_icon(&icon_path, 256, 256)
     });

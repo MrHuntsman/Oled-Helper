@@ -1,4 +1,4 @@
-// gamma_ramp.rs ,  256-entry 16-bit gamma ramps using a Reinhard-based shadow-recovery curve.
+// gamma_ramp.rs, 256-entry 16-bit gamma ramps using a Reinhard-based shadow-recovery curve.
 // Pure black (index 0) is always left untouched.
 
 use windows::core::PCWSTR;
@@ -106,7 +106,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// Applies a ramp to a specific display device (e.g. r"\\.\DISPLAY1").
 /// `GetDC(None)` always targets the primary monitor, so per-monitor
-/// calibration must CreateDCW on the device name instead — this is what lets
+/// calibration must CreateDCW on the device name instead, this is what lets
 /// Black Crush land on secondary displays.
 pub unsafe fn set_monitor_ramp(device_name: &str, ramp: &GammaRamp) -> bool {
     let device = wide(device_name);

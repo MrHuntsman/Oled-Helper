@@ -1,5 +1,5 @@
 <script>
-  // Inlined data URI ,  see App.svelte for why icons never hit the network.
+  // Inlined data URI, see App.svelte for why icons never hit the network.
   import tabHotkeysIcon from './icons/tab_hotkeys.png?inline';
   import { hotkeys, setHotkey, resetHotkeys } from './stores.svelte.js';
 
@@ -74,7 +74,7 @@
 
   // e.code → key name for punctuation. e.key reports the SHIFTED character
   // when Shift is held (e.g. Shift+/ gives '?'), but the Rust table only holds
-  // the unshifted layout characters ,  so map from e.code, which is stable.
+  // the unshifted layout characters, so map from e.code, which is stable.
   const CODE_PUNCT = {
     Comma: ',',
     Period: '.',
@@ -106,9 +106,9 @@
     let name = null;
     const code = e.code || '';
     const key = e.key;
-    if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) name = code;          // F1–F24
-    else if (/^Key[A-Z]$/.test(code)) name = code.slice(3);          // A–Z
-    else if (/^Digit[0-9]$/.test(code)) name = code.slice(5);        // 0–9
+    if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) name = code;          // F1-F24
+    else if (/^Key[A-Z]$/.test(code)) name = code.slice(3);          // A-Z
+    else if (/^Digit[0-9]$/.test(code)) name = code.slice(5);        // 0-9
     else if (/^Numpad[0-9]$/.test(code)) name = `Num${code.slice(6)}`;
     else if (code.startsWith('Numpad')) {
       const map = { NumpadMultiply: 'Num*', NumpadAdd: 'Num+', NumpadSubtract: 'Num-', NumpadDecimal: 'Num.', NumpadDivide: 'Num/' };
@@ -162,7 +162,7 @@
   </div>
   <div class="separator"></div>
 
-  <p class="hotkey-hint hotkey-hint-top">Use key modifiers: Win, Ctrl, Alt or Shift. (F1–F24) keys can be used without a modifier.</p>
+  <p class="hotkey-hint hotkey-hint-top">Use key modifiers: Win, Ctrl, Alt or Shift. (F1-F24) keys can be used without a modifier.</p>
 
   {#each SECTIONS as section}
     <div class="hotkey-section">

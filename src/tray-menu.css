@@ -1,4 +1,4 @@
-/* tray-menu.css — custom CSS tray popup, styled with the same tokens as
+/* tray-menu.css, custom CSS tray popup, styled with the same tokens as
    the rest of the app (see :root in app.css: --panel, --accent, --hover,
    --divider). Kept separate from app.css since this window has no other
    shared chrome (no modal backdrop, no dropdown machinery). */
@@ -21,7 +21,7 @@
      row-reverse) so the base menu pane is the one flush against the
      window's right edge. The Rust side anchors the window's RIGHT edge to
      the taskbar/tray corner and grows further left when the submenu opens
-     (see tray_menu_window.rs taskbar_position) — with a normal left-to-
+     (see tray_menu_window.rs taskbar_position), with a normal left-to-
      right row the base menu is the LEFT pane, so growing the window
      leftward drags it along too. Right-aligning the base menu instead
      means growing the window only extends the submenu into the new space

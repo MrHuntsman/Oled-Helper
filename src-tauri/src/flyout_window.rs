@@ -1,4 +1,4 @@
-// flyout_window.rs ,  shows the tray-triggered "Keep display mode?" popup.
+// flyout_window.rs, shows the tray-triggered "Keep display mode?" popup.
 //
 // This used to be a fully hand-painted native Win32 window (~700 lines of raw
 // GDI: manual word-wrap, hand-rolled hit testing, a hardcoded copy of the
@@ -20,7 +20,7 @@
 // An earlier version of this file avoided touching `shadow` at all because
 // `transparent + decorations:false + shadow:false` together was observed as
 // a flaky combination that left the window "dead" (every call failing with
-// FailedToReceiveMessage, nothing ever rendering) ,  see tauri-apps/tauri#8308.
+// FailedToReceiveMessage, nothing ever rendering), see tauri-apps/tauri#8308.
 // That flakiness tracked back to two separate root causes that are now fixed
 // independently (the WebView2 environment conflict from mismatched
 // additionalBrowserArgs, and the initial-size transparency bug below), so
@@ -136,35 +136,35 @@ fn taskbar_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
     let max_x = (work.right - width_px).max(work.left);
     let max_y = (work.bottom - height_px).max(work.top);
     let (x, y) = if monitor.bottom - work.bottom > 0 {
-        // Taskbar along the bottom edge ,  pin the flyout just above it,
+        // Taskbar along the bottom edge, pin the flyout just above it,
         // aligned with the tray/notification area on the right.
         (
             (work.right - width_px - gap).max(work.left),
             (work.bottom - height_px - gap).max(work.top),
         )
     } else if work.top - monitor.top > 0 {
-        // Taskbar along the top edge ,  just below it, near the tray on the
+        // Taskbar along the top edge, just below it, near the tray on the
         // right.
         (
             (work.right - width_px - gap).max(work.left),
             (work.top + gap).min(max_y),
         )
     } else if work.left - monitor.left > 0 {
-        // Taskbar along the left edge ,  just right of it, near the tray at
+        // Taskbar along the left edge, just right of it, near the tray at
         // the bottom.
         (
             (work.left + gap).min(max_x),
             (work.bottom - height_px - gap).max(work.top),
         )
     } else if monitor.right - work.right > 0 {
-        // Taskbar along the right edge ,  just left of it, near the tray at
+        // Taskbar along the right edge, just left of it, near the tray at
         // the bottom.
         (
             (work.right - width_px - gap).max(work.left),
             (work.bottom - height_px - gap).max(work.top),
         )
     } else {
-        // No taskbar on the primary monitor ,  keep the flyout visible near
+        // No taskbar on the primary monitor, keep the flyout visible near
         // the lower-right corner of the affected display.
         (
             (work.right - width_px - gap).max(work.left),
@@ -239,7 +239,7 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
     // No SWP_NOACTIVATE on purpose: the confirmation dialog must take
     // keyboard focus so Enter (revert) and Escape (revert) work immediately,
     // like Windows' own display-mode confirm dialog. Showing with activation
-    // is safe here ,  the flyout is only ever shown while the main window is
+    // is safe here, the flyout is only ever shown while the main window is
     // hidden in the tray (the visible-window path uses the in-app modal), so
     // no other app window loses focus it needs.
     unsafe {
@@ -446,7 +446,7 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
         .map_err(|error| format!("could not create flyout window: {error}"))?;
     disable_dwm_corner_rounding(app);
     // WebView2's transparent background on Windows is only actually honored
-    // for the region touched by a real resize after creation ,  the area at
+    // for the region touched by a real resize after creation, the area at
     // the window's initial defined size renders opaque regardless of the
     // `transparent` flag (see tauri-apps/tauri#8133). Creating the window
     // 1px smaller than the real target size and immediately resizing up here
@@ -471,7 +471,7 @@ pub fn prewarm(app: &AppHandle) {
     }
     // Also warm up the DPI query itself. On a cold start, primary_monitor_scale
     // can still be racing DWM/monitor initialization for its first ~300ms
-    // (retry budget) ,  if that race is lost on the very first display-mode
+    // (retry budget), if that race is lost on the very first display-mode
     // change, size_and_position() computes width_px/height_px from a stale
     // scale factor, which throws off the taskbar-anchored y-coordinate and
     // shows the flyout noticeably higher than the (correct) position used by
@@ -598,7 +598,7 @@ fn prepare(app: &AppHandle, mode: &AppliedMode) -> Result<(), String> {
 // finish_show only changes visibility, so no DPI/size reflow is introduced
 // after the flyout becomes visible. Emits "flyout-shown" right after the
 // native window actually becomes visible, so the frontend can start its
-// entrance transition exactly when the user can see it ,  starting it any
+// entrance transition exactly when the user can see it, starting it any
 // earlier (e.g. on mount/mode-set) would let it finish playing while the
 // window is still hidden behind SetWindowPos.
 fn finish_show(app: &AppHandle) -> Result<(), String> {
@@ -620,7 +620,7 @@ fn finish_show(app: &AppHandle) -> Result<(), String> {
         // Tell the taskbar dimmer overlay this HWND is now visible and
         // topmost, so its periodic z-order repair inserts itself just
         // behind the flyout instead of in front of it (see
-        // taskbar_dimmer.rs's active_flyout_window for why ,  HWND_TOPMOST
+        // taskbar_dimmer.rs's active_flyout_window for why, HWND_TOPMOST
         // otherwise lets the dimmer's continuous repair cover the flyout
         // entirely, even though the flyout itself is also topmost).
         #[cfg(target_os = "windows")]
@@ -690,7 +690,7 @@ pub fn hide(app: &AppHandle) {
 // Called by the frontend (confirm()/rollback() in Flyout.svelte) right after
 // it hides the window itself. The frontend owns the hide() call for the
 // normal confirm/rollback flow, so this only clears the dimmer's
-// flyout-priority pointer ,  without it, the dimmer overlay would keep
+// flyout-priority pointer, without it, the dimmer overlay would keep
 // yielding z-order to a flyout HWND that is no longer showing, which is
 // harmless (active_flyout_window checks IsWindowVisible) but leaves a stale
 // pointer around until the next show. Clearing it here keeps the state tidy.
@@ -711,7 +711,7 @@ pub fn flyout_hidden(app: AppHandle) {
 // This command must NOT run the show_after_ready handshake on its own thread:
 // it's a sync command, so it executes on the Tauri main thread, and
 // show_after_ready blocks waiting for work it schedules back onto that same
-// main thread (run_on_main_thread + channel recv) — a guaranteed deadlock
+// main thread (run_on_main_thread + channel recv), a guaranteed deadlock
 // until the channel timeout. Spawn a worker thread so the handshake behaves
 // exactly like the tray path always did.
 #[tauri::command]

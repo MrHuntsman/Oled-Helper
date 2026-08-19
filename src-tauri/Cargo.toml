@@ -1,7 +1,7 @@
 [package]
 name = "OledHelper"
 version = "0.1.5"
-description = "OLED Helper — near-black calibration tool"
+description = "OLED Helper - near-black calibration tool"
 edition = "2021"
 rust-version = "1.77.2"
 

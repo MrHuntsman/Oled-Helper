@@ -1,16 +1,16 @@
 <script>
   import { onDestroy } from 'svelte';
 
-  // Windows-style admin shield badge ,  flat single-color icon (filled bold
+  // Windows-style admin shield badge, flat single-color icon (filled bold
   // silhouette + checkmark, one fill, no strokes) signalling a control needs
   // administrator rights. Hovering (or keyboard-focusing) reveals a tooltip.
   //
   //   <ShieldBadge text="Changing RTX HDR requires administrator rights." />
   //
   // Props:
-  //   label – accessible name for the icon
-  //   text  – tooltip content shown on hover/focus
-  //   size  – icon size in px (inline style so it beats the scoped CSS)
+  //   label, accessible name for the icon
+  //   text: tooltip content shown on hover/focus
+  //   size: icon size in px (inline style so it beats the scoped CSS)
   let { label = 'Requires administrator rights', text = '', size = 18 } = $props();
 
   let badgeEl = $state(null);

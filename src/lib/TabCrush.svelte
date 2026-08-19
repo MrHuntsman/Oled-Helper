@@ -89,7 +89,7 @@
       // Fixed 3×7 grid (21 cells) in normal mode, no zoom; in fullscreen the
       // grid grows to the aspect-fit cell count (up to 40) so every slot has
       // a value. HDR shows region-stepped round nits values ending exactly
-      // at the user's Max (1000-step above 5000, 500-step from 1000–5000,
+      // at the user's Max (1000-step above 5000, 500-step from 1000-5000,
       // 100-step below, finer when needed); SDR shows the bright RGB range
       // sampled over the same number of cells. Only HDR cells are true nits
       // values, so the 2000-nits outline threshold below never applies to
@@ -138,7 +138,7 @@
   // Best-fit square-ish grid on a canvas of the given aspect ratio: search
   // every rows×cols layout whose cell count is between the fixed 21 and the
   // 40-cell cap, keep the layout whose cells come closest to 1:1 (width vs
-  // height). Every slot gets a real value, the value generators accept the
+  // height). Every slot gets a real value; the value generators accept the
   // returned cell count, so nothing renders black.
   function bestFitGrid(canvasW, canvasH) {
     if (canvasW < 1 || canvasH < 1) return { cells: HIGH_NITS_CELLS, cols: HIGH_NITS_COLS, rows: HIGH_NITS_ROWS };
@@ -818,15 +818,15 @@
   // ── High Nits Max slider ─────────────────────────────────────
   // The user only drags Max, which snaps to HIGH_NITS_MAX_STOPS. Step is
   // derived in stores.svelte.js from the Max via the region rule (1000 above
-  // 5000, 500 from 1000–5000, 100 below), and the grid always ends exactly
+  // 5000, 500 from 1000-5000, 100 below), and the grid always ends exactly
   // at the Max (see calibration.js highNitsGridCodes).
   //
   // The slider is NON-LINEAR: it maps to the stop index (0..22), so each of
   // the 23 stops occupies an equal slice of the track regardless of its nits
   // value. That makes the visual steps match the requested stops exactly
   // (100, 200, … 1000, 1500, … 5000, 6000, … 10000 all evenly spaced) and
-  // keeps every stop clickable, a linear 100→10000 scale would cram the
-  // 100–1000 stops into the left 9% of the track. The readout and the strip
+  // keeps every stop clickable; a linear 100→10000 scale would cram the
+  // 100-1000 stops into the left 9% of the track. The readout and the strip
   // still use the true nits value.
   function highNitsStopIndex() {
     const idx = HIGH_NITS_MAX_STOPS.indexOf(highNitsMaxValue());
@@ -919,7 +919,7 @@
     const idx = row * cols + col;
     if (idx !== lastHoverIdx) { lastHoverIdx = idx; hoverCell = idx; }
     // Sit on the right side of the cursor with its top edge aligned to the
-    // cursor's Y. Never flips sides, it just follows the cursor even at the
+    // cursor's Y. Never flips sides; it just follows the cursor even at the
     // screen edges (only the vertical position clamps to keep it on-screen).
     const off = 12;
     const x = e.clientX + off;

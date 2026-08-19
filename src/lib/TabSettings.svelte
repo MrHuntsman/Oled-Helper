@@ -1,5 +1,5 @@
 <script>
-  // Inlined data URIs ,  see App.svelte for why icons never hit the network.
+  // Inlined data URIs, see App.svelte for why icons never hit the network.
   import tabSystemIcon from './icons/tab_system.png?inline';
   import tabDebugIcon from './icons/tab_debug.png?inline';
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
@@ -27,7 +27,7 @@
 
   async function toggleStartOnBoot() {
     const next = !startOnBoot;
-    startOnBoot = next; // optimistic ,  reverted below on failure
+    startOnBoot = next; // optimistic; reverted below on failure
     try {
       if (next) await enable();
       else await disable();
@@ -123,7 +123,7 @@
   async function confirmResetAll() {
     closeResetAllConfirm();
     // Start on Boot is handled by the autostart plugin, not the config file,
-    // so restoreAllDefaults() can't reset it ,  disable it here too.
+    // so restoreAllDefaults() can't reset it, disable it here too.
     if (startOnBoot) {
       try {
         await disable();
@@ -137,7 +137,7 @@
       await restoreAllDefaults();
     } catch (e) {
       console.warn('[settings] reset all failed', e);
-      resetAllError = 'Reset failed ,  please try again.';
+      resetAllError = 'Reset failed. Please try again.';
     }
     resetAllBtnEl?.focus();
   }

@@ -1,10 +1,10 @@
-// gamepad.rs — gamepad/joystick input detection for the Screen Dimmer.
+// gamepad.rs, gamepad/joystick input detection for the Screen Dimmer.
 //
 // Windows' GetLastInputInfo only tracks keyboard and mouse, so controller
 // input does not reset the system idle clock. A game played exclusively with
 // a gamepad would otherwise let the Screen Dimmer fade the display mid-game.
-// This module polls the two controller APIs that Windows games actually use —
-// XInput (Xbox controllers) and legacy DirectInput (most other joysticks) —
+// This module polls the two controller APIs that Windows games actually use -
+// XInput (Xbox controllers) and legacy DirectInput (most other joysticks) -
 // and reports whether any connected device is currently producing non-neutral
 // input (a pressed button, a moved trigger, or a stick/hat outside its
 // deadzone).
@@ -141,7 +141,7 @@ const IID_IDIRECTINPUT8W: GUID = GUID::from_values(
     [0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00],
 );
 
-// DIJOYSTATE2 — the immediate-state buffer DirectInput game controllers fill.
+// DIJOYSTATE2, the immediate-state buffer DirectInput game controllers fill.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DiJoyState2 {
@@ -177,7 +177,7 @@ struct DiJoyState2 {
     rgl_fslider: [i32; 2],
 }
 
-// DIDEVICEINSTANCEW — only the leading fields are read during enumeration.
+// DIDEVICEINSTANCEW, only the leading fields are read during enumeration.
 #[repr(C)]
 struct DiDeviceInstanceW {
     dw_size: u32,

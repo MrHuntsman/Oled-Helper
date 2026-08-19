@@ -52,7 +52,7 @@ pub struct AppConfig {
     pub black_lift_profiles: HashMap<String, f64>,
     #[serde(default = "default_true")]
     pub black_enabled: bool,
-    // Hide the calibration strip interface (labels, controls) ,  right-click
+    // Hide the calibration strip interface (labels, controls), right-click
     // menu on the strip. The info tooltip and fullscreen slider only hide in
     // fullscreen modes; the rest of the interface hides everywhere.
     #[serde(default)]
@@ -66,7 +66,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub explorer_hook_enabled: bool,
     // Text-tab hook scope: whether the swash detour applies to every GUI
-    // process (all apps — the default) or only the shell/Control Panel
+    // process (all apps, the default) or only the shell/Control Panel
     // hosts. Many GDI apps (7-Zip, WinRAR, ...) force ClearType per-font and
     // ignore the registry grayscale setting, and the hook is the only layer
     // that reaches them; games are unaffected (they don't draw GDI text, and
@@ -100,7 +100,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub active_monitor_sig: String,
     // Power tab screen protector: seconds of idle before the display fades
-    // and stays dimmed until input (10–180 seconds). Enabled separately via
+    // and stays dimmed until input (10-180 seconds). Enabled separately via
     // the Screen Dimmer title-section toggle.
     #[serde(default = "default_screen_protector_seconds")]
     pub screen_protector_seconds: u32,
@@ -156,7 +156,7 @@ pub struct AppConfig {
     // config should seed both new fields from it. Serde's alias only binds
     // the first field that claims it per input key when deserializing a
     // struct from a map, so the JSON key would only reach whichever field is
-    // listed first ,  to migrate old configs correctly, the fade-out field
+    // listed first, to migrate old configs correctly, the fade-out field
     // reads the legacy key by hand in `migrate_legacy_ease_duration` below
     // instead of relying on a second #[serde(alias)] here.
     #[serde(
@@ -448,7 +448,7 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
 // can decide whether a UAC relaunch is warranted.
 pub fn screen_protector_enabled_on_disk() -> bool {
     read_config_raw(|obj| {
-        // The explicit toggle wins whenever it is present — including an
+        // The explicit toggle wins whenever it is present, including an
         // explicit false. (Falling through to the legacy heuristic on a
         // present-but-false toggle re-enabled elevation on every launch for
         // users who turned the dimmer off but kept a non-zero timeout.)

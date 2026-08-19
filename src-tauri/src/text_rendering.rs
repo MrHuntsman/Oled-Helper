@@ -1,4 +1,4 @@
-// text_rendering.rs — configure Windows font smoothing / ClearType subpixel
+// text_rendering.rs, configure Windows font smoothing / ClearType subpixel
 // rendering (the same settings BetterClearTypeTuner and the built-in ClearType
 // tuner manipulate). Writes only HKCU values (no admin) and applies them via
 // the documented SystemParametersInfo actions for the GDI settings, plus
@@ -203,7 +203,7 @@ fn write_dword(subkey: &str, value: &str, data: u32) -> Result<(), String> {
 // Posted asynchronously like broadcast_font_change: a synchronous broadcast
 // to every top-level window would block the UI thread on each contrast/gamma
 // slider tick, which is the whole reason those controls feel laggy.
-// Fire-and-forget is enough — apps pick the change up whenever they next run
+// Fire-and-forget is enough, apps pick the change up whenever they next run
 // their message loop.
 fn broadcast_settings_change() {
     unsafe {
@@ -219,14 +219,14 @@ fn broadcast_settings_change() {
 
 // WM_FONTCHANGE tells renderers (Chromium included) that font rasterization
 // settings changed, so they flush their glyph caches. Sent alongside the
-// WM_SETTINGCHANGE broadcast on mode changes only — a full cache flush on
+// WM_SETTINGCHANGE broadcast on mode changes only, a full cache flush on
 // every gamma/contrast slider tick would be wasteful.
 //
 // Posted asynchronously (PostMessage) instead of sent synchronously: a
 // synchronous broadcast to every top-level window on the desktop blocks the
 // UI thread until each one answers, which is what makes mode switching feel
-// sluggish. The notification is fire-and-forget — other apps pick it up
-// whenever they next run their message loop — so the command returns as soon
+// sluggish. The notification is fire-and-forget, other apps pick it up
+// whenever they next run their message loop, so the command returns as soon
 // as it is queued.
 fn broadcast_font_change() {
     unsafe {
@@ -303,7 +303,7 @@ fn apply_directwrite(mode: &str) -> Result<(), String> {
     let (pixel_structure, cleartype_level) = match mode {
         "off" | "grayscale" => (0u32, 0u32),
         // Custom (the hook's per-panel subpixel mode) has no DirectWrite
-        // equivalent — DirectWrite only knows flat/RGB/BGR — so fall back to
+        // equivalent, DirectWrite only knows flat/RGB/BGR, so fall back to
         // standard RGB ClearType for the system-wide path.
         "rgb" | "custom" => (1u32, 100u32),
         "bgr" => (2u32, 100u32),
@@ -327,7 +327,7 @@ fn apply_mode(mode: &str) -> Result<(), String> {
             set_smoothing_type(false)?;
         }
         // Custom maps to standard RGB ClearType system-wide (see
-        // apply_directwrite) — the tuned subpixel layout only lives in the hook.
+        // apply_directwrite), the tuned subpixel layout only lives in the hook.
         "rgb" | "custom" => {
             set_smoothing_enabled(true)?;
             set_smoothing_type(true)?;
@@ -391,7 +391,7 @@ fn derive_effective_mode(smoothing_enabled: bool, smoothing_type: u32, orientati
 // Read back the full GDI + DirectWrite smoothing state from the registry and
 // log it. This is how we verify writes actually landed and let users compare
 // what the app sets against what Explorer (a known ClearType holdout) visibly
-// honors — the registry values update, but Explorer's text may not.
+// honors, the registry values update, but Explorer's text may not.
 fn log_smoothing_state(context: &str) {
     let smoothing_enabled = read_string(DESKTOP_SUBKEY, "FontSmoothing")
         .ok()
@@ -836,7 +836,7 @@ mod native_preview {
     // Destroy the preview window entirely (not just hide it). Used when the
     // main window minimizes: the preview is an owned popup, and Windows
     // automatically re-shows owned windows that were visible when their owner
-    // is restored — mid restore-animation, bypassing set_bounds. With the
+    // is restored, mid restore-animation, bypassing set_bounds. With the
     // HWND gone there is nothing for Windows to re-show, so the text sample
     // can never appear over the transition. The frontend recreates it (via
     // text_preview_show) once the window is back and settled.
@@ -1032,7 +1032,7 @@ pub fn text_preview_render(
     };
     // Knobs are mode-scoped (same rule as the hook DLL): a mode that can't
     // use a knob must not inherit it from another mode's settings. "No
-    // filter" (crisp) applies NO knobs — boldness included — and grayscale
+    // filter" (crisp) applies NO knobs, boldness included, and grayscale
     // applies only boldness (fringe damping is subpixel-only; the rasterizer
     // ignores it for mask content, this keeps it explicit). RGB/BGR/Custom
     // use the full knob pair.
@@ -1072,7 +1072,7 @@ pub fn text_preview_render(
 // Windows exposes no API signal for when the DWM minimize→restore animation
 // ends: the window rect is at its final position immediately (the animation
 // is a DWM-side transform), the window is uncloaked at animation start, and
-// no message storm marks the end. The only exact signal is the visual one —
+// no message storm marks the end. The only exact signal is the visual one -
 // the window's pixels change every frame while the animation plays and stop
 // when it completes. So after a genuine restore-from-minimized, capture the
 // window's region at ~30 fps, hash it, and emit `window-restore-settled` the
@@ -1205,7 +1205,7 @@ mod restore_settle {
                         }
                     }
                     None => {
-                        // Capture failed; keep polling — the timeout below is
+                        // Capture failed; keep polling, the timeout below is
                         // the safety net.
                     }
                 }
@@ -1318,6 +1318,6 @@ pub fn text_rendering_reset() -> Result<(), String> {
 // and forwards --open-tab so the user lands back on the tab they were using.
 #[tauri::command]
 pub fn text_rendering_restart_app(app: tauri::AppHandle, tab: Option<String>) -> Result<(), String> {
-    crate::request_restart(&app, tab.as_deref());
+    crate::process::request_restart(&app, tab.as_deref());
     Ok(())
 }

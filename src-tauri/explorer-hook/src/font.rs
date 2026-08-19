@@ -1,4 +1,4 @@
-//! font.rs — resolve a GDI LOGFONTW face name to font-file bytes for swash.
+//! font.rs, resolve a GDI LOGFONTW face name to font-file bytes for swash.
 //!
 //! GDI hands us an HFONT; there is no Win32 API to map that straight back to a
 //! font file, so we go through the registry font table (the same lookup MacType
@@ -105,7 +105,7 @@ fn resolve_font_path(file: &str) -> Option<PathBuf> {
     Some(windir.join("Fonts").join(file))
 }
 
-// Resolve a face (unchecked, always index 0 — TTC face selection comes later)
+// Resolve a face (unchecked, always index 0, TTC face selection comes later)
 // to its file bytes.
 fn resolve_font(face: &str, weight: i32, italic: bool) -> Option<Arc<[u8]>> {
     for name in display_name_candidates(face, weight, italic) {

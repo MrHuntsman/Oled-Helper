@@ -25,7 +25,7 @@
   const CUSTOM_OFFSET_STEP = 0.01;
   // Starting point for a fresh custom profile: all subpixel centers at 0
   // (every channel sampled at the pixel center). An all-zero set means
-  // "not tuned" — the hook rasterizes the mode's default layout — so the
+  // "not tuned", the hook rasterizes the mode's default layout, so the
   // sliders start neutral and tuning one axis activates the full set.
   const CUSTOM_OFFSET_DEFAULT = { rx: 0, ry: 0, gx: 0, gy: 0, bx: 0, by: 0 };
   // The six Subpixel center axes (R/G/B × x/y) in slider order.
@@ -94,12 +94,12 @@
 
   // Shared handler for the tuning sliders: update the selected monitor's
   // knob value, persist, push to the hook (debounced), and re-render the
-  // preview (debounced — a drag fires dozens of input events, and each
+  // preview (debounced, a drag fires dozens of input events, and each
   // rasterization batch is a few backend calls, so rendering on the final
   // value keeps the UI responsive).
   // The boldness knob is stored 0..=30 but IS real pixels of stroke
   // thickening (swash emboldens the outline by boldness/100 px), so the
-  // slider reads in px: 0.00..0.30, one notch = 0.05px. No "px" suffix —
+  // slider reads in px: 0.00..0.30, one notch = 0.05px. No "px" suffix -
   // it would need a wider value slot and shorten the slider vs its peers.
   function formatBoldness(v) {
     return (v / 100).toFixed(2);
@@ -112,7 +112,7 @@
     const k = textSettings.perMonitorKnobs[sig]
       || { boldness: 0, damping: 0 };
     k[field] = v;
-    // An all-default pair (no bold, no damping) is "no adjustment" — drop
+    // An all-default pair (no bold, no damping) is "no adjustment", drop
     // the entry so it does not silently keep per-monitor resolution active.
     if (k.boldness === 0 && k.damping === 0) {
       delete textSettings.perMonitorKnobs[sig];
@@ -159,12 +159,12 @@
   // Every monitor carries its own profile; the top-bar selector (stores
   // activeMonitor) picks which one the mode control edits. A monitor without
   // an explicit mode follows the system text setting (the hook's fallback
-  // slot, synced from text_rendering_get_state) — the base state, which the
+  // slot, synced from text_rendering_get_state), the base state, which the
   // radios reflect directly. The hook's per-monitor flag is derived in
   // stores from whether any assignment exists.
 
   // The mode the radios should show as active: the selected monitor's assigned
-  // mode, or the system text setting when it has no override (the base state —
+  // mode, or the system text setting when it has no override (the base state -
   // unconfigured monitors follow the system, which is RGB for most setups).
   // Restore defaults (the tab's reset button) clears overrides back to this.
   // Custom is not representable through the registry, so while scope is
@@ -276,7 +276,7 @@
     return applicableMode(state.effective_mode);
   }
 
-  // The knobs the preview must render with for the current mode — the same
+  // The knobs the preview must render with for the current mode, the same
   // mode-scoping rule the hook DLL applies. A mode that can't use a knob
   // must not inherit it from another mode's settings: "No filter" applies
   // NO knobs (boldness included, so a boldness tuned in grayscale does not
@@ -293,7 +293,7 @@
   // Coverage levels: registry-only (no hook), shell hosts, or every GUI
   // process. The three stops map onto the two persisted booleans
   // (explorerHookEnabled + hookAllApps), so the storage and backend are
-  // unchanged — this is one control over existing state.
+  // unchanged, this is one control over existing state.
   function currentScope() {
     if (!textSettings.explorerHookEnabled) return 'registry';
     return textSettings.hookAllApps ? 'all' : 'shell';
@@ -435,7 +435,7 @@
     if (!canvas || !loaded) return;
     const dpr = window.devicePixelRatio || 1;
     // Size the backing store from the canvas's OWN CSS box (width: 100%),
-    // not the parent panel's client size — the panel is taller than the
+    // not the parent panel's client size, the panel is taller than the
     // canvas (caption row + padding), so using it as the source gives the
     // backing store a different aspect ratio than the displayed box and the
     // browser stretches the drawing to fit.
@@ -457,7 +457,7 @@
     } else {
       try {
         // Rasterize at device-pixel density (size × dpr) so each bitmap pixel
-        // maps to exactly one physical pixel when drawn back at CSS size — the
+        // maps to exactly one physical pixel when drawn back at CSS size, the
         // 100% column is crisp on HiDPI instead of half-resolution. On a 1×
         // display dpr = 1 and this is identical to before.
         const renderArgs = {
@@ -624,9 +624,9 @@
               <span>
                 Where the selected mode is applied:<br>
                 <br>
-                <b>Default</b> — apps that follow Windows text settings (browsers, DirectWrite apps...).<br>
-                <b>Windows shell</b> — adds live re-rendering for Explorer, Control Panel and MMC.<br>
-                <b>All apps</b> — hooks every GDI process (2D remap + filters); browsers and games aren't affected.
+                <b>Default</b>: apps that follow Windows text settings (browsers, DirectWrite apps...).<br>
+                <b>Windows shell</b>: adds live re-rendering for Explorer, Control Panel and MMC.<br>
+                <b>All apps</b>: hooks every GDI process (2D remap + filters); browsers and games aren't affected.
               </span>
             </span>
           </span>

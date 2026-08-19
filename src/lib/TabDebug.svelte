@@ -53,7 +53,7 @@
   });
 
   // Re-derive off the version counter so this stays in sync without deep-watching
-  // the whole log array (which caused a startup hang ,  see stores.svelte.js).
+  // the whole log array (which caused a startup hang, see stores.svelte.js).
   // The store returns a fresh chronological snapshot from its ring buffer.
   let logEntries = $derived.by(() => { void gpuLogVersion.n; return gpuLogSnapshot(); });
 
@@ -113,7 +113,7 @@
   async function triggerDimPreview() {
     try {
       await invoke('power_dim_preview');
-      dimPreviewState = 'Dimmed — move mouse to restore';
+      dimPreviewState = 'Dimmed. Move the mouse to restore';
       setTimeout(() => { dimPreviewState = ''; }, 10000);
     } catch (e) {
       console.warn('[debug] screen protector preview failed', e);
@@ -122,7 +122,7 @@
 
   async function copyGpuLog() {
     const lines = logEntries.map(e => `[${formatTs(e.ts)}] [${e.level.toUpperCase()}] ${e.message}`).join('\n');
-    const text = `OLED Helper ,  Runtime Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
+    const text = `OLED Helper: Runtime Log\n${'='.repeat(28)}\n${lines || '(empty)'}`;
     try {
       await navigator.clipboard.writeText(text);
       logCopied = true;
@@ -170,7 +170,7 @@
         <button class="copy-btn config-folder-btn" class:error={configFolderError} onclick={openConfigFolder} title={configFolderError || 'Open config folder'} aria-label="Open config folder">
           <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 4.5C2.5 3.95 2.95 3.5 3.5 3.5H6.3L7.5 4.8H12.5C13.05 4.8 13.5 5.25 13.5 5.8V11.5C13.5 12.05 13.05 12.5 12.5 12.5H3.5C2.95 12.5 2.5 12.05 2.5 11.5V4.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M2.8 6H13.2" stroke="currentColor" stroke-width="1.3"/></svg>
         </button>
-        <button class="copy-btn" class:success={noticeReset} onclick={resetTrayNotice} title={noticeReset ? 'Tray notice reset!' : 'Reset tray notice — show the tray balloon again on the next close-to-tray'} aria-label="Reset tray notice">
+        <button class="copy-btn" class:success={noticeReset} onclick={resetTrayNotice} title={noticeReset ? 'Tray notice reset!' : 'Reset tray notice: show the tray balloon again on the next close-to-tray'} aria-label="Reset tray notice">
           {#if noticeReset}
             <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           {:else}

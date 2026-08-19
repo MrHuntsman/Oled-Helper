@@ -1,4 +1,4 @@
-// input_monitor.rs — real keyboard/mouse input tracking for the Screen Dimmer.
+// input_monitor.rs, real keyboard/mouse input tracking for the Screen Dimmer.
 //
 // GetLastInputInfo is reset by gamepad/HID reports on some systems, so a
 // connected-but-idle controller makes Windows report continuous "input" and

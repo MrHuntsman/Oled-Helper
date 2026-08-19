@@ -1,4 +1,4 @@
-// tray_menu_window.rs — custom CSS-styled tray popup (replaces the native
+// tray_menu_window.rs, custom CSS-styled tray popup (replaces the native
 // muda menu from tray_menu.rs for the right-click path, as a test).
 //
 // Built the same way as flyout_window.rs: a small undecorated/transparent
@@ -61,7 +61,7 @@ const BASE_WIDTH: f64 = 284.0;
 // Favorites / separator / Restart / Exit (6 rows + 1 separator). Only used
 // as the initial native hit-region before the first real Svelte layout
 // measurement replaces it via tray_menu_set_expanded (see below), so an
-// approximate value is fine — it only has to be roughly right for the very
+// approximate value is fine; it only has to be roughly right for the very
 // first frame after the window is created.
 // Includes the title/monitor/current-mode header, the three compact quick
 // control rows, separators, plus the largest inline favorites layout (up to
@@ -183,7 +183,7 @@ fn primary_monitor_info() -> Option<(HMONITOR, MONITORINFO)> {
 // window's own scale factor (GetDpiForWindow / window.scale_factor()) can
 // retain the pre-change DPI context briefly after a display-mode switch,
 // which made the first menu open after a resolution change land at the wrong
-// y — the physical size derived from the stale scale no longer matches the
+// y, the physical size derived from the stale scale no longer matches the
 // new work area. Querying the monitor directly (mirroring
 // flyout_window.rs's primary_monitor_scale) is independent of the hidden
 // window's previous scale, with a short retry budget for the DWM/monitor
@@ -216,18 +216,18 @@ fn primary_monitor_scale(fallback: f64) -> f64 {
 // The taskbar edge is derived from the monitor's work area (rcWork =
 // rcMonitor minus the taskbar strip): the edge where the two differ is where
 // the taskbar sits. Called on each anchor pass when the menu opens (see
-// toggle below); the window is never resized while visible — the final
+// toggle below); the window is never resized while visible; the final
 // post-show pass only re-applies the position, which is what corrects the
 // DPI-transition shift after a mode switch.
 //
 // anchor_x_px, when given, is the tray icon's click x-position in physical
-// pixels (from the TrayIconEvent) — the visible base-menu card (which sits
+// pixels (from the TrayIconEvent), the visible base-menu card (which sits
 // flush against the window's right edge, see tray-menu.css's row-reverse
 // layout and apply_default_hit_region's BASE_WIDTH offset) is centered on
 // that x instead of the window always hugging the work area's right edge.
 // card_width_px is the base menu card's width, so the card itself ends up
 // centered on the icon rather than the invisible full window (which is
-// wider, to also fit the resolution submenu) being centered on it — that
+// wider, to also fit the resolution submenu) being centered on it, that
 // would visually offset the card away from the icon.
 #[cfg(target_os = "windows")]
 fn taskbar_position(
@@ -247,8 +247,8 @@ fn taskbar_position(
     // meaningful), center the visible base-menu card on it instead of
     // pinning the window to the work area's right edge. Vertical taskbars
     // (left/right edge) keep the existing bottom-aligned behavior, since the
-    // icon's y position — not x — is what varies there. The card sits at the
-    // window's right edge, so window_x = desired_card_x - (width_px -
+    // icon's y position, not x, is what varies there. The card sits at the
+    // window's right edge, so window_x = desired_card_x, (width_px -
     // card_width_px).
     let horizontal_taskbar = monitor.bottom - work.bottom > 0 || work.top - monitor.top > 0;
     let anchored_x = anchor_x_px.filter(|_| horizontal_taskbar).map(|anchor_x| {
@@ -257,7 +257,7 @@ fn taskbar_position(
         window_x.clamp(work.left, max_x)
     });
     let (x, y) = if monitor.bottom - work.bottom > 0 {
-        // Taskbar along the bottom edge — pin just above it, centered on the
+        // Taskbar along the bottom edge, pin just above it, centered on the
         // tray icon's x position when known, otherwise right-aligned near
         // the tray/notification area.
         (
@@ -265,26 +265,26 @@ fn taskbar_position(
             (work.bottom - height_px - gap).max(work.top),
         )
     } else if work.top - monitor.top > 0 {
-        // Taskbar along the top edge — just below it, centered on the tray
+        // Taskbar along the top edge, just below it, centered on the tray
         // icon's x position when known, otherwise near the tray on the right.
         (
             anchored_x.unwrap_or((work.right - width_px - gap).max(work.left)),
             (work.top + gap).min(max_y),
         )
     } else if work.left - monitor.left > 0 {
-        // Taskbar along the left edge — just right of it, near the tray.
+        // Taskbar along the left edge, just right of it, near the tray.
         (
             (work.left + gap).min(max_x),
             (work.bottom - height_px - gap).max(work.top),
         )
     } else if monitor.right - work.right > 0 {
-        // Taskbar along the right edge — just left of it, near the tray.
+        // Taskbar along the right edge, just left of it, near the tray.
         (
             (work.right - width_px - gap).max(work.left),
             (work.bottom - height_px - gap).max(work.top),
         )
     } else {
-        // No taskbar on the primary monitor — fall back to the lower-right
+        // No taskbar on the primary monitor; fall back to the lower-right
         // corner of the work area.
         (
             (work.right - width_px - gap).max(work.left),
@@ -318,7 +318,7 @@ fn taskbar_position(
 // the monitor's fresh DPI and applies it natively while hidden (set_size
 // alone only updates Tauri's bookkeeping; the native SetWindowPos is what
 // actually moves/resizes the HWND). resize=false is a reposition-only pass
-// (SWP_NOSIZE) that re-samples the taskbar position — Explorer can update
+// (SWP_NOSIZE) that re-samples the taskbar position; Explorer can update
 // rcWork (the taskbar-excluded work area) after rcMonitor has already
 // settled, so the first open after a mode switch can otherwise land a few
 // dozen px off.
@@ -326,7 +326,7 @@ fn taskbar_position(
 // IMPORTANT (learned from the diagnostic logs): the hidden window's DPI
 // context is NOT updated by these passes. Windows defers a hidden window's
 // DPI transition until the window is shown, and applies it by rescaling the
-// window's pre-change geometry *during* show() — which is why the first
+// window's pre-change geometry *during* show(), which is why the first
 // open after a resolution change used to land at the old y scaled by the
 // DPI ratio (e.g. y=711 instead of 959 in the logs). toggle() therefore
 // calls this with resize=false once more AFTER show(), when the transition
@@ -409,7 +409,7 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
         .build()
         .map_err(|e| format!("could not create tray menu window: {e}"))?;
     disable_dwm_corner_rounding(app);
-    // Transparency-nudge resize — WebView2's transparent background is only
+    // Transparency-nudge resize, WebView2's transparent background is only
     // honored after a real post-creation resize (see flyout_window.rs).
     if let Err(e) = window.set_size(LogicalSize::new(FULL_WIDTH, FULL_HEIGHT)) {
         log::warn!("[tray-menu] initial resize failed: {e}");
@@ -428,7 +428,7 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
             // the pointer crossed internally and the popup must remain visible.
             // Capture the menu generation so an old blur callback can never
             // hide a newly reopened tray menu. Kept short (60ms) since there
-            // is no exit animation to wait for — the window hides instantly
+            // is no exit animation to wait for; the window hides instantly
             // once this guard clears, so a long delay only reads as sluggish.
             let generation = MENU_GENERATION.load(Ordering::Acquire);
             let delayed_window = blur_window.clone();
@@ -490,7 +490,7 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     // the first open after a resolution change at the wrong y (e.g. 711
     // instead of 959). Step 2 runs right after show(), when the transition
     // is complete and the window's scale matches the monitor, and re-applies
-    // the anchor — it sticks this time. Both steps run in the same
+    // the anchor; it sticks this time. Both steps run in the same
     // synchronous main-thread block, so no intermediate frame is ever
     // painted at the stale position.
     let anchor = Some(anchor_x.round() as i32);
@@ -552,11 +552,10 @@ pub fn tray_menu_set_expanded(
 pub fn tray_menu_get_display_info() -> Result<crate::display_info::DisplayInfo, String> {
     let mut info = crate::display_info::query_current_display()
         .ok_or_else(|| "could not query display info".to_string())?;
-    // Black Crush profiles are keyed by the monitor identity the main app
-    // resolves (monitors.rs: the adapter-level device id). display_info.rs's
-    // monitor_id is the EDID MONITOR\... id; returning that here would make
-    // the tray read a different profile entry than the main app for the same
-    // display. Substitute the main app's identity so both agree.
+    // Black Crush profiles are keyed by the monitor EDID id (MONITOR\...),
+    // which monitors.rs and display_info.rs both resolve today. Keep the
+    // substitution anyway so the tray always reports exactly what the main
+    // app's monitor list uses, even if the two resolutions ever drift.
     if let Some(primary) = crate::monitors::all_monitors().into_iter().find(|m| m.primary) {
         if !primary.monitor_id.is_empty() {
             info.monitor_id = primary.monitor_id.clone();
@@ -622,7 +621,7 @@ pub fn tray_menu_hide(app: AppHandle) {
 #[tauri::command]
 pub fn tray_menu_restart(app: AppHandle) {
     hide(&app);
-    crate::request_restart(&app, None);
+    crate::process::request_restart(&app, None);
 }
 
 /// Open (not toggle) the main app window from the tray menu header. Mirrors

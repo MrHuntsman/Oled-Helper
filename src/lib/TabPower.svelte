@@ -27,11 +27,11 @@
   // The current path may be a third-party .scr that lives outside the
   // enumerated system dirs; surface it as its own option so the dropdown never
   // silently overwrites it with "Blank screen". The $derived must use the
-  // expression form (plain function call), NOT $derived(() => {...}) — that
+  // expression form (plain function call), NOT $derived(() => {...}), that
   // form makes the derived value the function object itself.
   // First option is "Disabled" (off state, empty path); the rest are the
   // installed .scr files. The current path may be a third-party .scr that
-  // lives outside the enumerated system dirs — surface it as its own option
+  // lives outside the enumerated system dirs, surface it as its own option
   // right after "Disabled" so the dropdown never silently drops it.
   function computeScreensaverOptions() {
     const cur = state.screensaverPath;
@@ -50,7 +50,7 @@
 
   // ── Screensaver dropdown ───────────────────────────────────────────
   // Custom dropdown instead of a native <select>: the OS popup opens downward
-  // and gets clipped at the bottom of the tab. Mirrors the RTX HDR menu — a
+  // and gets clipped at the bottom of the tab. Mirrors the RTX HDR menu, a
   // trigger button + a collision-aware .dd-menu that flips upward when there
   // is no room below.
   let screensaverMenuOpen = $state(false);

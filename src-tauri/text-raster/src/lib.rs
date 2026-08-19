@@ -1,4 +1,4 @@
-//! text-raster — pure-Rust glyph rasterization core shared by the hook DLL
+//! text-raster, pure-Rust glyph rasterization core shared by the hook DLL
 //! and the in-app preview.
 //!
 //! This is the replacement for GDI's ClearType rasterizer in the targeted
@@ -32,7 +32,7 @@ pub struct RenderOptions {
     pub boldness: u8,
     /// Fringe damping, 0..=100: blends each subpixel pixel toward its
     /// luminance (c → lerp(c, lum, t)). Reduces fringe chroma so colored
-    /// edges fade toward gray — a desaturation, useful when fringing is
+    /// edges fade toward gray, a desaturation, useful when fringing is
     /// more distracting than the color loss. 0 = no damping.
     /// Only affects subpixel modes.
     pub damping: u8,
@@ -58,7 +58,7 @@ impl Default for RenderOptions {
 }
 
 /// How the current mode maps to rasterization. Mode 0 (passthrough) never
-/// reaches this code — the caller forwards to GDI instead.
+/// reaches this code, the caller forwards to GDI instead.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RenderMode {
@@ -89,7 +89,7 @@ pub struct PlacedGlyph {
     pub width: u32,
     pub height: u32,
     /// 8-bit coverage, `width * height` bytes, row-major. Shared with the
-    /// glyph cache via `Arc` — the blit only reads it, so the run and the
+    /// glyph cache via `Arc`, the blit only reads it, so the run and the
     /// cache share one immutable buffer instead of copying it per draw.
     pub coverage: Arc<[u8]>,
 }
@@ -127,8 +127,8 @@ fn mode_format(mode: RenderMode) -> (Format, Content) {
 
 /// The swash format for a 1D render: the mode's layout, or the user's custom
 /// x-centers when mode is Custom and offsets are present. Layouts with any
-/// vertical component never reach here — `custom_2d_offsets` routes them to
-/// the three-pass path — so only the x components are the native centers.
+/// vertical component never reach here, `custom_2d_offsets` routes them to
+/// the three-pass path, so only the x components are the native centers.
 fn render_format(mode: RenderMode, opts: RenderOptions) -> Format {
     let (format, _) = mode_format(mode);
     if mode == RenderMode::Custom {
@@ -209,12 +209,12 @@ const GLYPH_ENTRY_OVERHEAD: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct GlyphCacheKey {
-    /// `font_data.as_ptr()` — stable because every caller (the hook's
+    /// `font_data.as_ptr()`, stable because every caller (the hook's
     /// `cached_font` and the preview's `preview_font`) keeps the font bytes in
     /// a process-lifetime cache, so the pointer identifies the face.
     font: usize,
     font_index: u32,
-    /// `pixel_size.to_bits()` — exact f32 identity, deterministic per caller.
+    /// `pixel_size.to_bits()`, exact f32 identity, deterministic per caller.
     size: u32,
     glyph: u16,
     /// Subpixel phase bits (`offset.x/y.to_bits()`). The glyph-index path
@@ -224,7 +224,7 @@ struct GlyphCacheKey {
     mode: u8,
     boldness: u8,
     damping: u8,
-    /// Custom subpixel center bits (0 when unused) — tuned offsets must not
+    /// Custom subpixel center bits (0 when unused), tuned offsets must not
     /// share cache entries with the fixed layouts. All six (x, y) offsets are
     /// carried so a 2D layout never collides with a horizontal-only one.
     sub_rx: u32,
@@ -267,7 +267,7 @@ fn glyph_cache() -> &'static Mutex<GlyphCache> {
     })
 }
 
-/// Cache lookup; counts hits. Hands out an `Arc` (a refcount bump — no
+/// Cache lookup; counts hits. Hands out an `Arc` (a refcount bump, no
 /// coverage copy), which the caller reads immediately and drops.
 fn cache_get(key: &GlyphCacheKey) -> Option<Arc<CachedGlyph>> {
     let cache = glyph_cache().lock().unwrap_or_else(|p| p.into_inner());
@@ -604,7 +604,7 @@ pub fn rasterize(
         .scale(pixel_size);
 
     // Whitespace-only runs carry no ink. Returning an empty run here skips
-    // the shaper + scaler build entirely — spaces and separators are drawn
+    // the shaper + scaler build entirely, spaces and separators are drawn
     // constantly by Explorer (each as its own count=1 ExtTextOutW) and would
     // otherwise pay the full swash setup for a glyph that has no outline. The
     // advance is taken from the font's hmtx so right/center-aligned draws
@@ -770,8 +770,8 @@ pub fn rasterize_glyphs(
 
     // Glyph-index runs carry no subpixel phase (rasterize at the integer
     // origin), so every glyph's key is known up front. Look the whole run up
-    // in one lock acquisition: when every glyph is cached — the common
-    // repaint case while resizing, where only the position changes — the
+    // in one lock acquisition: when every glyph is cached, the common
+    // repaint case while resizing, where only the position changes, the
     // swash scaler is never built.
     let keys: Vec<GlyphCacheKey> = glyph_ids
         .iter()

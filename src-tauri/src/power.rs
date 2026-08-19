@@ -1,4 +1,4 @@
-// power.rs — power saving controls: display/sleep timeouts, the screen saver,
+// power.rs, power saving controls: display/sleep timeouts, the screen saver,
 // an instant "turn off display" action, and a screen protector that fades the
 // display output after a configurable idle timeout
 // (a burn-in protection nicety no other tool offers).
@@ -70,7 +70,7 @@ const DESKTOP_SUBKEY: &str = r"Control Panel\Desktop";
 const SCRNSAVE_VALUE: &str = "SCRNSAVE.EXE";
 
 // powrprof exports used for READS only. (There is no PowerWriteACValue/
-// PowerWriteDCValue export — powrprof only exposes the *ValueIndex write
+// PowerWriteDCValue export, powrprof only exposes the *ValueIndex write
 // variants, so arbitrary second values are written through `powercfg /change`
 // instead.) HKEY is repr(transparent) over *mut c_void, so it is safe to pass
 // a raw pointer here; the root power key is always NULL (active user).
@@ -598,7 +598,7 @@ fn display_power_request_active() -> bool {
     // can be enabled, so reaching this branch as a standard-user process is
     // only possible for a legacy config; fail quietly instead of spawning a
     // command that can never succeed.
-    if !crate::process_is_elevated() {
+    if !crate::process::process_is_elevated() {
         return false;
     }
     let executable = std::env::var_os("SystemRoot")
@@ -714,7 +714,7 @@ fn configure_screen_protector(
 /*
 // A fullscreen WS_POPUP window with WS_EX_LAYERED (alpha-driven), plus
 // WS_EX_TRANSPARENT + WS_EX_NOACTIVATE + HTTRANSPARENT so it never steals
-// input — any physical mouse/keyboard input still updates the system idle
+// input, any physical mouse/keyboard input still updates the system idle
 // clock, which is what restores the screen. Created on the main thread during
 // setup so the app's message loop pumps its WM_PAINT; every call the watcher
 // thread makes on it (SetLayeredWindowAttributes, SetWindowPos, ShowWindow,
@@ -875,7 +875,7 @@ fn apply_dim_levels(levels: &HashMap<String, u32>, restore_unconfigured: bool) {
         if let Ok(mut brightness) = context.brightness.lock() {
             *brightness = levels.clone();
         }
-        crate::apply_screen_gamma_ramps(
+        crate::gamma::apply_screen_gamma_ramps(
             &context.desired,
             &context.per_monitor,
             levels,
@@ -939,7 +939,7 @@ fn repair_overlay_zorder() {
 
 // ── Cursor hiding ───────────────────────────────────────────────────
 // The overlay is a window, so the system cursor still renders on top of it at
-// full brightness — a static bright cursor on the dimmed screen is exactly the
+// full brightness, a static bright cursor on the dimmed screen is exactly the
 // burn-in hazard the protector exists to prevent.
 //
 // ── Cursor hiding ───────────────────────────────────────────────────

@@ -82,7 +82,7 @@ listen('log://log', (event) => {
   const level = normalizeLevel(payload.level);
   const message = payload.message;
   // Records emitted while the startup replay handshake is in flight can be
-  // BOTH buffered in Rust and delivered here live ,  remember them so the
+  // BOTH buffered in Rust and delivered here live, remember them so the
   // replay below skips them instead of printing duplicates.
   if (dedupeWindowActive) {
     const key = `${level}\u0000${message}`;
@@ -176,7 +176,7 @@ window.addEventListener('unhandledrejection', (event) => {
 // interception. Convert them into normal canonical records instead. NOTE:
 // Chromium/WebView2 also prints its own native "Failed to load resource"
 // line to DevTools that JS cannot intercept, so resource failures appear
-// twice in DevTools (one native line + one canonical record) ,  the terminal,
+// twice in DevTools (one native line + one canonical record), the terminal,
 // file, and Debug tab see exactly one copy.
 window.addEventListener('error', (event) => {
   const target = event.target;
@@ -185,7 +185,7 @@ window.addEventListener('error', (event) => {
   if (!['img', 'script', 'link', 'audio', 'video'].includes(tag)) return;
   const src = target.currentSrc || target.src || target.href || '';
   const detail = (target.error && target.error.message) || event.message || '';
-  sendFrontendRecord('error', `Resource load failed: <${tag}> ${src}${detail ? ` ,  ${detail}` : ''}`);
+  sendFrontendRecord('error', `Resource load failed: <${tag}> ${src}${detail ? ` (${detail})` : ''}`);
 }, true);
 
 

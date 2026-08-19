@@ -1,5 +1,5 @@
 <script>
-  // Inlined data URI ,  see App.svelte for why icons never hit the network.
+  // Inlined data URI, see App.svelte for why icons never hit the network.
   import tabSystemIcon from './icons/tab_system.png?inline';
   import TabHeading from './TabHeading.svelte';
   import { onMount } from 'svelte';
@@ -14,7 +14,7 @@
   );
 
   // Peak luminance in nits comes from the monitor's EDID/driver via DXGI
-  // (IDXGIOutput6::GetDesc1) ,  see hdr_toggle.rs. Falls back to '-' when
+  // (IDXGIOutput6::GetDesc1), see hdr_toggle.rs. Falls back to '-' when
   // the panel doesn't report it (some drivers return 0).
   let hdrLuminance = $derived.by(() => {
     const l = app.hdrLuminance;
@@ -23,7 +23,7 @@
     return max ? `${max} nits` : '-';
   });
 
-  // True native resolution (EDID preferred timing) ,  the same data Windows
+  // True native resolution (EDID preferred timing), the same data Windows
   // uses for its "(Recommended)" label. `nativeSource` says which EDID
   // location supplied it ("CEA-861" for the extension block TVs use,
   // "base EDID" for the base block, or empty when unreadable).
@@ -69,7 +69,7 @@
         ? `WebGPU canvas (${hdr ? 'rgba16float · display-p3' : 'rgba8unorm · srgb'}; initializes in Black Crush)`
         : 'WebGPU unavailable';
     // The GPU model comes from DXGI (vendor-agnostic, available at startup)
-    // and is preferred over the WebGPU adapter label ,  WebView2 leaves the
+    // and is preferred over the WebGPU adapter label, WebView2 leaves the
     // adapter's device field blank on Windows, which is where the old
     // "nvidia / ? / ampere" came from.
     const gpuModel = (app.displayInfo.gpuModel || '').trim();
@@ -121,7 +121,7 @@
           // connection, the signal, and finally how Windows renders it.
           // These fields are also exposed in the compact monitor tooltip;
           // keeping them here makes the report canonical and copyable (and
-          // avoids a duplicate "Current" row ,  Screen Resolution already
+          // avoids a duplicate "Current" row, Screen Resolution already
           // includes the active resolution and refresh rate).
           // HDR max luminance is only meaningful while HDR is active; hide it
           // in SDR (same rule as the tooltip).
@@ -134,7 +134,7 @@
           // SDR white level is used as the reference for the Brightness
           // strip's HDR cells. Chromium froze the value at WebView startup,
           // so the strip encodes against that frozen base
-          // (app.sdrWhiteBaseNits), not the live slider ,  show the base so
+          // (app.sdrWhiteBaseNits), not the live slider, show the base so
           // the row matches what the strip renders.
           ...(app.hdrStatus === 'hdr' ? [['SDR White Level', `${Math.round(app.sdrWhiteBaseNits ?? app.sdrWhiteNits)} nits`]] : []),
         ],
@@ -151,7 +151,7 @@
 
   async function copySystemInfo() {
     const lines = sections.flatMap((section) => section.rows).map(([k, v]) => `${k}: ${v}`).join('\n');
-    const text = `OLED Helper ,  System Info\n${'='.repeat(28)}\n${lines}`;
+    const text = `OLED Helper: System Info\n${'='.repeat(28)}\n${lines}`;
     try {
       await navigator.clipboard.writeText(text);
       copied = true;

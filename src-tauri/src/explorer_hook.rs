@@ -1,11 +1,11 @@
-// explorer_hook.rs — load explorer_hook.dll into the shell and the classic
+// explorer_hook.rs, load explorer_hook.dll into the shell and the classic
 // Control Panel host processes via a single global WH_CBT hook, and control
 // their font-antialiasing override. The Windows shell (and several system
 // consoles) hard-code ClearType and ignore the per-user font-smoothing
 // registry values, so the only way to change their text is to load a DLL that
 // hooks ExtTextOutW and re-rasterizes each draw with swash (see explorer-hook/).
 // The DLL is loaded through a
-// global SetWindowsHookExW WH_CBT hook — the documented OS mechanism — instead
+// global SetWindowsHookExW WH_CBT hook, the documented OS mechanism, instead
 // of CreateRemoteThread injection, so Windows Defender does not flag the app
 // the way it did the injection path. WH_CBT fires on window creation, before
 // fonts are rasterized, so the fix reaches fast-starting applets (Device
@@ -13,7 +13,7 @@
 // miss. The DLL reads a session-local shared-memory mode that this module
 // writes: 0 = pass through, 1 = force grayscale, 2 = force crisp, 3 = subpixel
 // RGB, 4 = subpixel BGR, 7 = custom subpixel offsets (5/6 were the fixed
-// WOLED RGWB/RWBG presets, removed — the Custom mode covers those layouts).
+// WOLED RGWB/RWBG presets, removed, the Custom mode covers those layouts).
 // Because the hook sits on the draw path, a mode change applies on the next
 // repaint (live).
 
@@ -50,7 +50,7 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //       on Text-tab load)
 //    4  u32 status + 8 u32 pid (explorer->app, written by the DLL at attach
 //       so the app can VERIFY the hook is really installed in the current
-//       explorer.exe instead of trusting its own bookkeeping — the DLL
+//       explorer.exe instead of trusting its own bookkeeping, the DLL
 //       loading only proves the module mapped, not that the detour
 //       installed)
 //   12  unused padding (old global knob slots, kept at 0)
@@ -62,9 +62,9 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //       u32 physical size (horzsize | vertsize<<16)
 //       u32 dpi (logpixelsx | logpixelsy<<16)
 //       u32 mode | primary<<8  (mode 0 = system default, 7 = custom)
-//       u32 lcd filter (reserved at 0 — removed filter), boldness,
+//       u32 lcd filter (reserved at 0, removed filter), boldness,
 //           damping (all 0..=100; the crosstalk / gamma / filter-width
-//           slots likewise reserved at 0 — removed filters)
+//           slots likewise reserved at 0, removed filters)
 //       u32 custom subpixel centers r/g/b x/y (f32 bits; all-zero = not set)
 // After the table, the hook-scope blocklist (count + up to 8 exe names x 32
 // UTF-16 units); offset 12 holds the hook-scope flags (bit 0 = all apps).
@@ -93,7 +93,7 @@ const STATUS_HOOK_W_INSTALLED: u32 = 1;
 // The single global WH_CBT hook handle (0 = not installed yet). A global hook
 // (thread id 0) makes Windows map the DLL into every GUI process on the
 // desktop, including ones that start later, so no per-process discovery or
-// re-install is needed — the DLL's own is_target() gate limits the detour to
+// re-install is needed, the DLL's own is_target() gate limits the detour to
 // the shell/Control Panel hosts.
 static GLOBAL_HOOK: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 // Last explorer pid whose hook report verified, so a pid change (Explorer
@@ -112,7 +112,7 @@ static LAST_STATE: AtomicU32 = AtomicU32::new(0);
 // (see MonitorEntry::sig). Mode values match the DLL: 1..=7 as in
 // explorer_hook_set_mode; absent = "system default". Knobs are the
 // boldness / damping pairs (0..=100); absent = the defaults (no bold,
-// no damping). The LCD filter knob was removed — its shared-memory slot
+// no damping). The LCD filter knob was removed, its shared-memory slot
 // stays reserved at 0.
 static PER_MONITOR_ENABLED: AtomicBool = AtomicBool::new(false);
 static MONITOR_MODES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
@@ -122,7 +122,7 @@ static MONITOR_KNOBS: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::n
 // entry writes 0, and the DLL only uses them when the mode is 7).
 static MONITOR_CUSTOM: OnceLock<Mutex<HashMap<String, [[f32; 2]; 3]>>> = OnceLock::new();
 // Text hook scope (Text tab): whether the detour applies to every GUI
-// process ("all apps", the default — many GDI apps force ClearType per-font
+// process ("all apps", the default, many GDI apps force ClearType per-font
 // and ignore the registry setting) or only the shell/Control Panel hosts,
 // plus the exe-name blocklist as the escape hatch. Pushed into shared
 // memory so the DLL's attach/callback decisions and per-draw scope guard
@@ -250,7 +250,7 @@ fn write_state_table() -> Result<(), String> {
                 entry.add(16) as *mut u32,
                 modes.get(&e.sig()).copied().unwrap_or(0).min(7) | ((e.primary as u32) << 8),
             );
-            // Slot 20 (LCD filter) is reserved at 0 — the filter was removed.
+            // Slot 20 (LCD filter) is reserved at 0, the filter was removed.
             std::ptr::write_volatile(entry.add(20) as *mut u32, 0);
             // Slots 24 (crosstalk), 32 (gamma), and 40 (filter width) are
             // likewise reserved: the filters were removed, but the slots stay
@@ -432,7 +432,7 @@ static EMBEDDED_HOOK_DLL: &[u8] =
 // Layout-generation marker. MUST match explorer-hook's HOOK_LAYOUT_MARKER
 // (explorer-hook/src/lib.rs); bump both whenever STATE_SIZE / the
 // shared-memory layout changes. With per-build DLL names the app only ever
-// loads its own build, so this is no longer a serve gate — it is a
+// loads its own build, so this is no longer a serve gate, it is a
 // diagnostic: a stale copy on disk that lacks the marker means a running
 // process holds a build predating the current layout and will keep
 // misreading the shared memory until it restarts.
@@ -441,13 +441,13 @@ const HOOK_LAYOUT_MARKER: &[u8] = b"OH2-SMEM-1124";
 // Hook DLL naming: one file per build, named by an FNV-1a hash of the
 // embedded bytes (explorer_hook-<hash>.dll). A new build is always a NEW
 // file name, so it can never collide with a copy still mapped by running
-// processes (os error 32) — deployment never needs a free slot or a reboot,
+// processes (os error 32), deployment never needs a free slot or a reboot,
 // and the app never has to serve a previous build. Stale copies are deleted
 // as soon as their last holder exits; locked ones are scheduled for deletion
 // at the next boot, so the directory converges to the current build. This
 // replaces the retired two-slot scheme, whose fixed names deadlocked once
 // two different builds were held by different processes. (The Windows limit
-// on distinct global-hook DLL names — historically 32 — only counts builds
+// on distinct global-hook DLL names, historically 32, only counts builds
 // still alive in a boot session; release users accumulate one per update,
 // so it is not reachable in practice.)
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -484,9 +484,9 @@ fn dll_has_current_layout(path: &std::path::Path) -> bool {
     )
 }
 
-// Delete every stale hook DLL in the config dir — previous hash-named
-// builds and the retired fixed slots (explorer_hook.dll / explorer_hook_b.dll)
-// — except the build in use. A file still mapped by a running process cannot
+// Delete every stale hook DLL in the config dir, previous hash-named
+// builds and the retired fixed slots (explorer_hook.dll / explorer_hook_b.dll),
+// except the build in use. A file still mapped by a running process cannot
 // be deleted; those are scheduled for deletion at the next boot, so the
 // directory converges to the current build without ever blocking a deploy.
 fn cleanup_hook_dlls(dir: &std::path::Path, keep: Option<&std::path::Path>) {
@@ -533,7 +533,7 @@ fn schedule_delete_at_boot(path: &std::path::Path) {
 
 // Get the on-disk hook DLL for this build, writing the embedded copy under
 // its build-unique name if needed. The name derives from the bytes, so the
-// write can never hit a file a running process has mapped — Explorer and
+// write can never hit a file a running process has mapped, Explorer and
 // injected apps keep the previous build mapped for the whole session, but
 // that is handled by cleanup_hook_dlls: old files die when their last
 // holder exits or at the next boot, and newly started processes always load
@@ -556,8 +556,8 @@ fn ensure_hook_dll(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 
 // Load the DLL into this process (so SetWindowsHookExW can resolve its hook
 // procedure), then install a single GLOBAL WH_CBT hook (thread id 0). Windows
-// itself maps the DLL into every GUI process on the desktop — both currently
-// running and any that start later — which is why this does not trip the
+// itself maps the DLL into every GUI process on the desktop, both currently
+// running and any that start later, which is why this does not trip the
 // injection signatures that Windows Defender flags and why no per-process
 // watchdog discovery is needed.
 fn install_hook(app: &tauri::AppHandle) -> Result<(), String> {
@@ -640,8 +640,8 @@ fn apply_state(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 // Map a mode string to the hook's mode id (0 = system default / passthrough).
-// The fixed WOLED RGWB/RWBG presets (ids 5/6) were removed — the Custom mode
-// covers those layouts with user-tuned offsets — so a stale string maps to 0.
+// The fixed WOLED RGWB/RWBG presets (ids 5/6) were removed, the Custom mode
+// covers those layouts with user-tuned offsets, so a stale string maps to 0.
 fn mode_id(mode: &str) -> u32 {
     match mode {
         "grayscale" => 1,
@@ -684,7 +684,7 @@ pub fn explorer_hook_set_per_monitor(enabled: bool) -> Result<(), String> {
 }
 
 /// Hook scope (Text tab): `hook_all` widens the swash detour from the
-/// shell/Control Panel hosts to every GUI process (the default — GDI apps
+/// shell/Control Panel hosts to every GUI process (the default, GDI apps
 /// like 7-Zip force ClearType per-font and ignore the registry setting);
 /// `blocklist` excludes specific exe names from the detour as the escape
 /// hatch. Written into shared memory so the DLL's per-draw guard applies it
@@ -716,8 +716,8 @@ pub fn explorer_hook_set_scope(
 /// ("grayscale"/"off"/"rgb"/"bgr"/"custom"); "default" clears the
 /// assignment so the monitor uses the system text setting. `sig` is the
 /// monitor's stable signature from `explorer_hook_monitors`. The fixed
-/// WOLED RGWB/RWBG presets (ids 5/6) were removed — the Custom mode covers
-/// those layouts with user-tuned offsets — so a stale string maps to 0.
+/// WOLED RGWB/RWBG presets (ids 5/6) were removed, the Custom mode covers
+/// those layouts with user-tuned offsets, so a stale string maps to 0.
 #[tauri::command]
 pub fn explorer_hook_set_monitor_mode(sig: String, mode: String) -> Result<(), String> {
     let value = mode_id(&mode); // "default" (and anything unknown) maps to 0
@@ -771,7 +771,7 @@ pub fn explorer_hook_monitors() -> Result<Vec<ExplorerMonitorInfo>, String> {
 /// Assign a per-monitor render knob pair (faux boldness, fringe damping;
 /// 0..=100, boldness capped at 30). Written into the monitor table so the
 /// DLL applies them to that monitor's draws on the next repaint (live). An
-/// entry equal to the defaults (0, 0) — "no adjustment" — clears the entry.
+/// entry equal to the defaults (0, 0), "no adjustment", clears the entry.
 #[tauri::command]
 pub fn explorer_hook_set_monitor_knobs(
     sig: String,
@@ -922,7 +922,7 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
 /// Report whether the hook is currently VERIFIED in the running explorer.exe,
 /// so the Text tab can reflect it.
 ///
-/// active is not inferred from app bookkeeping — the DLL itself writes its pid
+/// active is not inferred from app bookkeeping, the DLL itself writes its pid
 /// and status into the shared memory at attach, and we only count it when the
 /// report comes from the CURRENT explorer.exe generation AND the detour
 /// actually installed. That closes the gap where the DLL mapped but
@@ -988,7 +988,7 @@ fn verify_report(pid: u32) {
 /// Install the global WH_CBT hook if it isn't already installed. Serialized so
 /// the watchdog and the mode-change handler cannot race. A global hook reaches
 /// every GUI process automatically (including ones started later), so there is
-/// no per-process install work — this only ensures the single hook exists.
+/// no per-process install work, this only ensures the single hook exists.
 fn ensure_hooked(app: &tauri::AppHandle) -> Result<(), String> {
     let _guard = HOOK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let installed = global_hook()

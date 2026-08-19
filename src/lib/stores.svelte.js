@@ -1,4 +1,4 @@
-// Svelte 5 runes stores ,  $state object pattern
+// Svelte 5 runes stores, $state object pattern
 import { invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
 import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_CELLS, HIGH_NITS_MAX_CEILING, HIGH_NITS_MAX_STOPS, highNitsStepForMax } from './calibration.js';
@@ -22,12 +22,12 @@ export const app = $state({
   windowShownAt: 0,
   hdrStatus: 'unknown',
   hdrLuminance: null,
-  // Windows SDR white level in nits (80–480), read live for System Info and
+  // Windows SDR white level in nits (80-480), read live for System Info and
   // the Windows HDR tab.
   sdrWhiteNits: 80,
   // The SDR white level the browser's HDR compositor captured at WebView
   // startup and froze for the session. The Brightness strip must encode
-  // against THIS frozen value ,  Chromium/WebView2 scales the HDR canvas
+  // against THIS frozen value, Chromium/WebView2 scales the HDR canvas
   // relative to it and only re-reads it on restart, so compensating against
   // the live slider makes the strip drift whenever the SDR brightness moves.
   // Captured on the first successful read (null → fallback 80).
@@ -59,10 +59,10 @@ export const crush = $state({
   blackProfiles: {},
   blackEnabled: true,
   // Which calibration strip is active ('black' | 'highNits'). Session-only
-  // (never persisted) ,  every launch starts on Black.
+  // (never persisted), every launch starts on Black.
   stripType: 'black',
   // Per-strip square counts (zoom), session-only like squareCount was.
-  // Only the Black strip zooms ,  the High Nits grid is always fixed.
+  // Only the Black strip zooms; the High Nits grid is always fixed.
   squareCounts: { black: 12, highNits: 8 },
   // High Nits strip range. The grid is always a fixed 3 rows × 7 columns
   // (21 cells) with no zoom; Min is fixed and the user picks Max via a
@@ -73,7 +73,7 @@ export const crush = $state({
   highNitsMax: HIGH_NITS_DEFAULT_MAX,
   highNitsStep: HIGH_NITS_DEFAULT_STEP,
   fullscreen: 'normal',
-  // Hide the calibration strip interface (labels, controls) ,  right-click
+  // Hide the calibration strip interface (labels, controls), right-click
   // menu on the strip. The info tooltip and fullscreen slider only hide in
   // fullscreen modes; the rest of the interface hides everywhere.
   hideCalibrationInterface: false,
@@ -84,7 +84,7 @@ export const crush = $state({
 });
 
 // ── Per-monitor selector (M3) ────────────────────────────────────────────
-// The monitor chosen in the top bar — every connected monitor is listed
+// The monitor chosen in the top bar, every connected monitor is listed
 // (defaults to the primary), and each tab reads/writes the selected monitor's
 // profiles. Null only before the monitor list has loaded.
 // Svelte 5: exported $state bindings cannot be reassigned, so the selection
@@ -193,7 +193,7 @@ export function setStripType(type) {
 // step above 5000, 500-step from 1000 to 5000, 100-step below (finer when
 // the Max is too low for 21 distinct round values). The user controls a
 // single Max slider that rests on HIGH_NITS_MAX_STOPS; Step is derived from
-// Max via the region rule (highNitsStepForMax) ,  never dragged directly.
+// Max via the region rule (highNitsStepForMax), never dragged directly.
 const NITS_MIN_FLOOR = HIGH_NITS_DEFAULT_MIN;
 
 function nearestStop(value) {
@@ -212,13 +212,13 @@ export function highNitsMaxValue() {
 
 export function setHighNitsMax(value) {
   const raw = Math.max(HIGH_NITS_MAX_STOPS[0], Math.min(HIGH_NITS_MAX_CEILING, Number(value) || HIGH_NITS_MAX_CEILING));
-  // Snap directly to the nearest slider stop ,  the slider only ever rests on
+  // Snap directly to the nearest slider stop, the slider only ever rests on
   // a stop, so every position is a clean round Max (100/500/1000-step).
   crush.highNitsMax = nearestStop(raw);
   crush.highNitsStep = highNitsStepForMax(crush.highNitsMax);
   scheduleNitsRangeSave();
 }
-// Re-clamps max/step against the stops and fixes Min to the floor ,  used
+// Re-clamps max/step against the stops and fixes Min to the floor, used
 // after loading a persisted config, since an old save (from the previous
 // uniform-step design, or a future manual edit of the config file) could
 // have Min away from the floor or a Max that isn't on a slider stop.
@@ -231,7 +231,7 @@ function clampHighNitsRange() {
 // Debounced like setPollIntervalMs below: a slider fires many oninput events
 // per drag (unlike the old +/- buttons, which only ever fired on discrete
 // clicks or wheel ticks), so saving on every one would spam the config-file
-// write. crush.highNitsMin/Step update immediately above ,  only the disk
+// write. crush.highNitsMin/Step update immediately above, only the disk
 // write and the invoke() call wait for the drag to settle.
 let nitsRangeSaveTimer = null;
 function scheduleNitsRangeSave() {
@@ -248,7 +248,7 @@ let legacyBlackLift = null;
 // to upgrade without losing their calibration.
 let legacyBlackProfiles = {};
 
-// Canonical dimmer defaults — the single source the state initializers and
+// Canonical dimmer defaults, the single source the state initializers and
 // the "restore defaults" handlers read from, so changing a default can't
 // leave the restore out of sync. The Rust serde defaults in
 // src-tauri/src/config.rs (default_screen_protector_*, default_dimmer_*,
@@ -292,7 +292,7 @@ export const taskbarDimmer = $state({
 export const textSettings = $state({
   explorerHookEnabled: false,
   // Hook scope: whether the swash detour applies to every GUI process
-  // (all apps — the default; GDI apps like 7-Zip force ClearType and ignore
+  // (all apps, the default; GDI apps like 7-Zip force ClearType and ignore
   // the registry setting) or only the shell/Control Panel hosts. The
   // blocklist is the escape hatch: exe names excluded from the detour.
   hookAllApps: true,
@@ -300,7 +300,7 @@ export const textSettings = $state({
   // Per-monitor mode assignments keyed by the monitor's stable signature
   // ("WxH|phys|dpi") → mode id ("rgb", "bgr", "custom", ...). Absent = the
   // system default ("Default" in the UI). Whether per-monitor resolution is
-  // active is derived from whether any assignment exists — no stored flag.
+  // active is derived from whether any assignment exists, no stored flag.
   perMonitorModes: {},
   // Per-monitor render knob pairs, sig → { boldness, damping } (all
   // 0..=100). Absent = the defaults (no bold, no damping). Like modes, the
@@ -308,7 +308,7 @@ export const textSettings = $state({
   perMonitorKnobs: {},
   // Per-monitor custom subpixel centers, sig → { rx, ry, gx, gy, bx, by }
   // (per-channel x/y fractions of a pixel). Used when the monitor's mode is
-  // 'custom' — the live calibration controls. Absent = the mode's default
+  // 'custom', the live calibration controls. Absent = the mode's default
   // layout.
   perMonitorCustom: {},
 });
@@ -327,8 +327,8 @@ export const appSettings = $state({
 });
 
 // Debug-tab logging switches, independent of each other:
-//   verbosePeriodic ,  vendor/EDID detailed diagnostics (set_detailed_logging)
-//   dimmerVerbose   ,  taskbar dimmer tick/winevent/fade verbose logs
+//   verbosePeriodic: vendor/EDID detailed diagnostics (set_detailed_logging)
+//   dimmerVerbose: taskbar dimmer tick/winevent/fade verbose logs
 //                     (set_taskbar_dimmer_verbose_logging)
 export const runtimeLogSettings = $state({ verbosePeriodic: false, dimmerVerbose: false });
 export const debugSettings = $state({ contextMenuEnabled: false });
@@ -353,7 +353,7 @@ export async function setHotkey(action, combo) {
     scheduleHotkeySave();
     return { ok: true };
   } catch (e) {
-    // Registration failed (e.g. the combo is already in use) ,  revert the UI
+    // Registration failed (e.g. the combo is already in use), revert the UI
     // to the previous binding so it never shows a combo that isn't live.
     if (previous === 'None') delete hotkeys[action];
     else hotkeys[action] = previous;
@@ -705,6 +705,13 @@ export async function loadConfig(prefetchedCfg = null) {
         || null;
       activeMonitor.mon = match;
       syncTextPerMonitor();
+      // main.js's startup Black Crush apply runs before the monitor list
+      // resolves and can only resolve the profile key against the primary
+      // display identity. Re-resolve now that the real selection is known so
+      // the selected monitor's own profile wins (and its gamma is applied).
+      if (configLoaded.v && app.displayInfo.refreshRateHz) {
+        applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
+      }
     }).catch(() => { syncTextPerMonitor(); });
     if (cfg && typeof cfg.screen_protector_enabled === 'boolean') {
       screenDimmer.enabled = cfg.screen_protector_enabled;
@@ -789,7 +796,7 @@ export async function initTaskbarDimmerRuntime() {
     if (status) taskbarDimmer.available = status.available !== false;
   } catch { taskbarDimmer.available = false; }
   if (!taskbarDimmer.available) {
-    // Transient false reading (tray restart, shell settling) ,  re-check with
+    // Transient false reading (tray restart, shell settling), re-check with
     // backoff instead of latching "unavailable" for the rest of the session.
     clearTimeout(dimmerAvailabilityRetryTimer);
     dimmerAvailabilityRetryTimer = null;
@@ -801,7 +808,7 @@ export async function initTaskbarDimmerRuntime() {
   } catch (e) {
     // Transient failure (the shell can still be settling Shell_TrayWnd right
     // after a tray restart). Do NOT overwrite the loaded toggle state with
-    // false ,  that silently erased the persisted ON state. The availability
+    // false, that silently erased the persisted ON state. The availability
     // recheck re-applies the settings once the taskbar is reachable again.
     console.warn('[taskbar-dimmer] initial apply failed, keeping loaded state', e);
   }
@@ -933,7 +940,7 @@ let pendingTaskbarDimmerUpdate = null;
 let taskbarDimmerUpdateInFlight = false;
 let taskbarDimmerUpdateVersion = 0;
 // A persist=true update that gets superseded by a newer (possibly
-// persist=false) update would lose its save under the plain version check , 
+// persist=false) update would lose its save under the plain version check,
 // e.g. toggling the dimmer right as the startup availability recovery
 // re-applies settings, which silently dropped the toggle save and left the
 // config stuck on the old value. Remember the save intent and flush it once
@@ -951,7 +958,7 @@ function flushTaskbarDimmerUpdate() {
   if (taskbarDimmerUpdateInFlight) return;
   const update = pendingTaskbarDimmerUpdate;
   if (!update) {
-    // Pipeline drained ,  honor any save that a superseded update requested.
+    // Pipeline drained, honor any save that a superseded update requested.
     if (taskbarDimmerSaveQueued) {
       taskbarDimmerSaveQueued = false;
       saveConfig();
@@ -963,7 +970,7 @@ function flushTaskbarDimmerUpdate() {
   invoke('set_taskbar_dimmer', { enabled: update.enabled, opacity: update.opacity, fadeInDurationMs: update.fadeInDurationMs, fadeOutDurationMs: update.fadeOutDurationMs, immediate: update.immediate })
     .then(() => {
       if (update.version === taskbarDimmerUpdateVersion) {
-        // This is the latest update ,  it owns the save decision. Also honor a
+        // This is the latest update; it owns the save decision. Also honor a
         // save that an earlier persist=true update queued.
         emitTaskbarDimmerChanged();
         if (update.persist || taskbarDimmerSaveQueued) {
@@ -986,7 +993,7 @@ function flushTaskbarDimmerUpdate() {
         // wiping `enabled` here would silently drop the persisted ON intent.
         emitTaskbarDimmerChanged();
       }
-      // A failed persist=true update still represents the user's intent ,  queue
+      // A failed persist=true update still represents the user's intent, queue
       // the save so the drained pipeline writes the current store state.
       if (update.persist) taskbarDimmerSaveQueued = true;
     })
@@ -1015,7 +1022,7 @@ export function restoreTaskbarDimmerDefaults() {
 // Rust retries overlay creation in the background if it fails at startup
 // (e.g. the taskbar/shell hadn't settled yet) and emits this event once that
 // retry succeeds. get_taskbar_dimmer_status in loadConfig only runs once, at
-// startup, before a background retry can possibly finish ,  without this the
+// startup, before a background retry can possibly finish, without this the
 // tab would keep showing "unavailable" for the rest of the session even
 // after the overlay comes online. Re-apply the user's current settings too,
 // since any set_taskbar_dimmer calls made while the overlay was missing
@@ -1035,11 +1042,11 @@ export function handleTaskbarDimmerAvailable() {
 let dimmerAvailabilityRetryTimer = null;
 // Epoch guard: cancelling the pending timer in loadConfig (restart of the
 // retry window, e.g. restoreAllDefaults) can't stop an invoke that already
-// fired ,  without this a stale resolution could schedule a second chain.
+// fired, without this a stale resolution could schedule a second chain.
 let dimmerAvailabilityRetryEpoch = 0;
 function scheduleDimmerAvailabilityRecheck(attemptsLeft, epoch) {
   if (attemptsLeft <= 0) return;
-  // 1s, 2s, 3s, 4s, 5s after the initial false reading ,  bounded, so a
+  // 1s, 2s, 3s, 4s, 5s after the initial false reading, bounded, so a
   // genuinely missing taskbar just gives up quietly.
   const delayMs = 1000 * (6 - attemptsLeft);
   dimmerAvailabilityRetryTimer = setTimeout(() => {
@@ -1048,7 +1055,7 @@ function scheduleDimmerAvailabilityRecheck(attemptsLeft, epoch) {
       .then((status) => {
         if (epoch !== dimmerAvailabilityRetryEpoch) return;
         if (status && status.available) {
-          // Re-apply the user's settings ,  any set_taskbar_dimmer call made
+          // Re-apply the user's settings, any set_taskbar_dimmer call made
           // while the overlay looked unavailable failed silently. Same
           // recovery path as the backend's taskbar-dimmer-available event.
           handleTaskbarDimmerAvailable();
@@ -1133,7 +1140,7 @@ export function refreshSdrWhiteLevel(asBase = false) {
       if (Number.isFinite(nits) && nits >= 80 && nits <= 480) {
         app.sdrWhiteNits = nits;
         // The first successful read captures the browser's frozen base. Keep it
-        // frozen for the whole session ,  the WebView still scales the canvas
+        // frozen for the whole session, the WebView still scales the canvas
         // with that value while the Windows slider moves, so re-capturing on
         // slider changes would drift the strip again. asBase re-captures after
         // an event that DID make the WebView re-read its display info (HDR
@@ -1170,7 +1177,7 @@ export function refreshVendorDisplayInfo() {
     app.displayInfo.dynamicRange = typeof info.dynamic_range === 'string' ? info.dynamic_range : '';
     app.displayInfo.vrr = typeof info.vrr === 'string' ? info.vrr : '';
     app.displayInfo.referenceMode = info.reference_mode === true;
-    // Keep the last-known model ,  a transient vendor refresh returning an
+    // Keep the last-known model, a transient vendor refresh returning an
     // empty name should never wipe a good one.
     if (typeof info.gpu_model === 'string' && info.gpu_model) app.displayInfo.gpuModel = info.gpu_model;
     // A display-mode transition can briefly return an incomplete vendor
@@ -1185,6 +1192,32 @@ export function refreshVendorDisplayInfo() {
       setTimeout(() => refreshVendorDisplayInfo(), 0);
     }
   });
+}
+
+// NVIDIA "Override to reference mode" is a driver-control setting that can
+// change while the app is open (NVIDIA Control Panel) with no Windows display
+// notification. The Black Crush tab polls this cheap registry-backed flag so
+// its warning clears and gamma resumes as soon as the driver setting is
+// disabled; the one-shot refreshVendorDisplayInfo on tab entry goes stale,
+// and polling that runs the full NVAPI chain on every tick. The backend caches
+// the flag for 5 s, so this 3 s poll notices a change within a few seconds of
+// the cache expiring.
+let referenceModePollTimer = null;
+export function startReferenceModePolling() {
+  if (referenceModePollTimer !== null) return;
+  const poll = () => {
+    invoke('get_nvidia_reference_mode')
+      .then((enabled) => { app.displayInfo.referenceMode = enabled === true; })
+      .catch(() => {});
+  };
+  poll();
+  referenceModePollTimer = setInterval(poll, 3000);
+}
+export function stopReferenceModePolling() {
+  if (referenceModePollTimer !== null) {
+    clearInterval(referenceModePollTimer);
+    referenceModePollTimer = null;
+  }
 }
 
 let displayPollSequence = 0;

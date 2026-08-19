@@ -3,7 +3,7 @@
   // small always-on-top WebviewWindow (see src-tauri/src/flyout_window.rs).
   // This is intentionally the SAME markup/classes as the in-app modal in
   // App.svelte (.modal-backdrop.mode-confirm-backdrop / .modal.mode-confirm-modal)
-  // so the two never visually drift ,  they share app.css, not a hand-copied
+  // so the two never visually drift; they share app.css, not a hand-copied
   // palette. Unlike the in-app modal there is no backdrop click-through
   // concern (the window IS the modal, sized to fit it exactly), so the
   // backdrop wrapper is kept only for the shared CSS classes, not for a
@@ -29,7 +29,7 @@
   const FLYOUT_EXIT_FAILSAFE_MS = 600;
 
   function diag(message) {
-    // Temporary diagnostic logging while bringing up the new flyout window , 
+    // Temporary diagnostic logging while bringing up the new flyout window
     // routes through the same log_frontend bridge main.js uses, so these
     // lines land in the terminal/file log next to everything else.
     invoke('log_frontend', { level: 'info', message }).catch(() => {});
@@ -37,7 +37,7 @@
 
   let mode = $state(null); // { width, height, refresh_hz, monitor_name, confirmation_seconds }
   let remaining = $state(0);
-  // Total confirmation duration ,  drives the bottom timer bar's drain. Kept
+  // Total confirmation duration, drives the bottom timer bar's drain. Kept
   // separately from `remaining` because the bar animates over the full span
   // while `remaining` only holds the whole seconds left.
   let totalSeconds = $state(15);
@@ -105,7 +105,7 @@
   }
 
   // The entrance animation must not start at the exact moment the native
-  // window becomes visible (flyout-shown) ,  it would finish before the eye
+  // window becomes visible (flyout-shown), it would finish before the eye
   // registers the popup, so the user would never see it. Wait a short dwell
   // after the window is on screen, then trigger the animation. Matches
   // --mode-confirm-entrance-dwell in app.css.
@@ -148,7 +148,7 @@
   // re-apply the display mode via ChangeDisplaySettingsExW, and doing that
   // while the animation plays stalls the compositor and makes it stutter.
   // So the order is: play the exit animation (smooth), hide the window, and
-  // only then run the mode-change invoke ,  its display work now happens
+  // only then run the mode-change invoke, its display work now happens
   // invisibly. Clicking still feels instant because the exit starts
   // immediately. If the invoke fails afterward the window is already gone;
   // the recovery watchdog still restores the old mode at its deadline.
@@ -168,7 +168,7 @@
             modal.removeEventListener('animationcancel', onCancel);
             resolve();
           };
-          // Only the exit animation ends the dialog ,  a leftover entrance
+          // Only the exit animation ends the dialog; a leftover entrance
           // animationend (mode-confirm-rise-in) must not resolve this early.
           const onEnd = (event) => {
             if (event.animationName === 'mode-confirm-exit-in') finish();
@@ -187,7 +187,7 @@
         })
       : Promise.resolve();
     try {
-      // 1. Exit animation plays smoothly ,  nothing concurrent yet.
+      // 1. Exit animation plays smoothly, nothing concurrent yet.
       await exitFinished;
       clearTimer();
       // 2. Hide the window before touching the display.
@@ -222,7 +222,7 @@
     let unlistenShown;
     let unlistenHdr;
     // Rust shows the window and immediately emits the mode payload, rather
-    // than the frontend polling ,  mirrors the old native flyout's "show(mode)"
+    // than the frontend polling, mirrors the old native flyout's "show(mode)"
     // entry point but as a normal Tauri event.
     listen('flyout-show', (event) => {
       diag('[flyout] flyout-show event received');
@@ -249,7 +249,7 @@
     }).catch((e) => diag(`[flyout] listen(flyout-show) failed: ${e}`));
     // Fired by Rust right after the native SetWindowPos(...SWP_SHOWWINDOW)
     // call, i.e. the instant the window is actually visible on screen. Only
-    // now is it safe to start the CSS entrance transition ,  starting it any
+    // now is it safe to start the CSS entrance transition, starting it any
     // earlier (mount/mode-set) would let it finish playing while still
     // hidden behind the native show call, so the user would just see the
     // final state pop in with no visible motion.

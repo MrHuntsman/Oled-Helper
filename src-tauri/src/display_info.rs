@@ -1,4 +1,4 @@
-// display_info.rs ,  queries and changes the current display mode via Win32.
+// display_info.rs, queries and changes the current display mode via Win32.
 // Browser APIs (window.screen) can report resolution but never expose the real
 // refresh rate or the complete set of supported display modes.
 
@@ -61,13 +61,13 @@ pub struct DisplayInfo {
     pub native_width: u32,
     pub native_height: u32,
     // Which EDID location supplied the native resolution ("CEA-861",
-    // "base EDID", or "") ,  diagnostic info for the Debug tab.
+    // "base EDID", or ""), diagnostic info for the Debug tab.
     pub native_source: String,
     // Full GPU model name of the adapter driving the primary display (DXGI
     // adapter description). Vendor-agnostic; see vendor_info.rs.
     pub gpu_model: String,
     // Physical connector ("HDMI", "DisplayPort", ...) and the current color
-    // pipeline (format + bits per channel) ,  queried via the CCD API. Empty
+    // pipeline (format + bits per channel), queried via the CCD API. Empty
     // strings / 0 when the query failed.
     pub connector: String,
     pub color_format: String,
@@ -636,7 +636,7 @@ pub fn query_current_display() -> Option<DisplayInfo> {
 
 // ── Native (recommended) resolution via EDID ──────────────────────────────
 // Windows' Display Settings marks a resolution as "(Recommended)" based on
-// the monitor's EDID preferred timing descriptor ,  there is no public API
+// the monitor's EDID preferred timing descriptor, there is no public API
 // that returns "native resolution" directly. Read the primary display's EDID
 // from the monitor device's registry key (SetupAPI) and decode the first
 // Detailed Timing Descriptor, exactly the data Windows itself uses. Falls
@@ -648,7 +648,7 @@ const GUID_CLASS_MONITOR: GUID = GUID::from_u128(0x4d36e96ee32511cebfc108002be10
 
 // Decodes the horizontal/vertical active pixels from an 18-byte Detailed
 // Timing Descriptor. Returns None when the block is not a video timing
-// (pixel clock 0 ,  a monitor descriptor like name/serial/range limits).
+// (pixel clock 0, a monitor descriptor like name/serial/range limits).
 fn decode_dtd(dtd: &[u8]) -> Option<(u32, u32)> {
     if dtd.len() < 18 {
         return None;
@@ -755,7 +755,7 @@ fn cea_native_svd_resolution(edid: &[u8], block: usize, dtd_offset: usize) -> Op
 }
 
 // Looks for a CTA-861 (CEA) extension block and returns its preferred
-// timing ,  a native CTA DTD first, then a native SVD. Many TVs (e.g. LG OLEDs)
+// timing, a native CTA DTD first, then a native SVD. Many TVs (e.g. LG OLEDs)
 // report 4096×2160 as the base-block DTD1 but mark 3840×2160 as the CTA
 // preferred timing, which is exactly the resolution Windows shows as
 // "(Recommended)".
@@ -910,7 +910,7 @@ struct CachedNative {
 static NATIVE_CACHE: OnceLock<Mutex<Option<CachedNative>>> = OnceLock::new();
 
 // The friendly monitor name is read from EDID through SetupAPI + a registry
-// lookup ,  the same cost class as the native resolution read. It is called on
+// lookup, the same cost class as the native resolution read. It is called on
 // every display poll and at every mode change, so cache it per monitor for the
 // same window as the native-resolution cache instead of re-walking SetupAPI
 // each time (that burst would otherwise land right in the middle of the
@@ -1214,7 +1214,7 @@ fn query_native_resolution(target: &DisplayTarget) -> Option<(u32, u32, &'static
                 }
                 let mut result = read_edid_value(key);
                 if result.is_none() {
-                    // Driver stores the EDID under "Device Parameters" ,  open
+                    // Driver stores the EDID under "Device Parameters", open
                     // that subkey and retry.
                     let params_name = wide("Device Parameters");
                     let mut params = HKEY::default();
@@ -1271,7 +1271,7 @@ fn query_native_resolution(target: &DisplayTarget) -> Option<(u32, u32, &'static
                 // stash the id + its DevInst for later use.
                 match only_device {
                     None => only_device = Some((id, dev_data)),
-                    Some(_) => only_device = None, // more than one ,  not unambiguous
+                    Some(_) => only_device = None, // more than one; not unambiguous
                 }
             }
             index += 1;
