@@ -502,64 +502,6 @@ fn read_config_raw(f: impl FnOnce(&serde_json::Map<String, serde_json::Value>) -
     f(obj)
 }
 
-// Pre-Tauri companion to screen_protector_enabled_on_disk(): when the startup
-// UAC relaunch is declined, the Screen Dimmer is switched off on disk so the
-// app never runs in the silent half-state (dimming on, media detection off).
-// Writes the explicit false flag even for legacy configs whose non-zero
-// timeout implied "on", so the migrate-on-load logic cannot flip it back.
-// Returns true when the config was changed (was enabled and is now disabled).
-pub fn screen_protector_disable_on_disk() -> bool {
-    #[derive(serde::Deserialize)]
-    struct Conf {
-        identifier: String,
-    }
-    let Ok(conf) = serde_json::from_str::<Conf>(include_str!("../tauri.conf.json")) else {
-        return false;
-    };
-    let Ok(localappdata) = std::env::var("LOCALAPPDATA") else {
-        return false;
-    };
-    let path = PathBuf::from(localappdata)
-        .join(conf.identifier)
-        .join("config.json");
-    let Ok(text) = fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return false;
-    };
-    let was_enabled = obj
-        .get("screen_protector_enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or_else(|| {
-            obj.get("screen_protector_seconds")
-                .and_then(|v| v.as_u64())
-                .map_or(false, |seconds| seconds > 0)
-        });
-    if !was_enabled {
-        return false;
-    }
-    obj.insert(
-        "screen_protector_enabled".to_string(),
-        serde_json::Value::Bool(false),
-    );
-    let Ok(out_text) = serde_json::to_string_pretty(&value) else {
-        return false;
-    };
-    let temp = path.with_extension("json.tmp");
-    if fs::write(&temp, out_text).is_err() {
-        return false;
-    }
-    if replace_config_file(&temp, &path).is_err() {
-        let _ = fs::remove_file(&temp);
-        return false;
-    }
-    true
-}
-
 struct PendingConfigWrite {
     path: PathBuf,
     text: String,

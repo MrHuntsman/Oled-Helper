@@ -667,6 +667,152 @@ fn take_ownership(path: &Path) {
     }
 }
 
+/// Directory holding the once-captured original owner and DACL snapshots
+/// (one pair per canonical font filename), kept beside the font backups.
+fn acl_backup_root() -> PathBuf {
+    backup_root().join("acl")
+}
+
+/// The file to snapshot a slot's owner/DACL from. When the live canonical
+/// file still matches the authentic WinSxS copy it IS the original, so
+/// snapshot it directly (its ACL carries the Fonts-directory inheritance). If
+/// an older build already replaced it, the live ACL may itself be modified
+/// (takeown'd), so snapshot the pristine WinSxS copy instead, which hands the
+/// file back to TrustedInstaller ownership on restore. Falls back to the live
+/// file when WinSxS has no authentic copy. This is what makes the capture
+/// self-healing for systems that used a pre-fix build.
+fn acl_capture_source(slot: &SystemFontSlot) -> Option<PathBuf> {
+    let live = system_fonts_root().join(slot.filename);
+    if !live.is_file() {
+        return None;
+    }
+    let Some(winsxs) = find_winsxs_authentic(slot) else {
+        return Some(live);
+    };
+    match (std::fs::read(&live).ok(), std::fs::read(&winsxs).ok()) {
+        (Some(l), Some(w)) if l == w => Some(live),
+        _ => Some(winsxs),
+    }
+}
+
+/// Capture the original owner of every canonical font file in one PowerShell
+/// call (a fresh powershell.exe per file would add about a second each). The
+/// owner is not something icacls can save, so it is captured separately.
+/// Once-only per file: a later apply must never re-snapshot the already
+/// modified permissions as "original".
+fn capture_original_owners(slots: &[SystemFontSlot]) {
+    let dir = acl_backup_root();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut pending: Vec<(String, PathBuf)> = Vec::new();
+    for slot in slots {
+        let owner_file = dir.join(format!("{}.owner", slot.filename));
+        if owner_file.is_file() {
+            continue;
+        }
+        if let Some(source) = acl_capture_source(slot) {
+            pending.push((source.to_string_lossy().into_owned(), owner_file));
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    let list = pending
+        .iter()
+        .map(|(p, _)| format!("'{}'", p.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let script = format!(
+        "$paths = @({list}); foreach ($p in $paths) {{ if (Test-Path $p) {{ \"$p`t\" + (Get-Acl $p).Owner }} }}"
+    );
+    let Some(out) = run_hidden("powershell", &["-NoProfile", "-NonInteractive", "-Command", &script])
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+    else {
+        return;
+    };
+    for line in out.lines() {
+        let Some((p, owner)) = line.split_once('\t') else { continue };
+        let owner = owner.trim().to_string();
+        if owner.is_empty() {
+            continue;
+        }
+        if let Some((_, owner_file)) = pending.iter().find(|(path, _)| path == &p) {
+            let _ = std::fs::write(owner_file, &owner);
+        }
+    }
+}
+
+/// Snapshot the original DACL of one canonical font file with icacls (which
+/// cannot capture the owner; that is capture_original_owners). Once-only per
+/// file for the same reason.
+fn capture_original_dacl(slot: &SystemFontSlot) {
+    let dir = acl_backup_root();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let acl_file = dir.join(format!("{}.acl", slot.filename));
+    if acl_file.is_file() {
+        return;
+    }
+    let Some(source) = acl_capture_source(slot) else {
+        return;
+    };
+    let p = source.to_string_lossy().into_owned();
+    let _ = run_hidden("icacls", &[&p, "/save", &acl_file.to_string_lossy()]);
+}
+
+/// Reapply the captured original owner and DACL to a file. `filename` is the
+/// canonical slot name (the ACL snapshot key); `path` is the target, so staged
+/// files with batch-suffixed names can be repaired too. Best effort: the byte
+/// swap proceeds even if the ACL repair fails, so failures are logged, not
+/// fatal. Without this repair the replaced files stay owned by Administrators,
+/// which Windows Update may refuse to overwrite when it ships a new Segoe UI.
+fn restore_original_acl(filename: &str, path: &Path) {
+    let dir = acl_backup_root();
+    let acl_file = dir.join(format!("{filename}.acl"));
+    let owner_file = dir.join(format!("{filename}.owner"));
+    if !path.is_file() {
+        return;
+    }
+    let p = path.to_string_lossy().into_owned();
+    if acl_file.is_file() {
+        match run_hidden("icacls", &[&p, "/restore", &acl_file.to_string_lossy()]) {
+            Ok(out) if !out.status.success() => log::warn!(
+                "[font] icacls restore {} failed: {}",
+                filename,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => log::warn!("[font] icacls restore {} failed: {e}", filename),
+            _ => {}
+        }
+    }
+    if owner_file.is_file() {
+        if let Ok(owner) = std::fs::read_to_string(&owner_file) {
+            let owner = owner.trim();
+            if !owner.is_empty() {
+                let p_esc = p.replace('\'', "''");
+                let script = format!(
+                    "$acl = Get-Acl '{}'; $acl.SetOwner([System.Security.Principal.NTAccount]'{}'); Set-Acl '{}' $acl",
+                    p_esc,
+                    owner.replace('\'', "''"),
+                    p_esc
+                );
+                match run_hidden("powershell", &["-NoProfile", "-NonInteractive", "-Command", &script]) {
+                    Ok(out) if !out.status.success() => log::warn!(
+                        "[font] owner restore {} failed: {}",
+                        filename,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                    Err(e) => log::warn!("[font] owner restore {} failed: {e}", filename),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Schedule `staged` to atomically replace `dest` at the next boot. The move is
 /// recorded in Session Manager's pending-file-operations list; no file bytes
 /// are touched now, which is what dodges the FontCache file lock entirely.
@@ -703,6 +849,12 @@ fn apply_artifact(artifact: &Artifact, batch: &str) -> Result<(), String> {
         .map_err(|e| format!("could not stage {}: {e}", artifact.staging_path))?;
     take_ownership(&dest);
     schedule_replace(&staged, &dest)?;
+    // Hand both the live file and the staged source back their original owner
+    // and permissions: whichever security descriptor survives the boot-time
+    // move, the result is service-owned with stock ACLs, so Windows Update
+    // can still overwrite these files later.
+    restore_original_acl(&artifact.filename, &dest);
+    restore_original_acl(&artifact.filename, &staged);
     log::info!(
         "[font] scheduled {} -> {} at next boot",
         staged.display(),
@@ -724,6 +876,10 @@ fn state_path() -> PathBuf {
     runtime_root().join("state.json")
 }
 
+fn state_tmp_path() -> PathBuf {
+    state_path().with_extension("json.tmp")
+}
+
 pub fn load_state() -> Option<ReplaceState> {
     let data = std::fs::read(state_path()).ok()?;
     serde_json::from_slice(&data).ok()
@@ -732,7 +888,11 @@ pub fn load_state() -> Option<ReplaceState> {
 fn save_state(state: &ReplaceState) -> Result<(), String> {
     std::fs::create_dir_all(runtime_root()).map_err(|e| e.to_string())?;
     let data = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    std::fs::write(state_path(), data).map_err(|e| e.to_string())
+    // Write to a temp file and rename, so a crash mid-write can never leave a
+    // truncated state.json that load_state would silently read as "nothing
+    // applied".
+    std::fs::write(state_tmp_path(), data).map_err(|e| e.to_string())?;
+    std::fs::rename(state_tmp_path(), state_path()).map_err(|e| e.to_string())
 }
 
 // ── Step 6: font cache purge + change broadcast ────────────────────
@@ -825,6 +985,10 @@ pub struct DownloadableFont {
     pub key: String,
     pub family: String,
     pub license: String,
+    /// One short phrase that sets this family apart, shown next to its
+    /// name in the Google Fonts dropdown so the entries are easy to tell
+    /// apart at a glance.
+    pub description: String,
     /// Substring that selects the base static set in the manifest (e.g.
     /// "Inter_18pt-" picks the normal optical-size Inter statics; Roboto's
     /// "Roboto-" skips the _Condensed/_SemiCondensed width variants).
@@ -833,22 +997,23 @@ pub struct DownloadableFont {
 
 fn download_catalog() -> Vec<DownloadableFont> {
     vec![
-        DownloadableFont { key: "inter".to_string(), family: "Inter".to_string(), license: "SIL Open Font License".to_string(), filter: "Inter_18pt-".to_string() },
-        DownloadableFont { key: "roboto".to_string(), family: "Roboto".to_string(), license: "Apache License 2.0".to_string(), filter: "Roboto-".to_string() },
-        DownloadableFont { key: "noto-sans".to_string(), family: "Noto Sans".to_string(), license: "SIL Open Font License".to_string(), filter: "NotoSans-".to_string() },
-        DownloadableFont { key: "source-sans-3".to_string(), family: "Source Sans 3".to_string(), license: "SIL Open Font License".to_string(), filter: "SourceSans3-".to_string() },
-        DownloadableFont { key: "ibm-plex-sans".to_string(), family: "IBM Plex Sans".to_string(), license: "SIL Open Font License".to_string(), filter: "IBMPlexSans-".to_string() },
-        DownloadableFont { key: "ubuntu".to_string(), family: "Ubuntu".to_string(), license: "Ubuntu Font License".to_string(), filter: "Ubuntu-".to_string() },
-        DownloadableFont { key: "open-sans".to_string(), family: "Open Sans".to_string(), license: "SIL Open Font License".to_string(), filter: "OpenSans-".to_string() },
-        DownloadableFont { key: "lato".to_string(), family: "Lato".to_string(), license: "SIL Open Font License".to_string(), filter: "Lato-".to_string() },
-        DownloadableFont { key: "montserrat".to_string(), family: "Montserrat".to_string(), license: "SIL Open Font License".to_string(), filter: "Montserrat-".to_string() },
-        DownloadableFont { key: "poppins".to_string(), family: "Poppins".to_string(), license: "SIL Open Font License".to_string(), filter: "Poppins-".to_string() },
-        DownloadableFont { key: "work-sans".to_string(), family: "Work Sans".to_string(), license: "SIL Open Font License".to_string(), filter: "WorkSans-".to_string() },
-        DownloadableFont { key: "fira-sans".to_string(), family: "Fira Sans".to_string(), license: "SIL Open Font License".to_string(), filter: "FiraSans-".to_string() },
-        DownloadableFont { key: "public-sans".to_string(), family: "Public Sans".to_string(), license: "SIL Open Font License".to_string(), filter: "PublicSans-".to_string() },
-        DownloadableFont { key: "karla".to_string(), family: "Karla".to_string(), license: "SIL Open Font License".to_string(), filter: "Karla-".to_string() },
-        DownloadableFont { key: "overpass".to_string(), family: "Overpass".to_string(), license: "SIL Open Font License".to_string(), filter: "Overpass-".to_string() },
-        DownloadableFont { key: "barlow".to_string(), family: "Barlow".to_string(), license: "SIL Open Font License".to_string(), filter: "Barlow-".to_string() },
+        DownloadableFont { key: "inter".to_string(), family: "Inter".to_string(), license: "SIL Open Font License".to_string(), description: "Built for UI screens".to_string(), filter: "Inter_18pt-".to_string() },
+        DownloadableFont { key: "roboto".to_string(), family: "Roboto".to_string(), license: "Apache License 2.0".to_string(), description: "Android's system font".to_string(), filter: "Roboto-".to_string() },
+        DownloadableFont { key: "noto-sans".to_string(), family: "Noto Sans".to_string(), license: "SIL Open Font License".to_string(), description: "Google's neutral system font".to_string(), filter: "NotoSans-".to_string() },
+        DownloadableFont { key: "source-sans-3".to_string(), family: "Source Sans 3".to_string(), license: "SIL Open Font License".to_string(), description: "Adobe's UI font".to_string(), filter: "SourceSans3-".to_string() },
+        DownloadableFont { key: "ibm-plex-sans".to_string(), family: "IBM Plex Sans".to_string(), license: "SIL Open Font License".to_string(), description: "IBM's corporate font".to_string(), filter: "IBMPlexSans-".to_string() },
+        DownloadableFont { key: "ubuntu-sans".to_string(), family: "Ubuntu Sans".to_string(), license: "Ubuntu Font License".to_string(), description: "Ubuntu's system font".to_string(), filter: "UbuntuSans-".to_string() },
+        DownloadableFont { key: "open-sans".to_string(), family: "Open Sans".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "OpenSans-".to_string() },
+        DownloadableFont { key: "lato".to_string(), family: "Lato".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Lato-".to_string() },
+        DownloadableFont { key: "montserrat".to_string(), family: "Montserrat".to_string(), license: "SIL Open Font License".to_string(), description: "Urban typography style".to_string(), filter: "Montserrat-".to_string() },
+        DownloadableFont { key: "poppins".to_string(), family: "Poppins".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Poppins-".to_string() },
+        DownloadableFont { key: "work-sans".to_string(), family: "Work Sans".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "WorkSans-".to_string() },
+        DownloadableFont { key: "fira-sans".to_string(), family: "Fira Sans".to_string(), license: "SIL Open Font License".to_string(), description: "Mozilla's UI font".to_string(), filter: "FiraSans-".to_string() },
+        DownloadableFont { key: "public-sans".to_string(), family: "Public Sans".to_string(), license: "SIL Open Font License".to_string(), description: "The US government font".to_string(), filter: "PublicSans-".to_string() },
+        DownloadableFont { key: "karla".to_string(), family: "Karla".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Karla-".to_string() },
+        DownloadableFont { key: "overpass".to_string(), family: "Overpass".to_string(), license: "SIL Open Font License".to_string(), description: "Highway signage style".to_string(), filter: "Overpass-".to_string() },
+        DownloadableFont { key: "barlow".to_string(), family: "Barlow".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Barlow-".to_string() },
+        DownloadableFont { key: "geist".to_string(), family: "Geist".to_string(), license: "SIL Open Font License".to_string(), description: "Vercel's UI font".to_string(), filter: "Geist-".to_string() },
     ]
 }
 
@@ -894,7 +1059,7 @@ pub async fn font_preview_sources() -> Vec<FontPreviewSource> {
         Err(_) => return Vec::new(),
     };
 
-    // Fetch every family manifest in parallel: the catalog is 16 families,
+    // Fetch every family manifest in parallel: the catalog is 17 families,
     // and sequential round-trips added a second or two to the first tab
     // open, which delayed the whole Windows Font tab.
     let responses = futures_util::future::join_all(download_catalog().iter().map(|entry| {
@@ -976,6 +1141,36 @@ fn select_static_files(entry: &DownloadableFont, refs: &[GfFileRef]) -> Vec<GfFi
         .collect()
 }
 
+/// Cap on a single downloaded response (fonts and manifests). Google Fonts
+/// statics are a few MB each; anything past this is almost certainly not a
+/// font and would otherwise be buffered whole into memory by reqwest.
+const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Download `url` with a hard size cap, rejecting oversized responses by
+/// content-length before buffering, and by actual size after reading (in case
+/// the header is missing or lies).
+async fn fetch_limited(client: &reqwest::Client, url: &str, label: &str) -> Result<Vec<u8>, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch {label}: {e}"))?;
+    if let Some(len) = response.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(format!("{label} is too large ({len} bytes)"));
+        }
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("could not read {label}: {e}"))?
+        .to_vec();
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return Err(format!("{label} is too large ({} bytes)", bytes.len()));
+    }
+    Ok(bytes)
+}
+
 /// Download the static files of a catalog family into a private cache dir and
 /// return the path of the primary (Regular weight 400) file, ready for
 /// `apply_replacement`. The cache dir is under the runtime root, so it needs
@@ -993,14 +1188,8 @@ async fn download_family(entry: &DownloadableFont, app: Option<&tauri::AppHandle
         "https://fonts.google.com/download/list?family={}",
         entry.family.replace(' ', "%20")
     );
-    let text = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("could not fetch {} manifest: {e}", entry.family))?
-        .text()
-        .await
-        .map_err(|e| format!("could not read {} manifest: {e}", entry.family))?;
+    let bytes = fetch_limited(&client, &url, &format!("{} manifest", entry.family)).await?;
+    let text = String::from_utf8_lossy(&bytes);
     let text = text.strip_prefix(")]}'").unwrap_or(&text);
     let manifest: GfManifest =
         serde_json::from_str(text).map_err(|e| format!("manifest parse failed: {e}"))?;
@@ -1023,14 +1212,22 @@ async fn download_family(entry: &DownloadableFont, app: Option<&tauri::AppHandle
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| file.filename.clone());
         let out = dir.join(&name);
-        let bytes = client
-            .get(&file.url)
-            .send()
-            .await
-            .map_err(|e| format!("could not download {}: {e}", name))?
-            .bytes()
-            .await
-            .map_err(|e| format!("could not read {}: {e}", name))?;
+        let bytes = fetch_limited(&client, &file.url, &name).await?;
+
+        // Verify every downloaded file before it can ever be staged as a
+        // system font: it must parse, and its internal family must match the
+        // catalog entry. A corrupt or swapped file that still parses would
+        // otherwise be scheduled onto the Segoe slots.
+        let face = ttf_parser::Face::parse(&bytes, 0)
+            .map_err(|_| format!("{name} is not a valid TrueType font"))?;
+        let family = family_of(&bytes).ok_or_else(|| format!("{name} has no readable family name"))?;
+        if !family.eq_ignore_ascii_case(&entry.family) {
+            return Err(format!(
+                "{name} reports family {family:?}, expected {:?}",
+                entry.family
+            ));
+        }
+
         std::fs::write(&out, &bytes).map_err(|e| format!("could not write {}: {e}", out.display()))?;
         downloaded += 1;
         emit_progress(
@@ -1041,9 +1238,19 @@ async fn download_family(entry: &DownloadableFont, app: Option<&tauri::AppHandle
 
         // Remember the Regular (weight 400, non-italic) file as the primary
         // source; siblings are matched by family in the same directory.
-        if let Some(face) = ttf_parser::Face::parse(&bytes, 0).ok() {
-            if face.weight().to_number() == 400 && !face.is_italic() && primary.is_none() {
-                primary = Some(out);
+        if face.weight().to_number() == 400 && !face.is_italic() && primary.is_none() {
+            primary = Some(out);
+        }
+    }
+
+    // Keep only the most recently used family cached: a full family of
+    // statics downloads each time, so old families would otherwise pile up in
+    // the downloads dir forever.
+    let downloads_root = runtime_root().join("downloads");
+    if let Ok(entries) = std::fs::read_dir(&downloads_root) {
+        for entry in entries.flatten() {
+            if entry.path() != dir {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -1104,6 +1311,11 @@ fn restore_slot(slot: &SystemFontSlot, batch: &str) -> Result<(), String> {
         .map_err(|e| format!("could not stage restore {}: {e}", slot.filename))?;
     take_ownership(&dest);
     schedule_replace(&staged, &dest)?;
+    // Same ACL repair as apply: hand the live file and the staged source back
+    // their original owner and permissions so the restored font is fully
+    // pristine, not just byte-identical.
+    restore_original_acl(&slot.filename, &dest);
+    restore_original_acl(&slot.filename, &staged);
     log::info!("[font] scheduled restore of {} at next boot", slot.filename);
     Ok(())
 }
@@ -1140,6 +1352,16 @@ pub fn apply_replacement(primary: &Path, app: Option<&tauri::AppHandle>) -> Resu
     std::fs::create_dir_all(&build_dir).map_err(|e| e.to_string())?;
     let artifacts = build_all_artifacts(primary, &build_dir)?;
 
+    // Snapshot every slot's original owner and DACL before this run's takeown
+    // touches anything (mono slots included: restore hands those back too).
+    // Once-only, so a later apply can never re-snapshot the already modified
+    // permissions as "original".
+    let slots: Vec<SystemFontSlot> = manifest_slots();
+    capture_original_owners(&slots);
+    for slot in &slots {
+        capture_original_dacl(slot);
+    }
+
     // This run supersedes any un-rebooted apply/restore from before: clear the
     // staging dir so old pending sources are gone (their boot entries are then
     // harmlessly skipped) and give this run a unique id so its own entries
@@ -1150,7 +1372,7 @@ pub fn apply_replacement(primary: &Path, app: Option<&tauri::AppHandle>) -> Resu
     // Back up the originals before touching anything. Always from the
     // authentic WinSxS copies (see backup_original). Monospace slots are
     // never replaced, so they are not backed up.
-    let backup_slots: Vec<SystemFontSlot> = manifest_slots().into_iter().filter(|s| !s.mono).collect();
+    let backup_slots: Vec<SystemFontSlot> = slots.iter().copied().filter(|s| !s.mono).collect();
     let backup_total = backup_slots.len();
     for (i, slot) in backup_slots.iter().enumerate() {
         emit_progress(
@@ -1161,7 +1383,11 @@ pub fn apply_replacement(primary: &Path, app: Option<&tauri::AppHandle>) -> Resu
         backup_original(&slot)?;
     }
 
-    // Schedule every artifact for boot-time replacement.
+    // Schedule every artifact for boot-time replacement. If a slot fails
+    // partway, roll the whole run back: delete the staged sources (the
+    // already-scheduled boot entries then find a missing source at boot and
+    // are skipped harmlessly) and repair every canonical file's ACL, so a
+    // partial apply is never left half-scheduled.
     let mut applied = Vec::new();
     let apply_total = artifacts.len();
     for (i, artifact) in artifacts.iter().enumerate() {
@@ -1170,7 +1396,18 @@ pub fn apply_replacement(primary: &Path, app: Option<&tauri::AppHandle>) -> Resu
             "apply",
             &format!("Scheduling boot replacement ({}/{apply_total})…", i + 1),
         );
-        apply_artifact(artifact, &batch)?;
+        if let Err(e) = apply_artifact(artifact, &batch) {
+            clear_staging();
+            for slot in &slots {
+                let dest = system_fonts_root().join(slot.filename);
+                restore_original_acl(&slot.filename, &dest);
+            }
+            log::warn!(
+                "[font] apply failed at artifact {}/{apply_total}; rolled back scheduled replacements",
+                i + 1
+            );
+            return Err(e);
+        }
         applied.push(artifact.filename.clone());
     }
 
@@ -1216,6 +1453,7 @@ pub fn restore_originals(app: Option<&tauri::AppHandle>) -> Result<(), String> {
     purge_font_cache();
     broadcast_font_change();
     let _ = std::fs::remove_file(state_path());
+    let _ = std::fs::remove_file(state_tmp_path());
     log::info!("[font] restore scheduled for all system font slots, reboot required");
     Ok(())
 }
@@ -1252,9 +1490,27 @@ pub fn font_restore(app: tauri::AppHandle) -> Result<(), String> {
     restore_originals(Some(&app))
 }
 
+/// Tauri command: live status for the UI. Also reconciles the persisted
+/// applied state against reality: once a scheduled swap has run (staging is
+/// empty) but the live regular slot still holds the authentic original backup,
+/// the replacement is gone (a manual restore, Windows Update reverting the
+/// fonts, or a boot swap that never ran), so the stale applied state is
+/// dropped.
 #[tauri::command]
 pub fn font_get_status() -> FontStatus {
-    let applied = load_state();
+    let mut applied = load_state();
+    if applied.is_some() && !restart_pending() {
+        let live = system_fonts_root().join("segoeui.ttf");
+        let backup = backup_root().join("segoeui.ttf");
+        if let (Ok(live_bytes), Ok(backup_bytes)) = (std::fs::read(&live), std::fs::read(&backup)) {
+            if live_bytes == backup_bytes {
+                log::info!("[font] live Segoe UI matches the authentic original; clearing stale applied state");
+                let _ = std::fs::remove_file(state_path());
+                let _ = std::fs::remove_file(state_tmp_path());
+                applied = None;
+            }
+        }
+    }
     FontStatus {
         elevated: crate::process::process_is_elevated(),
         needs_restart: restart_pending(),
@@ -1347,5 +1603,59 @@ mod tests {
         let face = ttf_parser::Face::parse(&built, 0).expect("built font should reparse");
         assert!(face.tables().cmap.is_some());
         assert!(face.tables().glyf.is_some());
+    }
+
+    #[test]
+    fn slot_key_round_trips_the_segoe_weight_axes() {
+        for (weight, italic, key) in [
+            (400, false, "regular"),
+            (700, false, "bold"),
+            (400, true, "italic"),
+            (700, true, "bold_italic"),
+            (300, false, "light"),
+            (350, false, "semilight"),
+            (600, false, "semibold"),
+            (900, false, "black"),
+            (900, true, "black_italic"),
+            (300, true, "light_italic"),
+            (600, true, "semibold_italic"),
+            (350, true, "semilight_italic"),
+        ] {
+            assert_eq!(slot_key_for(weight, italic), Some(key), "weight {weight} italic {italic}");
+        }
+        // Non-standard weights map to no slot.
+        assert_eq!(slot_key_for(500, false), None);
+        assert_eq!(slot_key_for(450, true), None);
+    }
+
+    #[test]
+    fn next_batch_id_is_unique_per_run() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            assert!(seen.insert(next_batch_id()), "batch ids must be unique");
+        }
+        assert_eq!(seen.len(), 100);
+    }
+
+    #[test]
+    fn select_static_files_keeps_only_the_base_static_set() {
+        let entry = DownloadableFont {
+            key: "roboto".into(),
+            family: "Roboto".into(),
+            license: "Apache License 2.0".into(),
+            description: "Android's system sans".into(),
+            filter: "Roboto-".into(),
+        };
+        let refs = vec![
+            GfFileRef { filename: "Roboto-Regular.ttf".into(), url: "https://example.test/a".into() },
+            GfFileRef { filename: "Roboto-Bold.ttf".into(), url: "https://example.test/b".into() },
+            GfFileRef { filename: "Roboto_Condensed-Regular.ttf".into(), url: "https://example.test/c".into() },
+            GfFileRef { filename: "Roboto-VariableFont_wdth,wght.ttf".into(), url: "https://example.test/d".into() },
+            GfFileRef { filename: "OFL.txt".into(), url: "https://example.test/e".into() },
+        ];
+        let files = select_static_files(&entry, &refs);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.filename.starts_with("Roboto-")));
+        assert!(!files.iter().any(|f| f.filename.contains("Condensed") || f.filename.contains("Variable")));
     }
 }

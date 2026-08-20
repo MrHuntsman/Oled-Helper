@@ -20,6 +20,10 @@ export const app = $state({
   // from a taskbar restore (no event fires; a taskbar restore is always a
   // minimized restore, so it always animates).
   windowShownAt: 0,
+  // Whether this session runs with administrator rights. null until the
+  // startup probe answers; the Screen Dimmer tab shows a restart-as-admin
+  // prompt when the dimmer is enabled but the session is not elevated.
+  isElevated: null,
   hdrStatus: 'unknown',
   hdrLuminance: null,
   // Windows SDR white level in nits (80-480), read live for System Info and
@@ -893,6 +897,17 @@ export async function setScreenDimmerEnabled(enabled, tab = app.activeTab) {
     return;
   }
 
+  // Record the enabled state in the backend too, so the tab's state poll
+  // keeps the toggle on even before the relaunch lands (the backend never
+  // starts the watcher in a non-elevated session, it only records the flag).
+  await invoke('power_set_screen_protector', {
+    enabled: true,
+    seconds: screenDimmer.seconds,
+    opacity: screenDimmer.opacity,
+    fadeInDurationMs: screenDimmer.fadeInDurationMs,
+    fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+    fullscreenDetection: screenDimmer.fullscreenDetection,
+  }).catch(() => {});
   // Save before the UAC relaunch so the elevated replacement has the same
   // settings even if the old frontend closes before its normal save cycle.
   await saveConfig();
@@ -905,9 +920,10 @@ export async function setScreenDimmerEnabled(enabled, tab = app.activeTab) {
       tab,
     });
   } catch (error) {
-    screenDimmer.enabled = false;
-    await saveConfig();
-    throw error;
+    // A declined prompt keeps the dimmer enabled: the user's intent stays
+    // saved, and the Screen Dimmer tab shows a restart-as-admin prompt
+    // instead of silently reverting the toggle.
+    console.warn('[screen-dimmer] elevation declined, dimmer stays enabled', error);
   }
 }
 

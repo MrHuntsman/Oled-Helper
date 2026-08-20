@@ -83,6 +83,25 @@
     }
   }
 
+  // The dimmer only runs in an elevated session. If the user declined the
+  // startup prompt (or launched without admin), this relaunches the app
+  // elevated so the dimmer actually starts; a second decline keeps the
+  // enabled state and the warning banner.
+  async function restartScreenDimmerAsAdmin() {
+    try {
+      await invoke('relaunch_elevated', {
+        rtxHdrFlags: null,
+        rtxHdrEnabled: null,
+        hdrMode: null,
+        screenDimmerEnabled: true,
+        tab: 'screen-dimmer',
+      });
+    } catch (e) {
+      screenError = String(e);
+      console.warn('[screen-dimmer] restart as admin failed', e);
+    }
+  }
+
   let screenDimmerMasterAttention = $state(false);
   let screenDimmerMasterAttentionTimer = null;
   let screenDimmerMasterAttentionRaf = 0;
@@ -357,6 +376,17 @@
 
     {#if screenError}
       <p class="power-error" role="alert">⚠ {screenError}</p>
+    {/if}
+
+    {#if app.isElevated === false && screenDimmer.enabled}
+      <div class="dimmer-admin-warning" role="alert">
+        <span class="dimmer-admin-warning-icon" aria-hidden="true">⚠</span>
+        <div class="dimmer-admin-warning-text">
+          <span class="dimmer-admin-warning-title">Administrator rights required</span>
+          <span class="dimmer-admin-warning-desc">The Screen Dimmer needs administrator rights for power state detection (pausing while video is playing, etc). Restart OLED Helper as administrator to enable it.</span>
+        </div>
+        <button type="button" class="dimmer-admin-restart-btn" onclick={restartScreenDimmerAsAdmin}>Restart as administrator</button>
+      </div>
     {/if}
 
     <div class="dimmer-control-group" class:disabled={!screenDimmer.enabled}>

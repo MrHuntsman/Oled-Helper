@@ -9,6 +9,7 @@
   import ShieldBadge from './ShieldBadge.svelte';
   import VendorTag from './VendorTag.svelte';
   import { createDropdownPositionController } from './dropdown-position.js';
+  import { createDropdownKeyboardHandlers } from './dropdown.js';
 
   let currentNits = $state(null);
   let detectedNits = $state(null);
@@ -159,6 +160,7 @@
   let rtxHdrFlagsBusy = $state(false);
   let rtxHdrMenuOpen = $state(false);
   let rtxHdrMenuPlacement = $state('down-right');
+  let rtxHdrHighlightIndex = $state(-1);
   let rtxHdrWrapEl = $state(null);
   let rtxHdrMenuEl = $state(null);
   let rtxHdrPositionController = null;
@@ -229,9 +231,21 @@
         { value: 'auto', label: 'Windows Auto HDR', description: 'Use Windows tone mapping for supported SDR games.' },
       ]);
 
+  function currentRtxHdrOptionIndex() {
+    return RTX_HDR_OPTIONS.findIndex((option) => option.value === rtxHdrFlags);
+  }
+
+  function closeRtxHdrMenu() {
+    rtxHdrMenuOpen = false;
+    rtxHdrHighlightIndex = -1;
+    rtxHdrPositionController?.stop();
+    rtxHdrPositionController = null;
+  }
+
   function toggleRtxHdrMenu() {
     rtxHdrMenuOpen = !rtxHdrMenuOpen;
     if (rtxHdrMenuOpen) {
+      rtxHdrHighlightIndex = currentRtxHdrOptionIndex();
       rtxHdrPositionController?.stop();
       rtxHdrPositionController = createDropdownPositionController({
         getTrigger: () => rtxHdrWrapEl?.querySelector('.rtx-hdr-trigger'),
@@ -241,15 +255,12 @@
       });
       rtxHdrPositionController.start();
     } else {
-      rtxHdrPositionController?.stop();
-      rtxHdrPositionController = null;
+      closeRtxHdrMenu();
     }
   }
 
   async function selectRtxHdrFlags(value) {
-    rtxHdrMenuOpen = false;
-    rtxHdrPositionController?.stop();
-    rtxHdrPositionController = null;
+    closeRtxHdrMenu();
     if (rtxHdrFlagsBusy || !isNvidiaGpu || hdrMode !== 'rtx' || rtxHdrFlags === value) return;
     rtxHdrFlagsBusy = true;
     rtxHdrError = '';
@@ -280,6 +291,22 @@
       rtxHdrFlagsBusy = false;
     }
   }
+
+  const rtxHdrKeyboard = createDropdownKeyboardHandlers({
+    getOptions: () => RTX_HDR_OPTIONS,
+    getSelectedIndex: currentRtxHdrOptionIndex,
+    getHighlightIndex: () => rtxHdrHighlightIndex,
+    setHighlightIndex: (index) => { rtxHdrHighlightIndex = index; },
+    isOpen: () => rtxHdrMenuOpen,
+    toggle: toggleRtxHdrMenu,
+    close: closeRtxHdrMenu,
+    select: (index) => {
+      const option = RTX_HDR_OPTIONS[index];
+      if (option) selectRtxHdrFlags(option.value);
+    },
+    getMenu: () => rtxHdrMenuEl,
+    getTrigger: () => rtxHdrWrapEl?.querySelector('.rtx-hdr-trigger'),
+  });
 
   async function selectHdrMode(mode) {
     if (!hdrModeReady || hdrModeBusy || !hdrAvailable) return;
@@ -345,22 +372,19 @@
     if (!rtxHdrMenuOpen) return;
     function onDown(event) {
       if (rtxHdrWrapEl && !rtxHdrWrapEl.contains(event.target)) {
-        rtxHdrMenuOpen = false;
-        rtxHdrPositionController?.stop();
+        closeRtxHdrMenu();
       }
     }
     function onKey(event) {
       if (event.key === 'Escape') {
-        rtxHdrMenuOpen = false;
-        rtxHdrPositionController?.stop();
+        closeRtxHdrMenu();
       }
     }
     // The window losing focus (minimize, backgrounded, hidden to tray)
     // must close the menu too, it would otherwise still be open, stale,
     // when the user returns to the window.
     function onBlur() {
-      rtxHdrMenuOpen = false;
-      rtxHdrPositionController?.stop();
+      closeRtxHdrMenu();
     }
     window.addEventListener('pointerdown', onDown);
     window.addEventListener('keydown', onKey);
@@ -369,8 +393,7 @@
       window.removeEventListener('pointerdown', onDown);
       window.removeEventListener('keydown', onKey);
       window.removeEventListener('blur', onBlur);
-      rtxHdrPositionController?.stop();
-      rtxHdrPositionController = null;
+      closeRtxHdrMenu();
     };
   });
 
@@ -590,7 +613,7 @@
               <span class="hdr-mode-radio-dot" aria-hidden="true"></span>
               <span class="hdr-mode-option-copy">
                 <span class="hdr-mode-option-title">
-                  {option.label}
+                  <span class="hdr-mode-option-title-text">{option.label}</span>
                   {#if option.value === 'rtx'}<VendorTag vendor="nvidia" />{/if}
                 </span>
                 <span class="hdr-mode-option-desc">{option.description}</span>
@@ -609,7 +632,8 @@
                     aria-haspopup="listbox"
                     aria-expanded={rtxHdrMenuOpen}
                     disabled={rtxHdrFlagsBusy || hdrModeBusy}
-                    onclick={toggleRtxHdrMenu}>
+                    onclick={toggleRtxHdrMenu}
+                    onkeydown={rtxHdrKeyboard.onTriggerKeydown}>
                     <span>{rtxHdrLabel}</span>
                     <span class="rtx-hdr-caret" aria-hidden="true"></span>
                   </button>
@@ -619,14 +643,20 @@
                     class="dd-menu rtx-hdr-menu dropdown-menu-position-{rtxHdrMenuPlacement}"
                     bind:this={rtxHdrMenuEl}
                     role="listbox"
-                    aria-label="RTX HDR mode options">
-                    {#each RTX_HDR_OPTIONS as rtxOption (rtxOption.value)}
+                    aria-label="RTX HDR mode options"
+                    tabindex="-1"
+                    onkeydown={rtxHdrKeyboard.onMenuKeydown}>
+                    {#each RTX_HDR_OPTIONS as rtxOption, index (rtxOption.value)}
                       <button
                         type="button"
                         class="dd-menu-item"
                         class:active={rtxHdrFlags === rtxOption.value}
+                        class:keyboard-highlighted={rtxHdrHighlightIndex === index}
+                        data-dropdown-option-index={index}
                         role="option"
                         aria-selected={rtxHdrFlags === rtxOption.value}
+                        onfocus={() => rtxHdrKeyboard.onItemFocus(index)}
+                        onkeydown={rtxHdrKeyboard.onItemKeydown}
                         onclick={() => selectRtxHdrFlags(rtxOption.value)}>
                         {rtxOption.label}
                       </button>

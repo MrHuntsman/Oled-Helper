@@ -29,6 +29,123 @@ export function dropdownCloseEffect(menuEl, buttonEl, ctxMenuEl, closeFn, focusE
 }
 
 /**
+ * Creates reusable keyboard handlers for a custom listbox dropdown.
+ * Resolution, refresh rate, and favorites intentionally do not use this helper.
+ */
+export function createDropdownKeyboardHandlers({
+  getOptions,
+  getSelectedIndex,
+  getHighlightIndex,
+  setHighlightIndex,
+  isOpen,
+  toggle,
+  close,
+  select,
+  canSelect = () => true,
+  getMenu,
+  getTrigger,
+}) {
+  function scrollHighlighted() {
+    requestAnimationFrame(() => {
+      const index = getHighlightIndex();
+      const option = getMenu()?.querySelector(`[data-dropdown-option-index="${index}"]`);
+      option?.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  function moveHighlight(direction) {
+    const options = getOptions();
+    if (options.length === 0) return;
+    const current = getHighlightIndex() >= 0
+      ? getHighlightIndex()
+      : getSelectedIndex();
+    const next = current < 0
+      ? (direction > 0 ? 0 : options.length - 1)
+      : (current + direction + options.length) % options.length;
+    setHighlightIndex(next);
+    scrollHighlighted();
+  }
+
+  function onTriggerKeydown(event) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const direction = event.key === 'ArrowDown' ? 1 : -1;
+      if (isOpen()) moveHighlight(direction);
+      else {
+        const options = getOptions();
+        if (options.length === 0 || !canSelect()) return;
+        const current = getSelectedIndex();
+        const next = current < 0
+          ? (direction > 0 ? 0 : options.length - 1)
+          : (current + direction + options.length) % options.length;
+        select(next);
+      }
+      return;
+    }
+
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (isOpen()) select(getHighlightIndex());
+      else {
+        setHighlightIndex(getSelectedIndex());
+        toggle();
+        requestAnimationFrame(() => {
+          if (isOpen()) getMenu()?.focus();
+        });
+      }
+      return;
+    }
+
+    if (event.key === 'Escape' && isOpen()) {
+      event.preventDefault();
+      close();
+      getTrigger()?.focus();
+    }
+  }
+
+  function onMenuKeydown(event) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveHighlight(event.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      const options = getOptions();
+      if (options.length > 0) {
+        setHighlightIndex(event.key === 'Home' ? 0 : options.length - 1);
+        scrollHighlighted();
+      }
+      return;
+    }
+
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      select(getHighlightIndex());
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      close();
+      getTrigger()?.focus();
+    }
+  }
+
+  function onItemFocus(index) {
+    setHighlightIndex(index);
+  }
+
+  function onItemKeydown(event) {
+    event.stopPropagation();
+    onMenuKeydown(event);
+  }
+
+  return { onTriggerKeydown, onMenuKeydown, onItemFocus, onItemKeydown };
+}
+
+/**
  * Attaches document-level listeners to close a context menu when the user
  * clicks outside it, right-clicks, or presses Escape. Returns a cleanup
  * function.

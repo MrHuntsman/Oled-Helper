@@ -8,7 +8,6 @@
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import TabPowerIcon from './TabPowerIcon.svelte';
-  import { createDropdownPositionController } from './dropdown-position.js';
 
   let state = $state({
     displayTimeout: 10,
@@ -49,57 +48,7 @@
   }
 
   // ── Screensaver dropdown ───────────────────────────────────────────
-  // Custom dropdown instead of a native <select>: the OS popup opens downward
-  // and gets clipped at the bottom of the tab. Mirrors the RTX HDR menu, a
-  // trigger button + a collision-aware .dd-menu that flips upward when there
-  // is no room below.
-  let screensaverMenuOpen = $state(false);
-  let screensaverMenuEl = $state(null);
-  let screensaverWrapEl = $state(null);
-  let screensaverMenuPlacement = $state('down-right');
-  let screensaverPositionController = null;
-
-  // Derived directly from `state` (not from the `screensaverOptions` derived).
-  const selectedScreensaverName = $derived(computeSelectedScreensaverName());
-  function computeSelectedScreensaverName() {
-    // Reads the live Windows state: off → "Disabled", on → the .scr name.
-    if (!state.screensaverEnabled) return 'Disabled';
-    const cur = state.screensaverPath;
-    if (!cur) return 'Disabled';
-    const found = state.screensavers.find((s) => s.path === cur);
-    if (found) return found.name;
-    // Third-party .scr outside the enumerated dirs: show its file stem.
-    return cur.split(/[\\/]/).pop()?.replace(/\.scr$/i, '') || cur;
-  }
-
-  function isScreensaverOptionActive(ss) {
-    if (ss.path === '') return !state.screensaverEnabled;
-    return state.screensaverEnabled && state.screensaverPath === ss.path;
-  }
-
-  function toggleScreensaverMenu() {
-    screensaverMenuOpen = !screensaverMenuOpen;
-    if (screensaverMenuOpen) {
-      screensaverPositionController?.stop();
-      screensaverPositionController = createDropdownPositionController({
-        getTrigger: () => screensaverWrapEl?.querySelector('.power-select-trigger'),
-        getMenu: () => screensaverMenuEl,
-        onPlacement: (placement) => { screensaverMenuPlacement = placement; },
-        // A little extra edge margin so a menu that barely fits below still
-        // flips upward instead of sitting flush against the pane's edge.
-        options: { gap: 6, viewportMargin: 14, maxHeight: 240 },
-      });
-      screensaverPositionController.start();
-    } else {
-      screensaverPositionController?.stop();
-      screensaverPositionController = null;
-    }
-  }
-
   function selectScreensaver(path) {
-    screensaverMenuOpen = false;
-    screensaverPositionController?.stop();
-    screensaverPositionController = null;
     if (path === '') {
       // The "Disabled" option: turn the screen saver off.
       state.screensaverEnabled = false;
@@ -111,35 +60,9 @@
     applyScreensaver();
   }
 
-  // Close the screensaver menu on outside click, Escape, or window blur.
-  $effect(() => {
-    if (!screensaverMenuOpen) return;
-    function onDown(event) {
-      if (screensaverWrapEl && !screensaverWrapEl.contains(event.target)) {
-        screensaverMenuOpen = false;
-        screensaverPositionController?.stop();
-      }
-    }
-    function onKey(event) {
-      if (event.key === 'Escape') {
-        screensaverMenuOpen = false;
-        screensaverPositionController?.stop();
-      }
-    }
-    function onBlur() {
-      screensaverMenuOpen = false;
-      screensaverPositionController?.stop();
-    }
-    window.addEventListener('pointerdown', onDown);
-    window.addEventListener('keydown', onKey);
-    window.addEventListener('blur', onBlur);
-    return () => {
-      window.removeEventListener('pointerdown', onDown);
-      window.removeEventListener('keydown', onKey);
-      window.removeEventListener('blur', onBlur);
-      screensaverPositionController?.stop();
-    };
-  });
+  function selectNativeScreensaver(event) {
+    selectScreensaver(event.currentTarget.value);
+  }
 
   function mergeState(s) {
     if (!dragging.display) state.displayTimeout = s.display_timeout_minutes;
@@ -278,36 +201,15 @@
     <div class="dimmer-section-heading">Screensaver</div>
 
     <div class="power-screensaver-top-row">
-      <span class="power-select-wrap" bind:this={screensaverWrapEl}>
-        <button
-          type="button"
-          class="power-select-trigger"
-          aria-haspopup="listbox"
-          aria-expanded={screensaverMenuOpen}
-          onclick={toggleScreensaverMenu}>
-          <span>{selectedScreensaverName}</span>
-          <span class="power-select-caret" aria-hidden="true"></span>
-        </button>
-        {#if screensaverMenuOpen}
-          <div
-            class="dd-menu power-screensaver-menu dropdown-menu-position-{screensaverMenuPlacement}"
-            bind:this={screensaverMenuEl}
-            role="listbox"
-            aria-label="Choose a screensaver">
-            {#each screensaverOptions as ss (ss.path)}
-              <button
-                type="button"
-                class="dd-menu-item"
-                class:active={isScreensaverOptionActive(ss)}
-                role="option"
-                aria-selected={isScreensaverOptionActive(ss)}
-                onclick={() => selectScreensaver(ss.path)}>
-                {ss.name}
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </span>
+      <select
+        class="power-select-native"
+        aria-label="Screensaver"
+        value={state.screensaverEnabled ? state.screensaverPath : ''}
+        onchange={selectNativeScreensaver}>
+        {#each screensaverOptions as ss (ss.path)}
+          <option value={ss.path}>{ss.name}</option>
+        {/each}
+      </select>
     </div>
 
     <div class="power-row-gap"></div>

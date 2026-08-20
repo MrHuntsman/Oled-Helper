@@ -19,20 +19,3 @@
 {#if meta}
   <span class="vendor-tag" style="--vendor:{meta.color}">{meta.label}</span>
 {/if}
-
-<style>
-  .vendor-tag {
-    display: inline-flex;
-    align-items: center;
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    line-height: 1;
-    padding: 2px 6px;
-    border-radius: 4px;
-    text-transform: uppercase;
-    color: var(--vendor);
-    background: color-mix(in srgb, var(--vendor) 12%, transparent);
-    border: 1px solid color-mix(in srgb, var(--vendor) 35%, transparent);
-  }
-</style>

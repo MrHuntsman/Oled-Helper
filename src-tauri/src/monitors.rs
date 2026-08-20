@@ -301,6 +301,18 @@ pub fn primary_friendly_name() -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
+/// Friendly name (CCD/EDID) of the monitor on the given GDI device
+/// (e.g. r"\\.\DISPLAY2"), for the per-monitor tooltip in the top-bar
+/// selector. Falls back to the primary's name when the device is the
+/// primary, so both paths agree on the same source.
+pub fn friendly_name_for_device(device_name: &str) -> Option<String> {
+    all_monitors()
+        .into_iter()
+        .find(|m| m.device_name.eq_ignore_ascii_case(device_name))
+        .map(|m| m.friendly_name)
+        .filter(|n| !n.is_empty())
+}
+
 // CCD friendly names keyed by (left, top, width, height) of the monitor's
 // desktop rect, so they can be joined to the EnumDisplayMonitors pass (the
 // source-mode position/size is the same virtual-desktop coordinate space as

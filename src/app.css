@@ -8,6 +8,12 @@
   --text: rgba(255, 255, 255, 0.71);
   --text-weak: #8A8A94;
   --divider: #2A2A30;
+  /* Border for interactive controls (buttons, dropdown triggers): slightly
+     lighter than the passive divider so control edges stay visible against
+     the dark panels. */
+  --control-border: #3A3A44;
+  --control-border-strong: #555563;
+  --success: #62C779;
   --hover: #24242A;
   --font: 'Inter', system-ui, -apple-system, sans-serif;
   color-scheme: dark;
@@ -93,7 +99,7 @@ select,
 /* ── Layout grid ──────────────────────────────────────────────────── */
 .app-shell {
   display: grid;
-  grid-template-rows: 64px 1fr 28px;
+  grid-template-rows: 64px 1fr 34px;
   grid-template-columns: 240px minmax(0, 1fr);
   height: 100%;
   min-width: 0;
@@ -109,6 +115,7 @@ select,
   gap: 10px;
   border-bottom: 1px solid var(--divider);
   user-select: none;
+  position: relative;
 }
 .top-bar-left { display: flex; align-items: center; gap: 10px; }
 
@@ -166,7 +173,7 @@ select,
 }
 .top-bar .title-block { display: flex; flex-direction: column; gap: 0; }
 .top-bar .title { font-size: 15px; font-weight: 700; letter-spacing: -0.3px; color: #fff; }
-.top-bar .version { font-size: 10px; color: var(--text-weak); }
+.top-bar .version { font-size: 12px; color: var(--text-weak); }
 .top-bar .spacer { flex: 1; }
 .top-bar .top-btn-icon { width: 22px; height: 22px; opacity: 0.95; }
 .top-bar .top-exit-icon { flex-shrink: 0; opacity: 0.95; }
@@ -220,51 +227,78 @@ select,
   color: #f28a8a;
 }
 
-/* Per-monitor selector in the top bar: which monitor's settings the tabs
-   show/edit. Global = the app's usual primary/global behavior. */
-.top-bar .top-monitor-select {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.top-bar .top-monitor-label {
-  font-size: 11px;
-  color: var(--text-weak);
-}
-.top-bar .top-monitor-select-control {
-  max-width: 260px;
-  background: #1c1c22;
-  color: var(--text);
-  border: 1px solid var(--divider);
-  border-radius: 6px;
-  padding: 4px 8px;
-  font-size: 12px;
-  outline: none;
-  cursor: pointer;
-}
-.top-bar .top-monitor-select-control:hover,
-.top-bar .top-monitor-select-control:focus-visible {
-  border-color: var(--accent);
-}
-/* Custom monitor dropdown trigger: the button version of the select above,
-   hosting the collision-aware .dd-menu. The label ellipsizes at the
-   max-width instead of growing the top bar. */
-.top-bar .top-monitor-select-wrap {
+/* Per-monitor selector: which monitor's settings the tabs show/edit.
+   Global = the app's usual primary/global behavior. Lives in the status
+   bar (MonitorSelector.svelte), styled like the resolution/Hz selects:
+   transparent until hover. */
+.monitor-select-wrap {
   position: relative;
   display: inline-flex;
 }
-.top-bar .top-monitor-select-trigger {
+.monitor-select-trigger {
   display: flex;
   align-items: center;
   gap: 6px;
   max-width: 260px;
   text-align: left;
   font-family: inherit;
+  cursor: pointer;
+  outline: none;
 }
-.top-bar .top-monitor-select-label {
+.monitor-select-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.monitor-select-caret {
+  flex: 0 0 auto;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  opacity: 0.7;
+}
+/* Status-bar variant: no background and no border until hover, matching
+   the resolution and refresh-rate selects next to it. The caret uses the
+   same background gradient as those selects, so the hidden triangle span
+   keeps its placeholder role. */
+.status-bar .monitor-select-status .monitor-select-trigger {
+  min-width: 72px;
+  max-width: 200px;
+  height: 22px;
+  padding: 0 22px 0 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  user-select: none;
+  background:
+    linear-gradient(45deg, transparent 50%, var(--text-weak) 50%) calc(100% - 11px) 9px / 5px 5px no-repeat,
+    linear-gradient(135deg, var(--text-weak) 50%, transparent 50%) calc(100% - 7px) 9px / 5px 5px no-repeat,
+    transparent;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.status-bar .monitor-select-status .monitor-select-trigger:hover:not(:disabled),
+.status-bar .monitor-select-status .monitor-select-trigger:focus-visible,
+.status-bar .monitor-select-status .monitor-select-trigger.active {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--divider));
+  background:
+    linear-gradient(45deg, transparent 50%, var(--accent) 50%) calc(100% - 11px) 9px / 5px 5px no-repeat,
+    linear-gradient(135deg, var(--accent) 50%, transparent 50%) calc(100% - 7px) 9px / 5px 5px no-repeat,
+    color-mix(in srgb, var(--accent) 10%, var(--nav-bg));
+  color: #fff;
+}
+.status-bar .monitor-select-status .monitor-select-trigger:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.status-bar .monitor-select-status .monitor-select-caret {
+  display: none;
+}
+.monitor-select-menu {
+  min-width: max-content;
+  max-width: 320px;
 }
 
 /* ── Nav buttons ──────────────────────────────────────────────────── */
@@ -340,16 +374,20 @@ select,
   transition: left 0.12s;
 }
 .nav-switch.on .nav-switch-thumb { left: 18px; }
-/* Admin shield beside the Screen Dimmer nav switch, between the label and
-   the switch. The wrapper is positioned so ShieldBadge keeps its own
-   component styles untouched. */
+/* Admin-required warning badge beside the Screen Dimmer nav switch, between
+   the label and the switch. Shown only when the dimmer is enabled but the
+   session is not elevated; the triangle glyph matches the app's other amber
+   warning icons (see .text-render-warning-icon). */
 .nav-item-shield {
   position: absolute;
   right: 46px;
   top: 50%;
   transform: translateY(-50%);
-  display: flex;
-  align-items: center;
+  color: #E0A93C;
+  font-size: 13px;
+  line-height: 1;
+  cursor: default;
+  user-select: none;
 }
 
 .sidebar-spacer { flex: 1; }
@@ -535,7 +573,7 @@ select,
 .restore-defaults-btn {
   flex-shrink: 0;
   padding: 5px 8px;
-  border: 1px solid var(--divider);
+  border: 1px solid var(--control-border);
   border-radius: 5px;
   color: var(--text-weak);
   font-size: 11px;
@@ -1098,6 +1136,71 @@ select,
   border-width: 0 1.6px 1.6px 0;
   transform: rotate(45deg);
 }
+
+/* Screen Dimmer admin warning: shown when the dimmer is enabled but the
+   session is not elevated (declined startup prompt or manual launch). Uses
+   the gold accent of the admin shield so it reads as a privilege notice,
+   not an error. */
+.dimmer-admin-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid color-mix(in srgb, #e0a84b 45%, var(--divider));
+  border-radius: 8px;
+  background: color-mix(in srgb, #e0a84b 6%, transparent);
+}
+.dimmer-admin-warning-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  color: #E0A93C;
+  font-size: 15px;
+  line-height: 1;
+}
+.dimmer-admin-warning-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dimmer-admin-warning-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.dimmer-admin-warning-desc {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-weak);
+}
+/* Filled amber button so the action stands out against the dark banner,
+   matching the previous restart as administrator treatment. */
+.font-admin-restart-btn,
+.dimmer-admin-restart-btn {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  border: 1px solid #e0a84b;
+  border-radius: 6px;
+  background: transparent;
+  color: #e0a84b;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.08s, color 0.08s, border-color 0.08s;
+}
+.font-admin-restart-btn:hover,
+.font-admin-restart-btn:focus-visible,
+.dimmer-admin-restart-btn:hover,
+.dimmer-admin-restart-btn:focus-visible {
+  background: #e0a84b;
+  color: #0d0d0f;
+  border-color: #e0a84b;
+  outline: none;
+}
 .dimmer-check-toggle input:disabled {
   cursor: not-allowed;
   opacity: 0.5;
@@ -1383,15 +1486,17 @@ select,
   flex-shrink: 0;
   font-size: 12px;
   font-weight: 500;
-  color: var(--text-weak);
+  color: #ff6b6b;
   padding: 4px 10px;
-  border: 1px solid var(--divider);
+  border: 1px solid color-mix(in srgb, #ff6b6b 50%, var(--divider));
   border-radius: 5px;
+  background: color-mix(in srgb, #ff6b6b 10%, transparent);
   transition: color 0.12s, background 0.12s, border-color 0.12s;
 }
 .reset-all-row:hover .reset-all-chevron {
-  color: #ff6b6b;
-  border-color: color-mix(in srgb, #ff6b6b 50%, var(--divider));
+  color: #ff3b3b;
+  border-color: color-mix(in srgb, #ff3b3b 70%, var(--divider));
+  background: color-mix(in srgb, #ff3b3b 18%, transparent);
 }
 .reset-all-error {
   margin: 6px 12px 0;
@@ -1419,7 +1524,14 @@ select,
   font-size: 13px;
   font-weight: 600;
 }
+.font-admin-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .font-warning {
+  flex: 1;
   margin: 0;
   font-size: 12px;
   color: #e0a84b;
@@ -1429,6 +1541,22 @@ select,
   align-items: center;
   gap: 8px;
 }
+.font-choice-row {
+  align-items: flex-start;
+  gap: 12px;
+}
+.font-choice-group {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.font-choice-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-weak);
+}
 .settings-select {
   flex: 0 0 auto;
   width: fit-content;
@@ -1436,16 +1564,18 @@ select,
   max-width: 100%;
   background: #1c1c22;
   color: #fff;
-  border: 1px solid var(--divider);
+  border: 1px solid var(--control-border-strong);
   border-radius: 6px;
   padding: 6px 8px;
   font-size: 12px;
   outline: none;
   cursor: pointer;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--control-border-strong) 35%, transparent);
 }
 .settings-select:hover:not(:disabled),
 .settings-select:focus-visible {
   border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 .settings-select:disabled {
   opacity: 0.6;
@@ -1454,28 +1584,91 @@ select,
 .settings-select option {
   color: #fff;
 }
-/* The Windows Font dropdowns are custom .dd-menu triggers (native <select>
-   popups can't animate), styled like the old select and hosting a
-   collision-aware menu. The label ellipsizes so long family names don't
-   stretch the trigger; the caret matches the other custom dropdowns. */
+/* The Windows Font dropdowns use custom lists so every option can render
+   using its own typeface. */
 .font-select-wrap {
   position: relative;
   display: inline-flex;
+  width: 100%;
 }
 .font-select-trigger {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
+  width: 100%;
   text-align: left;
   cursor: pointer;
+}
+.font-select-trigger:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+  outline: none;
+}
+.font-select-current {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.font-select-check {
+  flex: 0 0 auto;
+  color: var(--success);
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1;
 }
 .font-select-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.font-select-caret,
-.top-monitor-caret {
+.font-select-label.placeholder {
+  color: var(--text-weak);
+}
+.font-current-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.font-current-label {
+  color: var(--text-weak);
+  font-size: 12px;
+}
+.font-current-name {
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+}
+.font-select-wrap .dd-menu-item {
+  height: 36px;
+  font-size: 12px;
+}
+.font-select-wrap .dd-menu-item:not(.active) {
+  color: #fff;
+}
+.font-select-wrap .dd-check {
+  color: var(--success);
+  font-family: var(--font);
+}
+.font-catalog-name {
+  flex: 0 0 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.font-catalog-desc {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 400;
+}
+.font-select-caret {
   flex: 0 0 auto;
   width: 0;
   height: 0;
@@ -1498,12 +1691,26 @@ select,
   cursor: default;
 }
 .font-btn-apply {
-  color: #0d0d0f;
-  background: var(--accent);
-  border-color: transparent;
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 8%, transparent);
+  border-color: color-mix(in srgb, var(--success) 70%, var(--divider));
+  font-weight: 600;
 }
 .font-btn-apply:hover:not(:disabled) {
-  filter: brightness(1.1);
+  color: #0d0d0f;
+  background: var(--success);
+  border-color: var(--success);
+  filter: none;
+}
+/* The applied state: same green identity but read-only, so the generic
+   disabled dimming is lifted, there is no hover reaction, and the border
+   and background drop out (border stays transparent to avoid a layout
+   shift). */
+.font-btn-applied:disabled {
+  opacity: 1;
+  cursor: default;
+  background: transparent;
+  border-color: transparent;
 }
 .font-btn-restore {
   color: var(--text-weak);
@@ -1522,14 +1729,6 @@ select,
 .font-btn-restart:hover:not(:disabled) {
   color: #fff;
   border-color: var(--accent);
-}
-.font-applied {
-  font-size: 12px;
-  color: var(--text-weak);
-}
-.font-applied-top {
-  margin: 0 0 10px;
-  color: var(--accent);
 }
 .font-preview-line {
   display: flex;
@@ -2824,36 +3023,11 @@ select,
   align-items: center;
   gap: 10px;
 }
-.monitor-tip-wrap {
-  position: relative;
-  display: inline-flex;
-  max-width: 180px;
-  outline: none;
-}
-.current-monitor {
-  max-width: 180px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-weak);
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0.01em;
-  opacity: 0.9;
-  cursor: help;
-}
-.current-monitor::before {
-  content: '▣';
-  margin-right: 5px;
-  color: var(--accent);
-  font-size: 9px;
-}
-/* Display-info tooltip on the monitor chip (status bar). Opens upward since
-   the status bar hugs the bottom edge; shown on hover or keyboard focus. */
-.monitor-tip {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  right: 0;
+/* Per-monitor hover tooltip in the monitor selector dropdown. Fixed so it
+   follows the cursor outside the transformed dropdown menu; the tip offsets
+   place it below and to the right of the mouse. */
+.monitor-hover-tip {
+  position: fixed;
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -2866,18 +3040,8 @@ select,
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   font-size: 11px;
   line-height: 1.35;
-  opacity: 0;
-  visibility: hidden;
-  transform: translateY(4px);
-  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms;
   pointer-events: none;
-  z-index: 70;
-}
-.monitor-tip-wrap:hover .monitor-tip,
-.monitor-tip-wrap:focus-visible .monitor-tip {
-  opacity: 1;
-  visibility: visible;
-  transform: translateY(0);
+  z-index: 80;
 }
 .monitor-tip-title {
   font-size: 12px;
@@ -2979,6 +3143,16 @@ select,
 }
 .dd-menu-item:hover:not(.active) { background: var(--hover); color: #fff; transform: translateX(2px); }
 .dd-menu-item.active { color: var(--accent); font-weight: 400; background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.dd-menu-item.keyboard-highlighted {
+  background: var(--hover);
+  color: #fff;
+  outline: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: -1px;
+}
+.dd-menu-item.keyboard-highlighted.active {
+  background: color-mix(in srgb, var(--accent) 15%, var(--hover));
+  color: var(--accent);
+}
 .dd-profile-value {
   color: var(--text-weak);
   font-weight: 500;
@@ -3486,6 +3660,23 @@ select,
 .diag-val { color: var(--text); word-break: break-all; }
 
 /* ── Windows HDR tab ───────────────────────────────────────────────── */
+.vendor-tag {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  color: var(--vendor);
+  background: color-mix(in srgb, var(--vendor) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--vendor) 35%, transparent);
+}
+
 /* Windows HDR tab: the control box's title group, label + Info button on
    the left of the heading row, value pushed right by space-between. */
 .hdr-control-title { display: inline-flex; align-items: center; min-width: 0; }
@@ -3634,16 +3825,25 @@ select,
   flex-direction: column;
   gap: 4px;
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 .hdr-mode-option-title {
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  width: 100%;
   min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
   gap: 6px;
   font-size: 12px;
   font-weight: 600;
   line-height: 1.2;
+}
+.hdr-mode-option-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .hdr-mode-option-desc {
   color: var(--text-weak);
@@ -3920,15 +4120,6 @@ select,
   gap: 8px;
   min-width: 0;
 }
-.status-version {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 8px;
-  margin-left: -8px;
-  border-radius: 6px;
-  color: var(--text-weak);
-  font: inherit;
-}
 .update-available-btn {
   display: inline-flex;
   align-items: center;
@@ -3980,6 +4171,14 @@ select,
   position: relative;
   display: inline-flex;
 }
+/* Expand the hover zone beyond the 22px icon so the menu is easier to hit
+   without moving the button (a pseudo-element, not padding, so the layout
+   stays put). The menu still opens on the wrap's pointerenter. */
+.favorites-wrap::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+}
 .favorites-btn {
   display: inline-flex;
   align-items: center;
@@ -3987,6 +4186,8 @@ select,
   width: 22px;
   height: 22px;
   padding: 0;
+  /* Paint above the expanded hover zone so the icon stays clickable. */
+  position: relative;
   border: 1px solid transparent;
   border-radius: 5px;
   background: none;
@@ -4600,47 +4801,35 @@ select,
 /* ── Power tab ─────────────────────────────────────────────────────── */
 .power-error { color: #E05555; margin: 4px 0 8px; font-size: 12px; }
 .power-row-gap { height: 14px; }
-/* Screensaver picker row: the dropdown button sits left-aligned and sizes
-   itself to its content. */
+/* Native screensaver selector, kept alongside the other power controls so
+   Windows supplies the standard popup and selection behavior. */
 .power-screensaver-top-row {
   display: flex;
   align-items: center;
   justify-content: flex-start;
-}
-/* Custom screensaver dropdown: a native <select> popup opens downward and gets
-   clipped by the bottom of the tab, so this uses a trigger button + a
-   collision-aware .dd-menu that flips upward when there is no room below. */
-.power-select-wrap { position: relative; display: inline-flex; max-width: 280px; }
-.power-select-trigger {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--divider);
+}
+.power-select-native {
+  flex: 0 1 280px;
+  width: 260px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--control-border);
   border-radius: 6px;
   background: #1c1c22;
   color: var(--text);
   font-size: 13px;
   font-family: var(--font);
   cursor: pointer;
-  transition: border-color 0.08s, background 0.08s;
-}
-.power-select-trigger:hover:not(:disabled) {
-  border-color: var(--accent);
-  background: var(--hover);
-}
-.power-select-trigger:focus-visible {
   outline: none;
+}
+.power-select-native:hover,
+.power-select-native:focus-visible {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
 }
-.power-select-trigger:disabled { opacity: 0.35; cursor: default; }
-.power-select-caret {
-  width: 0;
-  height: 0;
-  flex-shrink: 0;
-  border-left: 4px solid transparent;
-  border-right: 4px solid transparent;
-  border-top: 5px solid currentColor;
+.power-select-native option {
+  background: #1c1c22;
+  color: var(--text);
 }

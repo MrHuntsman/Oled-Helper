@@ -1229,9 +1229,26 @@ pub fn init(
         screen_protector_fade_out_duration_ms,
         screen_protector_fullscreen_detection,
     );
-    if screen_protector_enabled {
-        crate::input_monitor::start();
+    start_watcher_if_elevated(screen_protector_enabled);
+}
+
+// The dimmer needs admin for its media-playback detection (powercfg
+// /requests). Record the requested state so the UI and config stay truthful,
+// but never start the dimming machinery in a standard-user session: dimming
+// on while media detection is off is the half-state the startup prompt was
+// designed to prevent. The tab shows a restart-as-admin prompt instead.
+fn start_watcher_if_elevated(enabled: bool) {
+    if crate::process::process_is_elevated() {
+        if enabled {
+            crate::input_monitor::start();
+        } else {
+            crate::input_monitor::stop();
+        }
+        // The watcher is cheap (one idle poll per tick) and handles the
+        // disabled case by fading back up, so just make sure it is running.
         ensure_watcher();
+    } else if enabled {
+        log::warn!("[power] screen dimmer enabled but process is not elevated; watcher not started");
     }
 }
 
@@ -1251,14 +1268,10 @@ pub fn set_screen_protector(
         fade_out_duration_ms,
         fullscreen_detection,
     );
-    if enabled {
-        crate::input_monitor::start();
-    } else {
-        crate::input_monitor::stop();
-    }
-    // The watcher is cheap (one idle poll per tick) and handles the disabled
-    // case by fading back up, so just make sure it is running.
-    ensure_watcher();
+    // Same elevation rule as init: a non-elevated session records the new
+    // values but never starts the watcher, so toggling the dimmer on without
+    // admin just flips the flag for the next elevated launch.
+    start_watcher_if_elevated(enabled);
 }
 
 pub fn shutdown() {

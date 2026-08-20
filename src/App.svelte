@@ -4,7 +4,6 @@
   import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
-  import ShieldBadge from './lib/ShieldBadge.svelte';
   import TabCrush from './lib/TabCrush.svelte';
   import TabDimmer from './lib/TabDimmer.svelte';
   import TabHotkeys from './lib/TabHotkeys.svelte';
@@ -34,9 +33,8 @@
   import tabDebugIcon from './lib/icons/tab_debug.png?inline';
   import tabHotkeysIcon from './lib/icons/tab_hotkeys.png?inline';
   import { dropdownCloseEffect, ctxMenuCloseEffect } from './lib/dropdown.js';
-  import { createDropdownPositionController } from './lib/dropdown-position.js';
-  import { fmtNits } from './lib/calibration.js';
   import UpdateModal from './lib/UpdateModal.svelte';
+  import MonitorSelector from './lib/MonitorSelector.svelte';
 
   let windowVisible = $state(true);
   // Current app version read from the Tauri package at runtime, so the
@@ -139,55 +137,9 @@
     return dropdownCloseEffect(hzMenuEl, hzButtonEl, hzCtxMenuEl, closeHzMenu, hzButtonEl);
   });
 
-  // Custom click-only dropdown for the top-bar Monitor selector, replacing
-  // the native <select> for the same reason as the resolution/Hz dropdowns:
-  // the OS popup can't animate and opens/closes with the page's scroll
-  // behavior. A collision-aware .dd-menu anchored to the trigger keeps the
-  // entrance animation and flips direction when there's no room below.
-  let monitorMenuOpen = $state(false);
-  let monitorMenuEl = $state(null);
-  let monitorWrapEl = $state(null);
-  let monitorTriggerEl = $state(null);
-  let monitorMenuPlacement = $state('down-right');
-  let monitorPositionController = null;
-
-  // Label of the active monitor, or '' for Global (no per-monitor selection).
-  const activeMonitorLabel = $derived(
-    activeMonitor.mon
-      ? activeMonitor.mon.friendly_name || `Monitor ${monitors.indexOf(activeMonitor.mon) + 1}`
-      : ''
-  );
-
-  function toggleMonitorMenu() {
-    monitorMenuOpen = !monitorMenuOpen;
-    if (monitorMenuOpen) {
-      monitorPositionController?.stop();
-      monitorPositionController = createDropdownPositionController({
-        getTrigger: () => monitorWrapEl?.querySelector('.top-monitor-select-trigger'),
-        getMenu: () => monitorMenuEl,
-        onPlacement: (placement) => { monitorMenuPlacement = placement; },
-        options: { gap: 6, viewportMargin: 14, maxHeight: 320 },
-      });
-      monitorPositionController.start();
-    } else {
-      monitorPositionController?.stop();
-      monitorPositionController = null;
-    }
-  }
-  function closeMonitorMenu() {
-    monitorMenuOpen = false;
-    monitorPositionController?.stop();
-    monitorPositionController = null;
-  }
-  function pickMonitor(sig) {
-    closeMonitorMenu();
-    if (sig) setActiveMonitor(monitors.find((m) => m.sig === sig) || null);
-  }
-
-  $effect(() => {
-    if (!monitorMenuOpen) return;
-    return dropdownCloseEffect(monitorMenuEl, monitorTriggerEl, null, closeMonitorMenu, monitorTriggerEl);
-  });
+  // The status-bar monitor selector lives in MonitorSelector.svelte
+  // (trigger + collision-aware menu + per-monitor hover tooltip), styled
+  // transparent like the resolution/Hz selects.
 
   // ── Right-click context menus for the resolution and refresh-rate
   // dropdowns. Mirror the calibration strip's .ctx-menu pattern in TabCrush.
@@ -1294,41 +1246,6 @@
       </div>
     </div>
     <div class="spacer"></div>
-    <span class="top-monitor-select">
-      <span class="top-monitor-label">Monitor</span>
-      <span class="top-monitor-select-wrap" bind:this={monitorWrapEl}>
-        <button
-          type="button"
-          class="top-monitor-select-control top-monitor-select-trigger"
-          bind:this={monitorTriggerEl}
-          aria-haspopup="listbox"
-          aria-expanded={monitorMenuOpen}
-          aria-label="Active monitor for per-monitor settings"
-          onclick={toggleMonitorMenu}>
-          <span class="top-monitor-select-label">{activeMonitorLabel}</span>
-          <span class="top-monitor-caret" aria-hidden="true"></span>
-        </button>
-        {#if monitorMenuOpen}
-          <div
-            class="dd-menu top-monitor-menu dropdown-menu-position-{monitorMenuPlacement}"
-            bind:this={monitorMenuEl}
-            role="listbox"
-            aria-label="Active monitor for per-monitor settings">
-            {#each monitors as mon (mon.sig)}
-              <button
-                type="button"
-                class="dd-menu-item"
-                class:active={activeMonitor.mon?.sig === mon.sig}
-                role="option"
-                aria-selected={activeMonitor.mon?.sig === mon.sig}
-                onclick={() => pickMonitor(mon.sig)}>
-                {mon.friendly_name || `Monitor ${monitors.indexOf(mon) + 1}`}{mon.primary ? ' · Primary' : ''} · {mon.width}×{mon.height}
-              </button>
-            {/each}
-          </div>
-        {/if}
-      </span>
-    </span>
     <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabSystemIcon} alt="" /> Settings</span>
     </button>
@@ -1370,7 +1287,9 @@
       <button type="button" class="nav-switch" class:on={screenDimmer.enabled} aria-pressed={screenDimmer.enabled} onclick={toggleScreenDimmerFromNav} title="Toggle Screen Dimmer" aria-label="Toggle Screen Dimmer">
         <span class="nav-switch-thumb" aria-hidden="true"></span>
       </button>
-      <span class="nav-item-shield"><ShieldBadge size={14} text="Screen Dimmer requires administrator rights." /></span>
+      {#if app.isElevated === false && screenDimmer.enabled}
+        <span class="nav-item-shield" title="Screen Dimmer needs administrator rights for power state detection." aria-label="Screen Dimmer needs administrator rights">⚠</span>
+      {/if}
     </div>
     <div class="sidebar-sep" role="separator"></div>
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
@@ -1427,7 +1346,19 @@
 
   <div class="status-bar">
     <div class="status-bar-left">
-      <span class="status-version">v{appVersion || '0.1.1'}</span>
+      <div class="hdr-switch-wrap">
+        <button class="hdr-switch" class:hdr={app.hdrStatus === 'hdr'} disabled={windowsHdrBusy || app.hdrStatus === 'unknown'}
+          aria-label="Windows HDR"
+          onclick={toggleWindowsHdr}>
+          <span class="hdr-switch-opt" class:active={app.hdrStatus !== 'hdr'}>SDR</span>
+          <span class="hdr-switch-opt" class:active={app.hdrStatus === 'hdr'}>HDR</span>
+          <svg class="hdr-switch-arrow hdr-switch-arrow-right" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 2L7 5L3 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg class="hdr-switch-arrow hdr-switch-arrow-left" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M7 2L3 5L7 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="hdr-switch-tooltip">
+          {windowsHdrError || (app.hdrStatus === 'unknown' ? 'HDR status unknown' : `Switch to ${app.hdrStatus === 'hdr' ? 'SDR' : 'HDR'}`)}
+        </div>
+      </div>
       {#if updateState.status === 'available'}
         <button
           type="button"
@@ -1452,99 +1383,7 @@
           {favoritesStatusMsg}
         </span>
       {/if}
-      <div
-        class="favorites-wrap"
-        onpointerenter={openFavoritesOnHover}
-        onpointerleave={closeFavoritesOnHoverLeave}>
-        <button
-          type="button"
-          class="favorites-btn"
-          class:active={favoritesMenuOpen}
-          class:favorited={isCurrentFavorited}
-          bind:this={favoritesBtnEl}
-          aria-label="Favorite display modes"
-          aria-haspopup="listbox"
-          aria-expanded={favoritesMenuOpen}
-          title={isCurrentFavorited ? `Current mode is favorited: ${currentComboLabel}` : 'Favorite display modes'}
-          disabled={app.displayModeBusy || app.refreshRateBusy}
-          onclick={toggleFavoritesMenu}>
-          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={isCurrentFavorited ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-          </svg>
-        </button>
-        {#if favoritesMenuOpen}
-          <div class="dd-menu favorites-menu" bind:this={favoritesMenuEl} role="listbox" aria-label="Favorite display modes" tabindex="-1">
-            <div class="favorites-title">Favorites</div>
-            {#if currentComboLabel && !isCurrentFavorited}
-              <div class="favorites-item favorites-current">
-                <button
-                  type="button"
-                  class="dd-menu-item favorites-apply"
-                  role="option"
-                  aria-selected={false}
-                  onclick={saveCurrentFavorite}>
-                  {currentComboLabel}
-                </button>
-                <button
-                  type="button"
-                  class="favorites-star"
-                  aria-label={`Save current: ${currentComboLabel}`}
-                  title={`Save current: ${currentComboLabel}`}
-                  onclick={saveCurrentFavorite}>
-                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                    <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-                  </svg>
-                </button>
-              </div>
-            {/if}
-            {#if displayFavorites.length === 0}
-              <div class="favorites-empty">No favorites yet. Save the current mode to add one.</div>
-            {:else}
-              {#each displayFavorites as fav (displayModeFavoriteKey(fav.width, fav.height, fav.hz))}
-                <div class="favorites-item" class:active={isFavoriteCurrent(fav)}>
-                  <button
-                    type="button"
-                    class="dd-menu-item favorites-apply"
-                    role="option"
-                    aria-selected={isFavoriteCurrent(fav)}
-                    onclick={() => applyFavorite(fav)}>
-                    {fav.width}×{fav.height} @ {fav.hz} Hz
-                  </button>
-                  <button
-                    type="button"
-                    class="favorites-star"
-                    class:filled={true}
-                    aria-label={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
-                    title={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
-                    onclick={() => askRemoveFavorite(fav)}>
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                      <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-                    </svg>
-                  </button>
-                </div>
-              {/each}
-            {/if}
-          </div>
-        {/if}
-      </div>
-      {#if app.displayInfo.monitorName}
-        <span class="monitor-tip-wrap" tabindex="0" aria-label={`Monitor info: ${app.displayInfo.monitorName}`}>
-          <span class="current-monitor">
-            {app.displayInfo.monitorName}
-          </span>
-          <span class="monitor-tip" role="tooltip">
-            <span class="monitor-tip-title">{app.displayInfo.monitorName}</span>
-            {#if app.hdrStatus === 'hdr' && app.hdrLuminance?.maxNits}
-              <span class="monitor-tip-row"><span>HDR max</span><strong>{fmtNits(app.hdrLuminance.maxNits)} nits</strong></span>
-            {/if}
-            <span class="monitor-tip-row"><span>Connector</span><strong>{app.displayInfo.connector || '-'}</strong></span>
-            <span class="monitor-tip-row"><span>Color format</span><strong>{app.displayInfo.colorFormat || '-'}{app.displayInfo.bitsPerChannel ? ` · ${app.displayInfo.bitsPerChannel} bpc` : ''}</strong></span>
-            <span class="monitor-tip-row"><span>Dynamic range</span><strong>{app.displayInfo.dynamicRange || '-'}</strong></span>
-            <span class="monitor-tip-row"><span>VRR</span><strong>{app.displayInfo.vrr || '-'}</strong></span>
-            <span class="monitor-tip-row"><span>Current</span><strong>{app.displayInfo.width}×{app.displayInfo.height}{app.displayInfo.refreshRateHz ? ` @ ${app.displayInfo.refreshRateHz}Hz` : ''}</strong></span>
-          </span>
-        </span>
-      {/if}
+      <MonitorSelector variant="status" />
       <div class="resolution-wrap">
         <button type="button" class="resolution-select" class:active={resMenuOpen} class:no-tags={!displayMenuPrefs.showTags}
           bind:this={resButtonEl}
@@ -1666,18 +1505,80 @@
           <span class="refresh-rate-error" role="status" aria-label="Refresh rate change failed" title={refreshRateError}>!</span>
         {/if}
       </div>
-      <div class="hdr-switch-wrap">
-        <button class="hdr-switch" class:hdr={app.hdrStatus === 'hdr'} disabled={windowsHdrBusy || app.hdrStatus === 'unknown'}
-          aria-label="Windows HDR"
-          onclick={toggleWindowsHdr}>
-          <span class="hdr-switch-opt" class:active={app.hdrStatus !== 'hdr'}>SDR</span>
-          <span class="hdr-switch-opt" class:active={app.hdrStatus === 'hdr'}>HDR</span>
-          <svg class="hdr-switch-arrow hdr-switch-arrow-right" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 2L7 5L3 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          <svg class="hdr-switch-arrow hdr-switch-arrow-left" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M7 2L3 5L7 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div
+        class="favorites-wrap"
+        onpointerenter={openFavoritesOnHover}
+        onpointerleave={closeFavoritesOnHoverLeave}>
+        <button
+          type="button"
+          class="favorites-btn"
+          class:active={favoritesMenuOpen}
+          class:favorited={isCurrentFavorited}
+          bind:this={favoritesBtnEl}
+          aria-label="Favorite display modes"
+          aria-haspopup="listbox"
+          aria-expanded={favoritesMenuOpen}
+          title={isCurrentFavorited ? `Current mode is favorited: ${currentComboLabel}` : 'Favorite display modes'}
+          disabled={app.displayModeBusy || app.refreshRateBusy}
+          onclick={toggleFavoritesMenu}>
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill={isCurrentFavorited ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+          </svg>
         </button>
-        <div class="hdr-switch-tooltip">
-          {windowsHdrError || (app.hdrStatus === 'unknown' ? 'HDR status unknown' : `Switch to ${app.hdrStatus === 'hdr' ? 'SDR' : 'HDR'}`)}
-        </div>
+        {#if favoritesMenuOpen}
+          <div class="dd-menu favorites-menu" bind:this={favoritesMenuEl} role="listbox" aria-label="Favorite display modes" tabindex="-1">
+            <div class="favorites-title">Favorites</div>
+            {#if currentComboLabel && !isCurrentFavorited}
+              <div class="favorites-item favorites-current">
+                <button
+                  type="button"
+                  class="dd-menu-item favorites-apply"
+                  role="option"
+                  aria-selected={false}
+                  onclick={saveCurrentFavorite}>
+                  {currentComboLabel}
+                </button>
+                <button
+                  type="button"
+                  class="favorites-star"
+                  aria-label={`Save current: ${currentComboLabel}`}
+                  title={`Save current: ${currentComboLabel}`}
+                  onclick={saveCurrentFavorite}>
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+              </div>
+            {/if}
+            {#if displayFavorites.length === 0}
+              <div class="favorites-empty">No favorites yet. Save the current mode to add one.</div>
+            {:else}
+              {#each displayFavorites as fav (displayModeFavoriteKey(fav.width, fav.height, fav.hz))}
+                <div class="favorites-item" class:active={isFavoriteCurrent(fav)}>
+                  <button
+                    type="button"
+                    class="dd-menu-item favorites-apply"
+                    role="option"
+                    aria-selected={isFavoriteCurrent(fav)}
+                    onclick={() => applyFavorite(fav)}>
+                    {fav.width}×{fav.height} @ {fav.hz} Hz
+                  </button>
+                  <button
+                    type="button"
+                    class="favorites-star"
+                    class:filled={true}
+                    aria-label={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
+                    title={`Remove ${fav.width}×${fav.height} @ ${fav.hz} Hz from favorites`}
+                    onclick={() => askRemoveFavorite(fav)}>
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {/if}
       </div>
     </div>
   </div>

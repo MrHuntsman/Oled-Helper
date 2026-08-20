@@ -298,6 +298,11 @@ fn get_display_info() -> Option<display_info::DisplayInfo> {
 }
 
 #[tauri::command]
+fn get_display_info_for(device_name: String) -> Option<display_info::DisplayInfo> {
+    display_info::query_display_for(&device_name)
+}
+
+#[tauri::command]
 fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
     vendor_info::query_vendor_display_info_fresh()
 }
@@ -695,16 +700,13 @@ pub fn run() {
         if process::spawn_elevated(&extra).is_ok() {
             std::process::exit(0);
         }
+        // The always-elevated prompt covers the dimmer too: it needs admin as
+        // well, so a declined prompt skips the dimmer's own elevation ask
+        // (one UAC prompt per launch). The dimmer's on-disk setting is left
+        // untouched: the tab shows a restart-as-admin prompt instead, so the
+        // user's intent survives a declined prompt.
         elevation_declined = true;
-        // The dimmer can't run non-elevated either. Disable it on disk now
-        // (before the frontend loads config, so the tab shows it off) instead
-        // of asking a second time for its own elevation.
-        if config::screen_protector_enabled_on_disk() {
-            log::warn!("[power] elevation declined; disabling screen dimmer");
-            if config::screen_protector_disable_on_disk() {
-                log::info!("[power] screen dimmer disabled on disk");
-            }
-        }
+        log::warn!("[power] elevation declined; screen dimmer stays enabled but inactive");
     }
 
     // Screen Dimmer needs admin for its media-playback detection. Ask for
@@ -712,12 +714,13 @@ pub fn run() {
     // directly (no AppHandle exists yet) and a successful UAC relaunch hands
     // off to the elevated replacement, so a normal close/reopen never flashes
     // the window open before the prompt. A declined prompt (or any other
-    // failed launch) switches the dimmer off on disk and falls through to a
-    // plain non-elevated startup: the feature is admin-only, so a
-    // non-elevated session never runs a half-degraded version of it. The
-    // elevated replacement never re-enters this branch (process_is_elevated).
-    // Skipped entirely when the always-elevated prompt above was declined
-    // (which already disabled the dimmer on disk).
+    // failed launch) falls through to a plain non-elevated startup with the
+    // on-disk setting left intact; the dimmer never runs in the half-degraded
+    // state (dimming on, media detection off), and the tab shows a
+    // restart-as-admin prompt instead. The elevated replacement never
+    // re-enters this branch (process_is_elevated). Skipped entirely when the
+    // always-elevated prompt above was declined (it already covers the
+    // dimmer's elevation).
     #[cfg(target_os = "windows")]
     if !elevation_declined && !process::process_is_elevated() && config::screen_protector_enabled_on_disk() {
         let extra = [
@@ -728,11 +731,8 @@ pub fn run() {
             Ok(()) => std::process::exit(0),
             Err(error) => {
                 log::warn!(
-                    "[power] screen dimmer elevation declined ({error}); disabling screen dimmer"
+                    "[power] screen dimmer elevation declined ({error}); dimmer stays enabled but inactive"
                 );
-                if config::screen_protector_disable_on_disk() {
-                    log::info!("[power] screen dimmer disabled on disk");
-                }
             }
         }
     }
@@ -769,6 +769,7 @@ pub fn run() {
             monitors::list_monitors,
             log_frontend,
             get_display_info,
+            get_display_info_for,
             refresh_vendor_display_info,
             get_nvidia_reference_mode,
             vendor_info::get_rtx_hdr_settings_state,

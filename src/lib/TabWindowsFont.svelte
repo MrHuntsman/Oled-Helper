@@ -4,6 +4,7 @@
   import { onMount, onDestroy } from 'svelte';
   import TabWindowsFontIcon from './TabWindowsFontIcon.svelte';
   import { createDropdownPositionController } from './dropdown-position.js';
+  import { createDropdownKeyboardHandlers } from './dropdown.js';
 
   // System font replacement (milestone M5). The backend builds impersonated
   // Segoe UI files and schedules a boot-time swap, so this tab is deliberately
@@ -18,7 +19,7 @@
   let fontMessage = $state('');
   let fontError = $state('');
   let fontProgress = $state(''); // live phase text while download/apply runs
-  let downloadCatalog = $state([]); // [{ key, family, license, filter }]
+  let downloadCatalog = $state([]); // [{ key, family, license, description, filter }]
   let selectedDownloadKey = $state('');
   let unlistenFontProgress = null;
 
@@ -26,8 +27,8 @@
   // sources are expensive to rebuild (font enumeration + Google Fonts
   // manifest fetch) but identical across tab visits, so they're fetched once
   // and reused on every re-open. Only the cheap status read (elevation check
-  // + state file) runs each time, which keeps the "Currently applied" line
-  // and the dropdowns near-instant on subsequent visits.
+  // + state file) runs each time, which keeps the status and dropdowns
+  // near-instant on subsequent visits.
   let cachedFontData = null;
 
   onMount(async () => {
@@ -58,6 +59,7 @@
       fontList = cachedFontData.fonts;
       downloadCatalog = cachedFontData.catalog;
       registerFontPreviews(cachedFontData.previews);
+      syncSelectionToAppliedFont();
     }
     fontReady = true;
     // Live phase text from the backend while a font download/apply/restore
@@ -125,8 +127,7 @@
     return cssFontFamily(`GF-${key}`);
   }
 
-  // Trigger a UAC relaunch when the user interacts with a font dropdown while
-  // not elevated, so they don't hit a disabled Apply button.
+  // Trigger a UAC relaunch when a font operation needs administrator rights.
   async function requestFontElevation() {
     if (fontStatus.elevated || fontBusy) return;
     try {
@@ -138,19 +139,15 @@
   }
 
   // ── Font dropdowns ────────────────────────────────────────────────
-  // The two font picks are custom .dd-menu lists instead of native <select>s:
-  // the OS popup can't animate and gets clipped at the tab's scrollable
-  // bottom edge. Each row renders the family in its own font (installed
-  // families directly, catalog families via the registered GF-<key> face),
-  // and the elevation prompt + mutual-exclusion behavior from the native
-  // selects is preserved on the trigger buttons.
+  // Custom dropdowns keep each installed and downloadable family rendered in
+  // its own typeface, while the shared keyboard helper preserves native select
+  // navigation behavior.
   let fontMenu = $state({
-    installed: { open: false, el: null, wrap: null, placement: 'down-right' },
-    download: { open: false, el: null, wrap: null, placement: 'down-right' },
+    installed: { open: false, el: null, wrap: null, placement: 'down-right', highlightIndex: -1 },
+    download: { open: false, el: null, wrap: null, placement: 'down-right', highlightIndex: -1 },
   });
   let fontPositionControllers = { installed: null, download: null };
 
-  // Trigger labels: the selected family name, or the placeholder text.
   const selectedInstalledFamily = $derived(
     fontList.find((f) => f.path === selectedFontPath)?.family ?? ''
   );
@@ -158,18 +155,110 @@
     downloadCatalog.find((c) => c.key === selectedDownloadKey)?.family ?? ''
   );
 
+  function syncSelectionToAppliedFont() {
+    const appliedFamily = fontStatus.applied?.family;
+    if (!appliedFamily) return;
+
+    const installed = fontList.find(
+      (font) => font.family.localeCompare(appliedFamily, undefined, { sensitivity: 'base' }) === 0
+    );
+    const downloadable = downloadCatalog.find(
+      (font) => font.family.localeCompare(appliedFamily, undefined, { sensitivity: 'base' }) === 0
+    );
+
+    // Prefer the downloadable entry when both lists contain the same family.
+    // The applied state does not record which picker supplied the font, and a
+    // downloadable family is the actionable choice for the replacement flow.
+    if (downloadable) {
+      selectedFontPath = '';
+      selectedDownloadKey = downloadable.key;
+    } else if (installed) {
+      selectedDownloadKey = '';
+      selectedFontPath = installed.path;
+    }
+    updateFontPreviewFamily();
+  }
+
+  function isAppliedFont(family) {
+    return Boolean(
+      fontStatus.applied?.family &&
+      family.localeCompare(fontStatus.applied.family, undefined, { sensitivity: 'base' }) === 0
+    );
+  }
+
+  function fontOptions(which) {
+    return which === 'installed' ? fontList : downloadCatalog;
+  }
+
+  function currentFontOptionIndex(which) {
+    if (which === 'installed') {
+      return fontList.findIndex((font) => font.path === selectedFontPath);
+    }
+    return downloadCatalog.findIndex((font) => font.key === selectedDownloadKey);
+  }
+
+  function selectFontOption(which, index) {
+    const option = fontOptions(which)[index];
+    if (!option) return;
+    if (which === 'installed') selectInstalledFont(option.path);
+    else selectDownloadFont(option.key);
+  }
+
+  const fontKeyboard = {
+    installed: createDropdownKeyboardHandlers({
+      getOptions: () => fontList,
+      getSelectedIndex: () => currentFontOptionIndex('installed'),
+      getHighlightIndex: () => fontMenu.installed.highlightIndex,
+      setHighlightIndex: (index) => {
+        fontMenu.installed.highlightIndex = index;
+        previewFontAt('installed', index);
+      },
+      isOpen: () => fontMenu.installed.open,
+      toggle: () => toggleFontMenu('installed'),
+      close: closeFontMenus,
+      select: (index) => selectFontOption('installed', index),
+      canSelect: () => {
+        if (fontStatus.elevated) return true;
+        requestFontElevation();
+        return false;
+      },
+      getMenu: () => fontMenu.installed.el,
+      getTrigger: () => fontMenu.installed.wrap?.querySelector('.font-select-trigger'),
+    }),
+    download: createDropdownKeyboardHandlers({
+      getOptions: () => downloadCatalog,
+      getSelectedIndex: () => currentFontOptionIndex('download'),
+      getHighlightIndex: () => fontMenu.download.highlightIndex,
+      setHighlightIndex: (index) => {
+        fontMenu.download.highlightIndex = index;
+        previewFontAt('download', index);
+      },
+      isOpen: () => fontMenu.download.open,
+      toggle: () => toggleFontMenu('download'),
+      close: closeFontMenus,
+      select: (index) => selectFontOption('download', index),
+      canSelect: () => {
+        if (fontStatus.elevated) return true;
+        requestFontElevation();
+        return false;
+      },
+      getMenu: () => fontMenu.download.el,
+      getTrigger: () => fontMenu.download.wrap?.querySelector('.font-select-trigger'),
+    }),
+  };
+
   function closeFontMenus() {
     for (const which of ['installed', 'download']) {
       fontMenu[which].open = false;
+      fontMenu[which].highlightIndex = -1;
       fontPositionControllers[which]?.stop();
       fontPositionControllers[which] = null;
     }
+    clearHoverPreview();
   }
 
   function toggleFontMenu(which) {
     if (fontBusy || !fontReady) return;
-    // Not elevated: prompt for a UAC relaunch instead of opening the list
-    // (the Apply button would be disabled anyway).
     if (!fontStatus.elevated) {
       requestFontElevation();
       return;
@@ -177,37 +266,42 @@
     const menu = fontMenu[which];
     menu.open = !menu.open;
     if (menu.open) {
+      menu.highlightIndex = currentFontOptionIndex(which);
       fontPositionControllers[which]?.stop();
       fontPositionControllers[which] = createDropdownPositionController({
         getTrigger: () => fontMenu[which].wrap?.querySelector('.font-select-trigger'),
         getMenu: () => fontMenu[which].el,
         onPlacement: (placement) => { fontMenu[which].placement = placement; },
-        // The download dropdown is the row's right-side control, so its menu
-        // stays anchored to the trigger's right edge even when the free space
-        // to the left is narrower than the list (otherwise it would left-align
-        // and hang off the right of its control).
-        options: { gap: 6, viewportMargin: 14, maxHeight: 320, align: which === 'download' ? 'right' : undefined },
+        options: { gap: 6, viewportMargin: 14, maxHeight: 320, align: 'left' },
       });
       fontPositionControllers[which].start();
+      requestAnimationFrame(() => {
+        if (fontMenu[which].open) fontMenu[which].el?.focus();
+      });
     } else {
+      menu.highlightIndex = -1;
       fontPositionControllers[which]?.stop();
       fontPositionControllers[which] = null;
+      clearHoverPreview();
     }
   }
 
   function selectInstalledFont(path) {
+    const trigger = fontMenu.installed.wrap?.querySelector('.font-select-trigger');
     closeFontMenus();
     selectedFontPath = path;
     onSelectInstalledFont();
+    requestAnimationFrame(() => trigger?.focus());
   }
 
   function selectDownloadFont(key) {
+    const trigger = fontMenu.download.wrap?.querySelector('.font-select-trigger');
     closeFontMenus();
     selectedDownloadKey = key;
     onSelectDownloadFont();
+    requestAnimationFrame(() => trigger?.focus());
   }
 
-  // Close either font menu on outside click, Escape, or window blur.
   $effect(() => {
     if (!fontMenu.installed.open && !fontMenu.download.open) return;
     function onDown(event) {
@@ -215,8 +309,10 @@
         const menu = fontMenu[which];
         if (menu.open && menu.wrap && !menu.wrap.contains(event.target)) {
           menu.open = false;
+          menu.highlightIndex = -1;
           fontPositionControllers[which]?.stop();
           fontPositionControllers[which] = null;
+          clearHoverPreview();
         }
       }
     }
@@ -245,6 +341,30 @@
   // fonts, the unique GF-<key> name for catalog fonts.
   let fontPreviewFamily = $state('');
   let fontPreviewCss = $state('');
+  // Hover or keyboard highlight preview: while a dropdown is open the sample
+  // line follows the family under the cursor or highlighted by the keyboard,
+  // and reverts to the selected family when the menu closes.
+  let hoverPreviewFamily = $state('');
+  let hoverPreviewCss = $state('');
+  const previewFamily = $derived(hoverPreviewFamily || fontPreviewFamily);
+  const previewCss = $derived(hoverPreviewCss || fontPreviewCss);
+  // CSS font-family for the Currently Applied line: the real family name for
+  // installed fonts, the unique GF-<key> name for catalog fonts, empty when
+  // the system default is in use.
+  const appliedFontCss = $derived(() => {
+    const applied = fontStatus.applied?.family;
+    if (!applied) return '';
+    const installed = fontList.find((f) => f.family.localeCompare(applied, undefined, { sensitivity: 'base' }) === 0);
+    if (installed) return cssFontFamily(installed.family);
+    const catalog = downloadCatalog.find((c) => c.family.localeCompare(applied, undefined, { sensitivity: 'base' }) === 0);
+    return catalog ? catalogPreviewFont(catalog.key) : '';
+  });
+  // True when the current selection is the font already applied to Windows,
+  // which turns the Apply button into a read-only Applied state.
+  const selectionIsApplied = $derived(
+    (selectedFontPath !== '' && isAppliedFont(selectedInstalledFamily)) ||
+    (selectedDownloadKey !== '' && isAppliedFont(selectedDownloadFamily))
+  );
   function onSelectInstalledFont() {
     selectedDownloadKey = '';
     updateFontPreviewFamily();
@@ -266,6 +386,25 @@
       fontPreviewFamily = '';
       fontPreviewCss = '';
     }
+  }
+
+  // Show the family at a dropdown index in the sample line (hover or keyboard
+  // highlight). Resolves to the real family name for installed fonts and the
+  // unique GF-<key> name for catalog fonts, mirroring updateFontPreviewFamily.
+  function previewFontAt(which, index) {
+    const option = fontOptions(which)[index];
+    if (!option) {
+      hoverPreviewFamily = '';
+      hoverPreviewCss = '';
+      return;
+    }
+    hoverPreviewFamily = option.family;
+    hoverPreviewCss = which === 'installed' ? cssFontFamily(option.family) : catalogPreviewFont(option.key);
+  }
+
+  function clearHoverPreview() {
+    hoverPreviewFamily = '';
+    hoverPreviewCss = '';
   }
 
   // The two dropdowns are mutually exclusive, so one button applies whichever
@@ -435,90 +574,131 @@
   </div>
   <div class="separator"></div>
 
+  {#if !fontStatus.elevated}
+    <div class="font-admin-warning" role="alert">
+      <p class="font-warning">Administrator rights are required to apply or restore a font.</p>
+      <button type="button" class="font-admin-restart-btn" onclick={requestFontElevation}>Restart as administrator</button>
+    </div>
+  {/if}
+
   <div class="font-section">
-    {#if !fontStatus.elevated}
-      <p class="font-warning">Requires administrator rights. Choosing or restoring a font will prompt you to restart as administrator.</p>
-    {/if}
+    <div class="font-current-line">
+      <span class="font-current-label">Currently Applied:</span>
+      <span class="font-current-name" style={appliedFontCss ? `font-family: ${appliedFontCss}` : ''}>
+        {fontStatus.applied?.family ?? 'System default'}
+      </span>
+    </div>
 
-    {#if fontStatus.applied}
-      <p class="font-applied font-applied-top">Currently applied: {fontStatus.applied.family}</p>
-    {/if}
-
-    <div class="font-row">
-      <span class="font-select-wrap" bind:this={fontMenu.installed.wrap}>
-        <button
+    <div class="font-row font-choice-row">
+      <div class="font-choice-group">
+        <span class="font-choice-label">Installed fonts</span>
+        <span class="font-select-wrap" bind:this={fontMenu.installed.wrap}>
+          <button
           type="button"
           class="settings-select font-select-trigger"
           aria-haspopup="listbox"
           aria-expanded={fontMenu.installed.open}
           disabled={!fontReady || fontBusy}
-          onclick={() => toggleFontMenu('installed')}>
-          <span class="font-select-label">{selectedInstalledFamily || 'Choose an installed font…'}</span>
-          <span class="font-select-caret" aria-hidden="true"></span>
-        </button>
+          onclick={() => toggleFontMenu('installed')}
+            onkeydown={fontKeyboard.installed.onTriggerKeydown}>
+            <span class="font-select-current">
+              {#if isAppliedFont(selectedInstalledFamily)}<span class="font-select-check" aria-hidden="true">✓</span>{/if}
+              <span class="font-select-label" class:placeholder={!selectedInstalledFamily}>{selectedInstalledFamily || 'Choose an installed font…'}</span>
+            </span>
+            <span class="font-select-caret" aria-hidden="true"></span>
+          </button>
         {#if fontMenu.installed.open}
           <div
             class="dd-menu dropdown-menu-position-{fontMenu.installed.placement}"
             bind:this={fontMenu.installed.el}
             role="listbox"
-            aria-label="Choose an installed font">
-            {#each fontList as f (f.path)}
+            aria-label="Choose an installed font"
+            tabindex="-1"
+            onkeydown={fontKeyboard.installed.onMenuKeydown}>
+            {#each fontList as f, index (f.path)}
               <button
                 type="button"
                 class="dd-menu-item"
                 class:active={selectedFontPath === f.path}
+                class:keyboard-highlighted={fontMenu.installed.highlightIndex === index}
+                data-dropdown-option-index={index}
                 role="option"
                 aria-selected={selectedFontPath === f.path}
                 style="font-family: {cssFontFamily(f.family)}"
+                onfocus={() => fontKeyboard.installed.onItemFocus(index)}
+                onmouseenter={() => previewFontAt('installed', index)}
+                onmouseleave={clearHoverPreview}
+                onkeydown={fontKeyboard.installed.onItemKeydown}
                 onclick={() => selectInstalledFont(f.path)}>
-                {f.family}
+                <span class="dd-check" aria-hidden="true">{isAppliedFont(f.family) ? '✓' : ''}</span>
+                <span>{f.family}</span>
               </button>
             {/each}
           </div>
         {/if}
-      </span>
-      <span class="font-select-wrap" bind:this={fontMenu.download.wrap}>
-        <button
+        </span>
+      </div>
+      <div class="font-choice-group">
+        <span class="font-choice-label">Google Fonts</span>
+        <span class="font-select-wrap" bind:this={fontMenu.download.wrap}>
+          <button
           type="button"
           class="settings-select font-select-trigger"
           aria-haspopup="listbox"
           aria-expanded={fontMenu.download.open}
           disabled={!fontReady || fontBusy}
-          onclick={() => toggleFontMenu('download')}>
-          <span class="font-select-label">{selectedDownloadFamily || 'Or download a recommended font…'}</span>
-          <span class="font-select-caret" aria-hidden="true"></span>
-        </button>
+          onclick={() => toggleFontMenu('download')}
+            onkeydown={fontKeyboard.download.onTriggerKeydown}>
+            <span class="font-select-current">
+              {#if isAppliedFont(selectedDownloadFamily)}<span class="font-select-check" aria-hidden="true">✓</span>{/if}
+              <span class="font-select-label" class:placeholder={!selectedDownloadFamily}>{selectedDownloadFamily || 'Or download a recommended font…'}</span>
+            </span>
+            <span class="font-select-caret" aria-hidden="true"></span>
+          </button>
         {#if fontMenu.download.open}
           <div
             class="dd-menu dropdown-menu-position-{fontMenu.download.placement}"
             bind:this={fontMenu.download.el}
             role="listbox"
-            aria-label="Download a recommended font">
-            {#each downloadCatalog as c (c.key)}
+            aria-label="Download a recommended font"
+            tabindex="-1"
+            onkeydown={fontKeyboard.download.onMenuKeydown}>
+            {#each downloadCatalog as c, index (c.key)}
               <button
                 type="button"
                 class="dd-menu-item"
                 class:active={selectedDownloadKey === c.key}
+                class:keyboard-highlighted={fontMenu.download.highlightIndex === index}
+                data-dropdown-option-index={index}
                 role="option"
                 aria-selected={selectedDownloadKey === c.key}
                 style="font-family: {catalogPreviewFont(c.key)}"
+                onfocus={() => fontKeyboard.download.onItemFocus(index)}
+                onmouseenter={() => previewFontAt('download', index)}
+                onmouseleave={clearHoverPreview}
+                onkeydown={fontKeyboard.download.onItemKeydown}
                 onclick={() => selectDownloadFont(c.key)}>
-                {c.family}
+                <span class="dd-check" aria-hidden="true">{isAppliedFont(c.family) ? '✓' : ''}</span>
+                <span class="font-catalog-name">{c.family}</span>
+                {#if c.description}
+                  <span class="font-catalog-desc">{c.description}</span>
+                {/if}
               </button>
             {/each}
           </div>
         {/if}
-      </span>
+        </span>
+      </div>
     </div>
 
-    {#if fontPreviewFamily}
+    {#if previewFamily}
       <div class="font-preview-line">
         <span class="font-preview-label">Preview:</span>
         <div class="font-preview-sizes">
           {#each [8, 10, 12, 15] as size (size)}
             <div class="font-preview-size-row">
               <span class="font-preview-size-label">{size}</span>
-              <span class="font-preview-text" style="font-family: {fontPreviewCss}; font-size: {size}px">
+              <span class="font-preview-text" style="font-family: {previewCss}; font-size: {size}px">
                 The quick brown fox jumps over the lazy dog 0123456789
               </span>
             </div>
@@ -528,8 +708,8 @@
     {/if}
 
     <div class="font-row">
-      <button class="font-btn font-btn-apply" disabled={fontBusy || !fontStatus.elevated || (!selectedFontPath && !selectedDownloadKey)} onclick={applySelected}>
-        {fontBusy ? '…' : (selectedDownloadKey ? 'Download & apply' : 'Apply')}
+      <button class="font-btn font-btn-apply" class:font-btn-applied={selectionIsApplied} disabled={fontBusy || !fontStatus.elevated || (!selectedFontPath && !selectedDownloadKey) || selectionIsApplied} onclick={applySelected}>
+        {fontBusy ? '…' : (selectionIsApplied ? 'Applied ✓' : (selectedDownloadKey ? 'Download & apply' : 'Apply'))}
       </button>
       {#if fontStatus.needsRestart}
         <button class="font-btn font-btn-restart" bind:this={restartBtnEl} disabled={fontBusy || !fontStatus.elevated} onclick={openRestartConfirm}>

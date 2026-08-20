@@ -365,6 +365,22 @@ fn text(value: &[u16]) -> String {
 }
 
 fn primary_display_target() -> Option<DisplayTarget> {
+    display_target_matching(true, None)
+}
+
+/// DisplayTarget for a specific monitor by its GDI device name
+/// (e.g. r"\\.\DISPLAY2"). Used by the per-monitor tooltip in the top-bar
+/// selector, which needs the same rich info the status bar shows for the
+/// primary, but for whichever monitor is hovered.
+fn display_target_for_device(device_name: &str) -> Option<DisplayTarget> {
+    display_target_matching(false, Some(device_name))
+}
+
+/// Shared adapter enumeration: either the primary adapter (when
+/// `primary_only`) or the adapter whose DeviceName matches `device_name`.
+/// The matched adapter's first monitor becomes the target, mirroring what
+/// the status-bar query uses.
+fn display_target_matching(primary_only: bool, device_name: Option<&str>) -> Option<DisplayTarget> {
     unsafe {
         let mut adapter = DISPLAY_DEVICEW {
             cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
@@ -374,10 +390,15 @@ fn primary_display_target() -> Option<DisplayTarget> {
             if !EnumDisplayDevicesW(PCWSTR::null(), index, &mut adapter, 0).as_bool() {
                 break;
             }
-            if (adapter.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) == 0 {
+            let candidate_name = text(&adapter.DeviceName);
+            if primary_only {
+                if (adapter.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) == 0 {
+                    continue;
+                }
+            } else if !device_name.map_or(true, |wanted| candidate_name.eq_ignore_ascii_case(wanted)) {
                 continue;
             }
-            let device_name = text(&adapter.DeviceName);
+            let device_name = candidate_name;
             let device_name_wide = wide(&device_name);
             let mut monitor = DISPLAY_DEVICEW {
                 cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
@@ -400,7 +421,7 @@ fn primary_display_target() -> Option<DisplayTarget> {
                     break;
                 }
                 monitor = candidate;
-                if (monitor.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) != 0 {
+                if primary_only && (monitor.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) != 0 {
                     monitor_found = true;
                     break;
                 }
@@ -586,18 +607,28 @@ fn current_devmode(device_name: &str) -> Option<DEVMODEW> {
 }
 
 pub fn query_current_display() -> Option<DisplayInfo> {
-    let target = primary_display_target()?;
+    query_display_for(&primary_display_target()?.device_name)
+}
+
+/// Rich display info for any connected monitor by GDI device name. The
+/// status-bar tooltip queries the primary via `query_current_display`; the
+/// top-bar monitor selector uses this per-device variant so hovering any
+/// monitor shows the same fields.
+pub fn query_display_for(device_name: &str) -> Option<DisplayInfo> {
+    let target = display_target_for_device(device_name)?;
     let devmode = current_devmode(&target.device_name)?;
     let (refresh_rates, resolutions) = mode_lists_for(&target, &devmode);
-    let (native_width, native_height, native_source) = native_resolution()
+    let (native_width, native_height, native_source) = native_resolution_for(&target)
         .map(|(w, h, source)| (w, h, source.to_string()))
         .unwrap_or((0, 0, String::new()));
     // Prefer the shared monitors module's CCD friendly name (same source the
     // per-monitor table and the CCD output-info match use); fall back to the
     // EDID name when CCD yields nothing.
-    let monitor_name = crate::monitors::primary_friendly_name().unwrap_or_else(|| {
-        cached_edid_monitor_name(&target).unwrap_or_else(|| target.monitor_name.clone())
-    });
+    let monitor_name = crate::monitors::friendly_name_for_device(&target.device_name)
+        .or_else(|| crate::monitors::primary_friendly_name())
+        .unwrap_or_else(|| {
+            cached_edid_monitor_name(&target).unwrap_or_else(|| target.monitor_name.clone())
+        });
     let output = crate::hdr_toggle::query_display_output_info(&monitor_name);
     Some(DisplayInfo {
         width: devmode.dmPelsWidth,
@@ -1073,10 +1104,7 @@ unsafe fn read_name_from_registry_key(key: HKEY) -> Option<String> {
     })
 }
 
-fn native_resolution() -> Option<(u32, u32, &'static str)> {
-    // Use the same target discovery as mode enumeration and the status bar;
-    // native EDID data must never silently come from a different monitor.
-    let target = primary_display_target()?;
+fn native_resolution_for(target: &DisplayTarget) -> Option<(u32, u32, &'static str)> {
     let display_key = if target.monitor_id.is_empty() {
         target.device_name.clone()
     } else {
@@ -1102,7 +1130,7 @@ fn native_resolution() -> Option<(u32, u32, &'static str)> {
             ));
         }
     }
-    let native = query_native_resolution(&target);
+    let native = query_native_resolution(target);
     if let Ok(mut guard) = cache.lock() {
         let (width, height, source) = native.unwrap_or((0, 0, ""));
         *guard = Some(CachedNative {
