@@ -1346,19 +1346,6 @@
 
   <div class="status-bar">
     <div class="status-bar-left">
-      <div class="hdr-switch-wrap">
-        <button class="hdr-switch" class:hdr={app.hdrStatus === 'hdr'} disabled={windowsHdrBusy || app.hdrStatus === 'unknown'}
-          aria-label="Windows HDR"
-          onclick={toggleWindowsHdr}>
-          <span class="hdr-switch-opt" class:active={app.hdrStatus !== 'hdr'}>SDR</span>
-          <span class="hdr-switch-opt" class:active={app.hdrStatus === 'hdr'}>HDR</span>
-          <svg class="hdr-switch-arrow hdr-switch-arrow-right" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 2L7 5L3 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          <svg class="hdr-switch-arrow hdr-switch-arrow-left" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M7 2L3 5L7 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        <div class="hdr-switch-tooltip">
-          {windowsHdrError || (app.hdrStatus === 'unknown' ? 'HDR status unknown' : `Switch to ${app.hdrStatus === 'hdr' ? 'SDR' : 'HDR'}`)}
-        </div>
-      </div>
       {#if updateState.status === 'available'}
         <button
           type="button"
@@ -1373,7 +1360,7 @@
         </button>
       {/if}
     </div>
-    <div class="status-bar-right">
+    <div class="status-bar-center">
       {#if favoritesStatusMsg}
         <span
           class="favorites-status-msg"
@@ -1579,6 +1566,21 @@
             {/if}
           </div>
         {/if}
+      </div>
+    </div>
+    <div class="status-bar-right">
+      <div class="hdr-switch-wrap">
+        <button class="hdr-switch" class:hdr={app.hdrStatus === 'hdr'} disabled={windowsHdrBusy || app.hdrStatus === 'unknown'}
+          aria-label="Windows HDR"
+          onclick={toggleWindowsHdr}>
+          <span class="hdr-switch-opt" class:active={app.hdrStatus !== 'hdr'}>SDR</span>
+          <span class="hdr-switch-opt" class:active={app.hdrStatus === 'hdr'}>HDR</span>
+          <svg class="hdr-switch-arrow hdr-switch-arrow-right" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M3 2L7 5L3 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg class="hdr-switch-arrow hdr-switch-arrow-left" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M7 2L3 5L7 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="hdr-switch-tooltip">
+          {windowsHdrError || (app.hdrStatus === 'unknown' ? 'HDR status unknown' : `Switch to ${app.hdrStatus === 'hdr' ? 'SDR' : 'HDR'}`)}
+        </div>
       </div>
     </div>
   </div>

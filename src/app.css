@@ -157,12 +157,26 @@ select,
   grid-row: 3;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   padding: 0 16px 0 12px;
   background: var(--nav-bg);
   font-size: 11px;
   color: var(--text-weak);
   border-top: 1px solid var(--divider);
+}
+.status-bar-left,
+.status-bar-right {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.status-bar-left { justify-content: flex-start; }
+.status-bar-right { justify-content: flex-end; }
+.status-bar-center {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 /* ── Top bar ──────────────────────────────────────────────────────── */
@@ -3018,11 +3032,7 @@ select,
 }
 .ctx-item.active .ctx-checkbox::after { transform: rotate(45deg) scale(1); }
 
-/* ── Status bar ───────────────────────────────────────────────────── */.status-bar-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
+/* ── Status bar ───────────────────────────────────────────────────── */
 /* Per-monitor hover tooltip in the monitor selector dropdown. Fixed so it
    follows the cursor outside the transformed dropdown menu; the tip offsets
    place it below and to the right of the mouse. */
