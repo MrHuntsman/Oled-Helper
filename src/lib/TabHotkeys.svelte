@@ -1,7 +1,8 @@
 <script>
   // Inlined data URI, see App.svelte for why icons never hit the network.
   import tabHotkeysIcon from './icons/tab_hotkeys.png?inline';
-  import { hotkeys, setHotkey, resetHotkeys } from './stores.svelte.js';
+  import { emit } from '@tauri-apps/api/event';
+  import { hotkeys, setHotkey, resetHotkeys, displayFavorites, favoriteHotkeyAction, monitors } from './stores.svelte.js';
 
   // The action list mirrors ACTIONS in src-tauri/src/hotkeys.rs. The combo
   // strings produced by captureCombo must match the Rust parse_hotkey table.
@@ -32,6 +33,28 @@
 
   function binding(action) {
     return hotkeys[action] || 'None';
+  }
+
+  // A favorite whose saved monitor is not currently connected (legacy
+  // favorites without a monitor scope always target the primary, so they are
+  // never "orphaned"). Matches by EDID monitor_id first (stable across
+  // resolution changes), falling back to the sig's physical-size+DPI portion
+  // so a favorite saved at 4K still resolves after the same panel switches
+  // to an ultrawide mode.
+  function stableSigPart(sig) {
+    const parts = String(sig || '').split('|');
+    return parts.length >= 3 ? `${parts[1]}|${parts[2]}` : String(sig || '');
+  }
+  function favoriteDisconnected(fav) {
+    if (!fav.monitorId && !fav.monitorSig) return false;
+    return !monitors.some((m) =>
+      (fav.monitorId && m.monitor_id === fav.monitorId)
+      || (fav.monitorSig && (m.sig === fav.monitorSig || stableSigPart(m.sig) === stableSigPart(fav.monitorSig))));
+  }
+  function favoriteOptionLabel(fav) {
+    const base = `${fav.width}×${fav.height} @ ${fav.hz} Hz`;
+    const mon = fav.monitorName ? ` (${fav.monitorName})` : '';
+    return favoriteDisconnected(fav) ? `${base}${mon} (not connected)` : `${base}${mon}`;
   }
 
   async function apply(action, combo) {
@@ -196,6 +219,51 @@
       {/each}
     </div>
   {/each}
+
+  <div class="hotkey-section">
+    <span class="settings-row-label hotkey-section-label">Favorite Resolutions</span>
+    {#if displayFavorites.length === 0}
+      <p class="hotkey-hint">Save a favorite from the status bar first, then bind a hotkey to it.</p>
+    {:else}
+      {#each displayFavorites as fav (fav.favId)}
+        {@const favAction = favoriteHotkeyAction(fav.favId)}
+        {@const favLabel = favoriteOptionLabel(fav)}
+        <div class="hotkey-row hotkey-row-favorite">
+          <div class="hotkey-row-text hotkey-row-favorite-text">
+            <span class="settings-row-label" title={favLabel}>{favLabel}</span>
+            <button
+              type="button"
+              class="hotkey-fav-remove"
+              title={`Remove favorite ${favLabel}`}
+              aria-label={`Remove favorite ${favLabel}`}
+              onclick={() => emit('favorite-remove-request', fav)}>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M8 1.7l1.9 3.9 4.4.6-3.2 3.1.8 4.4L8 11.6 4.1 13.7l.8-4.4L1.7 6.2l4.4-.6z" fill="currentColor" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+          <div class="hotkey-row-controls">
+            <button
+              type="button"
+              class="hotkey-pill"
+              class:capturing={capturing === favAction}
+              class:bound={binding(favAction) !== 'None'}
+              onclick={() => { captureError = ''; capturing = capturing === favAction ? null : favAction; }}
+              aria-label={`Set hotkey for ${favLabel}`}>
+              {capturing === favAction ? 'Press keys… (Esc to clear)' : binding(favAction)}
+            </button>
+            <button
+              type="button"
+              class="hotkey-clear"
+              disabled={binding(favAction) === 'None'}
+              onclick={() => apply(favAction, 'None')}
+              title="Clear this hotkey"
+              aria-label={`Clear hotkey for ${favLabel}`}>×</button>
+          </div>
+        </div>
+      {/each}
+    {/if}
+  </div>
 
   {#if captureError}
     <p class="hotkey-error" role="status">{captureError}</p>

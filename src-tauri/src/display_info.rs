@@ -27,6 +27,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
 };
 
+use tauri::AppHandle;
 use windows::core::{GUID, PCWSTR};
 
 // Every record goes through the standard `log` facade. The tauri-plugin-log
@@ -242,9 +243,25 @@ fn mode_operation_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+// The automatic-rollback thread needs to force-hide the confirmation flyout
+// when the confirmation window expires without a decision: the frontend
+// countdown normally hides it, but a blank/missed flyout-show would
+// otherwise leave a transparent always-on-top window blocking clicks on the
+// main window underneath. Set once at startup.
+static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+pub fn set_app_handle(app: AppHandle) {
+    let _ = APP_HANDLE.set(app);
+}
+
 fn restore_recovery_record(record: &RecoveryRecord) -> Result<(), String> {
-    let detected = primary_display_target()
-        .ok_or_else(|| "recovery could not detect the primary monitor".to_string())?;
+    // Restore the EXACT monitor the transaction was for, not whichever one
+    // happens to be primary at recovery time. The monitor_id check below still
+    // guards against a reused device name pointing at a different physical
+    // monitor after a hotplug.
+    let detected = display_target_for_device(&record.device_name).ok_or_else(|| {
+        format!("recovery could not detect the recorded monitor {}", record.device_name)
+    })?;
     if detected.device_name != record.device_name {
         return Err(format!(
             "recovery target changed from {} to {}",
@@ -366,6 +383,18 @@ fn text(value: &[u16]) -> String {
 
 fn primary_display_target() -> Option<DisplayTarget> {
     display_target_matching(true, None)
+}
+
+/// Resolve the target monitor for a mode change: the specific monitor when a
+/// device name is supplied (per-monitor favorites), else the primary monitor.
+/// Centralizes the fallback so callers never duplicate it.
+fn resolve_target(device_name: Option<&str>) -> Result<DisplayTarget, String> {
+    match device_name {
+        Some(name) if !name.trim().is_empty() => display_target_for_device(name)
+            .ok_or_else(|| format!("the monitor {name} is not connected")),
+        _ => primary_display_target()
+            .ok_or_else(|| "no primary monitor was detected".to_string()),
+    }
 }
 
 /// DisplayTarget for a specific monitor by its GDI device name
@@ -1364,8 +1393,12 @@ fn mode_error(code: i32, phase: &str) -> String {
 }
 
 fn target_is_current(target: &DisplayTarget) -> Result<(), String> {
-    let current = primary_display_target()
-        .ok_or_else(|| "the primary monitor is no longer available".to_string())?;
+    // Re-resolve the SAME monitor (by device name) rather than assuming the
+    // primary: pending mode changes can target a non-primary monitor via a
+    // per-monitor favorite. Resolving the primary by its device name returns
+    // the equivalent target for the primary case.
+    let current = display_target_for_device(&target.device_name)
+        .ok_or_else(|| format!("the monitor {} is no longer available", target.device_name))?;
     if current.device_name != target.device_name {
         return Err("the display adapter changed while the mode was pending".into());
     }
@@ -1632,24 +1665,30 @@ fn begin_mode_change(
     }
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(15));
-        // Serialize the automatic rollback with confirmation and manual
-        // rollback. Without this guard, the timeout thread could restore the
-        // old mode while the user is simultaneously committing the new one.
-        let Ok(_operation_guard) = mode_operation_lock().lock() else {
-            log::error!(
-                "[display-info] automatic rollback could not acquire the mode operation lock"
-            );
-            return;
-        };
-        let Ok(_recovery_guard) = lock_recovery_state() else {
-            log::error!("[display-info] automatic rollback could not lock recovery state");
-            return;
-        };
-        let entry = pending_mode()
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().filter(|entry| entry.token == token).cloned());
-        if let Some(entry) = entry {
+        // Roll back inside a closure so the forced flyout hide below always
+        // runs, even on the early-return error paths.
+        let rollback = || {
+            // Serialize the automatic rollback with confirmation and manual
+            // rollback. Without this guard, the timeout thread could restore
+            // the old mode while the user is simultaneously committing the
+            // new one.
+            let Ok(_operation_guard) = mode_operation_lock().lock() else {
+                log::error!(
+                    "[display-info] automatic rollback could not acquire the mode operation lock"
+                );
+                return;
+            };
+            let Ok(_recovery_guard) = lock_recovery_state() else {
+                log::error!("[display-info] automatic rollback could not lock recovery state");
+                return;
+            };
+            let entry = pending_mode()
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().filter(|entry| entry.token == token).cloned());
+            let Some(entry) = entry else {
+                return;
+            };
             if let Err(error) = target_is_current(&entry.target) {
                 log::error!("[display-info] automatic rollback refused: {error}");
                 return;
@@ -1657,8 +1696,8 @@ fn begin_mode_change(
             match unsafe { change_mode(&entry.target, &entry.previous, CDS_UPDATEREGISTRY) } {
                 Ok(()) if wait_for_mode(&entry.target, &entry.previous).is_some() => {
                     invalidate_mode_cache();
-                    // Keep the in-memory transaction until recovery cleanup has
-                    // succeeded. If cleanup fails, the watchdog and manual
+                    // Keep the in-memory transaction until recovery cleanup
+                    // has succeeded. If cleanup fails, the watchdog and manual
                     // retry still retain the only recovery path.
                     if let Err(error) = clear_recovery_record_for(token) {
                         log::error!("[display-info] automatic rollback succeeded but recovery cleanup failed: {error}");
@@ -1682,6 +1721,16 @@ fn begin_mode_change(
                     log::error!("[display-info] automatic display-mode rollback failed: {error}");
                 }
             }
+        };
+        rollback();
+        // The confirmation window expired without the user deciding. The
+        // frontend countdown normally hides the flyout itself, but when the
+        // flyout was shown blank (missed flyout-show) nothing else would hide
+        // it, leaving a transparent always-on-top window blocking clicks on
+        // the main window underneath. Force-hide it here as the authoritative
+        // fallback.
+        if let Some(app) = APP_HANDLE.get() {
+            crate::flyout_window::hide(app);
         }
     });
     Ok(AppliedMode {
@@ -1695,9 +1744,8 @@ fn begin_mode_change(
     })
 }
 
-pub fn set_refresh_rate(hz: u32) -> Result<AppliedMode, String> {
-    let target =
-        primary_display_target().ok_or_else(|| "no primary monitor was detected".to_string())?;
+pub fn set_refresh_rate(hz: u32, device_name: Option<String>) -> Result<AppliedMode, String> {
+    let target = resolve_target(device_name.as_deref())?;
     let current = current_devmode(&target.device_name)
         .ok_or_else(|| "unable to read the current display mode".to_string())?;
     let mode = complete_mode_for(
@@ -1710,9 +1758,13 @@ pub fn set_refresh_rate(hz: u32) -> Result<AppliedMode, String> {
     begin_mode_change(target, current, mode)
 }
 
-pub fn set_resolution(width: u32, height: u32, preferred_hz: u32) -> Result<AppliedMode, String> {
-    let target =
-        primary_display_target().ok_or_else(|| "no primary monitor was detected".to_string())?;
+pub fn set_resolution(
+    width: u32,
+    height: u32,
+    preferred_hz: u32,
+    device_name: Option<String>,
+) -> Result<AppliedMode, String> {
+    let target = resolve_target(device_name.as_deref())?;
     let current = current_devmode(&target.device_name)
         .ok_or_else(|| "unable to read the current display mode".to_string())?;
     // Validate the resolution and requested refresh rate together against one

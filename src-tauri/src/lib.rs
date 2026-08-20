@@ -324,8 +324,11 @@ fn get_nvidia_reference_mode() -> bool {
 // The tray path already runs set_resolution/set_refresh_rate on its own
 // spawned thread; this makes the in-app path behave the same way.
 #[tauri::command]
-async fn set_refresh_rate(hz: u32) -> Result<display_info::AppliedMode, String> {
-    display_info::set_refresh_rate(hz)
+async fn set_refresh_rate(
+    hz: u32,
+    device_name: Option<String>,
+) -> Result<display_info::AppliedMode, String> {
+    display_info::set_refresh_rate(hz, device_name)
 }
 
 #[tauri::command]
@@ -333,8 +336,9 @@ async fn set_resolution(
     width: u32,
     height: u32,
     preferred_hz: u32,
+    device_name: Option<String>,
 ) -> Result<display_info::AppliedMode, String> {
-    display_info::set_resolution(width, height, preferred_hz)
+    display_info::set_resolution(width, height, preferred_hz, device_name)
 }
 
 // Async (not sync) commands: confirm/rollback persist or restore the display
@@ -344,13 +348,21 @@ async fn set_resolution(
 // duration, the "hitch" seen after clicking Keep. Moving them onto the async
 // runtime keeps the main thread responsive.
 #[tauri::command]
-async fn confirm_display_mode_change() -> Result<(), String> {
-    display_info::confirm_mode_change()
+async fn confirm_display_mode_change(app: AppHandle) -> Result<(), String> {
+    let result = display_info::confirm_mode_change();
+    // The flyout frontend hides its window before invoking this, but a
+    // failed or blank hide would leave a transparent always-on-top window
+    // blocking clicks on the main window. Force-hide it here regardless of
+    // the transaction result; hiding an already-hidden window is a no-op.
+    let _ = crate::flyout_window::hide(&app);
+    result
 }
 
 #[tauri::command]
-async fn rollback_display_mode_change() -> Result<(), String> {
-    display_info::rollback_mode_change()
+async fn rollback_display_mode_change(app: AppHandle) -> Result<(), String> {
+    let result = display_info::rollback_mode_change();
+    let _ = crate::flyout_window::hide(&app);
+    result
 }
 
 #[tauri::command]
@@ -1036,6 +1048,10 @@ pub fn run() {
                 );
             }
 
+            // The display-info module's auto-rollback thread force-hides the
+            // flyout when the confirmation window expires; it needs the app
+            // handle for that (see display_info.rs).
+            display_info::set_app_handle(app.handle().clone());
             flyout_window::prewarm(app.handle());
             log::info!("[tray] mode flyout window ready");
 

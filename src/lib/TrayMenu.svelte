@@ -463,7 +463,15 @@
       favorites = Array.isArray(cfg?.favorite_display_modes)
         ? cfg.favorite_display_modes
             .filter((f) => f && f.width > 0 && f.height > 0 && f.hz > 0)
-            .map((f) => ({ width: Math.round(f.width), height: Math.round(f.height), hz: Math.round(f.hz) }))
+            .map((f) => ({
+              width: Math.round(f.width),
+              height: Math.round(f.height),
+              hz: Math.round(f.hz),
+              fav_id: typeof f.fav_id === 'string' ? f.fav_id : '',
+              monitor_id: typeof f.monitor_id === 'string' ? f.monitor_id : '',
+              monitor_sig: typeof f.monitor_sig === 'string' ? f.monitor_sig : '',
+              monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
+            }))
         : [];
       syncHitRegion();
     } catch (e) {
@@ -471,11 +479,22 @@
     }
   }
 
+  // Preserve the monitor-scoping fields (fav_id, monitor_id, monitor_sig,
+  // monitor_name) so a tray-side add/remove never strips them from the saved
+  // favorites.
   function normalizeFavorites(list) {
     return Array.isArray(list)
       ? list
           .filter((f) => f && f.width > 0 && f.height > 0 && f.hz > 0)
-          .map((f) => ({ width: Math.round(f.width), height: Math.round(f.height), hz: Math.round(f.hz) }))
+          .map((f) => ({
+            width: Math.round(f.width),
+            height: Math.round(f.height),
+            hz: Math.round(f.hz),
+            fav_id: typeof f.fav_id === 'string' ? f.fav_id : '',
+            monitor_id: typeof f.monitor_id === 'string' ? f.monitor_id : '',
+            monitor_sig: typeof f.monitor_sig === 'string' ? f.monitor_sig : '',
+            monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
+          }))
       : [];
   }
 

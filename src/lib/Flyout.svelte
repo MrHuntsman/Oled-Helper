@@ -190,8 +190,20 @@
       // 1. Exit animation plays smoothly, nothing concurrent yet.
       await exitFinished;
       clearTimer();
-      // 2. Hide the window before touching the display.
-      await win.hide();
+      // 2. Hide the window before touching the display. If the native hide
+      // fails or hangs, do not abort: the backend force-hides the window as
+      // a fallback when the confirm/rollback invoke runs below (see lib.rs),
+      // so a failed hide can never leave a transparent always-on-top window
+      // blocking clicks on the main window. The race caps how long a hung
+      // hide can delay that backend invoke, which is the authoritative hide.
+      try {
+        await Promise.race([
+          win.hide(),
+          new Promise((resolve) => setTimeout(resolve, 800)),
+        ]);
+      } catch (e) {
+        diag(`[flyout] hide failed, relying on backend hide: ${e}`);
+      }
       invoke('flyout_hidden').catch(() => {});
       // 3. Now the mode change; the display re-apply happens invisibly.
       await invoke(action);

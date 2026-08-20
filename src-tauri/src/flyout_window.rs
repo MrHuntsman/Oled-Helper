@@ -51,7 +51,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW,
 };
 
 const FLYOUT_LABEL: &str = "flyout";
@@ -677,14 +678,40 @@ pub fn show_after_ready(app: &AppHandle, mode: AppliedMode) -> Result<(), String
     }
 }
 
-// Unused when the flyout is purely event-driven (the frontend hides itself
-// after confirm/rollback), kept for a forced-hide path such as app shutdown.
-#[allow(dead_code)]
+// Forced-hide path. The frontend normally hides the window itself after
+// confirm/rollback, but this is the belt-and-braces fallback so a failed or
+// blank frontend hide can never leave a transparent always-on-top window
+// blocking clicks on the main window. Called by the display-mode IPC
+// confirm/rollback commands and the 15-second auto-rollback thread.
+//
+// The native SetWindowPos(SWP_HIDEWINDOW) call comes FIRST, mirroring how
+// the show path uses native SetWindowPos(SWP_SHOWWINDOW): the Tauri
+// window.hide() API routes through the WebView2 controller, which can be
+// wedged ("dead window", FailedToReceiveMessage) exactly when a stuck flyout
+// needs hiding, and a silent failure would leave the transparent window
+// visible and click-blocking. Hiding the raw HWND works regardless of the
+// webview's state. window.hide() still runs after it as belt and braces so
+// the webview's own visibility bookkeeping matches.
 pub fn hide(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
+        #[cfg(target_os = "windows")]
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                let _ = SetWindowPos(
+                    HWND(hwnd.0),
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
         let _ = window.hide();
     }
     crate::taskbar_dimmer::set_flyout_hwnd(0);
+    log::debug!("[flyout] hidden");
 }
 
 // Called by the frontend (confirm()/rollback() in Flyout.svelte) right after

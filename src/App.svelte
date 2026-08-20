@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling } from './lib/stores.svelte.js';
+  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -464,29 +464,41 @@
 
   // Shared safe apply path for the resolution dropdown and the favorites
   // menu: requests a mode at (width, height) with a preferred refresh rate
-  // through set_resolution (validated against the current monitor, returns a
+  // through set_resolution (validated against the target monitor, returns a
   // pending confirmation with automatic rollback). preferredHz 0 keeps the
-  // current rate, matching the resolution dropdown's behavior.
-  async function applyModeCombo(width, height, preferredHz) {
+  // current rate, matching the resolution dropdown's behavior. deviceName is
+  // null for the primary monitor (the dropdown path); per-monitor favorites
+  // pass the GDI device name of the monitor they were saved on.
+  async function applyModeCombo(width, height, preferredHz, deviceName = null) {
+    const primaryTarget = !deviceName;
     const currentWidth = app.displayInfo.width;
     const currentHeight = app.displayInfo.height;
     if (!Number.isFinite(width) || !Number.isFinite(height)
       || width <= 0 || height <= 0 || app.displayModeBusy
       || app.refreshRateBusy
-      || (width === currentWidth && height === currentHeight && preferredHz === (app.displayInfo.refreshRateHz || 0))) return;
+      // The no-op guard only applies to the primary path, where the status
+      // bar's current mode is the target. A non-primary favorite is compared
+      // against its own monitor's live mode before applying (see
+      // applyFavoriteMode).
+      || (primaryTarget && width === currentWidth && height === currentHeight && preferredHz === (app.displayInfo.refreshRateHz || 0))) return;
 
     app.displayModeBusy = true;
     // Save the profile for the mode we are leaving before the optimistic UI
     // update changes the resolution fields used by the scoped profile key.
     persistCurrentBlackLevelProfile();
-    app.displayInfo.width = width;
-    app.displayInfo.height = height;
+    // The status bar reflects the primary monitor; a non-primary favorite
+    // must not pretend the primary changed.
+    if (primaryTarget) {
+      app.displayInfo.width = width;
+      app.displayInfo.height = height;
+    }
     resolutionError = '';
     try {
       const result = await invoke('set_resolution', {
         width,
         height,
         preferredHz,
+        deviceName,
       });
       // The backend only returns after the temporary mode has stabilized, so
       // load the profile for the newly active display/mode immediately.
@@ -544,9 +556,20 @@
     height: app.displayInfo.height,
     hz: app.displayInfo.refreshRateHz || 0,
   });
+  // Favorites are scoped to the currently selected monitor (the top-bar
+  // selector); the mode being saved comes from the status bar's display info.
+  function currentMonitorSig() {
+    return activeMonitor.mon?.sig || '';
+  }
+  function currentMonitorId() {
+    return activeMonitor.mon?.monitor_id || '';
+  }
+  function currentMonitorName() {
+    return activeMonitor.mon?.friendly_name || '';
+  }
   const isCurrentFavorited = $derived(
     favoriteOfCurrent.width > 0 && favoriteOfCurrent.height > 0 && favoriteOfCurrent.hz > 0
-      && isDisplayModeFavorited(favoriteOfCurrent.width, favoriteOfCurrent.height, favoriteOfCurrent.hz)
+      && isDisplayModeFavorited(favoriteOfCurrent.width, favoriteOfCurrent.height, favoriteOfCurrent.hz, currentMonitorId(), currentMonitorSig())
   );
   const currentComboLabel = $derived(
     favoriteOfCurrent.width > 0 && favoriteOfCurrent.height > 0 && favoriteOfCurrent.hz > 0
@@ -610,15 +633,83 @@
     }, 2000);
   }
   function saveCurrentFavorite() {
-    addFavoriteDisplayMode(favoriteOfCurrent.width, favoriteOfCurrent.height, favoriteOfCurrent.hz);
+    addFavoriteDisplayMode(
+      favoriteOfCurrent.width,
+      favoriteOfCurrent.height,
+      favoriteOfCurrent.hz,
+      currentMonitorSig(),
+      currentMonitorName(),
+      currentMonitorId(),
+    );
     flashFavoritesStatus('Saved', false);
+  }
+  // The resolution-independent portion of a monitor sig ("3840x2160|
+  // 1600x900|192x192" -> "1600x900|192x192"): physical size + DPI do not
+  // change when the mode changes, so a legacy favorite saved without an EDID
+  // monitor_id can still be matched to its panel after a resolution switch.
+  function stableSigPart(sig) {
+    const parts = String(sig || '').split('|');
+    return parts.length >= 3 ? `${parts[1]}|${parts[2]}` : String(sig || '');
+  }
+  // Resolve a favorite's target monitor at apply time. Returns null for the
+  // primary (legacy favorites saved without a monitor), a device name string
+  // for a connected monitor, or 'disconnected' when the favorite's monitor is
+  // not currently connected. The EDID monitor_id is the primary key (it is
+  // stable across resolution changes); the sig and its physical-size+DPI
+  // portion are fallbacks for legacy favorites.
+  function favoriteTargetDevice(fav) {
+    if (!fav.monitorId && !fav.monitorSig) return null;
+    const mon = monitors.find((m) =>
+      (fav.monitorId && m.monitor_id === fav.monitorId)
+      || m.sig === fav.monitorSig
+      || (fav.monitorSig && stableSigPart(m.sig) === stableSigPart(fav.monitorSig)));
+    return mon && mon.device_name ? mon.device_name : 'disconnected';
+  }
+  function favoriteMonitorConnected(fav) {
+    return favoriteTargetDevice(fav) !== 'disconnected';
+  }
+  // Monitor tag shown next to a favorite: only when it differs from the
+  // currently selected monitor (mirrors how resolution tags are shown), or
+  // when the monitor is disconnected, so the entry stays identifiable.
+  function favoriteMonitorLabel(fav) {
+    const name = fav.monitorName || '';
+    if (favoriteTargetDevice(fav) === 'disconnected') {
+      return name ? `${name} (not connected)` : 'Monitor not connected';
+    }
+    if (name && name !== currentMonitorName()) return name;
+    return '';
+  }
+  // Shared apply path for the favorites menu and the favorite hotkey slots:
+  // resolves the saved monitor, skips no-op applies (the monitor already runs
+  // this exact mode), and flashes a status message when the target is gone.
+  async function applyFavoriteMode(fav) {
+    const deviceName = favoriteTargetDevice(fav);
+    if (deviceName === 'disconnected') {
+      flashFavoritesStatus('Monitor not connected', true);
+      return;
+    }
+    // A favorite for a non-primary monitor is compared against that monitor's
+    // live mode so pressing the hotkey for an already-active mode does not
+    // open a pointless confirmation dialog.
+    if (deviceName) {
+      try {
+        const info = await invoke('get_display_info_for', { deviceName });
+        if (info && Number(info.width) === fav.width && Number(info.height) === fav.height
+          && (Number(info.refresh_hz) || 0) === fav.hz) {
+          return;
+        }
+      } catch {
+        // The backend validates the mode anyway; never block on this check.
+      }
+    }
+    await applyModeCombo(fav.width, fav.height, fav.hz, deviceName);
   }
   function applyFavorite(fav) {
     closeFavoritesMenu();
-    void applyModeCombo(fav.width, fav.height, fav.hz);
+    void applyFavoriteMode(fav);
   }
   function removeFavorite(fav) {
-    removeFavoriteDisplayMode(fav.width, fav.height, fav.hz);
+    removeFavoriteDisplayMode(fav.width, fav.height, fav.hz, fav.monitorId, fav.monitorSig);
     flashFavoritesStatus('Removed', true);
   }
   // Confirmation dialog before removing a saved favorite, reusing the app's
@@ -651,10 +742,12 @@
   function toggleResolutionFavorite(resolution) {
     const hz = app.displayInfo.refreshRateHz || 0;
     if (hz <= 0) return;
-    if (isDisplayModeFavorited(resolution.width, resolution.height, hz)) {
-      askRemoveFavorite({ width: resolution.width, height: resolution.height, hz });
+    const sig = currentMonitorSig();
+    const id = currentMonitorId();
+    if (isDisplayModeFavorited(resolution.width, resolution.height, hz, id, sig)) {
+      askRemoveFavorite({ width: resolution.width, height: resolution.height, hz, monitorId: id, monitorSig: sig });
     } else {
-      addFavoriteDisplayMode(resolution.width, resolution.height, hz);
+      addFavoriteDisplayMode(resolution.width, resolution.height, hz, sig, currentMonitorName(), id);
       flashFavoritesStatus('Saved', false);
     }
   }
@@ -935,6 +1028,15 @@
       case 'turn_off_display':
         invoke('power_turn_off_display').catch(() => {});
         break;
+      default: {
+        // Per-favorite resolution hotkeys (action name embeds the favorite's
+        // id): apply the favorite to the monitor it was saved on. No-ops
+        // safely when the favorite no longer exists; a disconnected monitor
+        // flashes a status message via applyFavoriteMode.
+        const fav = favoriteForAction(action);
+        if (fav) void applyFavoriteMode(fav);
+        break;
+      }
     }
   }
 
@@ -1075,6 +1177,16 @@
     document.addEventListener('visibilitychange', onDocumentVisibilityChange);
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
     listen('hotkey-pressed', (event) => handleHotkeyAction(event.payload)).then((stop) => { unlistenHotkeyPressed = stop; }).catch(() => {});
+    // A favorite removal requested from the Hotkeys tab (its slot rows have a
+    // remove button). Opens the same confirmation dialog as the status-bar
+    // star, so removal is always confirmed before it happens.
+    let unlistenFavoriteRemove;
+    listen('favorite-remove-request', (event) => {
+      const fav = event.payload;
+      if (fav && Number.isFinite(fav.width) && Number.isFinite(fav.height) && Number.isFinite(fav.hz)) {
+        favoritePendingRemove = fav;
+      }
+    }).then((stop) => { unlistenFavoriteRemove = stop; }).catch(() => {});
     // A resolution or refresh rate picked from the tray menu. Runs the same
     // flow as the in-app dropdowns: save the profile for the mode being left,
     // apply the new one, show the confirmation popup with the auto-revert
@@ -1101,6 +1213,7 @@
       unlistenDisplayChanged?.();
       clearTimeout(vendorDisplayRefreshTimer);
       unlistenHotkeyPressed?.();
+      unlistenFavoriteRemove?.();
       unlistenTrayMode?.();
       unlistenFlyoutCompleted?.();
       window.removeEventListener('focus', reconcileWindowVisible);
@@ -1361,15 +1474,6 @@
       {/if}
     </div>
     <div class="status-bar-center">
-      {#if favoritesStatusMsg}
-        <span
-          class="favorites-status-msg"
-          class:favorites-status-remove={favoritesStatusIsRemove}
-          aria-live="polite"
-          role="status">
-          {favoritesStatusMsg}
-        </span>
-      {/if}
       <MonitorSelector variant="status" />
       <div class="resolution-wrap">
         <button type="button" class="resolution-select" class:active={resMenuOpen} class:no-tags={!displayMenuPrefs.showTags}
@@ -1388,7 +1492,7 @@
           {@const recommended = isRecommendedResolution(resolution)}
           {@const ultrawide = isUltrawide(resolution.width, resolution.height)}
           {@const hz = app.displayInfo.refreshRateHz || 0}
-          {@const favored = hz > 0 && isDisplayModeFavorited(resolution.width, resolution.height, hz)}
+          {@const favored = hz > 0 && isDisplayModeFavorited(resolution.width, resolution.height, hz, currentMonitorId(), currentMonitorSig())}
           <div class="res-item" class:active={current}>
             <button type="button" class="dd-menu-item res-item-main" class:active={current}
               role="option" aria-selected={current}
@@ -1540,15 +1644,19 @@
             {#if displayFavorites.length === 0}
               <div class="favorites-empty">No favorites yet. Save the current mode to add one.</div>
             {:else}
-              {#each displayFavorites as fav (displayModeFavoriteKey(fav.width, fav.height, fav.hz))}
-                <div class="favorites-item" class:active={isFavoriteCurrent(fav)}>
+              {#each displayFavorites as fav (displayModeFavoriteKey(fav.width, fav.height, fav.hz, fav.monitorId, fav.monitorSig))}
+                {@const favTag = favoriteMonitorLabel(fav)}
+                {@const favDisconnected = !favoriteMonitorConnected(fav)}
+                <div class="favorites-item" class:active={isFavoriteCurrent(fav)} class:disconnected={favDisconnected}>
                   <button
                     type="button"
                     class="dd-menu-item favorites-apply"
                     role="option"
                     aria-selected={isFavoriteCurrent(fav)}
+                    disabled={favDisconnected}
+                    title={favDisconnected ? 'This monitor is not connected; the favorite applies once it is reconnected' : ''}
                     onclick={() => applyFavorite(fav)}>
-                    {fav.width}×{fav.height} @ {fav.hz} Hz
+                    {fav.width}×{fav.height} @ {fav.hz} Hz{#if favTag}<span class="favorites-monitor-tag">{favTag}</span>{/if}
                   </button>
                   <button
                     type="button"
@@ -1565,6 +1673,15 @@
               {/each}
             {/if}
           </div>
+        {/if}
+        {#if favoritesStatusMsg}
+          <span
+            class="favorites-status-msg"
+            class:favorites-status-remove={favoritesStatusIsRemove}
+            aria-live="polite"
+            role="status">
+            {favoritesStatusMsg}
+          </span>
         {/if}
       </div>
     </div>

@@ -105,6 +105,10 @@ export async function loadMonitors() {
     if (activeMonitor.mon && !monitors.some((m) => m.sig === activeMonitor.mon.sig)) {
       activeMonitor.mon = monitors.find((m) => m.primary) || monitors[0] || null;
     }
+    // Legacy favorites predate monitor_id (they only carry the sig, whose
+    // resolution component changes on every mode switch). Attach the EDID id
+    // now that the monitor list is live so their identity becomes stable.
+    backfillFavoriteMonitorIds();
   } catch (e) {
     console.warn('[monitors] list failed', e);
   }
@@ -370,6 +374,9 @@ export async function resetHotkeys() {
   } catch (e) {
     console.warn('[hotkeys] reset failed', e);
   }
+  // Restore Tab Defaults clears every hotkey combo, including the per-
+  // favorite resolution hotkeys (the user chose "clear everything"). The
+  // saved favorites themselves are kept.
   for (const action of Object.keys(hotkeys)) delete hotkeys[action];
   scheduleHotkeySave();
 }
@@ -427,16 +434,42 @@ export function setRefreshRateSort(dir) {
 }
 
 // User-saved resolution@hz combos for the status-bar favorites menu. Items
-// are { width, height, hz }; applying one goes through the same safe
-// set_resolution path as the resolution dropdown. Persisted as
-// favorite_display_modes in the config file.
+// are { width, height, hz, favId, monitorId, monitorSig, monitorName };
+// applying one goes through the same safe set_resolution path as the
+// resolution dropdown but targets the monitor it was saved on. Persisted as
+// favorite_display_modes in the config file. Favorites are scoped to the
+// monitor they were saved on: monitorId is the EDID device id (stable across
+// resolution changes, unlike the sig whose resolution component changes when
+// the mode changes), and monitorSig (resolution+physical size+DPI) is kept as
+// a fallback for legacy favorites saved before monitor_id existed, resolved
+// to a GDI device name at apply time via the live monitors list.
 export const displayFavorites = $state([]);
-export function displayModeFavoriteKey(width, height, hz) {
-  return `${Math.round(Number(width) || 0)}x${Math.round(Number(height) || 0)}@${Math.round(Number(hz) || 0)}`;
+// Stable per-favorite identity. Random UUIDs for new favorites; legacy
+// entries without one get a deterministic id derived from their key so slot
+// assignments survive restarts without persisting anything new.
+export function favoriteIdFor(width, height, hz, monitorSig = '', existing = '') {
+  if (typeof existing === 'string' && existing) return existing;
+  return `legacy:${String(monitorSig || '')}|${displayModeFavoriteKey(width, height, hz)}`;
 }
-export function isDisplayModeFavorited(width, height, hz) {
-  const key = displayModeFavoriteKey(width, height, hz);
-  return displayFavorites.some((f) => displayModeFavoriteKey(f.width, f.height, f.hz) === key);
+function newFavoriteId() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch { /* fall through to the local fallback */ }
+  return `fav-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+export function displayModeFavoriteKey(width, height, hz, monitorId = '', monitorSig = '') {
+  // Prefer the EDID device id: it identifies the physical panel regardless of
+  // the current mode, so the same combo saved at 4K still dedupes/star-checks
+  // after the user switches to an ultrawide mode on the same monitor. Legacy
+  // favorites without one fall back to the sig.
+  const identity = String(monitorId || '') || String(monitorSig || '');
+  return `${identity}|${Math.round(Number(width) || 0)}x${Math.round(Number(height) || 0)}@${Math.round(Number(hz) || 0)}`;
+}
+export function isDisplayModeFavorited(width, height, hz, monitorId = '', monitorSig = '') {
+  const key = displayModeFavoriteKey(width, height, hz, monitorId, monitorSig);
+  return displayFavorites.some((f) => displayModeFavoriteKey(f.width, f.height, f.hz, f.monitorId, f.monitorSig) === key);
 }
 let favoritesSaveTimer = null;
 function scheduleFavoritesSave() {
@@ -448,23 +481,69 @@ function emitFavoritesChanged() {
     width: fav.width,
     height: fav.height,
     hz: fav.hz,
+    fav_id: fav.favId,
+    monitor_id: fav.monitorId,
+    monitor_sig: fav.monitorSig,
+    monitor_name: fav.monitorName,
   }))).catch(() => {});
 }
-export function addFavoriteDisplayMode(width, height, hz) {
+// Accepts both the internal camelCase shape and the config/tray snake_case
+// shape (fav_id, monitor_id, monitor_sig, monitor_name), so config loads and
+// favorites-changed events from the tray round-trip without losing the
+// monitor-scoping fields.
+function normalizeFavorite(fav) {
+  const w = Math.round(Number(fav?.width) || 0);
+  const h = Math.round(Number(fav?.height) || 0);
+  const r = Math.round(Number(fav?.hz) || 0);
+  if (w <= 0 || h <= 0 || r <= 0) return null;
+  const favId = typeof fav?.favId === 'string' && fav.favId
+    ? fav.favId
+    : (typeof fav?.fav_id === 'string' ? fav.fav_id : '');
+  const monId = typeof fav?.monitorId === 'string'
+    ? fav.monitorId
+    : (typeof fav?.monitor_id === 'string' ? fav.monitor_id : '');
+  const sig = typeof fav?.monitorSig === 'string'
+    ? fav.monitorSig
+    : (typeof fav?.monitor_sig === 'string' ? fav.monitor_sig : '');
+  const name = typeof fav?.monitorName === 'string'
+    ? fav.monitorName
+    : (typeof fav?.monitor_name === 'string' ? fav.monitor_name : '');
+  return {
+    width: w,
+    height: h,
+    hz: r,
+    favId: favoriteIdFor(w, h, r, sig, favId),
+    monitorId: monId,
+    monitorSig: sig,
+    monitorName: name,
+  };
+}
+export function addFavoriteDisplayMode(width, height, hz, monitorSig = '', monitorName = '', monitorId = '') {
   const w = Math.round(Number(width) || 0);
   const h = Math.round(Number(height) || 0);
   const r = Math.round(Number(hz) || 0);
+  const sig = typeof monitorSig === 'string' ? monitorSig : '';
+  const monId = typeof monitorId === 'string' ? monitorId : '';
   if (w <= 0 || h <= 0 || r <= 0) return;
-  if (isDisplayModeFavorited(w, h, r)) return;
-  displayFavorites.push({ width: w, height: h, hz: r });
+  if (isDisplayModeFavorited(w, h, r, monId, sig)) return;
+  displayFavorites.push({
+    width: w,
+    height: h,
+    hz: r,
+    favId: newFavoriteId(),
+    monitorId: monId,
+    monitorSig: sig,
+    monitorName: typeof monitorName === 'string' ? monitorName : '',
+  });
   emitFavoritesChanged();
   scheduleFavoritesSave();
 }
-export function removeFavoriteDisplayMode(width, height, hz) {
-  const key = displayModeFavoriteKey(width, height, hz);
-  const index = displayFavorites.findIndex((f) => displayModeFavoriteKey(f.width, f.height, f.hz) === key);
+export function removeFavoriteDisplayMode(width, height, hz, monitorId = '', monitorSig = '') {
+  const key = displayModeFavoriteKey(width, height, hz, monitorId, monitorSig);
+  const index = displayFavorites.findIndex((f) => displayModeFavoriteKey(f.width, f.height, f.hz, f.monitorId, f.monitorSig) === key);
   if (index === -1) return;
   displayFavorites.splice(index, 1);
+  reconcileFavoriteHotkeys();
   emitFavoritesChanged();
   scheduleFavoritesSave();
 }
@@ -477,10 +556,74 @@ export function syncFavoritesFromBackend(list) {
   displayFavorites.length = 0;
   if (Array.isArray(list)) {
     for (const fav of list) {
-      if (fav && Number.isFinite(fav.width) && Number.isFinite(fav.height) && Number.isFinite(fav.hz)
-        && fav.width > 0 && fav.height > 0 && fav.hz > 0) {
-        displayFavorites.push({ width: Math.round(fav.width), height: Math.round(fav.height), hz: Math.round(fav.hz) });
-      }
+      const normalized = normalizeFavorite(fav);
+      if (normalized) displayFavorites.push(normalized);
+    }
+  }
+  reconcileFavoriteHotkeys();
+  backfillFavoriteMonitorIds();
+}
+
+// Favorites saved before monitor_id existed only carry the sig, and the sig's
+// resolution component changes whenever the mode changes. Once the live
+// monitor list is available, match those legacy favorites to their panel by
+// sig (or its physical-size+DPI portion) and attach the EDID device id so
+// their identity becomes resolution-independent from here on. No-op for
+// favorites that already have an id or whose monitor is currently absent
+// (those stay resolvable via the sig fallback at apply time).
+function stableSigPartForBackfill(sig) {
+  const parts = String(sig || '').split('|');
+  return parts.length >= 3 ? `${parts[1]}|${parts[2]}` : String(sig || '');
+}
+function backfillFavoriteMonitorIds() {
+  let changed = false;
+  for (const fav of displayFavorites) {
+    if (fav.monitorId || !fav.monitorSig) continue;
+    const mon = monitors.find((m) =>
+      m.sig === fav.monitorSig
+      || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(fav.monitorSig));
+    if (mon && mon.monitor_id) {
+      fav.monitorId = mon.monitor_id;
+      changed = true;
+    }
+  }
+  if (changed) {
+    emitFavoritesChanged();
+    scheduleFavoritesSave();
+  }
+}
+
+// ── Favorite hotkeys (bound directly to each favorite) ────────────────
+// Each favorite can carry its own hotkey: the action name embeds the
+// favorite's stable id ("favorite_<favId>", registered dynamically in
+// hotkeys.rs), so a hotkey stays bound to a specific saved favorite even if
+// the favorites list is reordered. There is no slot indirection: one row per
+// favorite, each with its own capture pill.
+export function favoriteHotkeyAction(favId) {
+  return `favorite_${String(favId)}`;
+}
+export function favoriteForAction(action) {
+  if (typeof action !== 'string' || !action.startsWith('favorite_')) return null;
+  const favId = action.slice('favorite_'.length);
+  if (!favId) return null;
+  return displayFavorites.find((f) => f.favId === favId) || null;
+}
+// Drop hotkey bindings whose favorite no longer exists; a hotkey must never
+// stay silently bound to a favId that resolves to nothing. Also unregisters
+// the stale combo live so the OS stops firing it. Called from every
+// favorites-removal path and after config load.
+function reconcileFavoriteHotkeys() {
+  const pruned = [];
+  for (const action of Object.keys(hotkeys)) {
+    if (action.startsWith('favorite_') && !favoriteForAction(action)) {
+      delete hotkeys[action];
+      pruned.push(action);
+    }
+  }
+  if (pruned.length) {
+    scheduleHotkeySave();
+    for (const action of pruned) {
+      invoke('set_hotkey', { action, combo: 'None' }).catch(() => {});
     }
   }
 }
@@ -634,6 +777,10 @@ export function currentBlackLevelProfileKey() {
 
 export const configLoaded = $state({ v: false });
 export async function loadConfig(prefetchedCfg = null) {
+  // Old slot-based favorite hotkeys (favorite_slot_N) migrated to hotkeys
+  // bound directly to the favorite (favorite_<favId>); filled during the
+  // config load below, applied live after the config is committed.
+  let migrateFavoriteHotkeys = [];
   try {
     const cfg = prefetchedCfg ?? await invoke('load_config');
     let loadedProfileCount = 0;
@@ -771,18 +918,49 @@ export async function loadConfig(prefetchedCfg = null) {
     displayFavorites.length = 0;
     if (cfg && Array.isArray(cfg.favorite_display_modes)) {
       for (const fav of cfg.favorite_display_modes) {
-        if (fav && Number.isFinite(fav.width) && Number.isFinite(fav.height) && Number.isFinite(fav.hz)
-          && fav.width > 0 && fav.height > 0 && fav.hz > 0) {
-          displayFavorites.push({ width: Math.round(fav.width), height: Math.round(fav.height), hz: Math.round(fav.hz) });
-        }
+        const normalized = normalizeFavorite(fav);
+        if (normalized) displayFavorites.push(normalized);
       }
     }
+    backfillFavoriteMonitorIds();
+    // Migrate the old slot-based favorite hotkeys (favorite_slot_N with a
+    // favorite_hotkey_slots map) to hotkeys bound directly to the favorite
+    // (favorite_<favId>). Runs before the prune below so mapped combos keep
+    // their bindings; unmapped old favorite_slot_N entries (no slot map
+    // entry) are treated as unknown favorites and pruned.
+    const migrated = [];
+    if (cfg && cfg.favorite_hotkey_slots && typeof cfg.favorite_hotkey_slots === 'object') {
+      for (const [slot, favId] of Object.entries(cfg.favorite_hotkey_slots)) {
+        if (typeof favId !== 'string' || !favId) continue;
+        if (!displayFavorites.some((f) => f.favId === favId)) continue;
+        const oldKey = `favorite_slot_${slot}`;
+        const combo = hotkeys[oldKey];
+        if (typeof combo !== 'string' || !combo) continue;
+        const newKey = favoriteHotkeyAction(favId);
+        if (!hotkeys[newKey]) {
+          hotkeys[newKey] = combo;
+          migrated.push({ action: newKey, combo });
+        }
+        delete hotkeys[oldKey];
+      }
+    }
+    migrateFavoriteHotkeys = migrated;
   } catch (e) {
     console.warn('[config] load failed', e);
   } finally {
     configLoaded.v = true;
     applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
   }
+  // One-time migration: make the migrated favorite hotkeys live in Rust
+  // (set_hotkey registers them), prune any stale favorite_ actions left in
+  // the config, then persist the migrated config.
+  if (migrateFavoriteHotkeys.length) {
+    for (const { action, combo } of migrateFavoriteHotkeys) {
+      await invoke('set_hotkey', { action, combo }).catch(() => {});
+    }
+  }
+  reconcileFavoriteHotkeys();
+  if (migrateFavoriteHotkeys.length) saveConfig();
   // Deferred and non-blocking: the dimmer availability snapshot and initial
   // apply can be slow while the shell settles (right after a tray restart),
   // so they must not delay the first paint. See initTaskbarDimmerRuntime.
@@ -860,7 +1038,15 @@ export function saveConfig() {
     display_menu_show_tags: displayMenuPrefs.showTags,
     display_menu_refresh_rate_sort: displayMenuPrefs.refreshRateSort,
     hotkeys: { ...hotkeys },
-    favorite_display_modes: displayFavorites.map((f) => ({ width: f.width, height: f.height, hz: f.hz })),
+    favorite_display_modes: displayFavorites.map((f) => ({
+      width: f.width,
+      height: f.height,
+      hz: f.hz,
+      fav_id: f.favId,
+      monitor_id: f.monitorId,
+      monitor_sig: f.monitorSig,
+      monitor_name: f.monitorName,
+    })),
   } }).catch((e) => {
     console.warn('[config] save failed', e);
     return undefined;

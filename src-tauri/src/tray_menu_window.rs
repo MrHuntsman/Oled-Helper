@@ -583,7 +583,7 @@ pub fn tray_menu_set_resolution(app: AppHandle, width: u32, height: u32, hz: Opt
         {
             return;
         }
-        match crate::display_info::set_resolution(width, height, target_hz) {
+        match crate::display_info::set_resolution(width, height, target_hz, None) {
             Ok(mode) => {
                 crate::flyout_window::show_after_ready(&app, mode).ok();
             }
@@ -604,7 +604,7 @@ pub fn tray_menu_set_refresh_rate(app: AppHandle, hz: u32) {
         {
             return;
         }
-        match crate::display_info::set_refresh_rate(hz) {
+        match crate::display_info::set_refresh_rate(hz, None) {
             Ok(mode) => {
                 crate::flyout_window::show_after_ready(&app, mode).ok();
             }

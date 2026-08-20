@@ -51,6 +51,37 @@ pub const ACTIONS: [(&str, i32, bool); 10] = [
     ("toggle_screen_dimmer", HK_TOGGLE_SCREEN_DIMMER, false),
 ];
 
+// ── Favorite hotkeys (bound directly to each favorite) ───────────────
+// Favorite resolution hotkeys are registered dynamically on demand (see
+// DYNAMIC_IDS below), so any number of favorites can have a hotkey with no
+// fixed cap. The action name embeds the favorite's stable id
+// ("favorite_<favId>"), so a hotkey stays bound to a specific saved favorite
+// even if the favorites list is reordered, and removing a favorite makes its
+// action inert (the frontend prunes it). Ids only need to be unique and
+// stable within a process lifetime: WM_HOTKEY dispatch reverse-looks up the
+// id through the same map, so allocation order across restarts does not
+// matter.
+static DYNAMIC_IDS: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
+static NEXT_DYNAMIC_ID: AtomicI32 = AtomicI32::new(4096);
+
+fn is_favorite_action(action: &str) -> bool {
+    action.strip_prefix("favorite_").is_some_and(|id| !id.is_empty())
+}
+
+fn dynamic_id(action: &str) -> i32 {
+    let map = DYNAMIC_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = map.lock() {
+        if let Some(id) = guard.get(action) {
+            return *id;
+        }
+    }
+    let id = NEXT_DYNAMIC_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut guard) = map.lock() {
+        guard.insert(action.to_string(), id);
+    }
+    id
+}
+
 static APP: OnceLock<AppHandle> = OnceLock::new();
 static MAIN_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static BINDINGS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -285,49 +316,37 @@ fn main_hwnd() -> Option<HWND> {
         .map(|raw| HWND(raw as *mut _))
 }
 
-/// Unregisters every slot, then re-registers the current bindings. Returns an
-/// error listing the combos that could not be registered (e.g. already in use
-/// by another application or bound twice within this app).
+/// Unregisters every slot (static and dynamic), then re-registers the current
+/// bindings. Returns an error listing the combos that could not be registered
+/// (e.g. already in use by another application or bound twice within this app).
 pub fn register_all() -> Result<(), String> {
     let hwnd = main_hwnd().ok_or_else(|| "hotkey window is not ready".to_string())?;
     unsafe {
         for (_, id, _) in ACTIONS {
             let _ = UnregisterHotKey(Some(hwnd), id);
         }
+        // Also release any dynamically allocated favorite-slot ids.
+        if let Some(map) = DYNAMIC_IDS.get() {
+            if let Ok(guard) = map.lock() {
+                for (_, id) in guard.iter() {
+                    let _ = UnregisterHotKey(Some(hwnd), *id);
+                }
+            }
+        }
     }
     let bindings = current_bindings();
     let mut errors: Vec<String> = Vec::new();
     for (action, id, repeat) in ACTIONS {
-        let Some(combo) = bindings.get(action) else {
-            continue;
-        };
-        let Some((mods, vk)) = parse_hotkey(combo) else {
-            // "None"/empty is the unbound marker and is skipped silently; only a
-            // real, non-empty combo that fails to parse is surfaced as an error
-            // (e.g. a hand-edited config entry).
-            let trimmed = combo.trim();
-            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none") {
-                errors.push(format!("{action}: unrecognized key combination '{combo}'"));
-            }
-            continue;
-        };
-        // "None" is stored as the unbound marker; parse_hotkey returns None for
-        // it, so the loop above already skipped it, but guard anyway.
-        let mods = if repeat { mods } else { mods | MOD_NOREPEAT.0 };
-        unsafe {
-            match RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(mods), vk) {
-                Ok(()) => {}
-                Err(e) => {
-                    let code = e.code().0;
-                    let detail = if (code & 0xFFFF) == 1409 {
-                        // ERROR_HOTKEY_ALREADY_REGISTERED
-                        "already in use by another application or action".to_string()
-                    } else {
-                        format!("{e}")
-                    };
-                    errors.push(format!("{action} ({combo}): {detail}"));
-                }
-            }
+        if let Some(combo) = bindings.get(action) {
+            register_combo(hwnd, action, combo, id, repeat, &mut errors);
+        }
+    }
+    // Favorite slots beyond the static pool register through dynamically
+    // allocated ids, so any number of favorites can be bound.
+    for (action, combo) in &bindings {
+        if is_favorite_action(action) && !ACTIONS.iter().any(|(name, _, _)| name == action) {
+            let id = dynamic_id(action);
+            register_combo(hwnd, action, combo, id, false, &mut errors);
         }
     }
     if errors.is_empty() {
@@ -337,11 +356,50 @@ pub fn register_all() -> Result<(), String> {
     }
 }
 
+fn register_combo(
+    hwnd: HWND,
+    action: &str,
+    combo: &str,
+    id: i32,
+    repeat: bool,
+    errors: &mut Vec<String>,
+) {
+    let Some((mods, vk)) = parse_hotkey(combo) else {
+        // "None"/empty is the unbound marker and is skipped silently; only a
+        // real, non-empty combo that fails to parse is surfaced as an error
+        // (e.g. a hand-edited config entry).
+        let trimmed = combo.trim();
+        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("none") {
+            errors.push(format!("{action}: unrecognized key combination '{combo}'"));
+        }
+        return;
+    };
+    // "None" is stored as the unbound marker; parse_hotkey returns None for
+    // it, so the branch above already skipped it, but guard anyway.
+    let mods = if repeat { mods } else { mods | MOD_NOREPEAT.0 };
+    unsafe {
+        match RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(mods), vk) {
+            Ok(()) => {}
+            Err(e) => {
+                let code = e.code().0;
+                let detail = if (code & 0xFFFF) == 1409 {
+                    // ERROR_HOTKEY_ALREADY_REGISTERED
+                    "already in use by another application or action".to_string()
+                } else {
+                    format!("{e}")
+                };
+                errors.push(format!("{action} ({combo}): {detail}"));
+            }
+        }
+    }
+}
+
 // ── Command: set / clear one binding ─────────────────────────────────────────
 
 #[tauri::command]
 pub fn set_hotkey(action: String, combo: String) -> Result<(), String> {
-    if !ACTIONS.iter().any(|(name, _, _)| *name == action) {
+    let known = ACTIONS.iter().any(|(name, _, _)| *name == action) || is_favorite_action(&action);
+    if !known {
         return Err(format!("unknown hotkey action '{action}'"));
     }
     let combo = combo.trim().to_string();
@@ -402,6 +460,16 @@ pub fn reset_hotkeys() -> Result<(), String> {
 
 pub fn handle_hotkey(id: i32) {
     let Some((action, _, _)) = ACTIONS.iter().find(|(_, hk, _)| *hk == id) else {
+        // Favorite-slot actions beyond the static pool live in the dynamic id
+        // map; reverse-look up the action name and dispatch normally.
+        let action = DYNAMIC_IDS
+            .get()
+            .and_then(|map| map.lock().ok())
+            .and_then(|guard| guard.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()));
+        let Some(action) = action else {
+            return;
+        };
+        emit("hotkey-pressed", &action);
         return;
     };
     if id == HK_HOLD_COMPARE {
@@ -610,6 +678,13 @@ pub fn shutdown() {
         unsafe {
             for (_, id, _) in ACTIONS {
                 let _ = UnregisterHotKey(Some(hwnd), id);
+            }
+            if let Some(map) = DYNAMIC_IDS.get() {
+                if let Ok(guard) = map.lock() {
+                    for (_, id) in guard.iter() {
+                        let _ = UnregisterHotKey(Some(hwnd), *id);
+                    }
+                }
             }
         }
     }

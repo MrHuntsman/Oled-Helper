@@ -2641,6 +2641,51 @@ select,
 .hotkey-hint-top {
   margin: 0 0 10px;
 }
+/* Favorite resolution rows show the favorite label + remove star on the
+   left and the capture controls on the right; wraps when the window is
+   narrow. */
+.hotkey-row-favorite {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.hotkey-row-favorite .hotkey-row-text {
+  flex: 1;
+  min-width: 0;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.hotkey-row-favorite .settings-row-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Remove button for the favorite in a row (deletes the favorite itself,
+   after the shared confirmation dialog). Sits right after the favorite
+   label and matches the filled star in the status-bar favorites menu, with
+   the destructive red hover. */
+.hotkey-fav-remove {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  transition: color 0.1s, background 0.1s;
+}
+.hotkey-fav-remove:hover,
+.hotkey-fav-remove:focus-visible {
+  color: #e87575;
+  background: color-mix(in srgb, #e87575 12%, transparent);
+}
 .strip-heading {
   margin: 4px 0;
   font-size: 13px;
@@ -4156,13 +4201,19 @@ select,
 }
 
 /* ── Status-bar favorites menu (favorite resolution@hz combos) ───── */
-/* Transient confirmation shown to the left of the favorites icon. Appears
+/* Transient confirmation anchored to the favorites icon (a child of
+   .favorites-wrap, which is position: relative). Absolutely positioned so
+   it is out of the status bar's flex flow entirely: the center cluster (and
+   its flanking flexible sides) never shift when the message appears. Shows
    only when a favorite is added or removed and auto-clears after a short
    delay (same pattern as the HDR tab's transient "Applied" messages). */
 .favorites-status-msg {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
-  margin-right: 8px;
   font-size: 11px;
   font-weight: 600;
   color: #6fd26f;
@@ -4174,8 +4225,8 @@ select,
   color: #e87575;
 }
 @keyframes favorites-status-in {
-  from { opacity: 0; transform: translateY(-2px); }
-  to { opacity: 1; transform: none; }
+  from { opacity: 0; transform: translateY(calc(-50% - 2px)); }
+  to { opacity: 1; transform: translateY(-50%); }
 }
 .favorites-wrap {
   position: relative;
@@ -4296,6 +4347,29 @@ select,
 .favorites-star.filled:hover {
   color: #e87575;
   background: color-mix(in srgb, #e87575 12%, transparent);
+}
+/* Monitor-scoping tag next to a favorite's label, shown only when the
+   favorite belongs to a different monitor than the currently selected one. */
+.favorites-monitor-tag {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-weak);
+  white-space: nowrap;
+}
+/* Favorite whose saved monitor is not connected: gray the apply action but
+   keep the entry (and its remove star) usable, so the saved data survives a
+   temporary unplug. */
+.favorites-item.disconnected .favorites-apply {
+  color: var(--text-weak);
+  opacity: 0.55;
+  cursor: default;
+}
+.favorites-item.disconnected .favorites-apply:hover:not(.active),
+.favorites-item.disconnected .favorites-apply:focus-visible {
+  background: none;
+  color: var(--text-weak);
+  transform: none;
 }
 .update-modal {
   width: min(420px, calc(100vw - 48px));

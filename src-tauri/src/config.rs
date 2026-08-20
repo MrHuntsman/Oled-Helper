@@ -22,11 +22,26 @@ use windows::Win32::Storage::FileSystem::{
 // A user-saved display mode (status-bar favorites menu): resolution + refresh
 // rate in one combo, e.g. "3840x2160 @ 144". Applies through the same safe
 // set_resolution path as the resolution dropdown (with preferred_hz).
+// Favorites are scoped to the monitor they were saved on: fav_id is the
+// stable identity slot hotkeys bind against, monitor_id is the EDID device
+// id (resolution-independent, so a favorite survives resolution changes on
+// the same panel), monitor_sig is the monitor's signature (resolution+
+// physical size+DPI) resolved to a device name at apply time, and
+// monitor_name is a display-only snapshot kept so the UI can label a
+// favorite even when that monitor is currently disconnected.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct FavoriteDisplayMode {
     pub width: u32,
     pub height: u32,
     pub hz: u32,
+    #[serde(default)]
+    pub fav_id: String,
+    #[serde(default)]
+    pub monitor_id: String,
+    #[serde(default)]
+    pub monitor_sig: String,
+    #[serde(default)]
+    pub monitor_name: String,
 }
 
 // A monitor's render knob pair (Text tab): faux boldness and fringe
@@ -193,6 +208,12 @@ pub struct AppConfig {
     // User-saved resolution@hz combos shown in the status-bar favorites menu.
     #[serde(default)]
     pub favorite_display_modes: Vec<FavoriteDisplayMode>,
+    // Legacy favorite-resolution hotkey slots (slot number → favorite
+    // fav_id). Kept only so old configs can migrate to hotkeys bound
+    // directly to each favorite (favorite_<favId>); new configs no longer
+    // write this field.
+    #[serde(default)]
+    pub favorite_hotkey_slots: HashMap<String, String>,
 }
 
 /// Deserialize `per_monitor_custom`: accepts the current 2D shape
@@ -307,6 +328,7 @@ impl Default for AppConfig {
             display_menu_refresh_rate_sort: default_refresh_rate_sort(),
             hotkeys: HashMap::new(),
             favorite_display_modes: Vec::new(),
+            favorite_hotkey_slots: HashMap::new(),
         }
     }
 }
