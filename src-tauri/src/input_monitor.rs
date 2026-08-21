@@ -78,20 +78,6 @@ fn hook_thread_loop() {
     HOOK_THREAD_ID.store(0, Ordering::Relaxed);
 }
 
-/// Whether the hook thread has been spawned (used by callers that need to
-/// know if they own the hooks' lifecycle).
-pub fn is_active() -> bool {
-    HOOK_THREAD
-        .get()
-        .map(|threads| {
-            threads
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some()
-        })
-        .unwrap_or(false)
-}
-
 pub fn start() {
     let threads = HOOK_THREAD.get_or_init(|| Mutex::new(None));
     let mut guard = match threads.lock() {

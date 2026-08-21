@@ -228,9 +228,24 @@ fn write_state_table() -> Result<(), String> {
         std::ptr::write_volatile(base.add(STATE_MONITOR_COUNT_OFFSET) as *mut u32, count);
         for (i, e) in entries.iter().take(MAX_MONITORS).enumerate() {
             let entry = base.add(STATE_MONITORS_OFFSET + i * MONITOR_ENTRY_STRIDE);
-            let (bd, dm) = knobs.get(&e.sig()).copied().unwrap_or((0, 0));
+            // Per-monitor assignments are persisted against the
+            // resolution-independent EDID device id (stable_monitor_key),
+            // while the sig embeds the CURRENT resolution and would orphan
+            // them on every mode switch. Look up by the stable key first,
+            // then the sig for legacy entries saved before the id existed.
+            let key = if e.monitor_id.is_empty() {
+                e.sig()
+            } else {
+                e.monitor_id.clone()
+            };
+            let (bd, dm) = knobs
+                .get(&key)
+                .or_else(|| knobs.get(&e.sig()))
+                .copied()
+                .unwrap_or((0, 0));
             let [[srx, sry], [sgx, sgy], [sbx, sby]] = custom
-                .get(&e.sig())
+                .get(&key)
+                .or_else(|| custom.get(&e.sig()))
                 .copied()
                 .unwrap_or([[0.0; 2]; 3]);
             std::ptr::write_volatile(entry as *mut u32, e.hmonitor);
@@ -248,7 +263,13 @@ fn write_state_table() -> Result<(), String> {
             );
             std::ptr::write_volatile(
                 entry.add(16) as *mut u32,
-                modes.get(&e.sig()).copied().unwrap_or(0).min(7) | ((e.primary as u32) << 8),
+                modes
+                    .get(&key)
+                    .or_else(|| modes.get(&e.sig()))
+                    .copied()
+                    .unwrap_or(0)
+                    .min(7)
+                    | ((e.primary as u32) << 8),
             );
             // Slot 20 (LCD filter) is reserved at 0, the filter was removed.
             std::ptr::write_volatile(entry.add(20) as *mut u32, 0);
@@ -712,6 +733,36 @@ pub fn explorer_hook_set_scope(
     Ok(())
 }
 
+// Resolve a monitor key to its resolution-independent EDID device id when
+// the input is a known sig (or already an id): the per-monitor assignment
+// maps are keyed by the EDID id so a resolution change (e.g. a hotkey
+// favorite switch) does not orphan saved modes/knobs. The sig embeds the
+// current resolution, so entries saved under it stop matching after a mode
+// change. Falls back to the input unchanged when it is not a connected
+// monitor (the id is unknown, keep whatever the caller sent).
+fn stable_monitor_key(sig: &str) -> String {
+    for e in all_monitors() {
+        if e.sig() == sig || (!e.monitor_id.is_empty() && e.monitor_id == sig) {
+            if !e.monitor_id.is_empty() {
+                return e.monitor_id;
+            }
+            break;
+        }
+    }
+    sig.to_string()
+}
+
+// Re-key a persisted assignment map from legacy sig keys to the current
+// monitors' EDID ids (stable_monitor_key), called at startup so the maps
+// are resolution-independent before the first table write.
+fn rekey_assignment_map<T: Clone>(map: &mut HashMap<String, T>) {
+    let rekeyed: Vec<(String, T)> = map
+        .drain()
+        .map(|(k, v)| (stable_monitor_key(&k), v))
+        .collect();
+    map.extend(rekeyed);
+}
+
 /// Assign a per-monitor render mode: `mode` is one of the mode ids
 /// ("grayscale"/"off"/"rgb"/"bgr"/"custom"); "default" clears the
 /// assignment so the monitor uses the system text setting. `sig` is the
@@ -720,6 +771,7 @@ pub fn explorer_hook_set_scope(
 /// those layouts with user-tuned offsets, so a stale string maps to 0.
 #[tauri::command]
 pub fn explorer_hook_set_monitor_mode(sig: String, mode: String) -> Result<(), String> {
+    let key = stable_monitor_key(&sig);
     let value = mode_id(&mode); // "default" (and anything unknown) maps to 0
     {
         let mut modes = MONITOR_MODES
@@ -727,9 +779,9 @@ pub fn explorer_hook_set_monitor_mode(sig: String, mode: String) -> Result<(), S
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if value == 0 {
-            modes.remove(&sig);
+            modes.remove(&key);
         } else {
-            modes.insert(sig, value);
+            modes.insert(key, value);
         }
     }
     write_state_table()?;
@@ -778,6 +830,7 @@ pub fn explorer_hook_set_monitor_knobs(
     boldness: u32,
     damping: u32,
 ) -> Result<(), String> {
+    let key = stable_monitor_key(&sig);
     {
         let mut knobs = MONITOR_KNOBS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -785,9 +838,9 @@ pub fn explorer_hook_set_monitor_knobs(
             .unwrap_or_else(|p| p.into_inner());
         let pair = (boldness.min(30), damping.min(100));
         if pair == (0, 0) {
-            knobs.remove(&sig);
+            knobs.remove(&key);
         } else {
-            knobs.insert(sig, pair);
+            knobs.insert(key, pair);
         }
     }
     write_state_table()?;
@@ -811,6 +864,7 @@ pub fn explorer_hook_set_monitor_custom(
     b_x: f32,
     b_y: f32,
 ) -> Result<(), String> {
+    let key = stable_monitor_key(&sig);
     {
         let mut custom = MONITOR_CUSTOM
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -823,9 +877,9 @@ pub fn explorer_hook_set_monitor_custom(
             [b_x.clamp(-1.0, 1.0), b_y.clamp(-1.0, 1.0)],
         ];
         if offsets == [[0.0; 2]; 3] {
-            custom.remove(&sig);
+            custom.remove(&key);
         } else {
-            custom.insert(sig, offsets);
+            custom.insert(key, offsets);
         }
     }
     write_state_table()?;
@@ -877,6 +931,10 @@ pub fn apply_startup_state(
         for (sig, mode) in &cfg.per_monitor_modes {
             modes.insert(sig.clone(), mode_id(mode));
         }
+        // Persisted entries predate the EDID-id keying (they were saved
+        // under the resolution-embedded sig); re-key them so a mode switch
+        // cannot orphan the loaded profiles before the first table write.
+        rekey_assignment_map(&mut modes);
     }
     {
         let mut knobs = MONITOR_KNOBS
@@ -887,6 +945,7 @@ pub fn apply_startup_state(
         for (sig, k) in &cfg.per_monitor_knobs {
             knobs.insert(sig.clone(), (k.boldness, k.damping));
         }
+        rekey_assignment_map(&mut knobs);
     }
     {
         let mut custom = MONITOR_CUSTOM
@@ -897,6 +956,7 @@ pub fn apply_startup_state(
         for (sig, offsets) in &cfg.per_monitor_custom {
             custom.insert(sig.clone(), *offsets);
         }
+        rekey_assignment_map(&mut custom);
     }
     PER_MONITOR_ENABLED.store(
         !cfg.per_monitor_modes.is_empty()

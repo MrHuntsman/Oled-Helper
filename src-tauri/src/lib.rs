@@ -835,7 +835,8 @@ pub fn run() {
             power::power_turn_off_display,
             power::system_restart,
             power::power_set_screen_protector,
-            power::power_dim_preview,
+            power::power_get_screen_dimmer_status,
+            power::power_get_screen_dimmer_diagnostics,
             gamepad::gamepad_input_active,
             font_replacement::font_list_installed,
             font_replacement::font_apply,
@@ -1002,25 +1003,46 @@ pub fn run() {
             // main window's frontend applies these to the overlay shortly
             // after launch, but the pre-warmed tray menu reads status before
             // that, without the seed it paints the default opacity (95%) on
-            // the first open and then jumps to the real value.
+            // the first open and then jumps to the real value. Per-monitor
+            // profiles go straight into the shared profiles map; the flat
+            // legacy fields seed the primary monitor so the tray menu (which
+            // has no monitor selector) reads real values on first open.
             {
                 let dimmer_state = app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
                 *dimmer_state
                     .enabled
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_enabled;
-                *dimmer_state
-                    .opacity
+                let mut profiles = crate::taskbar_dimmer::profiles_map()
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_opacity.clamp(0.0, 1.0);
-                *dimmer_state
-                    .fade_in_duration_ms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_fade_in_duration_ms;
-                *dimmer_state
-                    .fade_out_duration_ms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_fade_out_duration_ms;
+                    .unwrap_or_else(|e| e.into_inner());
+                for (key, profile) in &saved_config.taskbar_dimmer_profiles {
+                    profiles.insert(key.clone(), profile.clone());
+                }
+                if profiles.is_empty() {
+                    // Legacy config (or first run): seed the primary monitor's
+                    // profile from the flat fields so the tray menu's
+                    // primary-keyed status read shows the persisted values.
+                    let primary_key = crate::monitors::all_monitors()
+                        .into_iter()
+                        .find(|m| m.primary)
+                        .map(|m| {
+                            if !m.monitor_id.is_empty() {
+                                m.monitor_id
+                            } else {
+                                m.sig()
+                            }
+                        });
+                    if let Some(key) = primary_key {
+                        let entry = profiles.entry(key).or_default();
+                        entry.opacity = saved_config.taskbar_dimmer_opacity.clamp(0.0, 1.0);
+                        entry.fade_in_duration_ms = saved_config.taskbar_dimmer_fade_in_duration_ms;
+                        entry.fade_out_duration_ms =
+                            saved_config.taskbar_dimmer_fade_out_duration_ms;
+                        entry.hover_detection = saved_config.taskbar_dimmer_hover_detection.clone();
+                        entry.poll_interval_ms = saved_config.taskbar_dimmer_poll_interval_ms.clamp(16, 200) as u32;
+                    }
+                }
             }
 
             // Apply the persisted Explorer-hook state (Text tab) at startup
@@ -1033,19 +1055,47 @@ pub fn run() {
 
             // Start the screen protector watcher if a timeout was persisted,
             // so the dim works even before the frontend loads its config.
+            // Per-monitor profiles go straight into the shared profiles map;
+            // the flat legacy fields seed the primary monitor so the
+            // no-selector paths (TabPower's poll, the dim preview) read real
+            // values on first launch.
             {
+                let mut screen_profiles = saved_config.screen_dimmer_profiles.clone();
+                if screen_profiles.is_empty() {
+                    // Legacy config (or first run): seed the primary monitor's
+                    // profile from the flat fields so the primary keeps the
+                    // user's old settings.
+                    let primary_key = crate::monitors::all_monitors()
+                        .into_iter()
+                        .find(|m| m.primary)
+                        .map(|m| {
+                            if !m.monitor_id.is_empty() {
+                                m.monitor_id
+                            } else {
+                                m.sig()
+                            }
+                        });
+                    if let Some(key) = primary_key {
+                        let entry = screen_profiles.entry(key).or_default();
+                        entry.seconds = saved_config.screen_protector_seconds;
+                        entry.opacity = saved_config.screen_protector_opacity.clamp(0.0, 1.0);
+                        entry.fade_in_duration_ms = saved_config.screen_protector_fade_in_duration_ms;
+                        entry.fade_out_duration_ms =
+                            saved_config.screen_protector_fade_out_duration_ms;
+                        entry.fullscreen_detection = saved_config.screen_protector_fullscreen_detection;
+                    }
+                }
                 let state = app.state::<gamma::GammaState>();
                 crate::power::init(
                     saved_config.screen_protector_enabled,
-                    saved_config.screen_protector_seconds,
-                    saved_config.screen_protector_opacity,
-                    saved_config.screen_protector_fade_in_duration_ms,
-                    saved_config.screen_protector_fade_out_duration_ms,
-                    saved_config.screen_protector_fullscreen_detection,
+                    screen_profiles,
                     state.desired.clone(),
                     state.per_monitor.clone(),
                     state.screen_dim_brightness.clone(),
                 );
+                // Lets the dim watcher notify open readouts the instant the
+                // dim state flips (mirrors display_info::set_app_handle below).
+                crate::power::set_app_handle(app.handle().clone());
             }
 
             // The display-info module's auto-rollback thread force-hides the

@@ -346,6 +346,43 @@ select,
 }
 .nav-icon { width: 22px; height: 22px; opacity: 0.95; flex-shrink: 0; }
 .nav-btn.active .nav-icon { opacity: 1; }
+/* "Global" tag on nav items whose settings apply system-wide regardless of
+   the selected monitor (Windows HDR, Power Saving, Windows Font), so it's
+   clear the top-bar monitor selector does not affect them. Pushed to the
+   right edge of the nav button (margin-left: auto) so the label stays on
+   the left with the icon. */
+.nav-global-tag {
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 4px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--text-weak, #999);
+  background: rgba(128, 128, 128, 0.08);
+  border: 1px solid rgba(128, 128, 128, 0.2);
+}
+/* Per-monitor tab heading tag: shows which monitor the tab's settings apply
+   to (the one selected in the top-bar monitor selector). Shown on tabs that
+   are NOT tagged Global in the sidebar. */
+.tab-monitor-tag {
+  margin-left: 8px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--text-weak, #999);
+  background: rgba(128, 128, 128, 0.08);
+  border: 1px solid rgba(128, 128, 128, 0.2);
+}
 
 /* Nav items that own a master toggle get a mini switch at the right edge.
    The label stays a full-width navigation button; the switch is a sibling
@@ -1814,6 +1851,11 @@ select,
   margin: 0;
   font-size: 12px;
   color: #4CD964;
+}
+.font-restart-warning {
+  margin: 0;
+  font-size: 12px;
+  color: #e0a84b;
 }
 .font-error {
   margin: 0;
@@ -3575,30 +3617,6 @@ select,
 /* Dim-before-off preview button (Debug tab header, right of the tray-notice
    button): a compact text chip, narrower than the icon-only .copy-btn row it
    sits in. */
-.diag-dim-btn {
-  display: inline-flex;
-  align-items: center;
-  padding: 0 8px;
-  height: 26px;
-  color: var(--text-weak);
-  background: var(--hover);
-  border: 1px solid transparent;
-  border-radius: 5px;
-  font-size: 11px;
-  white-space: nowrap;
-  transition: color 0.12s, background 0.12s, border-color 0.12s;
-}
-.diag-dim-btn:hover, .diag-dim-btn:focus-visible {
-  color: var(--text);
-  background: var(--hover);
-  border-color: var(--accent);
-  outline: none;
-}
-.diag-actions-note {
-  color: var(--text-weak);
-  font-size: 11px;
-  white-space: nowrap;
-}
 .diag-detection-bar {
   display: flex;
   align-items: center;
@@ -3674,6 +3692,27 @@ select,
 }
 .diag-gamepad-status.diag-gamepad-active {
   color: var(--accent);
+}
+.diag-dim-status {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-weak);
+  white-space: nowrap;
+}
+.diag-dim-status.diag-dim-on {
+  color: var(--success);
+}
+.diag-dim-status.diag-dim-blocked {
+  color: #E0A93C;
+}
+.diag-dim-status.diag-dim-off {
+  color: var(--text-faint, var(--text-weak));
+  opacity: 0.75;
+}
+.diag-dim-reason {
+  font-size: 11px;
+  color: var(--text-weak);
+  white-space: nowrap;
 }
 .diag-section h3 { font-size: 13px; font-weight: 600; }
 .copy-btn {
@@ -4884,6 +4923,7 @@ select,
 
 /* ── Power tab ─────────────────────────────────────────────────────── */
 .power-error { color: #E05555; margin: 4px 0 8px; font-size: 12px; }
+.power-loading { color: var(--text-dim, #888); margin: 4px 0 8px; font-size: 12px; }
 .power-row-gap { height: 14px; }
 /* Native screensaver selector, kept alongside the other power controls so
    Windows supplies the standard popup and selection behavior. */

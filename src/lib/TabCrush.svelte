@@ -2,7 +2,7 @@
   // Inlined data URIs, see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
-  import { app, crush, adjustmentDisplay, blackLift, applyGamma, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, applyGamma, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax, activeMonitor, monitors } from './stores.svelte.js';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
   // duplicated in either destination.
@@ -14,6 +14,14 @@
   import { emit } from '@tauri-apps/api/event';
   import { onDestroy, untrack } from 'svelte';
   import { setGpuRenderingInfo, refreshSdrWhiteLevel } from './stores.svelte.js';
+
+  // The heading tag showing which monitor this tab's settings apply to (the
+  // one selected in the top-bar monitor selector), labeled like the selector.
+  const monitorTagLabel = $derived(
+    activeMonitor.mon
+      ? activeMonitor.mon.friendly_name || `Monitor ${monitors.indexOf(activeMonitor.mon) + 1}`
+      : ''
+  );
 
   let canvas = $state(null);
   let device = $state(null);
@@ -1069,6 +1077,7 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Black Crush Tweak</h2>
+          {#if monitorTagLabel}<span class="tab-monitor-tag">{monitorTagLabel}</span>{/if}
         </div>
         <span class="subtitle">Adjust visibility in dark ares. Preserves pure black.</span>
       </div>

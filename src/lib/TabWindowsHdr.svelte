@@ -516,6 +516,7 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Windows HDR</h2>
+          <span class="tab-monitor-tag">Global</span>
         </div>
         <span class="subtitle">Change Windows HDR settings</span>
       </div>

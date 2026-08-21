@@ -109,6 +109,19 @@ export async function loadMonitors() {
     // resolution component changes on every mode switch). Attach the EDID id
     // now that the monitor list is live so their identity becomes stable.
     backfillFavoriteMonitorIds();
+    // Same re-keying for the Text tab's per-monitor profiles: entries saved
+    // under a sig stop matching after a resolution change, so move them to
+    // the EDID id while the monitor list is live.
+    backfillTextMonitorKeys();
+    // Migrate legacy flat Taskbar Dimmer fields into the primary monitor's
+    // profile, and re-key sig-keyed profiles to the EDID id.
+    backfillTaskbarDimmerProfiles();
+    // Point the dimmer tab at the selected monitor's profile.
+    syncTaskbarDimmerView();
+    // Same migration + view sync for the Screen Dimmer's per-monitor
+    // profiles (legacy flat fields seed the primary, sig entries re-keyed).
+    backfillScreenDimmerProfiles();
+    syncScreenDimmerView();
   } catch (e) {
     console.warn('[monitors] list failed', e);
   }
@@ -125,6 +138,12 @@ export function setActiveMonitor(mon) {
   saveConfig();
   // Keep the hook's per-monitor table in sync from any tab.
   syncTextPerMonitor();
+  // Reload the Taskbar Dimmer tab's view to the newly selected monitor's
+  // profile.
+  syncTaskbarDimmerView();
+  // Same for the Screen Dimmer: the sliders edit the selected monitor's
+  // profile, so switching monitors must reload the view.
+  syncScreenDimmerView();
 }
 
 // Push the per-monitor text flag + all assignments to the hook so its
@@ -292,6 +311,55 @@ export const taskbarDimmer = $state({
   available: true,
 });
 
+// Per-monitor Taskbar Dimmer profiles, keyed by the monitor's stable
+// identity (monitor_id || sig), same keying as the Text-tab profiles.
+// `taskbarDimmer` above is the *view* of the active monitor's profile: the
+// sliders edit the selected monitor's entry through the helpers below, and
+// switching monitors reloads the view from this map. A monitor without an
+// entry uses TASKBAR_DIMMER_DEFAULTS (mirroring the backend's
+// DimmerProfile::default()).
+export const taskbarDimmerProfiles = $state({});
+
+// The profile key for a monitor: the resolution-independent EDID device id
+// when available, falling back to the sig. The backend normalizes to the
+// same key (monitor_key_for_taskbar / resolve_profile_key).
+export function dimmerMonKey(mon = activeMonitor.mon) {
+  return (mon && (mon.monitor_id || mon.sig)) || '';
+}
+
+// Load the active monitor's profile into the view fields. Called when the
+// monitor selector changes and after config load resolves the selection.
+export function syncTaskbarDimmerView() {
+  const key = dimmerMonKey();
+  const p = key ? taskbarDimmerProfiles[key] : null;
+  if (p) {
+    taskbarDimmer.opacity = p.opacity;
+    taskbarDimmer.fadeInDurationMs = p.fadeInDurationMs;
+    taskbarDimmer.fadeOutDurationMs = p.fadeOutDurationMs;
+    taskbarDimmer.hoverDetection = p.hoverDetection;
+    taskbarDimmer.pollIntervalMs = p.pollIntervalMs;
+  }
+}
+
+// The active monitor's profile entry, creating it from the defaults on first
+// edit so an untouched monitor gets the canonical defaults written back.
+function currentDimmerProfile() {
+  const key = dimmerMonKey();
+  if (!key) return null;
+  let p = taskbarDimmerProfiles[key];
+  if (!p) {
+    p = {
+      opacity: TASKBAR_DIMMER_DEFAULTS.opacity,
+      fadeInDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs,
+      fadeOutDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs,
+      hoverDetection: TASKBAR_DIMMER_DEFAULTS.hoverDetection,
+      pollIntervalMs: TASKBAR_DIMMER_DEFAULTS.pollIntervalMs,
+    };
+    taskbarDimmerProfiles[key] = p;
+  }
+  return p;
+}
+
 // Text rendering tab settings persisted in config. The Explorer hook toggle
 // decides whether the hook DLL fixes Explorer's text (Grayscale/Off
 // modes) or leaves it at system ClearType. The two render knobs (all
@@ -326,6 +394,49 @@ export const textSettings = $state({
 export const screenDimmer = $state({
   ...SCREEN_DIMMER_DEFAULTS,
 });
+
+// Per-monitor Screen Dimmer profiles, keyed by the monitor's stable
+// identity (monitor_id || sig), same keying as the Taskbar Dimmer profiles.
+// `screenDimmer` above is the *view* of the active monitor's profile: the
+// sliders edit the selected monitor's entry through the helpers below, and
+// switching monitors reloads the view from this map. A monitor without an
+// entry uses SCREEN_DIMMER_DEFAULTS (mirroring the backend's
+// ScreenDimmerProfile::default()). The master enabled toggle stays global.
+export const screenDimmerProfiles = $state({});
+
+// Load the active monitor's profile into the view fields. Called when the
+// monitor selector changes and after config load resolves the selection.
+// The enabled toggle is global, so it is never overwritten here.
+export function syncScreenDimmerView() {
+  const key = dimmerMonKey();
+  const p = key ? screenDimmerProfiles[key] : null;
+  if (p) {
+    screenDimmer.seconds = p.seconds;
+    screenDimmer.opacity = p.opacity;
+    screenDimmer.fadeInDurationMs = p.fadeInDurationMs;
+    screenDimmer.fadeOutDurationMs = p.fadeOutDurationMs;
+    screenDimmer.fullscreenDetection = p.fullscreenDetection;
+  }
+}
+
+// The active monitor's profile entry, creating it from the defaults on first
+// edit so an untouched monitor gets the canonical defaults written back.
+function currentScreenDimmerProfile() {
+  const key = dimmerMonKey();
+  if (!key) return null;
+  let p = screenDimmerProfiles[key];
+  if (!p) {
+    p = {
+      seconds: SCREEN_DIMMER_DEFAULTS.seconds,
+      opacity: SCREEN_DIMMER_DEFAULTS.opacity,
+      fadeInDurationMs: SCREEN_DIMMER_DEFAULTS.fadeInDurationMs,
+      fadeOutDurationMs: SCREEN_DIMMER_DEFAULTS.fadeOutDurationMs,
+      fullscreenDetection: SCREEN_DIMMER_DEFAULTS.fullscreenDetection,
+    };
+    screenDimmerProfiles[key] = p;
+  }
+  return p;
+}
 
 // App-level settings (Settings tab). alwaysElevated relaunches the app
 // elevated at startup; the backend probes the on-disk config before any
@@ -593,6 +704,111 @@ function backfillFavoriteMonitorIds() {
   }
 }
 
+// Re-key the Text tab's per-monitor profiles (modes, knobs, custom offsets)
+// from legacy sig keys to the EDID device id. The sig embeds the current
+// resolution, so an entry saved under it stops matching after a mode switch
+// (e.g. a hotkey favorite); the EDID id never changes with resolution. Runs
+// whenever the monitor list or config lands (idempotent: skips entries
+// whose key already matches a current monitor id or that have no resolvable
+// monitor).
+function backfillTextMonitorKeys() {
+  if (!monitors.length) return;
+  let changed = false;
+  for (const map of [textSettings.perMonitorModes, textSettings.perMonitorKnobs, textSettings.perMonitorCustom]) {
+    for (const [key, value] of Object.entries(map)) {
+      const mon = monitors.find((m) =>
+        m.monitor_id === key
+        || m.sig === key
+        || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key));
+      if (!mon || !mon.monitor_id || mon.monitor_id === key) continue;
+      delete map[key];
+      map[mon.monitor_id] = value;
+      changed = true;
+    }
+  }
+  if (changed) saveConfig();
+}
+
+// Re-key the Taskbar Dimmer's per-monitor profiles and migrate the legacy
+// flat taskbar_dimmer_* fields into the primary monitor's profile. Runs
+// whenever the monitor list or config lands (idempotent): the flat fields
+// seed the primary profile only while the profiles map is empty, and
+// sig-keyed entries are moved to the EDID id exactly like the Text-tab
+// backfill.
+function backfillTaskbarDimmerProfiles() {
+  if (!monitors.length) return;
+  // Re-key sig entries to the EDID id (resolution-independent).
+  let changed = false;
+  for (const [key, value] of Object.entries(taskbarDimmerProfiles)) {
+    const mon = monitors.find((m) =>
+      m.monitor_id === key
+      || m.sig === key
+      || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key));
+    if (!mon || !mon.monitor_id || mon.monitor_id === key) continue;
+    delete taskbarDimmerProfiles[key];
+    taskbarDimmerProfiles[mon.monitor_id] = value;
+    changed = true;
+  }
+  // Legacy flat fields (written by configs predating per-monitor profiles):
+  // seed the primary monitor's profile from them so the tray menu and the
+  // primary taskbar keep the user's old values.
+  const primary = monitors.find((m) => m.primary) || monitors[0];
+  if (primary && !Object.keys(taskbarDimmerProfiles).length) {
+    const key = primary.monitor_id || primary.sig;
+    if (key) {
+      taskbarDimmerProfiles[key] = {
+        opacity: taskbarDimmer.opacity,
+        fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
+        fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs,
+        hoverDetection: taskbarDimmer.hoverDetection,
+        pollIntervalMs: taskbarDimmer.pollIntervalMs,
+      };
+      changed = true;
+    }
+  }
+  if (changed) saveConfig();
+}
+
+// Re-key the Screen Dimmer's per-monitor profiles and migrate the legacy
+// flat screen_protector_* fields into the primary monitor's profile. Runs
+// whenever the monitor list or config lands (idempotent): the flat fields
+// seed the primary profile only while the profiles map is empty, and
+// sig-keyed entries are moved to the EDID id exactly like the Taskbar
+// Dimmer backfill.
+function backfillScreenDimmerProfiles() {
+  if (!monitors.length) return;
+  // Re-key sig entries to the EDID id (resolution-independent).
+  let changed = false;
+  for (const [key, value] of Object.entries(screenDimmerProfiles)) {
+    const mon = monitors.find((m) =>
+      m.monitor_id === key
+      || m.sig === key
+      || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key));
+    if (!mon || !mon.monitor_id || mon.monitor_id === key) continue;
+    delete screenDimmerProfiles[key];
+    screenDimmerProfiles[mon.monitor_id] = value;
+    changed = true;
+  }
+  // Legacy flat fields (written by configs predating per-monitor profiles):
+  // seed the primary monitor's profile from them so the primary keeps the
+  // user's old values and the no-selector paths stay truthful.
+  const primary = monitors.find((m) => m.primary) || monitors[0];
+  if (primary && !Object.keys(screenDimmerProfiles).length) {
+    const key = primary.monitor_id || primary.sig;
+    if (key) {
+      screenDimmerProfiles[key] = {
+        seconds: screenDimmer.seconds,
+        opacity: screenDimmer.opacity,
+        fadeInDurationMs: screenDimmer.fadeInDurationMs,
+        fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+        fullscreenDetection: screenDimmer.fullscreenDetection,
+      };
+      changed = true;
+    }
+  }
+  if (changed) saveConfig();
+}
+
 // ── Favorite hotkeys (bound directly to each favorite) ────────────────
 // Each favorite can carry its own hotkey: the action name embeds the
 // favorite's stable id ("favorite_<favId>", registered dynamically in
@@ -845,6 +1061,11 @@ export async function loadConfig(prefetchedCfg = null) {
         if (normalized) textSettings.perMonitorCustom[sig] = normalized;
       }
     }
+    // Profiles saved before the EDID-id keying sit under sig keys that stop
+    // matching after a resolution change; move them to the monitor id now
+    // (no-op when the monitor list isn't loaded yet — loadMonitors re-runs
+    // it).
+    backfillTextMonitorKeys();
     // Restore the per-monitor selector after the monitor list loads.
     // Default the selector to the primary monitor; a saved selection wins
     // when it still exists.
@@ -856,6 +1077,7 @@ export async function loadConfig(prefetchedCfg = null) {
         || null;
       activeMonitor.mon = match;
       syncTextPerMonitor();
+      syncTaskbarDimmerView();
       // main.js's startup Black Crush apply runs before the monitor list
       // resolves and can only resolve the profile key against the primary
       // display identity. Re-resolve now that the real selection is known so
@@ -900,12 +1122,49 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.taskbar_dimmer_hover_detection === 'string') {
       taskbarDimmer.hoverDetection = cfg.taskbar_dimmer_hover_detection;
       Object.assign(dimmerDetections, detectionDefaultsForMode(cfg.taskbar_dimmer_hover_detection));
-      invoke('set_taskbar_dimmer_hover_mode', { mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
+      invoke('set_taskbar_dimmer_hover_mode', { monitorKey: dimmerMonKey(), mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
     }
     if (cfg && typeof cfg.taskbar_dimmer_poll_interval_ms === 'number' && Number.isFinite(cfg.taskbar_dimmer_poll_interval_ms)) {
       taskbarDimmer.pollIntervalMs = Math.max(16, Math.min(200, Math.round(cfg.taskbar_dimmer_poll_interval_ms)));
-      invoke('set_taskbar_dimmer_poll_interval', { ms: taskbarDimmer.pollIntervalMs }).catch(() => {});
+      invoke('set_taskbar_dimmer_poll_interval', { monitorKey: dimmerMonKey(), ms: taskbarDimmer.pollIntervalMs }).catch(() => {});
     }
+    if (cfg && typeof cfg.taskbar_dimmer_profiles === 'object' && cfg.taskbar_dimmer_profiles) {
+      // Per-monitor profiles win over the flat legacy fields above (which
+      // stay as the pre-per-monitor format and the primary fallback).
+      for (const key of Object.keys(taskbarDimmerProfiles)) delete taskbarDimmerProfiles[key];
+      for (const [key, p] of Object.entries(cfg.taskbar_dimmer_profiles)) {
+        if (!p || typeof p !== 'object') continue;
+        taskbarDimmerProfiles[key] = {
+          opacity: Math.max(0, Math.min(1, Number(p.opacity) || TASKBAR_DIMMER_DEFAULTS.opacity)),
+          fadeInDurationMs: Math.max(0, Math.min(1000, Math.round(Number(p.fadeInDurationMs) || TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs))),
+          fadeOutDurationMs: Math.max(0, Math.min(1000, Math.round(Number(p.fadeOutDurationMs) || TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs))),
+          hoverDetection: typeof p.hoverDetection === 'string' ? p.hoverDetection : TASKBAR_DIMMER_DEFAULTS.hoverDetection,
+          pollIntervalMs: Math.max(16, Math.min(200, Math.round(Number(p.pollIntervalMs) || TASKBAR_DIMMER_DEFAULTS.pollIntervalMs))),
+        };
+      }
+    }
+    if (cfg && typeof cfg.screen_dimmer_profiles === 'object' && cfg.screen_dimmer_profiles) {
+      // Per-monitor profiles win over the flat legacy fields above (which
+      // stay as the pre-per-monitor format and the primary fallback).
+      for (const key of Object.keys(screenDimmerProfiles)) delete screenDimmerProfiles[key];
+      for (const [key, p] of Object.entries(cfg.screen_dimmer_profiles)) {
+        if (!p || typeof p !== 'object') continue;
+        screenDimmerProfiles[key] = {
+          seconds: Math.max(5, Math.min(180, Math.round(Number(p.seconds) || SCREEN_DIMMER_DEFAULTS.seconds))),
+          opacity: Math.max(0, Math.min(1, Number(p.opacity) || SCREEN_DIMMER_DEFAULTS.opacity)),
+          fadeInDurationMs: Math.max(0, Math.min(5000, Math.round(Number(p.fadeInDurationMs) || SCREEN_DIMMER_DEFAULTS.fadeInDurationMs))),
+          fadeOutDurationMs: Math.max(0, Math.min(5000, Math.round(Number(p.fadeOutDurationMs) || SCREEN_DIMMER_DEFAULTS.fadeOutDurationMs))),
+          fullscreenDetection: typeof p.fullscreenDetection === 'boolean' ? p.fullscreenDetection : SCREEN_DIMMER_DEFAULTS.fullscreenDetection,
+        };
+      }
+    }
+    // Seed/re-key the dimmer profiles now that the config is in (no-op when
+    // the monitor list isn't loaded yet — loadMonitors re-runs it), then
+    // point the tabs' views at the selected monitor's profiles.
+    backfillTaskbarDimmerProfiles();
+    syncTaskbarDimmerView();
+    backfillScreenDimmerProfiles();
+    syncScreenDimmerView();
     if (cfg && (cfg.display_menu_resolution_sort === 'asc' || cfg.display_menu_resolution_sort === 'desc')) displayMenuPrefs.resolutionSort = cfg.display_menu_resolution_sort;
     if (cfg && (cfg.display_menu_resolution_group_by === 'none' || cfg.display_menu_resolution_group_by === 'aspectRatio')) displayMenuPrefs.resolutionGroupBy = cfg.display_menu_resolution_group_by;
     if (cfg && typeof cfg.display_menu_show_tags === 'boolean') displayMenuPrefs.showTags = cfg.display_menu_show_tags;
@@ -974,7 +1233,7 @@ export async function loadConfig(prefetchedCfg = null) {
 // first paint for that is a worse failure than a momentarily-stale dimmer tab.
 export async function initTaskbarDimmerRuntime() {
   try {
-    const status = await invoke('get_taskbar_dimmer_status');
+    const status = await invoke('get_taskbar_dimmer_status', { monitorKey: dimmerMonKey() });
     if (status) taskbarDimmer.available = status.available !== false;
   } catch { taskbarDimmer.available = false; }
   if (!taskbarDimmer.available) {
@@ -986,7 +1245,7 @@ export async function initTaskbarDimmerRuntime() {
     scheduleDimmerAvailabilityRecheck(5, dimmerAvailabilityRetryEpoch);
   }
   try {
-    await invoke('set_taskbar_dimmer', { enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, immediate: true });
+    await invoke('set_taskbar_dimmer', { monitorKey: dimmerMonKey(), enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, immediate: true });
   } catch (e) {
     // Transient failure (the shell can still be settling Shell_TrayWnd right
     // after a tray restart). Do NOT overwrite the loaded toggle state with
@@ -1000,6 +1259,15 @@ export function saveConfig() {
   if (!configLoaded.v) return Promise.resolve();
   persistCurrentBlackLevelProfile();
   const blackLiftProfiles = Object.fromEntries(Object.entries(crush.blackProfiles).map(([key, value]) => [key, clampAdjustment(value) / 10]));
+  // The primary monitor's Taskbar Dimmer profile, used to keep the legacy
+  // flat taskbar_dimmer_* fields in sync (the tray menu reads those as its
+  // no-selector fallback). Falls back to the active monitor's view when the
+  // primary is unknown.
+  const primaryMon = monitors.find((m) => m.primary) || null;
+  const primaryDimmerKey = primaryMon ? dimmerMonKey(primaryMon) : '';
+  const primaryDimmerProfile = primaryDimmerKey ? taskbarDimmerProfiles[primaryDimmerKey] : null;
+  const primaryScreenDimmerKey = primaryMon ? dimmerMonKey(primaryMon) : '';
+  const primaryScreenDimmerProfile = primaryScreenDimmerKey ? screenDimmerProfiles[primaryScreenDimmerKey] : null;
   return invoke('save_config', { config: {
     black_lift: crush.adjustment / 10,
     black_lift_profiles: blackLiftProfiles,
@@ -1020,19 +1288,29 @@ export function saveConfig() {
     ),
     active_monitor_sig: activeMonitor.mon ? activeMonitor.mon.sig : '',
     screen_protector_enabled: screenDimmer.enabled,
-    screen_protector_seconds: screenDimmer.seconds,
-    screen_protector_opacity: screenDimmer.opacity,
-    screen_protector_fade_in_duration_ms: screenDimmer.fadeInDurationMs,
-    screen_protector_fade_out_duration_ms: screenDimmer.fadeOutDurationMs,
+    // The flat screen protector fields stay in sync with the PRIMARY
+    // monitor's profile (the no-selector paths read these as fallback and
+    // the backend seeds the primary from them at startup). The per-monitor
+    // map below is the source of truth for every monitor.
+    screen_protector_seconds: primaryScreenDimmerProfile?.seconds ?? screenDimmer.seconds,
+    screen_protector_opacity: primaryScreenDimmerProfile?.opacity ?? screenDimmer.opacity,
+    screen_protector_fade_in_duration_ms: primaryScreenDimmerProfile?.fadeInDurationMs ?? screenDimmer.fadeInDurationMs,
+    screen_protector_fade_out_duration_ms: primaryScreenDimmerProfile?.fadeOutDurationMs ?? screenDimmer.fadeOutDurationMs,
     screen_protector_fade_linked: screenDimmer.fadeLinked,
-    screen_protector_fullscreen_detection: screenDimmer.fullscreenDetection,
+    screen_protector_fullscreen_detection: primaryScreenDimmerProfile?.fullscreenDetection ?? screenDimmer.fullscreenDetection,
+    screen_dimmer_profiles: { ...screenDimmerProfiles },
     always_elevated: appSettings.alwaysElevated,
-    taskbar_dimmer_opacity: taskbarDimmer.opacity,
-    taskbar_dimmer_fade_in_duration_ms: taskbarDimmer.fadeInDurationMs,
-    taskbar_dimmer_fade_out_duration_ms: taskbarDimmer.fadeOutDurationMs,
+    // The flat legacy fields stay in sync with the PRIMARY monitor's profile
+    // (the tray menu, which has no monitor selector, reads these as its
+    // fallback and the backend seeds the primary from them at startup). The
+    // per-monitor map below is the source of truth for every monitor.
+    taskbar_dimmer_opacity: primaryDimmerProfile?.opacity ?? taskbarDimmer.opacity,
+    taskbar_dimmer_fade_in_duration_ms: primaryDimmerProfile?.fadeInDurationMs ?? taskbarDimmer.fadeInDurationMs,
+    taskbar_dimmer_fade_out_duration_ms: primaryDimmerProfile?.fadeOutDurationMs ?? taskbarDimmer.fadeOutDurationMs,
     taskbar_dimmer_fade_linked: taskbarDimmer.fadeLinked,
-    taskbar_dimmer_hover_detection: taskbarDimmer.hoverDetection || 'event',
-    taskbar_dimmer_poll_interval_ms: taskbarDimmer.pollIntervalMs,
+    taskbar_dimmer_hover_detection: primaryDimmerProfile?.hoverDetection ?? (taskbarDimmer.hoverDetection || 'event'),
+    taskbar_dimmer_poll_interval_ms: primaryDimmerProfile?.pollIntervalMs ?? taskbarDimmer.pollIntervalMs,
+    taskbar_dimmer_profiles: { ...taskbarDimmerProfiles },
     display_menu_resolution_sort: displayMenuPrefs.resolutionSort,
     display_menu_resolution_group_by: displayMenuPrefs.resolutionGroupBy,
     display_menu_show_tags: displayMenuPrefs.showTags,
@@ -1053,47 +1331,60 @@ export function saveConfig() {
   });
 }
 
+// Persist the active monitor's Screen Dimmer profile from the current view
+// fields, then push it (plus the global master toggle) to the backend.
+// `persist` triggers a config save; slider drags pass false and the change
+// handler commits once.
+export function setScreenDimmer(
+  enabled = screenDimmer.enabled,
+  seconds = screenDimmer.seconds,
+  opacity = screenDimmer.opacity,
+  fadeInDurationMs = screenDimmer.fadeInDurationMs,
+  fadeOutDurationMs = screenDimmer.fadeOutDurationMs,
+  fullscreenDetection = screenDimmer.fullscreenDetection,
+  persist = false
+) {
+  const profile = currentScreenDimmerProfile();
+  if (profile) {
+    profile.seconds = seconds;
+    profile.opacity = opacity;
+    profile.fadeInDurationMs = fadeInDurationMs;
+    profile.fadeOutDurationMs = fadeOutDurationMs;
+    profile.fullscreenDetection = fullscreenDetection;
+  }
+  const promise = invoke('power_set_screen_protector', {
+    monitorKey: dimmerMonKey(),
+    enabled,
+    seconds,
+    opacity,
+    fadeInDurationMs,
+    fadeOutDurationMs,
+    fullscreenDetection,
+  });
+  if (persist) {
+    promise.then(saveConfig).catch(() => {});
+  }
+  return promise;
+}
+
 export async function setScreenDimmerEnabled(enabled, tab = app.activeTab) {
   if (!enabled) {
     screenDimmer.enabled = false;
-    await invoke('power_set_screen_protector', {
-      enabled: false,
-      seconds: screenDimmer.seconds,
-      opacity: screenDimmer.opacity,
-      fadeInDurationMs: screenDimmer.fadeInDurationMs,
-      fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
-      fullscreenDetection: screenDimmer.fullscreenDetection,
-    });
-    await saveConfig();
+    await setScreenDimmer(false, screenDimmer.seconds, screenDimmer.opacity, screenDimmer.fadeInDurationMs, screenDimmer.fadeOutDurationMs, screenDimmer.fullscreenDetection, true);
     return;
   }
 
   const elevated = await invoke('is_process_elevated');
   screenDimmer.enabled = true;
   if (elevated) {
-    await invoke('power_set_screen_protector', {
-      enabled: true,
-      seconds: screenDimmer.seconds,
-      opacity: screenDimmer.opacity,
-      fadeInDurationMs: screenDimmer.fadeInDurationMs,
-      fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
-      fullscreenDetection: screenDimmer.fullscreenDetection,
-    });
-    await saveConfig();
+    await setScreenDimmer(true, screenDimmer.seconds, screenDimmer.opacity, screenDimmer.fadeInDurationMs, screenDimmer.fadeOutDurationMs, screenDimmer.fullscreenDetection, true);
     return;
   }
 
   // Record the enabled state in the backend too, so the tab's state poll
   // keeps the toggle on even before the relaunch lands (the backend never
   // starts the watcher in a non-elevated session, it only records the flag).
-  await invoke('power_set_screen_protector', {
-    enabled: true,
-    seconds: screenDimmer.seconds,
-    opacity: screenDimmer.opacity,
-    fadeInDurationMs: screenDimmer.fadeInDurationMs,
-    fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
-    fullscreenDetection: screenDimmer.fullscreenDetection,
-  }).catch(() => {});
+  await setScreenDimmer(true, screenDimmer.seconds, screenDimmer.opacity, screenDimmer.fadeInDurationMs, screenDimmer.fadeOutDurationMs, screenDimmer.fullscreenDetection, false).catch(() => {});
   // Save before the UAC relaunch so the elevated replacement has the same
   // settings even if the old frontend closes before its normal save cycle.
   await saveConfig();
@@ -1150,6 +1441,9 @@ let taskbarDimmerUpdateVersion = 0;
 let taskbarDimmerSaveQueued = false;
 function emitTaskbarDimmerChanged() {
   emit('taskbar-dimmer-changed', {
+    // monitorKey lets the tray menu (which is primary-scoped) ignore edits
+    // made to secondary monitors.
+    monitorKey: dimmerMonKey(),
     enabled: taskbarDimmer.enabled,
     opacity: taskbarDimmer.opacity,
     fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
@@ -1169,7 +1463,7 @@ function flushTaskbarDimmerUpdate() {
   }
   pendingTaskbarDimmerUpdate = null;
   taskbarDimmerUpdateInFlight = true;
-  invoke('set_taskbar_dimmer', { enabled: update.enabled, opacity: update.opacity, fadeInDurationMs: update.fadeInDurationMs, fadeOutDurationMs: update.fadeOutDurationMs, immediate: update.immediate })
+  invoke('set_taskbar_dimmer', { monitorKey: update.monitorKey, enabled: update.enabled, opacity: update.opacity, fadeInDurationMs: update.fadeInDurationMs, fadeOutDurationMs: update.fadeOutDurationMs, immediate: update.immediate })
     .then(() => {
       if (update.version === taskbarDimmerUpdateVersion) {
         // This is the latest update; it owns the save decision. Also honor a
@@ -1206,8 +1500,17 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
   taskbarDimmer.opacity = Math.max(0, Math.min(1, opacity));
   taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(fadeInDurationMs)));
   taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(fadeOutDurationMs)));
+  // Persist the edit into the active monitor's profile. The master enabled
+  // toggle stays global (one switch for every taskbar); the per-monitor
+  // settings are what vary.
+  const profile = currentDimmerProfile();
+  if (profile) {
+    profile.opacity = taskbarDimmer.opacity;
+    profile.fadeInDurationMs = taskbarDimmer.fadeInDurationMs;
+    profile.fadeOutDurationMs = taskbarDimmer.fadeOutDurationMs;
+  }
   taskbarDimmerUpdateVersion++;
-  pendingTaskbarDimmerUpdate = { enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, persist, immediate, version: taskbarDimmerUpdateVersion };
+  pendingTaskbarDimmerUpdate = { monitorKey: dimmerMonKey(), enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, persist, immediate, version: taskbarDimmerUpdateVersion };
   flushTaskbarDimmerUpdate();
 }
 export function restoreTaskbarDimmerDefaults() {
@@ -1216,6 +1519,13 @@ export function restoreTaskbarDimmerDefaults() {
   taskbarDimmer.fadeInDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs;
   taskbarDimmer.fadeOutDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs;
   taskbarDimmer.fadeLinked = TASKBAR_DIMMER_DEFAULTS.fadeLinked;
+  // Reset the active monitor's profile entry to the canonical defaults.
+  const profile = currentDimmerProfile();
+  if (profile) {
+    profile.opacity = TASKBAR_DIMMER_DEFAULTS.opacity;
+    profile.fadeInDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs;
+    profile.fadeOutDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs;
+  }
   setHoverDetection(TASKBAR_DIMMER_DEFAULTS.hoverDetection);
   setPollIntervalMs(TASKBAR_DIMMER_DEFAULTS.pollIntervalMs);
   setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeOutDurationMs, true, true);
@@ -1253,7 +1563,7 @@ function scheduleDimmerAvailabilityRecheck(attemptsLeft, epoch) {
   const delayMs = 1000 * (6 - attemptsLeft);
   dimmerAvailabilityRetryTimer = setTimeout(() => {
     dimmerAvailabilityRetryTimer = null;
-    invoke('get_taskbar_dimmer_status')
+    invoke('get_taskbar_dimmer_status', { monitorKey: dimmerMonKey() })
       .then((status) => {
         if (epoch !== dimmerAvailabilityRetryEpoch) return;
         if (status && status.available) {
@@ -1294,20 +1604,26 @@ export function setDimmerSuspendedForFullscreen(suspended) { invoke('set_taskbar
 export function setHoverDetection(mode) {
   const previous = taskbarDimmer.hoverDetection;
   taskbarDimmer.hoverDetection = mode;
+  // Persist into the active monitor's profile (Detection Method is per
+  // monitor, like the other dimmer settings).
+  const profile = currentDimmerProfile();
+  if (profile) profile.hoverDetection = mode;
   Object.assign(dimmerDetections, detectionDefaultsForMode(mode));
-  invoke('set_taskbar_dimmer_hover_mode', { mode }).catch((e) => { console.warn('[hover-detection] toggle failed', e); taskbarDimmer.hoverDetection = previous; Object.assign(dimmerDetections, detectionDefaultsForMode(previous)); });
+  invoke('set_taskbar_dimmer_hover_mode', { monitorKey: dimmerMonKey(), mode }).catch((e) => { console.warn('[hover-detection] toggle failed', e); taskbarDimmer.hoverDetection = previous; if (profile) profile.hoverDetection = previous; Object.assign(dimmerDetections, detectionDefaultsForMode(previous)); });
 }
 let pollIntervalSaveTimer = null;
 let pollIntervalInvokeTimer = null;
 export function setPollIntervalMs(ms) {
   const clamped = Math.max(16, Math.min(200, Math.round(ms)));
   taskbarDimmer.pollIntervalMs = clamped;
+  const profile = currentDimmerProfile();
+  if (profile) profile.pollIntervalMs = clamped;
   // Debounce the IPC call too: the slider fires on every input event during a
   // drag, and the polling cadence only matters once the user settles on one.
   clearTimeout(pollIntervalInvokeTimer);
   pollIntervalInvokeTimer = setTimeout(() => {
     pollIntervalInvokeTimer = null;
-    invoke('set_taskbar_dimmer_poll_interval', { ms: clamped }).catch((e) => console.warn('[poll-interval] update failed', e));
+    invoke('set_taskbar_dimmer_poll_interval', { monitorKey: dimmerMonKey(), ms: clamped }).catch((e) => console.warn('[poll-interval] update failed', e));
   }, 150);
   clearTimeout(pollIntervalSaveTimer);
   pollIntervalSaveTimer = setTimeout(() => saveConfig(), 400);

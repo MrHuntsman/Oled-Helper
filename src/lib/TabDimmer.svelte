@@ -4,7 +4,16 @@
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
   import ShieldBadge from './ShieldBadge.svelte';
-  import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs, SCREEN_DIMMER_DEFAULTS } from './stores.svelte.js';
+  import ScreenDimmerState from './ScreenDimmerState.svelte';
+  import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
+
+  // The heading tag showing which monitor this tab's settings apply to (the
+  // one selected in the top-bar monitor selector), labeled like the selector.
+  const dimmerMonitorTagLabel = $derived(
+    activeMonitor.mon
+      ? activeMonitor.mon.friendly_name || `Monitor ${monitors.indexOf(activeMonitor.mon) + 1}`
+      : ''
+  );
 
   let { screen = false } = $props();
   let screenError = $state('');
@@ -25,31 +34,35 @@
     screenDimmer.opacity = Math.max(0, Math.min(1, Number(screenDimmer.opacity) || 0));
     screenDimmer.fadeInDurationMs = Math.max(0, Math.min(5000, Math.round(Number(screenDimmer.fadeInDurationMs) || 0)));
     screenDimmer.fadeOutDurationMs = Math.max(0, Math.min(5000, Math.round(Number(screenDimmer.fadeOutDurationMs) || 0)));
-    invoke('power_set_screen_protector', {
-      enabled: screenDimmer.enabled,
-      seconds: screenDimmer.seconds,
-      opacity: screenDimmer.opacity,
-      fadeInDurationMs: screenDimmer.fadeInDurationMs,
-      fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
-      fullscreenDetection: screenDimmer.fullscreenDetection,
-    }).catch((e) => {
+    // Writes the active monitor's profile (the sliders edit the selected
+    // monitor) and pushes it to the backend; the master toggle is global.
+    setScreenDimmer(
+      screenDimmer.enabled,
+      screenDimmer.seconds,
+      screenDimmer.opacity,
+      screenDimmer.fadeInDurationMs,
+      screenDimmer.fadeOutDurationMs,
+      screenDimmer.fullscreenDetection,
+      persist
+    ).catch((e) => {
       screenError = String(e);
       console.warn('[screen-dimmer] apply failed', e);
     });
-    if (persist) saveConfig();
   }
 
   async function refreshScreenDimmer() {
     try {
-      const state = await invoke('power_get_state');
+      // Per-monitor status read: the poll targets the currently selected
+      // monitor, whose profile the sliders edit.
+      const state = await invoke('power_get_screen_dimmer_status', { monitorKey: dimmerMonKey() });
       if (!screenTimeoutDragging) {
-        screenDimmer.enabled = state.screen_protector_enabled === true;
-        screenDimmer.seconds = state.screen_protector_seconds;
+        screenDimmer.enabled = state.enabled === true;
+        screenDimmer.seconds = state.seconds;
       }
-      if (!screenOpacityDragging) screenDimmer.opacity = state.screen_protector_opacity;
-      if (!screenFadeInDragging) screenDimmer.fadeInDurationMs = state.screen_protector_fade_in_duration_ms;
-      if (!screenFadeOutDragging) screenDimmer.fadeOutDurationMs = state.screen_protector_fade_out_duration_ms;
-      screenDimmer.fullscreenDetection = state.screen_protector_fullscreen_detection === true;
+      if (!screenOpacityDragging) screenDimmer.opacity = state.opacity;
+      if (!screenFadeInDragging) screenDimmer.fadeInDurationMs = state.fade_in_duration_ms;
+      if (!screenFadeOutDragging) screenDimmer.fadeOutDurationMs = state.fade_out_duration_ms;
+      screenDimmer.fullscreenDetection = state.fullscreen_detection === true;
       screenError = '';
     } catch (e) {
       screenError = String(e);
@@ -58,6 +71,9 @@
   }
 
   function restoreScreenDimmerDefaults() {
+    // Reset the ACTIVE monitor's profile to the canonical defaults. The
+    // master toggle is global, and like the Taskbar Dimmer's restore it is
+    // reset too (a full restore of the tab's defaults).
     screenDimmer.enabled = SCREEN_DIMMER_DEFAULTS.enabled;
     screenDimmer.seconds = SCREEN_DIMMER_DEFAULTS.seconds;
     screenDimmer.opacity = SCREEN_DIMMER_DEFAULTS.opacity;
@@ -159,6 +175,15 @@
     refreshScreenDimmer();
     const poll = setInterval(refreshScreenDimmer, 3000);
     return () => clearInterval(poll);
+  });
+
+  // When the monitor selector changes while this tab is open, reload the
+  // sliders from the newly selected monitor's profile before the next poll.
+  // dimmerMonKey() reads activeMonitor.mon, so this re-runs on switch.
+  $effect(() => {
+    if (!screen) return;
+    dimmerMonKey();
+    syncScreenDimmerView();
   });
 
   $effect(() => {
@@ -363,6 +388,9 @@
         <div class="tab-heading-titles">
           <div class="tab-heading-title-row">
             <h2>Screen Dimmer</h2>
+            {#if dimmerMonitorTagLabel}
+              <span class="tab-monitor-tag">{dimmerMonitorTagLabel}</span>
+            {/if}
           </div>
           <span class="subtitle">Dims the display after inactivity to reduce static OLED content.</span>
         </div>
@@ -373,6 +401,8 @@
       <button class="restore-defaults-btn" onclick={restoreScreenDimmerDefaults}>↻ Restore Tab Defaults</button>
     </div>
     <div class="separator"></div>
+
+    <ScreenDimmerState />
 
     {#if screenError}
       <p class="power-error" role="alert">⚠ {screenError}</p>
@@ -490,8 +520,11 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Taskbar Dimmer</h2>
+          {#if dimmerMonitorTagLabel}
+            <span class="tab-monitor-tag">{dimmerMonitorTagLabel}</span>
+          {/if}
         </div>
-        <span class="subtitle">Adds a dark overlay over the taskbar.</span>
+        <span class="subtitle">Adds a dark overlay over the selected monitor's taskbar.</span>
       </div>
       <div class="tab-heading-spacer"></div>
       <span class={`pill${taskbarDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>

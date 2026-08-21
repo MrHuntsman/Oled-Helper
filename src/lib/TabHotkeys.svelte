@@ -176,6 +176,7 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Hotkeys</h2>
+          <span class="tab-monitor-tag">Global</span>
         </div>
         <span class="subtitle">Global shortcuts for the app's main features.</span>
       </div>

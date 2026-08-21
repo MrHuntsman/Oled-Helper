@@ -156,7 +156,22 @@ pub(crate) fn gamma_safety_loop(
         apply_screen_gamma_ramps(&desired, &per_monitor, &brightness, false);
         let global_lift = desired.load(Ordering::Relaxed);
         if global_lift != 0 {
-            let ramp = crate::gamma_ramp::build_ramp(global_lift);
+            // The global Black Crush fallback targets the primary display
+            // (GetDC(None)). Compose the primary's current screen-dimmer
+            // brightness into it, otherwise this safety tick would overwrite
+            // the primary's dimmed ramp with a full-brightness one every
+            // five seconds and the dim would vanish. At full brightness
+            // (dim off) build_dimmed_ramp equals build_ramp, so the
+            // fallback behavior is unchanged for the plain Black Crush case.
+            let primary_brightness = crate::monitors::all_monitors()
+                .iter()
+                .find(|m| m.primary)
+                .and_then(|m| brightness.get(&m.sig()).copied())
+                .unwrap_or(1000);
+            let ramp = crate::gamma_ramp::build_dimmed_ramp(
+                global_lift,
+                primary_brightness.min(1000) as f32 / 1000.0,
+            );
             unsafe {
                 let _ = crate::gamma_ramp::set_display_ramp(&ramp);
             }

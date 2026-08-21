@@ -19,6 +19,10 @@
   let fontMessage = $state('');
   let fontError = $state('');
   let fontProgress = $state(''); // live phase text while download/apply runs
+  // True only right after an actual apply (until the selection changes or
+  // the tab is reopened). The button reads "Applied ✓" just for this window;
+  // the auto-selected applied font on its own must not show it forever.
+  let fontJustApplied = $state(false);
   let downloadCatalog = $state([]); // [{ key, family, license, description, filter }]
   let selectedDownloadKey = $state('');
   let unlistenFontProgress = null;
@@ -33,9 +37,16 @@
 
   onMount(async () => {
     // Fast path first: status is a local read, so it renders immediately
-    // instead of waiting for the slow calls below.
+    // instead of waiting for the slow calls below. The backend derives
+    // needsRestart from whether a boot-time swap is still staged, so the
+    // restart prompt survives tab switches and app restarts until reboot.
     try {
-      fontStatus = await invoke('font_get_status');
+      const status = await invoke('font_get_status');
+      fontStatus = {
+        elevated: status.elevated,
+        applied: status.applied,
+        needsRestart: status.needs_restart === true,
+      };
     } catch (e) {
       console.warn('[font] status failed', e);
     }
@@ -359,18 +370,21 @@
     const catalog = downloadCatalog.find((c) => c.family.localeCompare(applied, undefined, { sensitivity: 'base' }) === 0);
     return catalog ? catalogPreviewFont(catalog.key) : '';
   });
-  // True when the current selection is the font already applied to Windows,
-  // which turns the Apply button into a read-only Applied state.
+  // True when the current selection is the font already applied to Windows.
+  // The Apply/Download & apply button is hidden for this state: re-applying
+  // the same font is a no-op, so the only action left is Restart.
   const selectionIsApplied = $derived(
     (selectedFontPath !== '' && isAppliedFont(selectedInstalledFamily)) ||
     (selectedDownloadKey !== '' && isAppliedFont(selectedDownloadFamily))
   );
   function onSelectInstalledFont() {
     selectedDownloadKey = '';
+    fontJustApplied = false;
     updateFontPreviewFamily();
   }
   function onSelectDownloadFont() {
     selectedFontPath = '';
+    fontJustApplied = false;
     updateFontPreviewFamily();
   }
   function updateFontPreviewFamily() {
@@ -425,7 +439,8 @@
     try {
       const state = await invoke('font_apply', { primaryPath: selectedFontPath });
       fontStatus = { ...fontStatus, applied: state, needsRestart: true };
-      fontMessage = `Applied "${state.family}". Reboot required to take effect.`;
+      fontJustApplied = true;
+      fontMessage = `Applied "${state.family}".`;
     } catch (e) {
       fontError = String(e);
       console.warn('[font] apply failed', e);
@@ -451,7 +466,8 @@
       await invoke('font_restore');
       // Restore also stages a boot-time swap, so a restart is still needed.
       fontStatus = { ...fontStatus, applied: null, needsRestart: true };
-      fontMessage = 'Restore scheduled. Reboot required to take effect.';
+      fontJustApplied = false;
+      fontMessage = 'Restore scheduled.';
     } catch (e) {
       fontError = String(e);
       console.warn('[font] restore failed', e);
@@ -544,7 +560,8 @@
     try {
       const state = await invoke('font_download_apply', { familyKey: selectedDownloadKey });
       fontStatus = { ...fontStatus, applied: state, needsRestart: true };
-      fontMessage = `Downloaded and applied "${state.family}". Reboot required to take effect.`;
+      fontJustApplied = true;
+      fontMessage = `Downloaded and applied "${state.family}".`;
     } catch (e) {
       fontError = String(e);
       console.warn('[font] download apply failed', e);
@@ -562,6 +579,7 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Windows Font</h2>
+          <span class="tab-monitor-tag">Global</span>
           <span class="text-render-experimental-badge">Experimental</span>
         </div>
         <span class="subtitle">Replace the system UI font</span>
@@ -708,9 +726,13 @@
     {/if}
 
     <div class="font-row">
-      <button class="font-btn font-btn-apply" class:font-btn-applied={selectionIsApplied} disabled={fontBusy || !fontStatus.elevated || (!selectedFontPath && !selectedDownloadKey) || selectionIsApplied} onclick={applySelected}>
-        {fontBusy ? '…' : (selectionIsApplied ? 'Applied ✓' : (selectedDownloadKey ? 'Download & apply' : 'Apply'))}
-      </button>
+      {#if fontJustApplied}
+        <button class="font-btn font-btn-apply font-btn-applied" disabled>Applied ✓</button>
+      {:else if !selectionIsApplied}
+        <button class="font-btn font-btn-apply" disabled={fontBusy || !fontStatus.elevated || (!selectedFontPath && !selectedDownloadKey)} onclick={applySelected}>
+          {fontBusy ? '…' : (selectedDownloadKey ? 'Download & apply' : 'Apply')}
+        </button>
+      {/if}
       {#if fontStatus.needsRestart}
         <button class="font-btn font-btn-restart" bind:this={restartBtnEl} disabled={fontBusy || !fontStatus.elevated} onclick={openRestartConfirm}>
           Restart System
@@ -722,7 +744,17 @@
       <p class="font-progress" role="status">{fontProgress}</p>
     {/if}
     {#if fontMessage}
-      <p class="font-message" role="status">{fontMessage}</p>
+      <p class="font-message" role="status">
+        {fontMessage}
+        {#if fontStatus.needsRestart}
+          <span class="font-restart-warning">Restart required to take effect.</span>
+        {/if}
+      </p>
+    {:else if fontStatus.needsRestart}
+      <!-- Standalone restart warning: shown whenever a boot-time swap is still
+           pending, including after switching tabs (fontMessage is transient
+           local state, needsRestart comes from the backend status). -->
+      <p class="font-restart-warning" role="status">Restart required to take effect.</p>
     {/if}
     {#if fontError}
       <p class="font-error" role="status">{fontError}</p>

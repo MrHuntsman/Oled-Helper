@@ -22,8 +22,9 @@ use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use tauri::Emitter;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
@@ -480,10 +481,13 @@ pub fn power_turn_off_display() -> Result<(), String> {
 const POLL_MS: u64 = 16;
 const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
 // Windows does not broadcast notifications when another process creates or
-// clears a display power request. We only query powercfg while the dimmer is
-// close to activating or already dimmed, so normal bright idle time does not
-// spawn a process every tick. One-second resolution is sufficient because the
-// shortest Screen Dimmer timeout is five seconds.
+// clears a display power request, so the only way to learn the culprit is to
+// query powercfg. The probe spawns a subprocess, so it only runs at the
+// one-second cadence when the dimmer is close to activating or already
+// dimmed (the shortest Screen Dimmer timeout is five seconds), plus on
+// demand whenever a screen-dimmer state readout is open (the diagnostics
+// command sets DIM_DIAGNOSTICS_PROBE on every poll). With no readout open
+// and the dimmer far from a timeout, no process is spawned at all.
 const DISPLAY_REQUEST_CHECK_INTERVAL_MS: u64 = 1000;
 // Gamepad polling cadence while the dimmer is enabled. Controllers are polled
 // at a low rate (not every 16 ms tick) so the DirectInput enumeration stays
@@ -491,6 +495,8 @@ const DISPLAY_REQUEST_CHECK_INTERVAL_MS: u64 = 1000;
 const GAMEPAD_CHECK_INTERVAL_MS: u64 = 100;
 const MIN_SCREEN_PROTECTOR_SECONDS: u32 = 5;
 const MAX_SCREEN_PROTECTOR_SECONDS: u32 = 180;
+// Matches ScreenDimmerProfile::default() / config default_screen_protector_seconds.
+const DEFAULT_SCREEN_PROTECTOR_SECONDS: u32 = 30;
 const DEFAULT_SCREEN_PROTECTOR_OPACITY: u32 = 800;
 const DEFAULT_SCREEN_PROTECTOR_FADE_IN_MS: u32 = 1000;
 const DEFAULT_SCREEN_PROTECTOR_FADE_OUT_MS: u32 = 200;
@@ -510,6 +516,129 @@ static DIM_TIMEOUT_SECONDS: AtomicU32 = AtomicU32::new(30);
 // per-monitor fullscreen check while this is off.
 static DIM_FULLSCREEN_DETECTION: AtomicBool = AtomicBool::new(true);
 static DIM_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+// Per-monitor screen protector settings, keyed by the monitor's stable
+// identity (monitor_id || sig) in the profiles map. One entry per connected
+// monitor; a monitor without an entry uses ScreenDimmerProfile::default().
+// The master enabled toggle stays global (DIM_ENABLED): one switch dims
+// every monitor, while each monitor keeps its own timeout, dim strength,
+// fade durations, and fullscreen suppression.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenDimmerProfile {
+    pub seconds: u32,
+    pub opacity: f64,
+    pub fade_in_duration_ms: u64,
+    pub fade_out_duration_ms: u64,
+    pub fullscreen_detection: bool,
+}
+
+impl Default for ScreenDimmerProfile {
+    fn default() -> Self {
+        // Must match config.rs's default_screen_protector_* helpers and the
+        // UI defaults (SCREEN_DIMMER_DEFAULTS in stores.svelte.js).
+        Self {
+            seconds: 30,
+            opacity: 0.8,
+            fade_in_duration_ms: 1000,
+            fade_out_duration_ms: 200,
+            fullscreen_detection: true,
+        }
+    }
+}
+
+// Live snapshot of the watcher's per-tick state, published for the Debug
+// tab's screen-dimmer readout. Kept in the watcher so the readout reflects
+// exactly what the dimming loop decided, and the expensive powercfg probe
+// cost stays inside the watcher's existing 1s cadence instead of being
+// repeated on every diagnostics poll.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenDimmerDiagnostics {
+    pub enabled: bool,
+    pub dimmed: bool,
+    pub idle_seconds: u64,
+    pub timeout_seconds: u64,
+    pub fullscreen_active: bool,
+    pub display_request_active: bool,
+    // The named culprits (process/driver/service) holding DISPLAY power
+    // requests, so the readout can point at who is keeping the screen awake.
+    pub display_requests: Vec<DisplayRequestInfo>,
+    pub gamepad_active: bool,
+}
+
+static DIM_DIAGNOSTICS: OnceLock<Mutex<ScreenDimmerDiagnostics>> = OnceLock::new();
+
+fn screen_dimmer_diagnostics() -> &'static Mutex<ScreenDimmerDiagnostics> {
+    DIM_DIAGNOSTICS.get_or_init(|| Mutex::new(ScreenDimmerDiagnostics::default()))
+}
+
+// App handle for emitting state-change events to the frontend readout. Set
+// once at startup (mirrors display_info::set_app_handle).
+static DIM_APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub(crate) fn set_app_handle(app: tauri::AppHandle) {
+    let _ = DIM_APP_HANDLE.set(app);
+}
+
+// Fired the moment the dimmed flag flips, so an open readout (Debug or Screen
+// Dimmer tab) can show the state change instantly instead of waiting for its
+// next poll. The event is a notification, the readout still re-reads the full
+// diagnostics snapshot on receipt.
+fn emit_screen_dimmer_state_changed(dimmed: bool) {
+    if let Some(handle) = DIM_APP_HANDLE.get() {
+        let _ = handle.emit("screen-dimmer-state-changed", dimmed);
+    }
+}
+
+// Set by the diagnostics command whenever a screen-dimmer state readout is
+// open, asking the watcher to probe powercfg on its next tick so the culprit
+// list is fresh instead of waiting for the timer to near its end. Consumed
+// by the watcher, so at most one probe per command call.
+static DIM_DIAGNOSTICS_PROBE: AtomicBool = AtomicBool::new(false);
+
+// Per-monitor settings pushed by the frontend, shared by the Tauri commands
+// and the watcher thread.
+static SCREEN_DIMMER_PROFILES: OnceLock<Mutex<HashMap<String, ScreenDimmerProfile>>> = OnceLock::new();
+
+pub(crate) fn screen_dimmer_profiles_map() -> &'static Mutex<HashMap<String, ScreenDimmerProfile>> {
+    SCREEN_DIMMER_PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Resolve the profile key for a monitor. A supplied key wins; otherwise fall
+// back to the primary monitor's stable identity, so callers without a
+// monitor selector (power_get_state, the dim preview) keep operating on the
+// primary monitor.
+fn resolve_profile_key(monitor_key: Option<&str>) -> String {
+    if let Some(key) = monitor_key {
+        let key = key.trim();
+        if !key.is_empty() {
+            return key.to_string();
+        }
+    }
+    for m in crate::monitors::all_monitors() {
+        if m.primary {
+            return if !m.monitor_id.is_empty() {
+                m.monitor_id
+            } else {
+                m.sig()
+            };
+        }
+    }
+    String::new()
+}
+
+// The profile-map key for a connected monitor: EDID id when present, sig
+// fallback. Must match resolve_profile_key / the frontend's dimmerMonKey,
+// or the watcher would look its own profiles up under a different key and
+// fall back to the defaults for every monitor.
+fn monitor_profile_key(monitor: &crate::monitors::AppMonitor) -> String {
+    if !monitor.monitor_id.is_empty() {
+        monitor.monitor_id.clone()
+    } else {
+        monitor.sig()
+    }
+}
 
 // Tick count of the most recent gamepad input. GetLastInputInfo does not see
 // controllers, so the watcher records its own timestamp whenever a polled
@@ -546,24 +675,56 @@ fn idle_seconds() -> u32 {
     kb_mouse_idle.min(gamepad_idle)
 }
 
+// One entry of the DISPLAY section emitted by powercfg /requests: the holder
+// kind ([PROCESS], [DRIVER], [SERVICE]), its path or name, and the reason
+// line that follows it ("Video Wake Lock", possibly localized).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayRequestInfo {
+    pub kind: String,
+    pub process: String,
+    pub reason: String,
+}
+
 // Parse the stable DISPLAY section emitted by powercfg /requests. The section
 // headings remain English even on localized Windows, while the reason text
 // (for example "Video Wake Lock") and some other headings may be localized.
-// Any process or driver entry in DISPLAY means Windows is being asked to keep
-// the display available, regardless of which app made the request.
-fn display_request_from_powercfg_output(output: &str) -> bool {
+// Every entry (process, driver, or service) names the culprit that is asking
+// Windows to keep the display available.
+fn display_requests_from_powercfg_output(output: &str) -> Vec<DisplayRequestInfo> {
+    let mut requests = Vec::new();
     let mut in_display = false;
+    // Entry line (kind + name) waiting for its reason line to complete it.
+    let mut pending: Option<(String, String)> = None;
     for line in output.lines() {
         let trimmed = line.trim().trim_start_matches('\u{feff}');
         if let Some(header) = trimmed.strip_suffix(':') {
             in_display = header.trim().eq_ignore_ascii_case("DISPLAY");
+            pending = None;
             continue;
         }
-        if in_display && trimmed.starts_with('[') && trimmed.contains(']') {
-            return true;
+        if !in_display {
+            continue;
         }
+        if trimmed.starts_with('[') && trimmed.contains(']') {
+            // Entry line: [PROCESS]\\Device\\...\\app.exe (path may itself
+            // contain brackets, so split on the first closing bracket only).
+            let end = trimmed.find(']').unwrap_or(0);
+            let kind = trimmed[1..end].trim().to_string();
+            let name = trimmed[end + 1..].trim().to_string();
+            pending = Some((kind, name));
+        } else if let Some((kind, name)) = pending.take() {
+            let reason = trimmed.to_string();
+            requests.push(DisplayRequestInfo {
+                kind,
+                process: name,
+                reason,
+            });
+        }
+        // A bare text line with no pending entry (for example the localized
+        // "None" placeholder) is ignored.
     }
-    false
+    requests
 }
 
 fn decode_powercfg_output(bytes: &[u8]) -> String {
@@ -592,14 +753,14 @@ fn decode_powercfg_output(bytes: &[u8]) -> String {
 // diagnostic surface, so use it as a conditional, low-rate fallback rather
 // than polling continuously. Capturing output and suppressing the console
 // window keeps this invisible to the user.
-fn display_power_request_active() -> bool {
+fn display_power_requests() -> Vec<DisplayRequestInfo> {
     // /requests and the native request-list query both require elevation on
     // current Windows builds. The Screen Dimmer asks for elevation before it
     // can be enabled, so reaching this branch as a standard-user process is
     // only possible for a legacy config; fail quietly instead of spawning a
     // command that can never succeed.
     if !crate::process::process_is_elevated() {
-        return false;
+        return Vec::new();
     }
     let executable = std::env::var_os("SystemRoot")
         .map(|root| PathBuf::from(root).join("System32").join("powercfg.exe"))
@@ -610,12 +771,12 @@ fn display_power_request_active() -> bool {
         .output();
     let Ok(output) = output else {
         log::debug!("[power] could not execute powercfg /requests");
-        return false;
+        return Vec::new();
     };
     let stdout = decode_powercfg_output(&output.stdout);
     let stderr = decode_powercfg_output(&output.stderr);
-    let mut active = display_request_from_powercfg_output(&stdout)
-        || display_request_from_powercfg_output(&stderr);
+    let mut requests = display_requests_from_powercfg_output(&stdout);
+    requests.extend(display_requests_from_powercfg_output(&stderr));
     if !output.status.success() {
         log::debug!(
             "[power] powercfg /requests exited with {}; stdout={:?}; stderr={:?}",
@@ -629,7 +790,7 @@ fn display_power_request_active() -> bool {
     // return exit code 1 for the slash spelling. Only retry when the first
     // invocation did not produce a display match, so the normal path still
     // launches at most one process per check.
-    if !active && !output.status.success() {
+    if requests.is_empty() && !output.status.success() {
         let fallback = std::process::Command::new(&executable)
             .args(["-requests"])
             .creation_flags(0x0800_0000)
@@ -637,8 +798,8 @@ fn display_power_request_active() -> bool {
         if let Ok(fallback) = fallback {
             let fallback_stdout = decode_powercfg_output(&fallback.stdout);
             let fallback_stderr = decode_powercfg_output(&fallback.stderr);
-            active = display_request_from_powercfg_output(&fallback_stdout)
-                || display_request_from_powercfg_output(&fallback_stderr);
+            requests = display_requests_from_powercfg_output(&fallback_stdout);
+            requests.extend(display_requests_from_powercfg_output(&fallback_stderr));
             if !fallback.status.success() {
                 log::debug!(
                     "[power] powercfg -requests exited with {}; stdout={:?}; stderr={:?}",
@@ -649,7 +810,7 @@ fn display_power_request_active() -> bool {
             }
         }
     }
-    active
+    requests
 }
 
 // Map the linear dim level (0..1000) to an eased brightness factor. The raw
@@ -690,8 +851,12 @@ fn interpolated_level(from: u32, target: u32, elapsed_ms: u128, duration_ms: u32
     (from as f64 + (target as f64 - from as f64) * progress).round() as u32
 }
 
-fn configure_screen_protector(
-    enabled: bool,
+// Write one monitor's screen protector profile (resolved from the optional
+// monitor key, primary fallback) into the shared profiles map, then re-sync
+// the legacy flat statics from the primary monitor's entry so
+// power_get_state (the no-selector status read) keeps returning real values.
+fn write_screen_protector_profile(
+    monitor_key: Option<&str>,
     seconds: u32,
     opacity: f64,
     fade_in_duration_ms: u64,
@@ -699,16 +864,38 @@ fn configure_screen_protector(
     fullscreen_detection: bool,
 ) {
     let opacity = opacity.clamp(0.0, 1.0);
-    DIM_ENABLED.store(enabled, Ordering::Release);
-    DIM_TIMEOUT_SECONDS.store(
-        seconds.clamp(MIN_SCREEN_PROTECTOR_SECONDS, MAX_SCREEN_PROTECTOR_SECONDS),
-        Ordering::Release,
-    );
-    DIM_OPACITY.store((opacity * 1000.0).round() as u32, Ordering::Release);
-    DIM_TARGET_LEVEL.store(dim_level_for_opacity(opacity), Ordering::Release);
-    DIM_FADE_IN_MS.store(fade_in_duration_ms.min(5000) as u32, Ordering::Release);
-    DIM_FADE_OUT_MS.store(fade_out_duration_ms.min(5000) as u32, Ordering::Release);
-    DIM_FULLSCREEN_DETECTION.store(fullscreen_detection, Ordering::Release);
+    let key = resolve_profile_key(monitor_key);
+    {
+        let mut profiles = screen_dimmer_profiles_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = profiles.entry(key).or_default();
+        entry.seconds = seconds.clamp(MIN_SCREEN_PROTECTOR_SECONDS, MAX_SCREEN_PROTECTOR_SECONDS);
+        entry.opacity = opacity;
+        entry.fade_in_duration_ms = fade_in_duration_ms.min(5000);
+        entry.fade_out_duration_ms = fade_out_duration_ms.min(5000);
+        entry.fullscreen_detection = fullscreen_detection;
+    }
+    sync_primary_mirror();
+}
+
+// Mirror the primary monitor's profile into the flat statics that
+// power_get_state and the dim preview read. Keeps the no-selector paths
+// (TabPower's status poll, the Debug-tab preview) operating on the primary.
+fn sync_primary_mirror() {
+    let key = resolve_profile_key(None);
+    let profile = screen_dimmer_profiles_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    DIM_TIMEOUT_SECONDS.store(profile.seconds, Ordering::Release);
+    DIM_OPACITY.store((profile.opacity * 1000.0).round() as u32, Ordering::Release);
+    DIM_TARGET_LEVEL.store(dim_level_for_opacity(profile.opacity), Ordering::Release);
+    DIM_FADE_IN_MS.store(profile.fade_in_duration_ms as u32, Ordering::Release);
+    DIM_FADE_OUT_MS.store(profile.fade_out_duration_ms as u32, Ordering::Release);
+    DIM_FULLSCREEN_DETECTION.store(profile.fullscreen_detection, Ordering::Release);
 }
 
 /*
@@ -1035,6 +1222,8 @@ fn dim_watcher_loop() {
     let mut monitors: Vec<crate::monitors::AppMonitor> = Vec::new();
     let mut fullscreen_by_monitor: HashMap<String, bool> = HashMap::new();
     let mut display_request_active = false;
+    let mut display_requests: Vec<DisplayRequestInfo> = Vec::new();
+    let mut last_published_dimmed = false;
     let mut last_monitor_refresh =
         std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut last_fullscreen_check =
@@ -1055,6 +1244,13 @@ fn dim_watcher_loop() {
             last_monitor_refresh = now;
             fullscreen_by_monitor.clear();
         }
+        // Snapshot the per-monitor profiles once per tick. Each monitor uses
+        // its own timeout, dim strength, fade durations, and fullscreen
+        // suppression; a monitor without an entry falls back to the defaults.
+        let profiles = screen_dimmer_profiles_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         if enabled && last_gamepad_check.elapsed() >= std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS) {
             let active = crate::gamepad::gamepad_input_active();
@@ -1081,8 +1277,16 @@ fn dim_watcher_loop() {
             // so no monitor ever reports fullscreen and the dim runs over
             // fullscreen content like any other.
             fullscreen_by_monitor.clear();
-            if DIM_FULLSCREEN_DETECTION.load(Ordering::Acquire) {
-                for monitor in &monitors {
+            for monitor in &monitors {
+                // Per-monitor fullscreen suppression: only monitors whose
+                // profile keeps detection on are checked, the rest stay
+                // absent from the map so the dim runs over fullscreen
+                // content like any other.
+                let profile = profiles
+                    .get(&monitor_profile_key(monitor))
+                    .cloned()
+                    .unwrap_or_default();
+                if profile.fullscreen_detection {
                     fullscreen_by_monitor.insert(
                         monitor.sig(),
                         crate::taskbar_dimmer::fullscreen_active_on_monitor(monitor.hmonitor),
@@ -1092,9 +1296,22 @@ fn dim_watcher_loop() {
             last_fullscreen_check = now;
         }
 
-        let timeout = DIM_TIMEOUT_SECONDS.load(Ordering::Acquire);
         let idle = idle_seconds();
         let currently_dimmed = levels.values().any(|level| *level < 1000);
+        // The powercfg request probe is system-wide, so it only needs to
+        // know whether ANY monitor is close to its own dim timeout. Use the
+        // shortest effective timeout across connected monitors.
+        let min_timeout = monitors
+            .iter()
+            .filter(|m| !m.device_name.is_empty())
+            .map(|m| {
+                profiles
+                    .get(&monitor_profile_key(m))
+                    .map(|p| p.seconds)
+                    .unwrap_or(DEFAULT_SCREEN_PROTECTOR_SECONDS)
+            })
+            .min()
+            .unwrap_or(DEFAULT_SCREEN_PROTECTOR_SECONDS);
 
         // Low-rate diagnostic so a stuck-bright dimmer can be traced to the
         // keyboard/mouse clock vs the gamepad clock vs fullscreen/requests.
@@ -1112,16 +1329,25 @@ fn dim_watcher_loop() {
             last_idle_diag = now;
         }
         let request_check_needed = enabled
-            && (idle.saturating_add(1) >= timeout || currently_dimmed);
+            && (idle.saturating_add(1) >= min_timeout || currently_dimmed);
+        // A readout is open: the diagnostics command sets this on every poll,
+        // so the culprit appears the moment it exists instead of waiting for
+        // the timer to near its end. With no readout open the flag stays
+        // false and only the near-timeout cadence below spawns a probe. Both
+        // paths share the one-second elapsed gate, so faster readout polling
+        // never spawns more than one subprocess per second.
+        let readout_probe_requested = DIM_DIAGNOSTICS_PROBE.swap(false, Ordering::AcqRel);
         if !enabled {
             display_request_active = false;
+            display_requests.clear();
             last_display_request_check = now
                 - std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS);
-        } else if request_check_needed
-            && last_display_request_check.elapsed()
-                >= std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS)
+        } else if last_display_request_check.elapsed()
+            >= std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS)
+            && (readout_probe_requested || request_check_needed)
         {
-            let request_active = display_power_request_active();
+            let requests = display_power_requests();
+            let request_active = !requests.is_empty();
             if request_active != display_request_active {
                 log::info!(
                     "[power] display power request {}",
@@ -1129,6 +1355,7 @@ fn dim_watcher_loop() {
                 );
             }
             display_request_active = request_active;
+            display_requests = requests;
             last_display_request_check = now;
         }
 
@@ -1141,14 +1368,21 @@ fn dim_watcher_loop() {
             }
             let sig = monitor.sig();
             seen.insert(sig.clone());
+            // This monitor's own profile: its timeout, dim strength, fade
+            // durations, and fullscreen suppression. Looked up by the same
+            // key the frontend writes (monitor_id || sig); missing = defaults.
+            let profile = profiles
+                .get(&monitor_profile_key(monitor))
+                .cloned()
+                .unwrap_or_default();
             let current = levels.get(&sig).copied().unwrap_or(1000);
             let fullscreen = fullscreen_by_monitor.get(&sig).copied().unwrap_or(false);
             let target = if enabled
                 && !fullscreen
                 && !display_request_active
-                && idle >= timeout
+                && idle >= profile.seconds
             {
-                DIM_TARGET_LEVEL.load(Ordering::Acquire)
+                dim_level_for_opacity(profile.opacity)
             } else {
                 1000
             };
@@ -1165,9 +1399,9 @@ fn dim_watcher_loop() {
                 target
             } else {
                 let duration = if target < transition.0 {
-                    DIM_FADE_IN_MS.load(Ordering::Acquire)
+                    profile.fade_in_duration_ms as u32
                 } else {
-                    DIM_FADE_OUT_MS.load(Ordering::Acquire)
+                    profile.fade_out_duration_ms as u32
                 };
                 interpolated_level(
                     transition.0,
@@ -1185,6 +1419,35 @@ fn dim_watcher_loop() {
             // `true` restores all monitors whose fullscreen suppression just
             // ended, while each monitor still receives its own brightness.
             apply_dim_levels(&levels, true);
+        }
+        // Publish the per-tick state for the Debug tab's screen-dimmer
+        // readout. Small struct, one lock; the reasons are derived by the
+        // diagnostics command from this snapshot plus the gamma-path checks.
+        {
+            // `levels` mirrors `next_levels` here (the branch above either
+            // moved `next_levels` into it or left it equal).
+            let dimmed = levels.values().any(|level| *level < 1000);
+            {
+                let mut diag = screen_dimmer_diagnostics()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                diag.enabled = enabled;
+                diag.dimmed = dimmed;
+                diag.idle_seconds = idle as u64;
+                diag.timeout_seconds = min_timeout as u64;
+                diag.fullscreen_active = fullscreen_by_monitor.values().any(|f| *f);
+                diag.display_request_active = display_request_active;
+                diag.display_requests = display_requests.clone();
+                diag.gamepad_active = gamepad_active;
+            }
+            // Notify open readouts the instant the dim state flips, so the
+            // message appears in lockstep with the screen instead of trailing
+            // it by up to a poll interval. Emitted after the snapshot write so
+            // a readout refreshing on this event always reads fresh data.
+            if dimmed != last_published_dimmed {
+                last_published_dimmed = dimmed;
+                emit_screen_dimmer_state_changed(dimmed);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
@@ -1207,11 +1470,7 @@ fn ensure_watcher() {
 
 pub fn init(
     screen_protector_enabled: bool,
-    screen_protector_seconds: u32,
-    screen_protector_opacity: f64,
-    screen_protector_fade_in_duration_ms: u64,
-    screen_protector_fade_out_duration_ms: u64,
-    screen_protector_fullscreen_detection: bool,
+    screen_dimmer_profiles: HashMap<String, ScreenDimmerProfile>,
     gamma_desired: Arc<AtomicI32>,
     gamma_per_monitor: Arc<Mutex<HashMap<String, i32>>>,
     gamma_brightness: Arc<Mutex<HashMap<String, u32>>>,
@@ -1221,14 +1480,19 @@ pub fn init(
         per_monitor: gamma_per_monitor,
         brightness: gamma_brightness,
     });
-    configure_screen_protector(
-        screen_protector_enabled,
-        screen_protector_seconds,
-        screen_protector_opacity,
-        screen_protector_fade_in_duration_ms,
-        screen_protector_fade_out_duration_ms,
-        screen_protector_fullscreen_detection,
-    );
+    // Seed the shared per-monitor profiles map from the persisted config.
+    // lib.rs already migrated legacy flat fields into the primary entry, so
+    // the map here is the source of truth for every monitor.
+    {
+        let mut profiles = screen_dimmer_profiles_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (key, profile) in screen_dimmer_profiles {
+            profiles.insert(key, profile);
+        }
+    }
+    sync_primary_mirror();
+    DIM_ENABLED.store(screen_protector_enabled, Ordering::Release);
     start_watcher_if_elevated(screen_protector_enabled);
 }
 
@@ -1254,14 +1518,16 @@ fn start_watcher_if_elevated(enabled: bool) {
 
 pub fn set_screen_protector(
     enabled: bool,
+    monitor_key: Option<String>,
     seconds: u32,
     opacity: f64,
     fade_in_duration_ms: u64,
     fade_out_duration_ms: u64,
     fullscreen_detection: bool,
 ) {
-    configure_screen_protector(
-        enabled,
+    DIM_ENABLED.store(enabled, Ordering::Release);
+    write_screen_protector_profile(
+        monitor_key.as_deref(),
         seconds,
         opacity,
         fade_in_duration_ms,
@@ -1354,6 +1620,7 @@ pub fn power_set_screensaver(
 
 #[tauri::command]
 pub fn power_set_screen_protector(
+    monitor_key: Option<String>,
     enabled: bool,
     seconds: u32,
     opacity: f64,
@@ -1363,6 +1630,7 @@ pub fn power_set_screen_protector(
 ) -> Result<(), String> {
     set_screen_protector(
         enabled,
+        monitor_key,
         seconds,
         opacity,
         fade_in_duration_ms,
@@ -1372,87 +1640,141 @@ pub fn power_set_screen_protector(
     Ok(())
 }
 
-// Debug helper: preview the screen protector without waiting out the real idle
-// timeout. Uses the same time-based interpolation and cadence as the watcher.
+// Per-monitor status read for the Screen Dimmer tab: returns the resolved
+// monitor's profile plus the global master toggle. Mirrors
+// get_taskbar_dimmer_status; power_get_state keeps returning the primary's
+// values for the no-selector paths (TabPower's poll).
+#[derive(Serialize)]
+pub struct ScreenDimmerStatus {
+    pub enabled: bool,
+    pub seconds: u32,
+    pub opacity: f64,
+    pub fade_in_duration_ms: u64,
+    pub fade_out_duration_ms: u64,
+    pub fullscreen_detection: bool,
+}
+
 #[tauri::command]
-pub fn power_dim_preview() -> Result<(), String> {
-    std::thread::Builder::new()
-        .name("dim-preview".to_string())
-        .spawn(move || {
-            // Make sure the hook-based input clock is running even if the
-            // dimmer itself is disabled, and stop it again afterward if we
-            // were the ones who started it.
-            let owned_hooks = !crate::input_monitor::is_active();
-            if owned_hooks {
-                crate::input_monitor::start();
-            }
-            // The click itself is input; give the mouse-up a short grace so it
-            // does not instantly cancel the preview.
-            let start_input = crate::input_monitor::last_kb_mouse_input_ms();
-            let target_level = DIM_TARGET_LEVEL.load(Ordering::Acquire);
-            let fade_in_duration = DIM_FADE_IN_MS.load(Ordering::Acquire);
-            let fade_started = std::time::Instant::now();
+pub fn power_get_screen_dimmer_status(monitor_key: Option<String>) -> ScreenDimmerStatus {
+    let key = resolve_profile_key(monitor_key.as_deref());
+    let profile = screen_dimmer_profiles_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    ScreenDimmerStatus {
+        enabled: DIM_ENABLED.load(Ordering::Acquire),
+        seconds: profile.seconds,
+        opacity: profile.opacity,
+        fade_in_duration_ms: profile.fade_in_duration_ms,
+        fade_out_duration_ms: profile.fade_out_duration_ms,
+        fullscreen_detection: profile.fullscreen_detection,
+    }
+}
 
-            loop {
-                if crate::input_monitor::last_kb_mouse_input_ms().wrapping_sub(start_input) > 150 {
-                    apply_uniform_dim_level(1000);
-                    if owned_hooks {
-                        crate::input_monitor::stop();
-                    }
-                    log::info!("[power] screen protector preview cancelled by input");
-                    return;
-                }
-                let level = interpolated_level(
-                    1000,
-                    target_level,
-                    fade_started.elapsed().as_millis(),
-                    fade_in_duration,
-                );
-                apply_uniform_dim_level(level);
-                if level == target_level {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-            }
-            log::info!("[power] screen protector preview dimmed; waiting for input");
+// Debug-tab readout: whether the screen dimmer is actively dimming and, if
+// not, what is preventing it. The watcher publishes the per-tick facts
+// (idle/timeout/fullscreen/power request/gamepad); the gamma-path blockers
+// and the elevation state are evaluated live because they live outside the
+// watcher.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenDimmerDiagnosticsView {
+    pub enabled: bool,
+    pub dimmed: bool,
+    pub idle_seconds: u64,
+    pub timeout_seconds: u64,
+    pub fullscreen_active: bool,
+    pub display_request_active: bool,
+    pub display_requests: Vec<DisplayRequestInfo>,
+    pub gamepad_active: bool,
+    pub elevated: bool,
+    pub nvidia_reference_mode: bool,
+    pub hold_compare_active: bool,
+    pub reasons: Vec<String>,
+}
 
-            // Hold dimmed until any input arrives.
-            while crate::input_monitor::last_kb_mouse_input_ms().wrapping_sub(start_input) <= 150 {
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
-            }
+#[tauri::command]
+pub fn power_get_screen_dimmer_diagnostics() -> ScreenDimmerDiagnosticsView {
+    // A readout is being viewed, so ask the watcher for a fresh powercfg
+    // probe on its next tick. The returned snapshot may be up to one poll
+    // old; the next poll (one second later) reflects the probe.
+    DIM_DIAGNOSTICS_PROBE.store(true, Ordering::Release);
+    let snapshot = screen_dimmer_diagnostics()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let enabled = DIM_ENABLED.load(Ordering::Acquire);
+    let elevated = crate::process::process_is_elevated();
+    let nvidia_reference_mode = crate::vendor_info::nvidia_reference_mode_enabled();
+    let hold_compare_active = crate::hotkeys::is_hold_compare_active();
 
-            let fade_out_duration = DIM_FADE_OUT_MS.load(Ordering::Acquire);
-            let restore_started = std::time::Instant::now();
-            loop {
-                let level = interpolated_level(
-                    target_level,
-                    1000,
-                    restore_started.elapsed().as_millis(),
-                    fade_out_duration,
-                );
-                apply_uniform_dim_level(level);
-                if level == 1000 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+    // The reasons a dimmed state is not visible on screen, mirroring the
+    // watcher's own suppression conditions plus the gamma-path early-outs.
+    // "Waiting for idle" is normal behavior, so it is not listed as a reason.
+    let mut reasons = Vec::new();
+    if !enabled {
+        reasons.push("Dimming is turned off".to_string());
+    } else if !elevated {
+        reasons.push("Requires administrator privileges (restart the app elevated)".to_string());
+    } else {
+        if snapshot.fullscreen_active {
+            reasons.push("A fullscreen app is active".to_string());
+        }
+        for request in &snapshot.display_requests {
+            // The path is a Windows device path, so the file name is the last
+            // backslash-separated component (for a plain [DRIVER] name with no
+            // path it is the whole string).
+            let name = std::path::Path::new(&request.process)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&request.process);
+            let mut detail = format!("{name} is keeping the display awake");
+            let reason = request.reason.trim();
+            if !reason.is_empty() && !reason.eq_ignore_ascii_case("none") {
+                detail.push_str(&format!(" ({reason})"));
             }
-            if owned_hooks {
-                crate::input_monitor::stop();
-            }
-            log::info!("[power] screen protector preview restored");
-        })
-        .map_err(|e| format!("could not spawn dim preview thread: {e}"))?;
-    Ok(())
+            reasons.push(detail);
+        }
+        if nvidia_reference_mode {
+            reasons.push("NVIDIA reference mode is enabled".to_string());
+        }
+        if hold_compare_active {
+            reasons.push("A gamma comparison is being held".to_string());
+        }
+    }
+
+    ScreenDimmerDiagnosticsView {
+        enabled,
+        dimmed: snapshot.dimmed,
+        idle_seconds: snapshot.idle_seconds,
+        timeout_seconds: snapshot.timeout_seconds,
+        fullscreen_active: snapshot.fullscreen_active,
+        display_request_active: snapshot.display_request_active,
+        display_requests: snapshot.display_requests.clone(),
+        gamepad_active: snapshot.gamepad_active,
+        elevated,
+        nvidia_reference_mode,
+        hold_compare_active,
+        reasons,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::display_request_from_powercfg_output;
+    // Any entry in the DISPLAY section means a display power request, which
+    // is what the old boolean parser asserted. The vec parser keeps that
+    // contract while also naming the culprit.
+    fn has_display_request(output: &str) -> bool {
+        !super::display_requests_from_powercfg_output(output).is_empty()
+    }
 
     #[test]
     fn detects_display_process_request() {
         let output = "DISPLAY:\n[PROCESS]\\Device\\HarddiskVolume2\\msedge.exe\nVideo Wake Lock\n\nSYSTEM:\nNone\n";
-        assert!(display_request_from_powercfg_output(output));
+        assert!(has_display_request(output));
     }
 
     #[test]
@@ -1465,18 +1787,51 @@ mod tests {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         let decoded = super::decode_powercfg_output(&bytes);
-        assert!(display_request_from_powercfg_output(&decoded));
+        assert!(has_display_request(&decoded));
     }
 
     #[test]
     fn detects_display_driver_request() {
         let output = "DISPLAY:\n[DRIVER] Example display driver\nReason\n";
-        assert!(display_request_from_powercfg_output(output));
+        assert!(has_display_request(output));
     }
 
     #[test]
     fn ignores_empty_display_section() {
         let output = "DISPLAY:\nNinguna\n\nSYSTEM:\n[PROCESS]\\foo.exe\n";
-        assert!(!display_request_from_powercfg_output(output));
+        assert!(!has_display_request(output));
+    }
+
+    #[test]
+    fn extracts_display_request_culprit() {
+        let output = "DISPLAY:\n[PROCESS]\\Device\\HarddiskVolume2\\msedge.exe\nVideo Wake Lock\n\nSYSTEM:\nNone\n";
+        let requests = super::display_requests_from_powercfg_output(output);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].kind, "PROCESS");
+        assert_eq!(requests[0].process, "\\Device\\HarddiskVolume2\\msedge.exe");
+        assert_eq!(requests[0].reason, "Video Wake Lock");
+    }
+
+    #[test]
+    fn extracts_multiple_display_request_culprits() {
+        let output = "DISPLAY:\n[PROCESS]\\app1.exe\nPlaying video\n[DRIVER] Example display driver\nSome reason\n[PROCESS]\\app2.exe\n\nSYSTEM:\nNone\n";
+        let requests = super::display_requests_from_powercfg_output(output);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].kind, "PROCESS");
+        assert_eq!(requests[0].process, "\\app1.exe");
+        assert_eq!(requests[0].reason, "Playing video");
+        assert_eq!(requests[1].kind, "DRIVER");
+        assert_eq!(requests[1].process, "Example display driver");
+        assert_eq!(requests[1].reason, "Some reason");
+        assert_eq!(requests[2].kind, "PROCESS");
+        assert_eq!(requests[2].process, "\\app2.exe");
+        // A trailing entry with no reason line still completes with empty text.
+        assert_eq!(requests[2].reason, "");
+    }
+
+    #[test]
+    fn ignores_other_sections_culprits() {
+        let output = "DISPLAY:\nNone\n\nSYSTEM:\n[PROCESS]\\foo.exe\nAudio\n";
+        assert!(super::display_requests_from_powercfg_output(output).is_empty());
     }
 }

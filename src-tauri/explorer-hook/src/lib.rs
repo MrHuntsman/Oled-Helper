@@ -328,6 +328,47 @@ fn resolve_draw_options(hdc: HDC) -> Option<(u32, u8, u8, [[f32; 2]; 3])> {
     None
 }
 
+// Fallback when a draw's DC cannot be attributed to a monitor: the PRIMARY
+// monitor's entry. Explorer's list views draw through memory DCs that carry
+// bitmaps (GetDeviceCaps reports the selected bitmap's dimensions, not the
+// screen's) and whose WindowFromDC is NULL, so neither the window path nor
+// the caps path matches them. Without this fallback those draws would render
+// with zero knobs while the mode still applies through the global slot — the
+// "grayscale works but boldness doesn't" symptom. The shell's windows live on
+// the primary, so its entry is the sane default; the caller still maps a 0
+// mode to the global mode exactly like a matched entry.
+fn resolve_primary_options() -> Option<(u32, u8, u8, [[f32; 2]; 3])> {
+    let count = state_monitor_count();
+    if count == 0 {
+        return None;
+    }
+    let knobs_of = |boldness: u32, damping: u32| -> (u8, u8) {
+        (boldness.min(30) as u8, damping.min(100) as u8)
+    };
+    let offsets_of = |rx: u32, ry: u32, gx: u32, gy: u32, bx: u32, by: u32| -> [[f32; 2]; 3] {
+        [
+            [f32::from_bits(rx), f32::from_bits(ry)],
+            [f32::from_bits(gx), f32::from_bits(gy)],
+            [f32::from_bits(bx), f32::from_bits(by)],
+        ]
+    };
+    for i in 0..count {
+        if let Some((_, _, _, _, mf, _lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)) =
+            state_monitor_entry(i)
+        {
+            if (mf >> 8) & 1 != 0 {
+                let (b, d) = knobs_of(bd, dm);
+                return Some((mf & 0xFF, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby)));
+            }
+        }
+    }
+    // No primary bit set (stale table from an old build): use entry 0.
+    state_monitor_entry(0).map(|(_, _, _, _, mf, _lcd, _ct, bd, _gm, dm, _fw, srx, sry, sgx, sgy, sbx, sby)| {
+        let (b, d) = knobs_of(bd, dm);
+        (mf & 0xFF, b, d, offsets_of(srx, sry, sgx, sgy, sbx, sby))
+    })
+}
+
 fn report_state(status: u32) {
     let Some(addr) = STATE.get() else {
         return;
@@ -815,16 +856,19 @@ unsafe extern "system" fn try_render_swash(
 ) -> bool {
     let global_mode = state_mode();
     // Per-monitor render options: when enabled, attribute this draw's DC to
-    // a monitor and use its mode + knob triplet; unattributable draws (or
+    // a monitor and use its mode + knob triplet. Unattributable draws (or
     // per-monitor off) fall back to the global mode with NO knob adjustments
-    // (knobs are purely per-monitor now).
+    // (knobs are purely per-monitor now) — except that when the DC cannot be
+    // attributed (Explorer's bitmap-carrying memory DCs), the PRIMARY
+    // monitor's entry stands in so knobs like faux boldness still apply
+    // instead of silently zeroing out.
     let fallback_opts = text_raster::RenderOptions {
         boldness: 0,
         damping: 0,
         subpixel_offsets: None,
     };
     let (mode, opts) = if state_per_monitor_enabled() && global_mode != 0 {
-        match resolve_draw_options(hdc) {
+        match resolve_draw_options(hdc).or_else(resolve_primary_options) {
             Some((m, b, d, offs)) => {
                 // Mode 0 in the table = "no explicit mode" (Default): fall
                 // back to the global mode (the system effective mode, synced

@@ -1405,22 +1405,21 @@
       {/if}
     </div>
     <div class="sidebar-sep" role="separator"></div>
-    <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
-      <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR
-    </button>
-    <div class="sidebar-sep" role="separator"></div>
     <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
       <TabTextIcon class="nav-icon" /> Text Rendering
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'windows-font'} onclick={() => app.activeTab = 'windows-font'}>
-      <TabWindowsFontIcon class="nav-icon" /> Windows Font
+      <TabWindowsFontIcon class="nav-icon" /> Windows Font <span class="nav-global-tag">Global</span>
     </button>
     <div class="sidebar-sep" role="separator"></div>
+    <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
+      <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR <span class="nav-global-tag">Global</span>
+    </button>
     <button class="nav-btn" class:active={app.activeTab === 'power'} onclick={() => app.activeTab = 'power'}>
-      <TabPowerIcon class="nav-icon" /> Power Saving
+      <TabPowerIcon class="nav-icon" /> Power Saving <span class="nav-global-tag">Global</span>
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
-      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
+      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys <span class="nav-global-tag">Global</span>
     </button>
 
     <div class="sidebar-spacer"></div>

@@ -70,7 +70,7 @@
       // rejects a toggle/slider update, never write that failed state to disk.
       const [cfg, status] = await Promise.all([
         invoke('load_config'),
-        invoke('get_taskbar_dimmer_status'),
+        invoke('get_taskbar_dimmer_status', { monitorKey: trayDimmerMonKey() }),
       ]);
       if (saveVersion !== quickInteractionVersion) {
         scheduleTrayDimmerSave();
@@ -104,6 +104,20 @@
           taskbar_dimmer_opacity: dimmerSettings.opacity,
           taskbar_dimmer_fade_in_duration_ms: dimmerSettings.fadeInDurationMs,
           taskbar_dimmer_fade_out_duration_ms: dimmerSettings.fadeOutDurationMs,
+          // Keep the tray's (primary-scoped) edit in the per-monitor map so
+          // the main window and a later startup read it back as a profile.
+          taskbar_dimmer_profiles: {
+            ...(cfg?.taskbar_dimmer_profiles && typeof cfg.taskbar_dimmer_profiles === 'object' ? cfg.taskbar_dimmer_profiles : {}),
+            ...(trayDimmerMonKey() ? {
+              [trayDimmerMonKey()]: {
+                opacity: dimmerSettings.opacity,
+                fadeInDurationMs: dimmerSettings.fadeInDurationMs,
+                fadeOutDurationMs: dimmerSettings.fadeOutDurationMs,
+                hoverDetection: cfg?.taskbar_dimmer_hover_detection || 'event',
+                pollIntervalMs: Number(cfg?.taskbar_dimmer_poll_interval_ms) || 100,
+              },
+            } : {}),
+          },
           black_enabled: trayBlack.enabled,
           black_lift: trayBlack.adjustment / 10,
           black_lift_profiles: blackProfiles,
@@ -140,12 +154,19 @@
   async function loadTaskbarDimmer() {
     const requestVersion = quickInteractionVersion;
     try {
-      const status = await invoke('get_taskbar_dimmer_status');
+      const status = await invoke('get_taskbar_dimmer_status', { monitorKey: trayDimmerMonKey() });
       if (requestVersion === quickInteractionVersion) applyTaskbarDimmerStatus(status);
     } catch (e) {
       taskbarDimmer.available = false;
       console.error('tray-menu: failed to load taskbar dimmer status', e);
     }
+  }
+
+  // The tray menu has no monitor selector: it operates on the primary
+  // monitor's taskbar. Its profile key is the primary's EDID id (what
+  // tray_menu_get_display_info reports), matching the main window's keying.
+  function trayDimmerMonKey() {
+    return String(display?.monitor_id || '').trim();
   }
 
   function toggleTaskbarDimmer() {
@@ -177,6 +198,11 @@
 
   function applyTaskbarDimmerEvent(status) {
     if (!status) return;
+    // The tray menu is primary-scoped: ignore dimmer edits the main window
+    // made on a secondary monitor (their monitorKey won't match the primary's
+    // EDID id the tray reports).
+    const trayKey = String(display?.monitor_id || '').trim();
+    if (trayKey && status.monitorKey && trayKey !== status.monitorKey) return;
     quickInteractionVersion++;
     if (typeof status.enabled === 'boolean') taskbarDimmer.enabled = status.enabled;
     if (typeof status.opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, status.opacity));

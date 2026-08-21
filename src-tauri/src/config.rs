@@ -142,6 +142,13 @@ pub struct AppConfig {
     // fullscreen content too.
     #[serde(default = "default_true")]
     pub screen_protector_fullscreen_detection: bool,
+    // Per-monitor screen dimmer profiles, keyed by the monitor's stable
+    // identity (monitor_id || sig). One entry per connected monitor; a
+    // monitor without an entry falls back to ScreenDimmerProfile::default().
+    // The flat screen_protector_* fields above remain as the legacy/primary
+    // fallback written by older versions and read for migration.
+    #[serde(default)]
+    pub screen_dimmer_profiles: HashMap<String, crate::power::ScreenDimmerProfile>,
     // Whether the app relaunches itself elevated at startup (Settings tab
     // "Always open as administrator"). On by user choice only; a UAC prompt
     // appears before any window when set and the process isn't elevated.
@@ -192,6 +199,13 @@ pub struct AppConfig {
     pub tray_notice_shown: bool,
     #[serde(default = "default_poll_interval")]
     pub taskbar_dimmer_poll_interval_ms: u64,
+    // Per-monitor taskbar dimmer profiles, keyed by the monitor's stable
+    // identity (monitor_id || sig). One entry per connected monitor; a
+    // monitor without an entry falls back to DimmerProfile::default(). The
+    // flat taskbar_dimmer_* fields above remain as the legacy/primary
+    // fallback written by older versions and read for migration.
+    #[serde(default)]
+    pub taskbar_dimmer_profiles: HashMap<String, crate::taskbar_dimmer::DimmerProfile>,
     #[serde(default = "default_resolution_sort")]
     pub display_menu_resolution_sort: String,
     #[serde(default = "default_resolution_group_by")]
@@ -310,6 +324,7 @@ impl Default for AppConfig {
             screen_protector_fade_out_duration_ms: default_screen_protector_fade_out_duration(),
             screen_protector_fade_linked: true,
             screen_protector_fullscreen_detection: true,
+            screen_dimmer_profiles: HashMap::new(),
             always_elevated: false,
             high_nits_min: default_high_nits_min(),
             high_nits_max: None,
@@ -321,6 +336,7 @@ impl Default for AppConfig {
             taskbar_dimmer_fade_linked: true,
             taskbar_dimmer_hover_detection: default_hover_detection(),
             taskbar_dimmer_poll_interval_ms: default_poll_interval(),
+            taskbar_dimmer_profiles: HashMap::new(),
             tray_notice_shown: false,
             display_menu_resolution_sort: default_resolution_sort(),
             display_menu_resolution_group_by: default_resolution_group_by(),

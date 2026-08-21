@@ -7,7 +7,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
-  import { textSettings, saveConfig, activeMonitor, syncTextPerMonitor, syncTextScope, BOLDNESS_MAX } from './stores.svelte.js';
+  import { textSettings, saveConfig, activeMonitor, monitors, syncTextPerMonitor, syncTextScope, BOLDNESS_MAX } from './stores.svelte.js';
 
   let { modalOpen = false, menuOpen = false } = $props();
 
@@ -71,13 +71,30 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled }).catch(() => {});
   }
 
+  // The heading tag showing which monitor this tab's settings apply to (the
+  // one selected in the top-bar monitor selector), labeled like the selector.
+  const monitorTagLabel = $derived(
+    activeMonitor.mon
+      ? activeMonitor.mon.friendly_name || `Monitor ${monitors.indexOf(activeMonitor.mon) + 1}`
+      : ''
+  );
+
+  // The key the per-monitor profiles are stored under: the resolution-
+  // independent EDID device id when available, falling back to the sig
+  // (which embeds the current resolution and changes on every mode switch,
+  // so saving under it would orphan the profile on a hotkey resolution
+  // change). The backend normalizes to the same key.
+  function monKey() {
+    return activeMonitor.mon.monitor_id || activeMonitor.mon.sig;
+  }
+
   // The knob the sliders show: the selected monitor's per-monitor value.
   // Knobs are part of each monitor's profile; before the selector has a
   // monitor (pre-load) there is nothing to edit, so the value is 0. An
   // absent entry means "the defaults": boldness/damping = 0.
   function knobValue(field) {
     if (!activeMonitor.mon) return 0;
-    const k = textSettings.perMonitorKnobs[activeMonitor.mon.sig];
+    const k = textSettings.perMonitorKnobs[monKey()];
     if (k) return k[field];
     return 0;
   }
@@ -108,7 +125,7 @@
   function onKnobInput(field, value) {
     if (!activeMonitor.mon) return;
     const v = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
-    const sig = activeMonitor.mon.sig;
+    const sig = monKey();
     const k = textSettings.perMonitorKnobs[sig]
       || { boldness: 0, damping: 0 };
     k[field] = v;
@@ -177,7 +194,7 @@
   }
 
   function shownMode() {
-    if (activeMonitor.mon) return applicableMode(textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode);
+    if (activeMonitor.mon) return applicableMode(textSettings.perMonitorModes[monKey()] || state.effective_mode);
     return applicableMode(state.effective_mode);
   }
 
@@ -192,7 +209,7 @@
 
   // Assign the selected monitor's mode override.
   function applyMonitorMode(mode) {
-    const sig = activeMonitor.mon.sig;
+    const sig = monKey();
     textSettings.perMonitorModes[sig] = mode;
     // A fresh custom profile starts with all subpixel centers at 0 so the
     // preview renders the mode's default layout until the user tunes them.
@@ -216,7 +233,7 @@
   // when it has none).
   function customOffsets() {
     if (!activeMonitor.mon) return { ...CUSTOM_OFFSET_DEFAULT };
-    return textSettings.perMonitorCustom[activeMonitor.mon.sig] || { ...CUSTOM_OFFSET_DEFAULT };
+    return textSettings.perMonitorCustom[monKey()] || { ...CUSTOM_OFFSET_DEFAULT };
   }
 
   // One axis of the custom subpixel centers.
@@ -230,7 +247,7 @@
   // hook's copy too (same as the fast-drag-to-0 fix in onKnobInput).
   function resetKnobs() {
     if (!activeMonitor.mon) return;
-    const sig = activeMonitor.mon.sig;
+    const sig = monKey();
     delete textSettings.perMonitorKnobs[sig];
     invoke('explorer_hook_set_monitor_knobs', {
       sig,
@@ -247,7 +264,7 @@
   // re-render the preview.
   function resetCustomOffsets() {
     if (!activeMonitor.mon) return;
-    const sig = activeMonitor.mon.sig;
+    const sig = monKey();
     textSettings.perMonitorCustom[sig] = { ...CUSTOM_OFFSET_DEFAULT };
     saveConfig();
     scheduleKnobSync();
@@ -258,7 +275,7 @@
   // and re-render the preview.
   function onCustomInput(axis, value) {
     if (!activeMonitor.mon) return;
-    const sig = activeMonitor.mon.sig;
+    const sig = monKey();
     const v = Math.max(CUSTOM_OFFSET_MIN, Math.min(CUSTOM_OFFSET_MAX, Number(value) || 0));
     const offs = textSettings.perMonitorCustom[sig] || { ...CUSTOM_OFFSET_DEFAULT };
     offs[axis] = v;
@@ -272,7 +289,7 @@
   // or the system default. Custom falls back to the system mode under
   // registry-only scope (see applicableMode).
   function previewMode() {
-    if (activeMonitor.mon) return applicableMode(textSettings.perMonitorModes[activeMonitor.mon.sig] || state.effective_mode);
+    if (activeMonitor.mon) return applicableMode(textSettings.perMonitorModes[monKey()] || state.effective_mode);
     return applicableMode(state.effective_mode);
   }
 
@@ -606,6 +623,7 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Text Rendering</h2>
+          {#if monitorTagLabel}<span class="tab-monitor-tag">{monitorTagLabel}</span>{/if}
           <span class="text-render-experimental-badge">Experimental</span>
         </div>
         <span class="subtitle">ClearType &amp; font smoothing</span>

@@ -148,6 +148,7 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Power Saving</h2>
+          <span class="tab-monitor-tag">Global</span>
         </div>
         <span class="subtitle">Display &amp; screensaver power saving</span>
       </div>
@@ -159,6 +160,9 @@
     <p class="power-error" role="alert">⚠ {error}</p>
   {/if}
 
+  {#if !loaded}
+    <p class="power-loading">Reading Windows power settings…</p>
+  {:else}
   <div class="dimmer-control">
     <div class="dimmer-section-heading">Display</div>
     <div class="dimmer-control-heading">
@@ -230,4 +234,5 @@
     </div>
     <div class="dimmer-scale"><span>1 min</span><span>60 min</span></div>
   </div>
+  {/if}
 </div>
