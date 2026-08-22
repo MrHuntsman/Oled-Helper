@@ -1045,7 +1045,11 @@ fn preview_cache() -> &'static std::sync::Mutex<Option<Vec<FontPreviewSource>>> 
 /// failures return whatever succeeded so the previews degrade gracefully.
 #[tauri::command]
 pub async fn font_preview_sources() -> Vec<FontPreviewSource> {
-    if let Some(cached) = preview_cache().lock().unwrap().as_ref() {
+    if let Some(cached) = preview_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
         return cached.clone();
     }
 
@@ -1100,7 +1104,9 @@ pub async fn font_preview_sources() -> Vec<FontPreviewSource> {
         }
     }
 
-    *preview_cache().lock().unwrap() = Some(sources.clone());
+    *preview_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sources.clone());
     sources
 }
 

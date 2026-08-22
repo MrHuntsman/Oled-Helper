@@ -568,22 +568,58 @@ pub fn tray_menu_get_display_info() -> Result<crate::display_info::DisplayInfo, 
 /// behavior as the native menu's tray:res: handler (tray_menu.rs). hz is
 /// optional: favorites need an exact width×height@hz triple, while the
 /// plain Resolution submenu keeps the display's current refresh rate (same
-/// behavior as tray_menu.rs's tray:res: handler).
+/// behavior as tray_menu.rs's tray:res: handler). monitor_id is the EDID id
+/// of the monitor a favorite was saved on: the change targets that monitor
+/// (like the main app's favorites path) instead of always the primary. The
+/// plain Resolution submenu sends none, so it stays primary-scoped.
 #[tauri::command]
-pub fn tray_menu_set_resolution(app: AppHandle, width: u32, height: u32, hz: Option<u32>) {
+pub fn tray_menu_set_resolution(
+    app: AppHandle,
+    width: u32,
+    height: u32,
+    hz: Option<u32>,
+    monitor_id: Option<String>,
+) {
     std::thread::spawn(move || {
-        let current = crate::display_info::query_current_display();
+        // Resolve the favorite's saved monitor to its GDI device name. A
+        // favorite whose monitor is not currently connected must not be
+        // applied to the primary instead, that would silently change the
+        // wrong display; skip it with a log line, mirroring the main app's
+        // "Monitor not connected" guard.
+        let device_name = match monitor_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => {
+                let resolved = crate::monitors::all_monitors()
+                    .into_iter()
+                    .find(|m| {
+                        !m.monitor_id.is_empty() && m.monitor_id.eq_ignore_ascii_case(id)
+                    })
+                    .map(|m| m.device_name)
+                    .filter(|name| !name.is_empty());
+                if resolved.is_none() {
+                    log::warn!(
+                        "[tray-menu] favorite target monitor {id} is not connected; skipping mode change"
+                    );
+                    return;
+                }
+                resolved
+            }
+            None => None,
+        };
+        // The no-op check must compare against the TARGET monitor's live
+        // mode, not the primary's, so an already-active favorite on a
+        // secondary display does not open a pointless confirmation.
+        let current = match device_name.as_deref() {
+            Some(name) => crate::display_info::query_display_for(name),
+            None => crate::display_info::query_current_display(),
+        };
         let target_hz = hz.unwrap_or_else(|| current.as_ref().map(|d| d.refresh_hz).unwrap_or(0));
-        // The tray resolution list keeps the current refresh rate. Applying
-        // the active width/height again is therefore a guaranteed no-op and
-        // must not open the Keep display mode? confirmation.
         if current
             .as_ref()
             .is_some_and(|d| d.width == width && d.height == height && d.refresh_hz == target_hz)
         {
             return;
         }
-        match crate::display_info::set_resolution(width, height, target_hz, None) {
+        match crate::display_info::set_resolution(width, height, target_hz, device_name) {
             Ok(mode) => {
                 crate::flyout_window::show_after_ready(&app, mode).ok();
             }

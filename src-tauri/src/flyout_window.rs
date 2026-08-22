@@ -2,12 +2,13 @@
 //
 // This used to be a fully hand-painted native Win32 window (~700 lines of raw
 // GDI: manual word-wrap, hand-rolled hit testing, a hardcoded copy of the
-// modal's CSS palette in Rust constants). It is now a second small Tauri
-// WebviewWindow ("flyout") that renders the exact same Svelte modal
-// component/markup as the in-app confirmation (src/lib/Flyout.svelte,
-// sharing app.css), centered on the primary monitor's work area and
-// shown/hidden from here. There is no possibility of the flyout's style
-// drifting from the in-app modal, because it IS the in-app modal's markup.
+// modal's CSS palette in Rust constants). It is now a small Tauri
+// WebviewWindow ("flyout") that renders the confirmation modal from
+// src/lib/Flyout.svelte (sharing app.css), centered on the primary monitor's
+// work area and shown/hidden from here. The flyout is the ONLY mode
+// confirmation UI: every mode change, whether initiated from the visible
+// main window or the tray, routes through show_mode_confirmation or
+// show_after_ready, there is no separate in-app modal markup anymore.
 //
 // The window is built lazily (on first use) with WebviewWindowBuilder rather
 // than declared statically in tauri.conf.json, so builder errors are visible
@@ -163,10 +164,11 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
         .ok_or_else(|| "could not determine final flyout geometry".to_string())?;
     // No SWP_NOACTIVATE on purpose: the confirmation dialog must take
     // keyboard focus so Enter (revert) and Escape (revert) work immediately,
-    // like Windows' own display-mode confirm dialog. Showing with activation
-    // is safe here, the flyout is only ever shown while the main window is
-    // hidden in the tray (the visible-window path uses the in-app modal), so
-    // no other app window loses focus it needs.
+    // like Windows' own display-mode confirm dialog. The flyout is the
+    // confirmation UI for every mode change, including ones started from the
+    // visible main window, so it briefly takes the foreground; that is
+    // exactly what a modal confirmation is supposed to do, and focus returns
+    // to the main window once it hides.
     unsafe {
         SetWindowPos(
             HWND(hwnd.0),
@@ -204,74 +206,6 @@ fn centered_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
 #[cfg(not(target_os = "windows"))]
 fn centered_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
     None
-}
-
-// Waits for the post-mode-change monitor geometry to settle before the flyout
-// is positioned. DEVMODE can report the requested mode as active slightly
-// before Windows updates the monitor/work-area rectangles used by SetWindowPos.
-// This runs on the tray worker, never the Tauri/UI thread. The expected mode
-// dimensions prevent two identical samples of the *old* geometry from being
-// accepted; the second identical sample confirms that the new shell geometry
-// has stopped moving. A bounded fallback keeps a broken/virtual display driver
-// from delaying the confirmation forever.
-#[cfg(target_os = "windows")]
-#[allow(dead_code)]
-pub fn wait_for_display_geometry(width: u32, height: u32) -> bool {
-    const MIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
-    const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
-
-    let started = std::time::Instant::now();
-    std::thread::sleep(MIN_SETTLE);
-    let mut previous: Option<MONITORINFO> = None;
-    while started.elapsed() < TIMEOUT {
-        let current = unsafe {
-            let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
-            if monitor.is_invalid() {
-                None
-            } else {
-                let mut info = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                GetMonitorInfoW(monitor, &mut info)
-                    .as_bool()
-                    .then_some(info)
-            }
-        };
-        if let Some(info) = current {
-            let monitor_width = (info.rcMonitor.right - info.rcMonitor.left) as u32;
-            let monitor_height = (info.rcMonitor.bottom - info.rcMonitor.top) as u32;
-            let matches_requested = monitor_width == width && monitor_height == height;
-            let unchanged = previous
-                .as_ref()
-                .is_some_and(|old| old.rcMonitor == info.rcMonitor && old.rcWork == info.rcWork);
-            if matches_requested && unchanged {
-                log::debug!(
-                    "[flyout] display geometry settled at {}x{} after {}ms",
-                    monitor_width,
-                    monitor_height,
-                    started.elapsed().as_millis()
-                );
-                return true;
-            }
-            previous = Some(info);
-        }
-        std::thread::sleep(SAMPLE_INTERVAL);
-    }
-    log::warn!(
-        "[flyout] display geometry did not settle at {}x{} within {}ms; showing flyout with the latest geometry",
-        width,
-        height,
-        TIMEOUT.as_millis()
-    );
-    false
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-pub fn wait_for_display_geometry(_width: u32, _height: u32) -> bool {
-    true
 }
 
 // Windows 11 applies its own DWM corner rounding to every top-level window
@@ -670,13 +604,27 @@ pub fn show_mode_confirmation(
     refresh_hz: u32,
     monitor_name: Option<String>,
     confirmation_seconds: Option<u32>,
+    confirmation_deadline_ms: Option<u64>,
 ) -> Result<(), String> {
+    let confirmation_seconds = confirmation_seconds.unwrap_or(15);
     let mode = AppliedMode {
         width,
         height,
         refresh_hz,
         monitor_name: monitor_name.unwrap_or_default(),
-        confirmation_seconds: confirmation_seconds.unwrap_or(15),
+        confirmation_seconds,
+        // The authoritative deadline computed by begin_mode_change, forwarded
+        // verbatim so the countdown matches the automatic rollback. Falls
+        // back to a fresh now+seconds deadline for any caller that did not
+        // round-trip an AppliedMode.
+        confirmation_deadline_ms: confirmation_deadline_ms
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+                    + (confirmation_seconds as u64) * 1000
+            }),
     };
     std::thread::spawn(move || {
         if let Err(error) = show_after_ready(&app, mode) {

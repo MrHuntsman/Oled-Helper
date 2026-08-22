@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
 };
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use windows::core::{GUID, PCWSTR};
 
 // Every record goes through the standard `log` facade. The tauri-plugin-log
@@ -1362,6 +1362,14 @@ fn query_native_resolution(target: &DisplayTarget) -> Option<(u32, u32, &'static
     }
 }
 
+// The mode-confirmation window and the automatic rollback must agree on the
+// same deadline. The absolute wall-clock deadline (not a relative duration)
+// is computed once here, used to schedule the rollback thread, and forwarded
+// through AppliedMode to the flyout so its countdown reaches zero at the
+// exact moment the rollback fires, regardless of how long the show handshake
+// took.
+const MODE_CONFIRMATION_SECONDS: u32 = 15;
+
 #[derive(Clone, serde::Serialize)]
 pub struct AppliedMode {
     pub width: u32,
@@ -1369,6 +1377,7 @@ pub struct AppliedMode {
     pub refresh_hz: u32,
     pub monitor_name: String,
     pub confirmation_seconds: u32,
+    pub confirmation_deadline_ms: u64,
 }
 
 #[derive(Clone)]
@@ -1663,8 +1672,15 @@ fn begin_mode_change(
             requested: mode,
         });
     }
+    // Absolute deadline for both the rollback thread and the flyout
+    // countdown, so the confirmation reaches zero at the same moment the
+    // automatic rollback fires even when the show handshake delays the
+    // flyout's first paint.
+    let confirmation_deadline_ms = now_ms() + (MODE_CONFIRMATION_SECONDS as u64) * 1000;
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(
+            confirmation_deadline_ms.saturating_sub(now_ms()),
+        ));
         // Roll back inside a closure so the forced flyout hide below always
         // runs, even on the early-return error paths.
         let rollback = || {
@@ -1731,6 +1747,15 @@ fn begin_mode_change(
         // fallback.
         if let Some(app) = APP_HANDLE.get() {
             crate::flyout_window::hide(app);
+            // The main window only learns the confirmation is over through
+            // the frontend's flyout_hidden -> flyout-completed path, which
+            // never runs when the flyout was shown blank or its webview
+            // wedged. Emit the completion here too so the main window's busy
+            // flags always clear and display info is re-polled, even if the
+            // JS countdown never fired. A duplicate emit alongside the
+            // frontend's own is harmless (the handler just clears flags and
+            // re-polls).
+            let _ = app.emit("flyout-completed", ());
         }
     });
     Ok(AppliedMode {
@@ -1740,7 +1765,8 @@ fn begin_mode_change(
         // Use the same EDID-backed friendly name shown by get_display_info;
         // DeviceString alone may only say "Generic PnP Monitor".
         monitor_name: cached_edid_monitor_name(&target).unwrap_or(target.monitor_name),
-        confirmation_seconds: 15,
+        confirmation_seconds: MODE_CONFIRMATION_SECONDS,
+        confirmation_deadline_ms,
     })
 }
 

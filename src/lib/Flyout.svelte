@@ -1,13 +1,14 @@
 <script>
-  // Standalone tray "Keep display mode?" confirmation, rendered in its own
-  // small always-on-top WebviewWindow (see src-tauri/src/flyout_window.rs).
-  // This is intentionally the SAME markup/classes as the in-app modal in
-  // App.svelte (.modal-backdrop.mode-confirm-backdrop / .modal.mode-confirm-modal)
-  // so the two never visually drift; they share app.css, not a hand-copied
-  // palette. Unlike the in-app modal there is no backdrop click-through
-  // concern (the window IS the modal, sized to fit it exactly), so the
-  // backdrop wrapper is kept only for the shared CSS classes, not for a
-  // dimming overlay.
+  // "Keep display mode?" confirmation, rendered in its own small
+  // always-on-top WebviewWindow (see src-tauri/src/flyout_window.rs). This
+  // is the ONLY mode-confirmation UI: every mode change, from the visible
+  // main window or the tray, routes through this popup. The modal classes
+  // (.modal-backdrop.mode-confirm-backdrop / .modal.mode-confirm-modal)
+  // live in the shared app.css; the old in-app copy of this modal in
+  // App.svelte was removed, so there is nothing to drift from. There is no
+  // backdrop click-through concern (the window IS the modal, sized to fit it
+  // exactly), so the backdrop wrapper is kept only for the shared CSS
+  // classes, not for a dimming overlay.
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
@@ -128,13 +129,20 @@
     });
   }
 
-  function startCountdown(seconds, startedAtMs) {
+  // Counts down to an absolute deadline (ms since epoch) instead of from the
+  // moment this event is received. The backend computes that deadline when it
+  // applies the mode and schedules its automatic rollback for the same
+  // instant, so the countdown reaches zero exactly when the mode reverts, no
+  // matter how long the show handshake delayed the first paint. Without this
+  // the flyout could still show "reverts in 1s" after the mode had already
+  // been restored (and a Keep click in that window silently did nothing).
+  function startCountdown(seconds, deadlineMs) {
     clearTimer();
-    const started = startedAtMs || Date.now();
     remaining = seconds;
     totalSeconds = Math.max(1, seconds);
+    const deadline = deadlineMs || Date.now() + Math.max(1, seconds) * 1000;
     timer = setInterval(() => {
-      const left = Math.max(0, seconds - Math.ceil((Date.now() - started) / 1000));
+      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
       remaining = left;
       if (left <= 0) {
         clearTimer();
@@ -242,7 +250,10 @@
       busy = false;
       visible = false;
       mode = payload;
-      startCountdown(Number(payload?.confirmation_seconds) || 15);
+      startCountdown(
+        Number(payload?.confirmation_seconds) || 15,
+        Number(payload?.confirmation_deadline_ms) || 0,
+      );
       notifyLayoutReady();
       // Safety net: if flyout-shown is ever dropped (IPC hiccup, listener
       // timing), force visibility after a generous timeout so the dialog can

@@ -817,12 +817,46 @@
     });
   }
 
+  // Favorites are scoped to the monitor they were saved on (the main app's
+  // keying: EDID monitor_id first, sig as the legacy fallback). The tray is
+  // primary-scoped, so matching, starring, saving, and removing all compare
+  // against the primary monitor's identity. Without this, favorites added
+  // from the tray were saved unscoped and never matched the main app's
+  // star/dedupe, and same-mode favorites from different monitors collided
+  // as {#each} keys.
+  function trayMonitorIdentity() {
+    return String(display?.monitor_id || '').trim();
+  }
+  function favoriteIdentityOf(fav) {
+    return String(fav?.monitor_id || fav?.monitor_sig || '').trim();
+  }
+  function favoriteMatchKey(fav) {
+    return `${favoriteIdentityOf(fav)}|${favoriteKey(fav)}`;
+  }
+  function newTrayFavoriteId() {
+    try {
+      if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+      }
+    } catch { /* fall through to the local fallback */ }
+    return `fav-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
   function isFavoriteMode(width, height, hz) {
-    return favorites.some((fav) => favoriteKey(fav) === `${width}x${height}@${hz}`);
+    const identity = trayMonitorIdentity();
+    if (!identity) return false;
+    const wanted = `${identity}|${width}x${height}@${hz}`;
+    return favorites.some((fav) => favoriteMatchKey(fav) === wanted);
   }
 
   function requestFavoriteRemove(fav) {
-    pendingFavoriteRemove = { width: fav.width, height: fav.height, hz: fav.hz };
+    pendingFavoriteRemove = {
+      width: fav.width,
+      height: fav.height,
+      hz: fav.hz,
+      monitor_id: fav.monitor_id,
+      monitor_sig: fav.monitor_sig,
+    };
     // Inline confirms replace the row in place, so only close a Resolution/
     // Refresh Rate submenu (which has nothing to do with this favorite).
     // Leave the Favorites submenu open so its own inline confirm row stays
@@ -838,10 +872,10 @@
 
   async function confirmFavoriteRemove() {
     if (!pendingFavoriteRemove) return;
-    const key = favoriteKey(pendingFavoriteRemove);
+    const key = favoriteMatchKey(pendingFavoriteRemove);
     pendingFavoriteRemove = null;
     syncHitRegion();
-    await saveFavorites(favorites.filter((fav) => favoriteKey(fav) !== key));
+    await saveFavorites(favorites.filter((fav) => favoriteMatchKey(fav) !== key));
   }
 
   async function toggleFavoriteMode(width, height, hz) {
@@ -851,7 +885,15 @@
       requestFavoriteRemove(fav);
       return;
     }
-    await saveFavorites([...favorites, fav]);
+    // Save scoped to the primary monitor (the tray's scope), so the main
+    // app's star/dedupe and the tray agree on which modes are favorited.
+    await saveFavorites([...favorites, {
+      ...fav,
+      fav_id: newTrayFavoriteId(),
+      monitor_id: trayMonitorIdentity(),
+      monitor_sig: '',
+      monitor_name: String(display?.monitor_name || ''),
+    }]);
   }
 
   async function pickResolution(res) {
@@ -871,7 +913,15 @@
   async function pickFavorite(fav) {
     if (isCurrentFavorite(fav)) return;
     closeSubmenu();
-    await invoke('tray_menu_set_resolution', { width: fav.width, height: fav.height, hz: fav.hz });
+    // Target the monitor the favorite was saved on (the backend resolves the
+    // EDID id to that display), so a secondary-monitor favorite is never
+    // silently applied to the primary; the backend skips it if disconnected.
+    await invoke('tray_menu_set_resolution', {
+      width: fav.width,
+      height: fav.height,
+      hz: fav.hz,
+      monitorId: fav.monitor_id || null,
+    });
     await invoke('tray_menu_hide');
   }
 
@@ -917,10 +967,13 @@
   }
 
   function isCurrentFavorite(fav) {
+    // A favorite only counts as the active mode on the monitor it was saved
+    // for; the tray compares against the primary monitor's identity.
     return display
       && fav.width === display.width
       && fav.height === display.height
-      && fav.hz === display.refresh_hz;
+      && fav.hz === display.refresh_hz
+      && favoriteIdentityOf(fav) === trayMonitorIdentity();
   }
 
   async function restart() {
@@ -1064,7 +1117,7 @@
           </button>
         </div>
         <div class="tray-menu-header-bottom-row">
-          <div class="tray-menu-header-monitor">v{appVersion || '0.1.1'}</div>
+          <div class="tray-menu-header-monitor">{appVersion ? `v${appVersion}` : ''}</div>
         </div>
       </div>
     </div>
@@ -1109,9 +1162,9 @@
         <span class="tray-item-chevron">›</span>
       </div>
     {:else}
-      {#each favorites as fav (favoriteKey(fav))}
+      {#each favorites as fav (favoriteMatchKey(fav))}
         {@const current = isCurrentFavorite(fav)}
-        {@const confirming = pendingFavoriteRemove !== null && favoriteKey(pendingFavoriteRemove) === favoriteKey(fav)}
+        {@const confirming = pendingFavoriteRemove !== null && favoriteMatchKey(pendingFavoriteRemove) === favoriteMatchKey(fav)}
         {#if confirming}
           <div class="tray-item tray-favorite-item tray-favorite-inline-confirm" role="group" aria-label={`Remove ${favoriteLabel(fav)} from favorites?`}>
             <span class="tray-item-label tray-favorite-inline-confirm-label">Remove {favoriteLabel(fav)}?</span>
@@ -1400,9 +1453,9 @@
 
   {#if openSubmenu === 'favorites' && favorites.length > 3}
     <div class="tray-submenu tray-favorites-submenu" role="menu" tabindex="-1" style="margin-bottom: {submenuLift}px">
-      {#each favorites as fav (favoriteKey(fav))}
+      {#each favorites as fav (favoriteMatchKey(fav))}
         {@const current = isCurrentFavorite(fav)}
-        {@const confirming = pendingFavoriteRemove !== null && favoriteKey(pendingFavoriteRemove) === favoriteKey(fav)}
+        {@const confirming = pendingFavoriteRemove !== null && favoriteMatchKey(pendingFavoriteRemove) === favoriteMatchKey(fav)}
         {#if confirming}
           <div class="tray-item tray-favorite-item tray-favorite-inline-confirm" role="group" aria-label={`Remove ${favoriteLabel(fav)} from favorites?`}>
             <span class="tray-item-label tray-favorite-inline-confirm-label">Remove {favoriteLabel(fav)}?</span>

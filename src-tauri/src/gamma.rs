@@ -84,6 +84,10 @@ pub(crate) fn apply_screen_gamma_ramps(
         .lock()
         .map(|map| map.clone())
         .unwrap_or_default();
+    // Keep the external gamma watchdog's record in step with the state this
+    // helper is about to write. Edge-triggered inside sync, so the every-5s
+    // safety tick never touches the disk after the first transition.
+    crate::gamma_watch::sync(desired.load(Ordering::Relaxed), &values, brightness_by_monitor);
     let primary_fallback = desired.load(Ordering::Relaxed);
     for monitor in crate::monitors::all_monitors() {
         if monitor.device_name.is_empty() {
@@ -205,6 +209,21 @@ pub fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(),
     }
     state.desired.store(black_lift, Ordering::Relaxed);
     crate::hotkeys::update_hold_restore_locked(black_lift);
+    // Reflect the new state in the external gamma watch record (first
+    // non-default transition writes the record and spawns the child).
+    crate::gamma_watch::sync(
+        black_lift,
+        &state
+            .per_monitor
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default(),
+        &state
+            .screen_dim_brightness
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default(),
+    );
     Ok(())
 }
 
@@ -246,5 +265,19 @@ pub fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i
         // could reintroduce an old lift on a monitor intentionally set to 0.
         map.insert(sig, black_lift);
     }
+    // Reflect the new state in the external gamma watch record.
+    crate::gamma_watch::sync(
+        state.desired.load(Ordering::Relaxed),
+        &state
+            .per_monitor
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default(),
+        &state
+            .screen_dim_brightness
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default(),
+    );
     Ok(())
 }

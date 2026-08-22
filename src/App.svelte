@@ -339,6 +339,11 @@
       refreshHz: result.refresh_hz,
       monitorName: result.monitor_name,
       confirmationSeconds: result.confirmation_seconds,
+      // The absolute deadline computed by the backend when the mode was
+      // applied; the flyout counts down to it so the confirmation expires at
+      // the exact moment the automatic rollback fires, no matter how long the
+      // show handshake took.
+      confirmationDeadlineMs: result.confirmation_deadline_ms,
     }).catch((e) => {
       resolutionError = String(e);
       app.displayModeBusy = false;
@@ -1067,7 +1072,6 @@
     let unlisten;
     let unlistenDisplayChanged;
     let unlistenHotkeyPressed;
-    let unlistenTrayMode;
     // The Rust window subclass forwards WM_DISPLAYCHANGE and WM_DEVICECHANGE.
     // Full display-info queries remain event-driven. Vendor control panels can
     // silently change range/VRR, so a separate low-frequency vendor-only
@@ -1187,19 +1191,6 @@
         favoritePendingRemove = fav;
       }
     }).then((stop) => { unlistenFavoriteRemove = stop; }).catch(() => {});
-    // A resolution or refresh rate picked from the tray menu. Runs the same
-    // flow as the in-app dropdowns: save the profile for the mode being left,
-    // apply the new one, show the confirmation popup with the auto-revert
-    // countdown, then re-query so the dropdowns match the new mode.
-    listen('display-mode-applied', (event) => {
-      const mode = event.payload;
-      persistCurrentBlackLevelProfile();
-      if (mode?.width) app.displayInfo.width = mode.width;
-      if (mode?.height) app.displayInfo.height = mode.height;
-      if (mode?.refresh_hz) app.displayInfo.refreshRateHz = mode.refresh_hz;
-      applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
-      showFlyoutConfirmation(mode);
-    }).then((stop) => { unlistenTrayMode = stop; }).catch(() => {});
     // When the flyout confirmation dialog completes (confirm/rollback),
     // clear busy flags and re-poll display info.
     let unlistenFlyoutCompleted;
@@ -1214,7 +1205,6 @@
       clearTimeout(vendorDisplayRefreshTimer);
       unlistenHotkeyPressed?.();
       unlistenFavoriteRemove?.();
-      unlistenTrayMode?.();
       unlistenFlyoutCompleted?.();
       window.removeEventListener('focus', reconcileWindowVisible);
       window.removeEventListener('blur', closeAllMenus);
@@ -1355,7 +1345,7 @@
       <img class="app-icon" src={appIcon} alt="OLED Helper" />
       <div class="title-block">
         <span class="title">OLED HELPER</span>
-        <span class="version">v{appVersion || '0.1.1'}</span>
+        <span class="version">{appVersion ? `v${appVersion}` : ''}</span>
       </div>
     </div>
     <div class="spacer"></div>

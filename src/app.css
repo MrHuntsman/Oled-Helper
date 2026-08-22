@@ -392,18 +392,18 @@ select,
 .nav-item { position: relative; }
 .nav-item .nav-btn { padding-right: 50px; }
 /* Nav switch mirrors the .pill toggle used in tab headings and settings rows
-   exactly (34×18 track, white 14px dot, same on/off colors), so the toggle
-   language is consistent everywhere. */
+   (same on/off colors, rounded capsule, white dot), scaled down so the sidebar
+   stays compact: 26×14 track with a 10px dot instead of the full-size 34×18. */
 .nav-switch {
   position: absolute;
   right: 10px;
   top: 50%;
   transform: translateY(-50%);
-  width: 34px;
-  height: 18px;
+  width: 26px;
+  height: 14px;
   padding: 0;
   border: none;
-  border-radius: 9px;
+  border-radius: 7px;
   background: var(--accent);
   cursor: pointer;
   transition: background 0.12s, filter 0.12s;
@@ -418,20 +418,22 @@ select,
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 14px;
-  height: 14px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   background: #fff;
   transition: left 0.12s;
 }
-.nav-switch.on .nav-switch-thumb { left: 18px; }
+.nav-switch.on .nav-switch-thumb { left: 14px; }
 /* Admin-required warning badge beside the Screen Dimmer nav switch, between
    the label and the switch. Shown only when the dimmer is enabled but the
    session is not elevated; the triangle glyph matches the app's other amber
-   warning icons (see .text-render-explorer-warning). */
+   warning icons (see .text-render-explorer-warning). Right edge tracks the
+   smaller nav switch (26px at right:10px ends at 36px), so 38px keeps the
+   2px gap. */
 .nav-item-shield {
   position: absolute;
-  right: 46px;
+  right: 38px;
   top: 50%;
   transform: translateY(-50%);
   color: #E0A93C;

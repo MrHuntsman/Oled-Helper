@@ -6,6 +6,7 @@ mod font_replacement;
 mod gamepad;
 mod gamma;
 mod gamma_ramp;
+mod gamma_watch;
 mod hdr_toggle;
 mod hotkeys;
 mod input_monitor;
@@ -421,7 +422,17 @@ pub(crate) fn show_main_window(app: &AppHandle) {
     }
 }
 
+// The exit paths can observe the same shutdown twice: request_shutdown_and_exit
+// runs the sequence explicitly, then app.exit(0) destroys the main window,
+// whose Destroyed handler runs it again. The module shutdowns are individually
+// idempotent, and this flag makes the whole gamma teardown (ramp reset, vendor
+// session release, config worker join, watch-record removal) run exactly once.
+static GAMMA_SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
+    if GAMMA_SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
     let state = app.state::<gamma::GammaState>();
     state.shutdown.requested.store(true, Ordering::Release);
     state.shutdown.wake.notify_one();
@@ -437,6 +448,10 @@ pub(crate) fn shutdown_gamma_worker(app: &AppHandle) {
         gamma_ramp::reset_display_ramp();
         gamma::reset_per_monitor_ramps(&state.per_monitor);
     }
+    // With the ramps back to default there is nothing left for the external
+    // gamma watchdog to restore, so release its record; the child exits on its
+    // next poll.
+    gamma_watch::shutdown();
     // app.exit(0) bypasses Rust Drop, so explicitly close the process-lifetime
     // NVAPI DRS session/context before Tauri terminates. Flush afterward so
     // the teardown confirmation is written to the file log before exit.
@@ -507,12 +522,24 @@ fn take_startup_tab() -> Option<String> {
     guard.take()
 }
 
+// Serializes the whole multi-write HDR transition. Each individual NVAPI/
+// registry write is already locked inside vendor_info/hdr_toggle, but a
+// transition spans several of them (enable RTX, then disable Auto HDR, with a
+// rollback on failure). Without a lock around the entire transaction, the
+// elevated-restart pending-apply thread (which runs ~1.5 s after startup) and
+// a user clicking an HDR mode in the Windows HDR tab could interleave and end
+// with both RTX HDR and Auto HDR active, or with the wrong final mode.
+static HDR_MODE_LOCK: Mutex<()> = Mutex::new(());
+
 // Applies a single HDR enhancement mode so exactly one of {RTX HDR, Auto HDR,
 // Off} is active. Shared by the interactive command (set_hdr_enhancement_mode)
 // and the elevated-restart pending apply in run(): the transition and its
 // rollback must stay identical in both paths, or a failed transition could
 // leave RTX and Auto HDR enabled together.
 fn apply_hdr_mode(mode: &str) -> Result<(), String> {
+    let _transaction_guard = HDR_MODE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     match mode {
         "rtx" => {
             if !vendor_info::is_nvidia_primary_gpu() {
@@ -580,7 +607,17 @@ pub fn run() {
         display_info::run_recovery_watchdog();
         return;
     }
+    // External gamma watchdog child: owns no window and runs before any
+    // Tauri/WebView2 init, so it can reset the display gamma ramp if this
+    // process dies while a non-default ramp is applied.
+    if std::env::args().any(|arg| arg == "--gamma-watchdog") {
+        gamma_watch::run_watchdog();
+        return;
+    }
     display_info::launch_recovery_watchdog_if_needed();
+    // A stale gamma watch record (a session that died with a ramp applied)
+    // spawns a resolver child that clears the stuck ramp.
+    gamma_watch::start();
 
     // Tray-restart child: let the old instance release the user-data folder
     // before we start WebView2. If the parent remains alive or its state cannot

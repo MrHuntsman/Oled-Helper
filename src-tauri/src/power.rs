@@ -1315,7 +1315,13 @@ fn dim_watcher_loop() {
 
         // Low-rate diagnostic so a stuck-bright dimmer can be traced to the
         // keyboard/mouse clock vs the gamepad clock vs fullscreen/requests.
-        if enabled && last_idle_diag.elapsed() >= std::time::Duration::from_secs(5) {
+        // Gated behind Detailed logging: it repeats every 5 seconds and would
+        // otherwise flood the Debug tab and file log during normal use (the
+        // same treatment as the periodic vendor/EDID diagnostics).
+        if enabled
+            && crate::detailed_logging_enabled()
+            && last_idle_diag.elapsed() >= std::time::Duration::from_secs(5)
+        {
             let (kb_mouse_idle, gamepad_idle) = idle_breakdown();
             log::debug!(
                 "[power] idle={}s kb/mouse={}s gamepad={}s gamepad_active={} fullscreen={} request={}",
