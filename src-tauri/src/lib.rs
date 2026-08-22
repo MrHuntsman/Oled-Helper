@@ -385,7 +385,7 @@ fn is_main_window_visible(app: AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn show_main_window(app: &AppHandle) {
+pub(crate) fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let is_minimized = window.is_minimized().unwrap_or(false);
         let is_visible = window.is_visible().unwrap_or(false);
@@ -602,6 +602,16 @@ pub fn run() {
         }
     }
 
+    // Acquire the single-instance lock before any elevation relaunch. A
+    // normal launch may immediately hand off to an elevated child for the
+    // Screen Dimmer or the always-elevated setting, so checking this later
+    // would let every launch create another replacement process. Restart
+    // children reach this point only after their old parent has exited, so
+    // they can safely acquire the lock instead of skipping it.
+    if !process::acquire_single_instance(process::APP_IDENTIFIER) {
+        return;
+    }
+
     // An elevated relaunch (RTX HDR write) can carry the mode the user tried
     // to apply before the restart. Apply it once, shortly after startup, on a
     // background thread, this instance is elevated, so the DRS write that
@@ -749,17 +759,7 @@ pub fn run() {
         }
     }
 
-    let mut builder = tauri::Builder::default();
-    // Must be the first plugin registered (Tauri docs recommendation). Skip
-    // it for our own restart-child processes: the old instance is still
-    // alive (mid-shutdown) when the replacement launches, so the single-
-    // instance lock would still be held and this new process would just get
-    // forwarded to the dying instance and exit instead of taking over.
-    if !is_restart_child {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main_window(app);
-        }));
-    }
+    let builder = tauri::Builder::default();
     let gamma_desired = Arc::new(AtomicI32::new(0));
     crate::hotkeys::set_current_lift(gamma_desired.clone());
     builder
@@ -905,6 +905,14 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            // Watch for a second launch: when another instance starts (the
+            // single-instance mutex already existed) it signals the named
+            // event and exits; this thread brings the main window forward
+            // in response, exactly what the old single-instance plugin's
+            // callback did. It is also active after a restart handoff, and
+            // is a no-op when the event could not be created.
+            process::start_single_instance_watcher(app.handle().clone());
+
             // Gamma safety thread: re-applies the last known ramp every 5
             // seconds so another app resetting the system gamma (fullscreen
             // games, driver mode switches) is corrected automatically.
@@ -1213,6 +1221,19 @@ pub fn run() {
                         window_icon::apply_crisp_window_icon(hwnd_raw);
                     });
                 }
+            }
+
+            // A restart child (tray restart, elevated UAC relaunch) can come
+            // up without the foreground: an elevated child is spawned by
+            // consent.exe, so Windows refuses its window activation. Grab the
+            // foreground shortly after startup, only for restart children,
+            // never for login/autostart launches where stealing focus would
+            // be wrong.
+            if is_restart_child {
+                let restart_app = app.handle().clone();
+                std::thread::spawn(move || {
+                    process::grab_foreground_after_restart(restart_app);
+                });
             }
 
             Ok(())

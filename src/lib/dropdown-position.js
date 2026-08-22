@@ -32,8 +32,15 @@ export function updateDropdownPlacement(triggerEl, menuEl, options = {}) {
   const triggerRect = triggerEl.getBoundingClientRect();
   const menuRect = menuEl.getBoundingClientRect();
   const containerRect = findScrollContainer(menuEl).getBoundingClientRect();
-  const viewportWidth = containerRect.width;
-  const viewportHeight = containerRect.height;
+  // All rects are viewport coordinates, so the horizontal fit checks compare
+  // trigger and menu edges against the container's LEFT/RIGHT edges. A width
+  // comparison only works when the container starts at x=0, which is never
+  // true here: the sidebar pushes .content right, and comparing viewport
+  // coordinates against a width misjudges a left-side trigger as "right
+  // aligned fits", placing the menu off to the side and clipped by the
+  // container's overflow.
+  const containerLeft = containerRect.left;
+  const containerRight = containerRect.right;
   const containerTop = containerRect.top;
   const containerBottom = containerRect.bottom;
   const belowSpace = Math.max(0, containerBottom - triggerRect.bottom - viewportMargin - gap);
@@ -42,10 +49,10 @@ export function updateDropdownPlacement(triggerEl, menuEl, options = {}) {
 
   const rightAlignedLeft = triggerRect.right - menuRect.width;
   const leftAlignedRight = triggerRect.left + menuRect.width;
-  const rightFits = rightAlignedLeft >= viewportMargin
-    && triggerRect.right <= viewportWidth - viewportMargin;
-  const leftFits = triggerRect.left >= viewportMargin
-    && leftAlignedRight <= viewportWidth - viewportMargin;
+  const rightFits = rightAlignedLeft >= containerLeft + viewportMargin
+    && triggerRect.right <= containerRight - viewportMargin;
+  const leftFits = triggerRect.left >= containerLeft + viewportMargin
+    && leftAlignedRight <= containerRight - viewportMargin;
   // A forced alignment (`options.align`) anchors the menu to a specific side
   // of its trigger regardless of the fit check. Used by controls whose
   // dropdown is expected to hang off a particular edge (e.g. a right-side

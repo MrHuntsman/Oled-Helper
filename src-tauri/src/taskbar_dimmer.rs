@@ -557,6 +557,22 @@ mod platform {
                 request_forced_repairs();
             }
         }
+        // A foreground switch, minimize, move/size end, or any geometry or
+        // state change of the foreground window can start a fullscreen
+        // transition, so hide the overlays on those events synchronously, at
+        // event time, instead of waiting for the posted tick. The live check
+        // keeps this a no-op for plain window switches and moves. Many games
+        // activate windowed and then resize programmatically to fullscreen,
+        // which raises LOCATIONCHANGE (not MOVESIZEEND), so the foreground-
+        // window geometry changes must be covered too. LOCATIONCHANGE fires
+        // every frame while the foreground window is dragged, but the chain
+        // is a handful of cheap Win32 reads and the check almost always
+        // fails for a dragged, non-fullscreen window.
+        let may_start_fullscreen =
+            foreground_transition || affects_fullscreen || event == EVENT_SYSTEM_MOVESIZEEND;
+        if may_start_fullscreen {
+            hide_overlays_for_fullscreen_foreground();
+        }
         // Event-driven taskbar cache: when an event targets the cached
         // taskbar window itself (drag to another edge, resize, auto-hide
         // slide, minimize), request an immediate cache refresh so the hook
@@ -827,11 +843,34 @@ mod platform {
                 if !ZORDER_REPAIR.load(Ordering::Relaxed) {
                     return LRESULT(0);
                 }
+                // The repair must never re-show a hidden overlay. Its
+                // SetWindowPos carries SWP_SHOWWINDOW (historically how the
+                // overlay returned after fullscreen), and re-showing it while
+                // a fullscreen app covers the monitor is exactly what keeps
+                // the taskbar visible above the game: the shell treats the
+                // game as not-fullscreen when a topmost window floats over
+                // it, so the taskbar stays up for the whole session until an
+                // alt-tab forces a fresh evaluation. Visibility is owned by
+                // the fade logic: update_fade's self-heal re-shows the
+                // overlay within a tick whenever it should be visible, so a
+                // hidden overlay only ever waits one tick, never a repair.
+                if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+                    return LRESULT(0);
+                }
                 // Z-order repair is deferred out of the animation tick to
                 // prevent SetWindowPos latency from starving the fade timer.
                 // The animation tick signals this request via PostMessageW
                 // and returns immediately, keeping the WM_TIMER callback fast.
                 let hwnd_raw = hwnd.0 as isize;
+                // Check the live foreground window in addition to the cached
+                // flag: the cached value can lag the real state mid-
+                // transition, and re-showing the overlay over a fullscreen
+                // game is exactly what keeps the taskbar visible above it.
+                // The chain is cheap at the repair cadence (throttled to
+                // 250ms and only when a repair is actually requested). Gated
+                // by the fullscreen detection toggle like the tick path.
+                let fullscreen_now = FULLSCREEN_DETECTION.load(Ordering::Relaxed)
+                    && fullscreen_app_active_for_monitor(Some(hwnd), None);
                 let mut fades = fades_map().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(fade) = fades.get_mut(&hwnd_raw) {
                     // Skip the repair while the overlay is hidden for
@@ -846,7 +885,9 @@ mod platform {
                     if SUSPENDED.load(Ordering::Relaxed) {
                         return LRESULT(0);
                     }
-                    if fade.fullscreen_active && FORCE_REPAIR_COUNT.load(Ordering::Acquire) == 0 {
+                    if (fade.fullscreen_active || fullscreen_now)
+                        && FORCE_REPAIR_COUNT.load(Ordering::Acquire) == 0
+                    {
                         // Skip the repair while the overlay is hidden for
                         // fullscreen, unless we're inside the post-transition
                         // recovery window (Show Desktop / minimize). During
@@ -1175,6 +1216,46 @@ mod platform {
                 && window_rect.bottom == monitor_info.rcMonitor.bottom;
             let is_maximized = (style & WS_MAXIMIZE.0) != 0;
             !has_window_chrome || (exact_monitor && !is_maximized)
+        }
+    }
+
+    // Hides every overlay whose monitor is currently covered by a fullscreen
+    // foreground window. Evaluated live from the actual foreground window,
+    // not from the cached per-overlay flag, which can lag the real state
+    // during a transition. Runs synchronously from the WinEvent callback on
+    // the hook thread, so the overlay is out of the way before the shell
+    // decides whether the new foreground window is truly fullscreen. A
+    // borderless fullscreen game's taskbar only hides when the game is the
+    // topmost window at that decision moment; an overlay still floating
+    // above it (the posted tick reaches the overlay's message loop a moment
+    // later) makes the shell keep the taskbar visible over the game for the
+    // whole session. Gated by the fullscreen detection toggle like the tick
+    // path, so the Debug-tab A/B switch keeps its meaning.
+    fn hide_overlays_for_fullscreen_foreground() {
+        if !FULLSCREEN_DETECTION.load(Ordering::Relaxed) {
+            return;
+        }
+        let hwnds: Vec<isize> = overlays_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        for raw in hwnds {
+            let hwnd = HWND(raw as *mut c_void);
+            if fullscreen_app_active_for_monitor(Some(hwnd), None) {
+                unsafe {
+                    if IsWindowVisible(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                            emit_runtime(
+                                "info",
+                                "[taskbar-dimmer] fullscreen_hide synchronous (event callback)".into(),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

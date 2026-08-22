@@ -50,9 +50,8 @@ html, body, #flyout-app {
 /* Keep the backdrop filling the whole window (the app.css base rule is
    position: fixed; inset: 0). Overriding this to `static` earlier collapsed
    it to the modal's height, which put all of the window's extra height BELOW
-   the modal and created the large gap above the taskbar. The window itself
-   is transparent, so the full-window backdrop paints nothing; it only
-   provides the layout box. */
+   the modal and created a visible gap. The window itself is transparent, so
+   the full-window backdrop paints nothing; it only provides the layout box. */
 .flyout-backdrop {
   position: fixed;
   inset: 0;
@@ -60,17 +59,16 @@ html, body, #flyout-app {
   background: transparent;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: center;
   animation: none;
 }
 
-/* Pin the dialog to the bottom edge of the window so it sits right on top of
-   the taskbar; the window's spare height ends up ABOVE the modal as
-   invisible transparent space instead of below it as a visible gap. */
+/* Center the dialog within the window: the flyout window itself is centered
+   on the primary monitor (flyout_window.rs), so the modal must be centered
+   inside it too rather than pinned to an edge. */
 .flyout-backdrop .modal {
   width: 380px;
-  margin-top: auto;
-  margin-bottom: 0;
+  margin: auto;
   /* Hold the entrance animation's "from" state; no animation plays until
      .flyout-visible is added (see the flyout-shown listener in
      Flyout.svelte), which happens only after the native window is already
@@ -84,18 +82,18 @@ html, body, #flyout-app {
 
 /* ── Animations ──────────────────────────────────────────────────────────── */
 
-/* Entrance: rise out of the taskbar and fade in. The `from`/`to` states are
-   both explicit so the end state is authoritative regardless of the base
-   rule's computed values. */
+/* Entrance: rise up and fade in (the same animation the in-app modal
+   plays). The `from`/`to` states are both explicit so the end state is
+   authoritative regardless of the base rule's computed values. */
 .flyout-backdrop .modal.flyout-visible {
   opacity: 1;
   transform: none;
   animation: mode-confirm-rise-in var(--mode-confirm-entrance-duration) var(--mode-confirm-entrance-curve) forwards;
 }
 
-/* Exit: slide back down toward the taskbar and fade out, mirror of the
-   entrance. closeFlyout() (Flyout.svelte) hides the window on the
-   `animationend` event, so this duration needs no mirrored JS constant. */
+/* Exit: slide back down and fade out, mirror of the entrance.
+   closeFlyout() (Flyout.svelte) hides the window on the `animationend`
+   event, so this duration needs no mirrored JS constant. */
 .flyout-backdrop .modal.flyout-exiting {
   animation: mode-confirm-exit-in var(--mode-confirm-exit-duration) var(--mode-confirm-exit-curve) forwards;
 }

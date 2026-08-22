@@ -428,7 +428,7 @@ select,
 /* Admin-required warning badge beside the Screen Dimmer nav switch, between
    the label and the switch. Shown only when the dimmer is enabled but the
    session is not elevated; the triangle glyph matches the app's other amber
-   warning icons (see .text-render-warning-icon). */
+   warning icons (see .text-render-explorer-warning). */
 .nav-item-shield {
   position: absolute;
   right: 46px;
@@ -4551,130 +4551,88 @@ select,
 .text-render-explorer-warning {
   color: #E0A93C;
 }
-/* Inline heading variant: sits beside the label/Info button instead of
-   wrapping to its own line (the restart hint's flex-basis: 100% would push
-   it down). */
-.text-render-explorer-warning-inline {
-  flex-basis: auto;
-  margin-left: 10px;
+/* Standalone variant: full-width note above the Custom renderer panel
+   (kept out of the section heading so the row stays one line). */
+.text-render-av-warning {
+  display: block;
+  margin: 0 0 6px;
   font-size: 12px;
   line-height: 1.4;
 }
-/* Amber warning glyph on the Shell apps / All apps coverage buttons. */
-.text-render-warning-icon {
-  color: #E0A93C;
-}
-.text-render-explorer-toggle-label {
+/* Custom renderer coverage: three buttons on their own row under the
+   section heading, the same compact segmented look as the other tab
+   selectors. */
+.text-render-scope-inline {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
 }
-/* Text coverage selector: compact radio cards with immediate application.
-   Each card includes a short description so the scope differences are clear
-   without relying on the Info tooltip alone. */
-.text-render-scope-options {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-  margin: 8px 0;
-}
-.text-render-scope-card {
-  position: relative;
-  min-width: 0;
-  padding: 9px 10px;
+.text-render-scope-inline-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 5px;
   border: 1px solid var(--divider);
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--hover) 35%, transparent);
+  background: transparent;
   color: var(--text-weak);
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  text-align: left;
-  transition: color 0.12s, background 0.12s, border-color 0.12s, box-shadow 0.12s;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s, border-color 0.12s, opacity 0.12s;
 }
-.text-render-scope-card:hover:not(:disabled) {
+/* The On pair is visually grouped and separated from Off by a divider, so
+   the row reads as "default | custom renderer (shell / all apps)". */
+.text-render-scope-on-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 8px;
+  margin-left: 4px;
+  border-left: 1px solid var(--divider);
+}
+/* The inactive family dims so the current on/off state reads at a glance:
+   Off selected fades the On pair, an On option selected fades Off. Hover
+   returns the alternative to full so it stays obviously clickable. */
+.text-render-scope-inline.off .text-render-scope-on-group .text-render-scope-inline-btn { opacity: 0.5; }
+.text-render-scope-inline.off .text-render-scope-on-group .text-render-scope-inline-btn:hover { opacity: 1; }
+.text-render-scope-inline:not(.off) > .text-render-scope-inline-btn { opacity: 0.5; }
+.text-render-scope-inline:not(.off) > .text-render-scope-inline-btn:hover { opacity: 1; }
+/* Status dot on the two On buttons, marking the custom renderer family:
+   hollow when the option is inactive, filled accent when it is live. The
+   Off (default) button has no dot, so the on/off split reads at a glance. */
+.text-render-scope-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--success) 50%, var(--text-weak));
+  background: transparent;
+  box-sizing: border-box;
+}
+.text-render-scope-inline-btn.active .text-render-scope-dot {
+  background: var(--success);
+  border-color: var(--success);
+}
+.text-render-scope-inline-btn:hover {
   color: var(--text);
   background: var(--hover);
   border-color: color-mix(in srgb, var(--accent) 45%, var(--divider));
 }
-.text-render-scope-card.active {
-  color: var(--text);
-  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent);
-}
-.text-render-scope-card:focus-visible {
+.text-render-scope-inline-btn:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
 }
-.text-render-scope-radio {
-  width: 13px;
-  height: 13px;
-  flex: 0 0 13px;
-  margin-top: 1px;
-  border: 1px solid var(--text-weak);
-  border-radius: 50%;
-  box-sizing: border-box;
+.text-render-scope-inline-btn.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 }
-.text-render-scope-card.active .text-render-scope-radio {
-  border: 4px solid var(--accent);
-  background: var(--panel);
-}
-.text-render-scope-card-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.text-render-scope-card-title {
-  color: inherit;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1.25;
-  white-space: nowrap;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  width: 100%;
-}
-.text-render-scope-card-title-label {
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.text-render-scope-card-meta {
-  position: absolute;
-  top: 8px;
-  right: 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.text-render-scope-card-custom {
-  color: var(--accent);
-  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--divider));
-  border-radius: 3px;
-  padding: 1px 4px;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-  font-size: 9px;
-  font-weight: 600;
-  line-height: 1.2;
-  white-space: nowrap;
-}
-.text-render-scope-card-desc {
-  color: var(--text-weak);
-  font-size: 10px;
-  line-height: 1.35;
-}
-.text-render-scope-card.active .text-render-scope-card-desc {
-  color: color-mix(in srgb, var(--text-weak) 85%, var(--text));
-}
-.text-render-scope-card-applied {
-  position: absolute;
-  right: 10px;
-  bottom: 8px;
+.text-render-scope-applied {
   color: #4CD964;
   font-size: 10px;
   font-weight: 600;

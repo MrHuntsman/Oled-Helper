@@ -1,13 +1,13 @@
-// flyout_window.rs, shows the tray-triggered "Keep display mode?" popup.
+// flyout_window.rs, shows the "Keep display mode?" popup.
 //
 // This used to be a fully hand-painted native Win32 window (~700 lines of raw
 // GDI: manual word-wrap, hand-rolled hit testing, a hardcoded copy of the
 // modal's CSS palette in Rust constants). It is now a second small Tauri
 // WebviewWindow ("flyout") that renders the exact same Svelte modal
 // component/markup as the in-app confirmation (src/lib/Flyout.svelte,
-// sharing app.css), positioned near the tray icon and shown/hidden from
-// here. There is no possibility of the flyout's style drifting from the
-// in-app modal, because it IS the in-app modal's markup.
+// sharing app.css), centered on the primary monitor's work area and
+// shown/hidden from here. There is no possibility of the flyout's style
+// drifting from the in-app modal, because it IS the in-app modal's markup.
 //
 // The window is built lazily (on first use) with WebviewWindowBuilder rather
 // than declared statically in tauri.conf.json, so builder errors are visible
@@ -26,16 +26,10 @@
 // additionalBrowserArgs, and the initial-size transparency bug below), so
 // shadow(false) no longer reproduces the dead-window failure here.
 use crate::display_info::AppliedMode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Condvar, Mutex, OnceLock};
 use tauri::{
     AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
 };
-
-// When true, the flyout is positioned centered on the primary monitor instead
-// of near the tray icon. Set by show_mode_confirmation before calling
-// show_after_ready, read by the positioning helpers on the main thread.
-static FLYOUT_CENTERED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::HWND;
@@ -115,66 +109,6 @@ fn primary_monitor_scale(fallback: f64) -> f64 {
     fallback.max(0.5)
 }
 
-// Positions the flyout anchored to the taskbar edge of the primary monitor ,
-// flush against the taskbar (small gap) so it reads as popping out of the
-// tray, aligned with the tray/notification side. The taskbar edge is derived
-// from the monitor's work area (rcWork = rcMonitor minus the taskbar strip):
-// the edge where the two differ is where the taskbar sits. Uses physical
-// pixels directly because monitor rectangles are already physical coordinates.
-//
-// Note: this intentionally anchors to the CURRENT (post-change) geometry ,
-// the flyout is shown only after the new mode is already live, and a
-// pre-change coordinate would be outside the new screen's bounds (e.g.
-// 2160 -> 1600 leaves y=1678 beyond the 1600-tall desktop) or float far from
-// the new taskbar. Anchoring to the new taskbar is the only position that is
-// both on-screen and correct in the new space.
-#[cfg(target_os = "windows")]
-fn taskbar_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
-    let (_monitor_handle, info) = primary_monitor_info()?;
-    let work = info.rcWork;
-    let monitor = info.rcMonitor;
-    let gap = 6;
-    let max_x = (work.right - width_px).max(work.left);
-    let max_y = (work.bottom - height_px).max(work.top);
-    let (x, y) = if monitor.bottom - work.bottom > 0 {
-        // Taskbar along the bottom edge, pin the flyout just above it,
-        // aligned with the tray/notification area on the right.
-        (
-            (work.right - width_px - gap).max(work.left),
-            (work.bottom - height_px - gap).max(work.top),
-        )
-    } else if work.top - monitor.top > 0 {
-        // Taskbar along the top edge, just below it, near the tray on the
-        // right.
-        (
-            (work.right - width_px - gap).max(work.left),
-            (work.top + gap).min(max_y),
-        )
-    } else if work.left - monitor.left > 0 {
-        // Taskbar along the left edge, just right of it, near the tray at
-        // the bottom.
-        (
-            (work.left + gap).min(max_x),
-            (work.bottom - height_px - gap).max(work.top),
-        )
-    } else if monitor.right - work.right > 0 {
-        // Taskbar along the right edge, just left of it, near the tray at
-        // the bottom.
-        (
-            (work.right - width_px - gap).max(work.left),
-            (work.bottom - height_px - gap).max(work.top),
-        )
-    } else {
-        // No taskbar on the primary monitor, keep the flyout visible near
-        // the lower-right corner of the affected display.
-        (
-            (work.right - width_px - gap).max(work.left),
-            (work.bottom - height_px - gap).max(work.top),
-        )
-    };
-    Some((x, y))
-}
-
 #[cfg(target_os = "windows")]
 fn place_hidden_at_final_position(
     app: &AppHandle,
@@ -187,12 +121,7 @@ fn place_hidden_at_final_position(
     let hwnd = window
         .hwnd()
         .map_err(|error| format!("could not get flyout HWND: {error}"))?;
-    let position_fn = if FLYOUT_CENTERED.load(Ordering::Relaxed) {
-        centered_position
-    } else {
-        taskbar_position
-    };
-    let (x, y) = position_fn(width_px, height_px)
+    let (x, y) = centered_position(width_px, height_px)
         .ok_or_else(|| "could not determine primary monitor geometry".to_string())?;
     // Move and size the hidden HWND before the payload is rendered. This
     // causes Windows/WebView2 to process the target monitor's DPI while the
@@ -222,20 +151,15 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
         .hwnd()
         .map_err(|error| format!("could not get flyout HWND: {error}"))?;
     // Explorer can update rcWork (the taskbar-excluded work area) after
-    // rcMonitor has already settled. Re-sample the taskbar position here and
-    // move the hidden HWND one last time before showing it. SWP_NOSIZE is
-    // essential: moving within the same monitor does not change DPI, so this
-    // corrects a stale first-use y coordinate without causing another
+    // rcMonitor has already settled. Re-sample the centered position here
+    // and move the hidden HWND one last time before showing it. SWP_NOSIZE
+    // is essential: moving within the same monitor does not change DPI, so
+    // this corrects a stale first-use y coordinate without causing another
     // WebView2 text reflow.
     let current_size = window
         .outer_size()
         .map_err(|error| format!("could not read flyout size: {error}"))?;
-    let position_fn = if FLYOUT_CENTERED.load(Ordering::Relaxed) {
-        centered_position
-    } else {
-        taskbar_position
-    };
-    let (x, y) = position_fn(current_size.width as i32, current_size.height as i32)
+    let (x, y) = centered_position(current_size.width as i32, current_size.height as i32)
         .ok_or_else(|| "could not determine final flyout geometry".to_string())?;
     // No SWP_NOACTIVATE on purpose: the confirmation dialog must take
     // keyboard focus so Enter (revert) and Escape (revert) work immediately,
@@ -265,7 +189,9 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
     }
 }
 
-// Centers the flyout on the primary monitor's work area.
+// Centers the flyout on the primary monitor's work area. Used by both the
+// in-app and tray-triggered confirmation paths, so every mode-confirmation
+// popup appears in the middle of the screen instead of near the tray.
 #[cfg(target_os = "windows")]
 fn centered_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
     let (_monitor_handle, info) = primary_monitor_info()?;
@@ -277,11 +203,6 @@ fn centered_position(width_px: i32, height_px: i32) -> Option<(i32, i32)> {
 
 #[cfg(not(target_os = "windows"))]
 fn centered_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
-    None
-}
-
-#[cfg(not(target_os = "windows"))]
-fn taskbar_position(_width_px: i32, _height_px: i32) -> Option<(i32, i32)> {
     None
 }
 
@@ -474,10 +395,10 @@ pub fn prewarm(app: &AppHandle) {
     // can still be racing DWM/monitor initialization for its first ~300ms
     // (retry budget), if that race is lost on the very first display-mode
     // change, size_and_position() computes width_px/height_px from a stale
-    // scale factor, which throws off the taskbar-anchored y-coordinate and
-    // shows the flyout noticeably higher than the (correct) position used by
-    // every subsequent change. Calling it once here, off any change's
-    // critical path, lets it settle before it's ever load-bearing.
+    // scale factor, which shifts the centered position (and the DPI-scaled
+    // size) away from the (correct) geometry used by every subsequent
+    // change. Calling it once here, off any change's critical path, lets it
+    // settle before it's ever load-bearing.
     #[cfg(target_os = "windows")]
     {
         let _ = primary_monitor_scale(1.0);
@@ -758,10 +679,7 @@ pub fn show_mode_confirmation(
         confirmation_seconds: confirmation_seconds.unwrap_or(15),
     };
     std::thread::spawn(move || {
-        FLYOUT_CENTERED.store(true, Ordering::Release);
-        let result = show_after_ready(&app, mode);
-        FLYOUT_CENTERED.store(false, Ordering::Release);
-        if let Err(error) = result {
+        if let Err(error) = show_after_ready(&app, mode) {
             log::error!("[flyout] mode confirmation failed to show: {error}");
         }
     });

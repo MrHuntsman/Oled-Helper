@@ -307,37 +307,44 @@
     return { boldness: knobValue('boldness'), damping: knobValue('damping') };
   }
 
-  // Coverage levels: registry-only (no hook), shell hosts, or every GUI
-  // process. The three stops map onto the two persisted booleans
-  // (explorerHookEnabled + hookAllApps), so the storage and backend are
-  // unchanged, this is one control over existing state.
-  function currentScope() {
-    if (!textSettings.explorerHookEnabled) return 'registry';
+  // Custom renderer coverage: off means the default Windows text settings
+  // (registry path, no hook), on means the custom hook renderer for shell
+  // hosts, with the all-apps option extending it to every GDI process. Three
+  // inline buttons over the two persisted booleans (explorerHookEnabled +
+  // hookAllApps), so the storage and backend are unchanged.
+  const COVERAGE_OFF = { value: 'off', label: 'Off (default)' };
+  const COVERAGE_ON = [
+    { value: 'shell', label: 'On (Windows shell)' },
+    { value: 'all', label: 'On (All apps)' },
+  ];
+
+  function coverageOption() {
+    if (!textSettings.explorerHookEnabled) return 'off';
     return textSettings.hookAllApps ? 'all' : 'shell';
   }
 
-  // Registry-only scope: the registry path (GDI FontSmoothing* + DirectWrite
+  // Registry-only mode: the registry path (GDI FontSmoothing* + DirectWrite
   // Avalon params) can express grayscale/RGB/BGR/off but NOT the 2D subpixel
   // offsets (Custom) or the swash filter knobs, so those controls hide.
   function isRegistryOnly() {
-    return currentScope() === 'registry';
+    return !textSettings.explorerHookEnabled;
   }  // Whether the most recent coverage selection was applied successfully. The
-  // confirmation is deliberately transient so switching scopes stays clear
-  // without adding another persistent row to the panel.
+  // confirmation is deliberately transient so picking stays clear without
+  // adding another persistent row to the panel.
   let scopeApplied = $state(false);
   let scopeAppliedTimer = null;
 
   // Pick a coverage level and push the matching backend state immediately.
-  // Registry disables the hook entirely (mode 0 → passthrough); shell/all
-  // enable it with the all-apps flag off/on. Scope reaches the DLL live
-  // (per-draw guard), so already-running non-shell apps stop being re-rendered
-  // the moment a new scope is picked.
-  function setScope(scope) {
-    if (scope === 'registry') {
+  // Off disables the hook entirely (mode 0 → passthrough); shell/all enable
+  // it with the all-apps flag off/on. Hook state reaches the DLL live
+  // (per-draw guard), so already-running apps stop being re-rendered the
+  // moment a lower coverage is picked.
+  function selectCoverage(value) {
+    if (value === 'off') {
       textSettings.explorerHookEnabled = false;
     } else {
       textSettings.explorerHookEnabled = true;
-      textSettings.hookAllApps = scope === 'all';
+      textSettings.hookAllApps = value === 'all';
       syncTextScope();
     }
     saveConfig();
@@ -632,67 +639,53 @@
     <div class="tab-heading-spacer"></div>
     <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore defaults</button>
   </div>
-  <div class="separator"></div>    <div class="dimmer-control">
+  <div class="separator"></div>
+  <span class="text-render-explorer-warning text-render-av-warning">⚠ Custom text renderer may trigger antivirus false positives.</span>
+  <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="hdr-control-title">
-          <span class="settings-row-label">Level of coverage</span>
+          <span class="settings-row-label">Custom renderer</span>
           <span class="info-tip-wrap">
-            <button class="info-tip-btn" aria-label="About text coverage" tabindex="0">Info</button>
+            <button class="info-tip-btn" aria-label="About the custom renderer" tabindex="0">Info</button>
             <span class="info-tip info-tip-right">
               <span>
-                Where the selected mode is applied:<br>
+                Off: apps follow Windows text settings (browsers, DirectWrite apps...).<br>
                 <br>
-                <b>Default</b>: apps that follow Windows text settings (browsers, DirectWrite apps...).<br>
-                <b>Windows shell</b>: adds live re-rendering for Explorer, Control Panel and MMC.<br>
-                <b>All apps</b>: hooks every GDI process (2D remap + filters); browsers and games aren't affected.
+                On: live re-rendering for Explorer, Control Panel and MMC via the custom hook.<br>
+                <br>
+                <b>On, all apps</b>: hooks every GDI process (2D remap + filters); browsers and games aren't affected.
               </span>
             </span>
           </span>
-          <span class="restart-explorer-hint text-render-explorer-warning text-render-explorer-warning-inline">⚠ Custom text renderer may trigger antivirus false positives.</span>
         </span>
       </div>
-      <div class="text-render-scope-options" role="radiogroup" aria-label="Text rendering coverage">
-        <button type="button" role="radio" class="text-render-scope-card" class:active={currentScope() === 'registry'} aria-checked={currentScope() === 'registry'} onclick={() => setScope('registry')}>
-          <span class="text-render-scope-radio" aria-hidden="true"></span>
-          <span class="text-render-scope-card-copy">
-            <span class="text-render-scope-card-title">
-              <span class="text-render-scope-card-title-label">Default</span>
-            </span>
-            {#if scopeApplied && currentScope() === 'registry'}<span class="text-render-scope-card-applied">✓ Applied</span>{/if}
-            <span class="text-render-scope-card-desc">Windows text render.<br>Limited coverage and apps/windows need a restart.</span>
-          </span>
+      <div class="text-render-scope-inline" class:off={coverageOption() === 'off'} role="radiogroup" aria-label="Custom renderer coverage">
+        <button
+          type="button"
+          role="radio"
+          class="text-render-scope-inline-btn"
+          class:active={coverageOption() === 'off'}
+          aria-checked={coverageOption() === 'off'}
+          onclick={() => selectCoverage('off')}>
+          {COVERAGE_OFF.label}
         </button>
-        <button type="button" role="radio" class="text-render-scope-card" class:active={currentScope() === 'shell'} aria-checked={currentScope() === 'shell'} onclick={() => setScope('shell')}>
-          <span class="text-render-scope-radio" aria-hidden="true"></span>
-          <span class="text-render-scope-card-copy">
-            <span class="text-render-scope-card-title">
-              <span class="text-render-scope-card-title-label"><span class="text-render-warning-icon">⚠</span> Windows shell</span>
-              <span class="text-render-scope-card-meta"><span class="text-render-scope-card-custom">Custom</span></span>
-            </span>
-            {#if scopeApplied && currentScope() === 'shell'}<span class="text-render-scope-card-applied">✓ Applied</span>{/if}
-            <span class="text-render-scope-card-desc">Explorer, Control Panel, and MMC.</span>
-          </span>
-        </button>
-        <button type="button" role="radio" class="text-render-scope-card" class:active={currentScope() === 'all'} aria-checked={currentScope() === 'all'} onclick={() => setScope('all')}>
-          <span class="text-render-scope-radio" aria-hidden="true"></span>
-          <span class="text-render-scope-card-copy">
-            <span class="text-render-scope-card-title">
-              <span class="text-render-scope-card-title-label"><span class="text-render-warning-icon">⚠</span> All apps</span>
-              <span class="text-render-scope-card-meta"><span class="text-render-scope-card-custom">Custom</span></span>
-            </span>
-            {#if scopeApplied && currentScope() === 'all'}<span class="text-render-scope-card-applied">✓ Applied</span>{/if}
-            <span class="text-render-scope-card-desc">All GDI apps.</span>
-          </span>
-        </button>
+        <span class="text-render-scope-on-group">
+          {#each COVERAGE_ON as option (option.value)}
+            <button
+              type="button"
+              role="radio"
+              class="text-render-scope-inline-btn"
+              class:active={coverageOption() === option.value}
+              aria-checked={coverageOption() === option.value}
+              onclick={() => selectCoverage(option.value)}>
+              <span class="text-render-scope-dot" aria-hidden="true"></span>
+              {option.label}
+            </button>
+          {/each}
+        </span>
+        {#if scopeApplied}<span class="text-render-scope-applied">✓ Applied</span>{/if}
       </div>
-    {#if currentScope() === 'registry'}
-      <span class="restart-explorer-hint">Default windows text render. Registry based. Limited coverage and apps/windows need a restart.</span>
-    {:else if currentScope() === 'shell'}
-      <span class="restart-explorer-hint">Custom hook text renderer. Allows live changes and extends coverage to Explorer, Control Panel and MMC.</span>
-    {:else}
-      <span class="restart-explorer-hint">All apps text render. Hook based, live re-rendering. Covers every GDI process; browsers and games aren't affected.</span>
-    {/if}
-    {#if currentScope() === 'all'}
+    {#if coverageOption() === 'all'}
       <label class="text-render-blocklist">
         <span class="text-render-explorer-toggle-label">Excluded apps</span>
         <input type="text" class="text-render-blocklist-input" placeholder="e.g. notepad.exe, winrar, 7zip"
