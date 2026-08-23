@@ -3,6 +3,7 @@
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
   import { app, crush, adjustmentDisplay, blackLift, applyGamma, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax, activeMonitor, monitors } from './stores.svelte.js';
+  import ConfirmModal from './ConfirmModal.svelte';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
   // duplicated in either destination.
@@ -1041,9 +1042,16 @@
     setBlackStripGapEnabled(!crush.blackStripGapEnabled);
   }
 
+  // Confirmation for the destructive "Restore Tab Defaults" action.
+  let resetConfirmOpen = $state(false);
+
   function restoreDefaults() {
     crush.adjustment = 0;
     crush.blackEnabled = true;
+    // Clear the per-refresh-rate black level profiles and the hide-interface
+    // toggle too, matching the config defaults (see AppConfig::default).
+    crush.blackProfiles = {};
+    crush.hideCalibrationInterface = false;
     crush.squareCounts = { black: 12, highNits: 8 };
     crush.highNitsMin = HIGH_NITS_DEFAULT_MIN;
     crush.highNitsMax = HIGH_NITS_DEFAULT_MAX;
@@ -1084,7 +1092,7 @@
       <div class="tab-heading-spacer"></div>
       <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
-    <button class="restore-defaults-btn" onclick={restoreDefaults}>↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={() => resetConfirmOpen = true}>↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>    <div class="dimmer-control" class:disabled={!crush.blackEnabled} onwheel={handleBlackLevelWheel}>
       {#if app.displayInfo.referenceMode}
@@ -1324,5 +1332,14 @@
         <button class="ctx-item" role="menuitem" class:active={crush.stripType === strip.id} onclick={() => selectStrip(strip.id)}><span class="ctx-radio-dot" aria-hidden="true"></span>{strip.label}</button>
       {/each}
     </div>
+  {/if}
+
+  {#if resetConfirmOpen}
+    <ConfirmModal
+      title="Restore Black Crush defaults?"
+      desc="This resets the black level adjustment, per-refresh-rate profiles, strip type, and grid settings to their defaults."
+      confirmLabel="Restore"
+      onConfirm={restoreDefaults}
+      onClose={() => resetConfirmOpen = false} />
   {/if}
 </div>

@@ -7,9 +7,13 @@
   import { invoke } from '@tauri-apps/api/core';
   import TabTextIcon from './TabTextIcon.svelte';
   import ModeBars from './ModeBars.svelte';
+  import ConfirmModal from './ConfirmModal.svelte';
   import { textSettings, saveConfig, activeMonitor, monitors, syncTextPerMonitor, syncTextScope, BOLDNESS_MAX } from './stores.svelte.js';
 
   let { modalOpen = false, menuOpen = false } = $props();
+
+  // Confirmation for the destructive "Restore defaults" action.
+  let resetConfirmOpen = $state(false);
 
   const MODES = [
     { id: 'off', label: 'No filter' },
@@ -511,12 +515,17 @@
         syncExplorerToggle();
       }
       // Restore defaults also clears any per-monitor mode, knob, and custom
-      // offset overrides.
+      // offset overrides, and resets the hook scope + blocklist to their
+      // defaults (all apps, no exclusions).
       textSettings.perMonitorModes = {};
       textSettings.perMonitorKnobs = {};
       textSettings.perMonitorCustom = {};
+      textSettings.hookAllApps = true;
+      textSettings.hookBlocklist = [];
+      blocklistText = '';
       saveConfig();
       syncTextPerMonitor();
+      syncTextScope();
       await refreshState();
       await renderPreview();
     } catch (e) {
@@ -532,11 +541,6 @@
   // and composites the returned coverage onto a canvas. Left column at 100%,
   // right column at 400% so the subpixel fringing is visible.
   const PREVIEW_TEXT = 'The quick brown fox jumps over the lazy dog';
-  // The right (zoomed) column shows the fringing-test characters instead of
-  // the pangram: at 800% zoom only a handful of glyphs fit, and these five
-  // are the best-to-worst fringe revealers (single-pixel stem l, dense M,
-  // paired stems H, stem+flag 1, tiny !). Kept unspaced so they fit.
-  const PREVIEW_TEXT_FRINGE = 'lMH1!';
   const PREVIEW_FG = [255, 255, 255];
   const PREVIEW_BG = [20, 20, 24];
 
@@ -603,7 +607,7 @@
           [8, 10, 12, 15].map((size) => invoke('text_preview_render', { ...renderArgs, size: size * dpr })),
         );
         right = await Promise.all(
-          [15].map((size) => invoke('text_preview_render', { ...renderArgs, text: PREVIEW_TEXT_FRINGE, size: size * dpr })),
+          [15].map((size) => invoke('text_preview_render', { ...renderArgs, text: PREVIEW_TEXT, size: size * dpr })),
         );
       } catch (e) {
         console.warn('[text] preview render failed', e);
@@ -736,21 +740,23 @@
           {#if monitorTagLabel}<span class="tab-monitor-tag">{monitorTagLabel}</span>{/if}
           <span class="text-render-experimental-badge">Experimental</span>
         </div>
-        <span class="subtitle">ClearType &amp; font smoothing</span>
+        <span class="subtitle">ClearType &amp; font smoothing.</span>
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore defaults</button>
+    <button class="restore-defaults-btn" onclick={() => resetConfirmOpen = true} disabled={busy}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
   <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="hdr-control-title">
-          <span class="settings-row-label">Custom text engine</span>
+          <span class="settings-row-label">Custom GDI text engine</span>
           <span class="info-tip-wrap">
-            <button class="info-tip-btn" aria-label="About the custom text engine" tabindex="0">Info</button>
+            <button class="info-tip-btn" aria-label="About the custom GDI text engine" tabindex="0">Info</button>
             <span class="info-tip info-tip-right">
               <span>
+                This engine targets GDI apps only. DirectWrite, WPF and browser text is not hooked but still benefits from grayscale.<br>
+                <br>
                 <b>Off</b>: Apps follow Windows text settings (browsers, DirectWrite apps...).<br>
                 <br>
                 <b>Normal</b>: Live rendering for Explorer, Control Panel and MMC via the custom hook.<br>
@@ -777,7 +783,7 @@
           {/if}
         </div>
       </div>
-      <div class="text-render-scope-inline" class:off={coverageOption() === 'off'} class:shell={coverageOption() === 'shell'} class:all={coverageOption() === 'all'} role="radiogroup" aria-label="Custom text engine coverage">
+      <div class="text-render-scope-inline" class:off={coverageOption() === 'off'} class:shell={coverageOption() === 'shell'} class:all={coverageOption() === 'all'} role="radiogroup" aria-label="Custom GDI text engine coverage">
         <button
           type="button"
           role="radio"
@@ -858,17 +864,18 @@
   <div class="dimmer-control">
     <div class="dimmer-control-heading">
       <span class="hdr-control-title">
-        <span class="settings-row-label">Text rendering mode</span>
+        <span class="settings-row-label">Global Rendering Mode</span>
         <span class="info-tip-wrap">
-          <button class="info-tip-btn" aria-label="About text rendering mode" tabindex="0">Info</button>
+          <button class="info-tip-btn" aria-label="About global rendering mode" tabindex="0">Info</button>
           <span class="info-tip info-tip-right">
             <span>
               Sets the subpixel mode for GDI and DirectWrite text pipelines.<br>
               <br>
-              Apps that cache their fonts like Chromium need a restart.
+              Most apps will need a restart.
             </span>
           </span>
         </span>
+        <span class="text-render-restart-note" title="Most apps will need to be restarted for this to take effect.">⚠ Most apps will need to be restarted.</span>
       </span>
     </div>
     <div class="text-render-modes-row">
@@ -947,6 +954,15 @@
 
   {#if error}
     <p class="text-render-error" role="alert">⚠ {error}</p>
+  {/if}
+
+  {#if resetConfirmOpen}
+    <ConfirmModal
+      title="Restore text rendering defaults?"
+      desc="This resets the rendering mode, custom GDI engine, and per-monitor overrides to their defaults."
+      confirmLabel="Restore"
+      onConfirm={resetDefaults}
+      onClose={() => resetConfirmOpen = false} />
   {/if}
 
 </div>

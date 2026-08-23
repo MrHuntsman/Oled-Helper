@@ -15,9 +15,10 @@
   import { getVersion } from '@tauri-apps/api/app';
   import appIcon from './icons/app-icon.png?inline';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
+  import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import tabHdrIcon from './icons/tab_hdr.png?inline';
-  import { taskbarDimmer, setTaskbarDimmer } from './stores.svelte.js';
+  import { taskbarDimmer, setTaskbarDimmer, screenDimmer, setScreenDimmer, setScreenDimmerEnabled } from './stores.svelte.js';
 
   let trayBlack = $state({ enabled: true, adjustment: 0 });
   let trayBlackProfiles = $state({});
@@ -47,6 +48,10 @@
   });
   let windowsHdrBusy = $state(false);
   let windowsHdrError = $state('');
+  // Whether this process is elevated. The Screen Dimmer only runs in an
+  // elevated session; the tray warns on its row when enabled but not
+  // elevated (same rule as the Screen Dimmer tab's admin banner).
+  let trayElevated = $state(true);
   let dimmerSaveTimer = null;
   let dimmerSaveInFlight = false;
   let quickInteractionVersion = 0;
@@ -68,15 +73,17 @@
       // Read the native status immediately before persisting. The tray UI is
       // optimistic while the shared command queue drains; if the overlay
       // rejects a toggle/slider update, never write that failed state to disk.
-      const [cfg, status] = await Promise.all([
+      const [cfg, status, screenStatus] = await Promise.all([
         invoke('load_config'),
         invoke('get_taskbar_dimmer_status', { monitorKey: trayDimmerMonKey() }),
+        invoke('power_get_screen_dimmer_status', { monitorKey: trayDimmerMonKey() }),
       ]);
       if (saveVersion !== quickInteractionVersion) {
         scheduleTrayDimmerSave();
         return;
       }
       if (status && status.available !== false) applyTaskbarDimmerStatus(status);
+      if (screenStatus) applyScreenDimmerStatus(screenStatus);
       const dimmerSettings = status && status.available !== false
         ? {
             enabled: status.enabled === true,
@@ -115,6 +122,29 @@
                 fadeOutDurationMs: dimmerSettings.fadeOutDurationMs,
                 hoverDetection: cfg?.taskbar_dimmer_hover_detection || 'event',
                 pollIntervalMs: Number(cfg?.taskbar_dimmer_poll_interval_ms) || 100,
+              },
+            } : {}),
+          },
+          // Screen Dimmer, same primary-scoped handling as the taskbar
+          // dimmer: flat fields stay in sync with the primary's profile and
+          // the per-monitor map keeps the tray's edit readable by the main
+          // window and future startups.
+          screen_protector_enabled: screenDimmer.enabled,
+          screen_protector_seconds: screenDimmer.seconds,
+          screen_protector_opacity: screenDimmer.opacity,
+          screen_protector_fade_in_duration_ms: screenDimmer.fadeInDurationMs,
+          screen_protector_fade_out_duration_ms: screenDimmer.fadeOutDurationMs,
+          screen_protector_fade_linked: screenDimmer.fadeLinked,
+          screen_protector_fullscreen_detection: screenDimmer.fullscreenDetection,
+          screen_dimmer_profiles: {
+            ...(cfg?.screen_dimmer_profiles && typeof cfg.screen_dimmer_profiles === 'object' ? cfg.screen_dimmer_profiles : {}),
+            ...(trayDimmerMonKey() ? {
+              [trayDimmerMonKey()]: {
+                seconds: screenDimmer.seconds,
+                opacity: screenDimmer.opacity,
+                fadeInDurationMs: screenDimmer.fadeInDurationMs,
+                fadeOutDurationMs: screenDimmer.fadeOutDurationMs,
+                fullscreenDetection: screenDimmer.fullscreenDetection,
               },
             } : {}),
           },
@@ -162,6 +192,16 @@
     }
   }
 
+  async function loadScreenDimmer() {
+    const requestVersion = quickInteractionVersion;
+    try {
+      const status = await invoke('power_get_screen_dimmer_status', { monitorKey: trayDimmerMonKey() });
+      if (requestVersion === quickInteractionVersion) applyScreenDimmerStatus(status);
+    } catch (e) {
+      console.error('tray-menu: failed to load screen dimmer status', e);
+    }
+  }
+
   // The tray menu has no monitor selector: it operates on the primary
   // monitor's taskbar. Its profile key is the primary's EDID id (what
   // tray_menu_get_display_info reports), matching the main window's keying.
@@ -191,6 +231,72 @@
       taskbarDimmer.fadeInDurationMs,
       taskbarDimmer.fadeOutDurationMs,
       true,
+      true,
+    );
+    scheduleTrayDimmerSave();
+  }
+
+  function applyScreenDimmerStatus(status) {
+    if (!status) return;
+    screenDimmer.enabled = status.enabled === true;
+    screenDimmer.seconds = Math.max(5, Math.min(180, Math.round(Number(status.seconds) || 30)));
+    screenDimmer.opacity = Math.max(0, Math.min(1, Number(status.opacity) || 0));
+    screenDimmer.fadeInDurationMs = Math.max(0, Math.min(5000, Math.round(Number(status.fade_in_duration_ms) || 0)));
+    screenDimmer.fadeOutDurationMs = Math.max(0, Math.min(5000, Math.round(Number(status.fade_out_duration_ms) || 0)));
+    screenDimmer.fullscreenDetection = status.fullscreen_detection === true;
+  }
+
+  function toggleScreenDimmer() {
+    quickInteractionVersion++;
+    // Route through the elevation-aware toggle (same path the Screen Dimmer
+    // tab uses): the dimmer only runs in an elevated session, so enabling
+    // from a non-elevated tray must trigger the UAC relaunch too, otherwise
+    // the flag flips but the watcher never starts. tab=null because the tray
+    // has no tab context to reopen after the elevated restart.
+    setScreenDimmerEnabled(!screenDimmer.enabled, null)
+      .catch((e) => console.warn('[screen-dimmer] tray toggle failed', e));
+    scheduleTrayDimmerSave();
+  }
+
+  async function loadTrayElevation() {
+    try {
+      const elevated = await invoke('is_process_elevated');
+      trayElevated = elevated === true;
+    } catch (e) {
+      console.error('tray-menu: failed to check elevation', e);
+    }
+  }
+
+  // The Screen Dimmer only runs elevated. If the user enabled it in a
+  // non-elevated session (declined the UAC prompt, or the startup prompt was
+  // declined), this relaunches the app elevated so the dimmer actually
+  // starts. Same command the Screen Dimmer tab's admin banner uses.
+  function relaunchScreenDimmerElevated() {
+    invoke('relaunch_elevated', {
+      rtxHdrFlags: null,
+      rtxHdrEnabled: null,
+      hdrMode: null,
+      screenDimmerEnabled: true,
+      tab: null,
+    }).catch((e) => console.warn('[screen-dimmer] tray relaunch elevated failed', e));
+  }
+
+  // The tray is narrow, so the timer slider moves in 5-second steps (the
+  // tab uses 1-second steps), coarse enough to resolve on a ~170px drag
+  // across the full 5-180 range.
+  function handleScreenDimmerInput(event) {
+    quickInteractionVersion++;
+    const seconds = Math.max(5, Math.min(180, Math.round(Number(event.currentTarget.value) || 30)));
+    // Update the view state so the slider tracks the drag immediately, then
+    // push to the backend (setScreenDimmer does not update the view itself).
+    screenDimmer.seconds = seconds;
+    setScreenDimmer(
+      screenDimmer.enabled,
+      seconds,
+      screenDimmer.opacity,
+      screenDimmer.fadeInDurationMs,
+      screenDimmer.fadeOutDurationMs,
+      screenDimmer.fullscreenDetection,
       true,
     );
     scheduleTrayDimmerSave();
@@ -993,6 +1099,8 @@
     loadDisplayInfo();
     loadFavorites();
     loadTaskbarDimmer();
+    loadScreenDimmer();
+    loadTrayElevation();
     loadHdrEnhancementMode();
     loadSdrContentBrightness();
     pollTrayHdrStatus();
@@ -1004,6 +1112,8 @@
       loadDisplayInfo();
       loadFavorites();
       loadTaskbarDimmer();
+      loadScreenDimmer();
+      loadTrayElevation();
       loadHdrEnhancementMode();
       loadSdrContentBrightness();
       pollTrayHdrStatus();
@@ -1282,6 +1392,46 @@
           onclick={(event) => event.stopPropagation()}
         />
         <span class="tray-dimmer-value">{Math.round(taskbarDimmer.opacity * 100)}%</span>
+      </div>
+    </div>
+
+    <div class="tray-dimmer-row" class:enabled={screenDimmer.enabled} role="group" aria-label="Screen Dimmer" onmouseenter={closeSubmenu}>
+      {#if !trayElevated && screenDimmer.enabled}
+        <button
+          type="button"
+          class="tray-screen-dimmer-warn"
+          aria-label="Screen Dimmer needs administrator rights to run"
+          title="The Screen Dimmer needs administrator rights for power state detection. Relaunch OLED Helper elevated to run it."
+          onclick={relaunchScreenDimmerElevated}
+        >⚠</button>
+      {/if}
+      <button
+        type="button"
+        class="tray-dimmer-toggle"
+        class:enabled={screenDimmer.enabled}
+        aria-label={screenDimmer.enabled ? 'Disable Screen Dimmer' : 'Enable Screen Dimmer'}
+        aria-pressed={screenDimmer.enabled}
+        title={screenDimmer.enabled ? 'Disable Screen Dimmer' : 'Enable Screen Dimmer'}
+        onclick={toggleScreenDimmer}
+      >
+        <img src={tabScreenDimmerIcon} alt="" aria-hidden="true" />
+      </button>
+      <div class="tray-dimmer-slider-wrap">
+        <input
+          class="tray-dimmer-slider"
+          type="range"
+          min="5"
+          max="180"
+          step="1"
+          value={screenDimmer.seconds}
+          style="--fill:{((screenDimmer.seconds - 5) / 175) * 100}%"
+          disabled={!screenDimmer.enabled}
+          aria-label="Screen Dimmer timer"
+          title={screenDimmer.enabled ? `Screen Dimmer timer ${screenDimmer.seconds} sec` : 'Enable Screen Dimmer to adjust the timer'}
+          oninput={handleScreenDimmerInput}
+          onclick={(event) => event.stopPropagation()}
+        />
+        <span class="tray-dimmer-value">{screenDimmer.seconds} sec</span>
       </div>
     </div>
 

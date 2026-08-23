@@ -5,6 +5,7 @@
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
   import ShieldBadge from './ShieldBadge.svelte';
   import ScreenDimmerState from './ScreenDimmerState.svelte';
+  import ConfirmModal from './ConfirmModal.svelte';
   import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
 
   // The heading tag showing which monitor this tab's settings apply to (the
@@ -18,6 +19,11 @@
   let { screen = false } = $props();
   let screenError = $state('');
   let screenTimeoutDragging = $state(false);
+
+  // Confirmation for the destructive "Restore Tab Defaults" actions (one per
+  // dimmer section; only the mounted section's modal can ever be open).
+  let screenRestoreConfirmOpen = $state(false);
+  let taskbarRestoreConfirmOpen = $state(false);
   let screenOpacityDragging = $state(false);
   let screenOpacityHovering = $state(false);
   let screenFadeInDragging = $state(false);
@@ -208,7 +214,9 @@
   }
 
   function handleScreenOpacityInput(event) {
-    screenDimmer.opacity = Number(event.currentTarget.value) / 100;
+    // The slider displays a 0-80 scale (the dimmer can't fully black the
+    // screen, so 80% is the honest max) but the internal value stays 0-1.
+    screenDimmer.opacity = Number(event.currentTarget.value) / 80;
     applyScreenDimmer(false);
   }
 
@@ -398,7 +406,7 @@
         <ShieldBadge size={24} text="Admin required." />
         <span class={`pill${screenDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
       </div>
-      <button class="restore-defaults-btn" onclick={restoreScreenDimmerDefaults}>↻ Restore Tab Defaults</button>
+      <button class="restore-defaults-btn" onclick={() => screenRestoreConfirmOpen = true}>↻ Restore Tab Defaults</button>
     </div>
     <div class="separator"></div>
 
@@ -441,16 +449,16 @@
     <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="settings-row-label">Dim strength</span>
-        <span class="slider-val">{Math.round(screenDimmer.opacity * 100)}%</span>
+        <span class="slider-val">{Math.round(screenDimmer.opacity * 80)}%</span>
       </div>
       <div class="slider-track-wrap dimmer-slider-track">
-        <input class="dimmer-opacity has-ticks-dimmer" type="range" min="0" max="100" step="1"
-          value={Math.round(screenDimmer.opacity * 100)} style="--fill:{screenDimmer.opacity * 100}%"
+        <input class="dimmer-opacity has-ticks-dimmer" type="range" min="0" max="80" step="1"
+          value={Math.round(screenDimmer.opacity * 80)} style="--fill:{screenDimmer.opacity * 100}%"
           disabled={!screenDimmer.enabled}
           oninput={handleScreenOpacityInput} onchange={() => { applyScreenDimmer(true); }}
           onpointerdown={() => screenOpacityDragging = true} onpointerup={() => screenOpacityDragging = false}
           onpointerenter={() => screenOpacityHovering = true} onpointerleave={() => screenOpacityHovering = false} />
-        <div class="slider-tooltip" class:visible={screenOpacityDragging || screenOpacityHovering} style="left:calc(9px + ({screenDimmer.opacity} * (100% - 18px)))">{Math.round(screenDimmer.opacity * 100)}%</div>
+        <div class="slider-tooltip" class:visible={screenOpacityDragging || screenOpacityHovering} style="left:calc(9px + ({screenDimmer.opacity} * (100% - 18px)))">{Math.round(screenDimmer.opacity * 80)}%</div>
       </div>
       <div class="dimmer-scale"><span>Subtle</span><span>Dark</span></div>
     </div>
@@ -506,7 +514,7 @@
         <input type="checkbox" checked={screenDimmer.fullscreenDetection} onchange={toggleFullscreenDetection} disabled={!screenDimmer.enabled} />
         <span class="dimmer-check-text">
           <span class="settings-row-label">Pause during fullscreen apps</span>
-          <span class="settings-row-desc dimmer-section-desc">Skips dimming while a fullscreen app or game is active on a monitor.</span>
+          <span class="settings-row-desc settings-section-desc">Skips dimming while a fullscreen app or game is active on a monitor.</span>
         </span>
       </label>
     </div>
@@ -529,7 +537,7 @@
       <div class="tab-heading-spacer"></div>
       <span class={`pill${taskbarDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
-    <button class="restore-defaults-btn" onclick={restoreTaskbarDimmerDefaults}>↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={() => taskbarRestoreConfirmOpen = true}>↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -631,4 +639,21 @@
     <p class="gpu-error">Windows taskbar overlay is unavailable.</p>
   {/if}
   </div>
+{/if}
+
+{#if screenRestoreConfirmOpen}
+  <ConfirmModal
+    title="Restore Screen Dimmer defaults?"
+    desc="This resets the screen dimmer's inactivity time, fade durations, and fullscreen detection to their defaults."
+    confirmLabel="Restore"
+    onConfirm={restoreScreenDimmerDefaults}
+    onClose={() => screenRestoreConfirmOpen = false} />
+{/if}
+{#if taskbarRestoreConfirmOpen}
+  <ConfirmModal
+    title="Restore Taskbar Dimmer defaults?"
+    desc="This resets the taskbar dimmer's opacity and fade durations to their defaults."
+    confirmLabel="Restore"
+    onConfirm={restoreTaskbarDimmerDefaults}
+    onClose={() => taskbarRestoreConfirmOpen = false} />
 {/if}

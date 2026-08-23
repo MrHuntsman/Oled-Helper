@@ -3,6 +3,7 @@
   import tabHotkeysIcon from './icons/tab_hotkeys.png?inline';
   import { emit } from '@tauri-apps/api/event';
   import { hotkeys, setHotkey, resetHotkeys, displayFavorites, favoriteHotkeyAction, monitors } from './stores.svelte.js';
+  import ConfirmModal from './ConfirmModal.svelte';
 
   // The action list mirrors ACTIONS in src-tauri/src/hotkeys.rs. The combo
   // strings produced by captureCombo must match the Rust parse_hotkey table.
@@ -30,6 +31,9 @@
   // Capturing state: the key of the row currently listening for a combo.
   let capturing = $state(null);
   let captureError = $state('');
+
+  // Confirmation for the destructive "Restore Tab Defaults" action.
+  let resetConfirmOpen = $state(false);
 
   function binding(action) {
     return hotkeys[action] || 'None';
@@ -182,7 +186,7 @@
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={resetHotkeys}>↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={() => resetConfirmOpen = true}>↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -268,5 +272,14 @@
 
   {#if captureError}
     <p class="hotkey-error" role="status">{captureError}</p>
+  {/if}
+
+  {#if resetConfirmOpen}
+    <ConfirmModal
+      title="Restore hotkey defaults?"
+      desc="This clears every hotkey combo back to its default."
+      confirmLabel="Restore"
+      onConfirm={resetHotkeys}
+      onClose={() => resetConfirmOpen = false} />
   {/if}
 </div>

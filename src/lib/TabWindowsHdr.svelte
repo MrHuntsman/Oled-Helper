@@ -518,7 +518,7 @@
           <h2>Windows HDR</h2>
           <span class="tab-monitor-tag">Global</span>
         </div>
-        <span class="subtitle">Change Windows HDR settings</span>
+        <span class="subtitle">Change Windows HDR settings.</span>
       </div>
     </div>
     <div class="tab-heading-spacer"></div>

@@ -1526,8 +1526,8 @@ export function restoreTaskbarDimmerDefaults() {
     profile.fadeInDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs;
     profile.fadeOutDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs;
   }
-  setHoverDetection(TASKBAR_DIMMER_DEFAULTS.hoverDetection);
-  setPollIntervalMs(TASKBAR_DIMMER_DEFAULTS.pollIntervalMs);
+  // Detection Method is global and lives on the Settings tab, so it is not
+  // reset here; the Settings tab's own restore handles it.
   setTaskbarDimmer(taskbarDimmer.enabled, taskbarDimmer.opacity, taskbarDimmer.fadeInDurationMs, taskbarDimmer.fadeOutDurationMs, true, true);
 }
 

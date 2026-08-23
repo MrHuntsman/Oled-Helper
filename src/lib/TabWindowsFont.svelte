@@ -3,6 +3,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { onMount, onDestroy } from 'svelte';
   import TabWindowsFontIcon from './TabWindowsFontIcon.svelte';
+  import ConfirmModal from './ConfirmModal.svelte';
   import { createDropdownPositionController } from './dropdown-position.js';
   import { createDropdownKeyboardHandlers } from './dropdown.js';
 
@@ -13,6 +14,9 @@
   // of requiring the user to install the static files.
   let fontReady = $state(false);
   let fontBusy = $state(false);
+
+  // Confirmation for the destructive "Restore original fonts" action.
+  let restoreConfirmOpen = $state(false);
   let fontList = $state([]); // [{ family, path }], de-duplicated by family
   let selectedFontPath = $state('');
   let fontStatus = $state({ elevated: false, applied: null });
@@ -582,11 +586,11 @@
           <span class="tab-monitor-tag">Global</span>
           <span class="text-render-experimental-badge">Experimental</span>
         </div>
-        <span class="subtitle">Replace the system UI font</span>
+        <span class="subtitle">Replace the system UI font.</span>
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" disabled={fontBusy || !fontStatus.applied} onclick={restoreFont}>
+    <button class="restore-defaults-btn" disabled={fontBusy || !fontStatus.applied} onclick={() => restoreConfirmOpen = true}>
       ↻ Restore original fonts
     </button>
   </div>
@@ -763,6 +767,15 @@
       <p class="font-error" role="status">{restartError}</p>
     {/if}
   </div>
+
+  {#if restoreConfirmOpen}
+    <ConfirmModal
+      title="Restore original fonts?"
+      desc="This switches the system UI font back to the original Windows fonts, taking effect after a restart."
+      confirmLabel="Restore"
+      onConfirm={restoreFont}
+      onClose={() => restoreConfirmOpen = false} />
+  {/if}
 
   {#if restartConfirmOpen}
     <div class="modal-backdrop" role="presentation">

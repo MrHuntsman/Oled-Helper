@@ -5,6 +5,7 @@
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
   import { app, appSettings, setAlwaysElevated, restoreAllDefaults, taskbarDimmer, setHoverDetection, setPollIntervalMs, TASKBAR_DIMMER_DEFAULTS } from './stores.svelte.js';
+  import ConfirmModal from './ConfirmModal.svelte';
 
   let startOnBoot = $state(false);
   let ready = $state(false);
@@ -14,6 +15,10 @@
   let resetAllConfirmEl = $state(null);
   let resetAllBtnEl = $state(null);
   let resetAllError = $state('');
+
+  // Confirmation for the tab-level "Restore Tab Defaults" action (Start on
+  // Boot + Detection Method), separate from the destructive "Reset all".
+  let restoreConfirmOpen = $state(false);
 
   onMount(async () => {
     try {
@@ -64,6 +69,16 @@
         startOnBoot = false;
       } catch (e) {
         console.warn('[settings] restore defaults could not disable autostart', e);
+      }
+    }
+    // Always open as administrator defaults to off. setAlwaysElevated only
+    // persists the flag (it never relaunches on its own), so resetting it
+    // here is safe while the app is already running.
+    if (appSettings.alwaysElevated) {
+      try {
+        await setAlwaysElevated(false, 'settings');
+      } catch (e) {
+        console.warn('[settings] restore defaults could not clear always elevated', e);
       }
     }
     // Detection Method (Taskbar Dimmer) is global and lives in Settings, so
@@ -153,7 +168,7 @@
     <img class="tab-icon" src={tabSystemIcon} alt="" />
     <h2>Settings</h2>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={restoreDefaults} title="Resets the Start on Boot and Detection Method options">↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={() => restoreConfirmOpen = true} title="Resets the Start on Boot, Always open as administrator and Detection Method options">↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -239,6 +254,15 @@
       <img class="top-btn-icon" src={tabDebugIcon} alt="" /> Debug
     </button>
   </div>
+
+  {#if restoreConfirmOpen}
+    <ConfirmModal
+      title="Restore Settings defaults?"
+      desc="This resets the Start on Boot, Always open as administrator and Detection Method options to their defaults."
+      confirmLabel="Restore"
+      onConfirm={restoreDefaults}
+      onClose={() => restoreConfirmOpen = false} />
+  {/if}
 
   {#if resetAllConfirmOpen}
     <div class="modal-backdrop" role="presentation">

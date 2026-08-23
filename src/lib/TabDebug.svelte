@@ -125,7 +125,7 @@
 </script>
 
 <div class="tab-body">
-  <TabHeading icon={tabDebugIcon} title="Debug" subtitle="Runtime & GPU diagnostics" />
+  <TabHeading icon={tabDebugIcon} title="Debug" subtitle="Runtime & GPU diagnostics." />
   <div class="separator"></div>
 
   <div class="diag-section">

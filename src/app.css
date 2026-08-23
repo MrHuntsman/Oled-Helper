@@ -2083,8 +2083,16 @@ select,
 }
 .hover-detect-controls .hover-detect-poll-rate input[type=range] { min-width: 90px; }
 
-.dimmer-section-heading { display: block; margin-bottom: 8px; }
-.dimmer-section-desc { display: block; margin-bottom: 8px; }
+.settings-section-heading {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-weak);
+  margin-bottom: 8px;
+}
+.settings-section-desc { display: block; margin-bottom: 8px; }
 
 /* Detection Method on the Settings tab. The track fills the row, while the
    two options remain equal width so the active indicator never changes the
@@ -4503,6 +4511,15 @@ select,
   color: var(--text-weak);
   font-size: 12px;
   line-height: 1.4;
+}
+/* Inline restart warning next to the mode heading: amber ⚠ marker,
+   readable at a glance next to the Info pill. */
+.text-render-restart-note {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #e8b84b;
+  cursor: help;
 }
 /* Mode buttons sit alone below the mode heading. */
 .text-render-modes-row {

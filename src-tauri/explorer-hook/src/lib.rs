@@ -45,6 +45,7 @@ use windows::Win32::Graphics::Gdi::{
     TA_CENTER, TA_RIGHT, VERTRES, VERTSIZE, GET_DEVICE_CAPS_INDEX,
 };
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
 };
@@ -166,10 +167,31 @@ fn proc_name() -> &'static str {
     PROC_NAME.get_or_init(process_base_name).as_str()
 }
 
+// Wall-clock local time for the session marker, so separate runs and
+// separate processes are distinguishable in the shared log file (the
+// per-line timestamp is process-relative milliseconds).
+fn wall_clock() -> String {
+    let st = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    )
+}
+
 fn log(msg: &str) {
     let cell = LOG_FILE.get_or_init(|| {
         let path = std::env::temp_dir().join("OledHelperHook.log");
-        let file = OpenOptions::new().create(true).append(true).open(path).ok();
+        let mut file = OpenOptions::new().create(true).append(true).open(path).ok();
+        if let Some(f) = file.as_mut() {
+            let _ = writeln!(
+                f,
+                "[{}][{} pid={}] session started",
+                wall_clock(),
+                proc_name(),
+                std::process::id()
+            );
+            let _ = f.flush();
+        }
         Mutex::new(file)
     });
     let ts = LOG_START.get_or_init(Instant::now).elapsed().as_millis();

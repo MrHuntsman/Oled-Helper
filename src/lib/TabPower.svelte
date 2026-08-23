@@ -150,7 +150,7 @@
           <h2>Power Saving</h2>
           <span class="tab-monitor-tag">Global</span>
         </div>
-        <span class="subtitle">Display &amp; screensaver power saving</span>
+        <span class="subtitle">Display &amp; screensaver power saving.</span>
       </div>
     </div>
   </div>
@@ -164,7 +164,7 @@
     <p class="power-loading">Reading Windows power settings…</p>
   {:else}
   <div class="dimmer-control">
-    <div class="dimmer-section-heading">Display</div>
+    <div class="settings-section-heading">Display</div>
     <div class="dimmer-control-heading">
       <span class="settings-row-label">Turn off display after</span>
       <span class="slider-val">{fmtMinutes(state.displayTimeout)}</span>
@@ -202,7 +202,7 @@
   <div class="separator"></div>
 
   <div class="dimmer-control">
-    <div class="dimmer-section-heading">Screensaver</div>
+    <div class="settings-section-heading">Screensaver</div>
 
     <div class="power-screensaver-top-row">
       <select

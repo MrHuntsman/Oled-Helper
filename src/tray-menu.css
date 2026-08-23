@@ -112,7 +112,14 @@
 
 .tray-menu-header-title-row .hdr-switch-opt {
   padding: 0 4px;
-  font-size: 8.5px;
+  font-size: 9px;
+}
+/* The base .hdr-switch-opt color is #666, too dim to read at the tray's
+   small switch size. Brighten the inactive label to #e3e3e3 so both
+   SDR/HDR letters stay legible; the active label keeps its base white /
+   gold-on-dark colors. Hover still brightens to #aaa. */
+.tray-menu-header-title-row .hdr-switch-opt:not(.active) {
+  color: #e3e3e3;
 }
 
 .tray-menu-header-title-row .hdr-switch-arrow {
@@ -278,7 +285,8 @@
 .tray-item-value {
   flex: 0 0 auto;
   margin-left: auto;
-  color: var(--text-weak);
+  /* Slightly brighter than --text-weak so values read at a glance. */
+  color: #9a9aa4;
   font-size: 12px;
   font-weight: 400;
   white-space: nowrap;
@@ -535,6 +543,7 @@
 }
 
 .tray-dimmer-toggle {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -575,6 +584,17 @@
 
 .tray-dimmer-toggle:disabled {
   cursor: default;
+}
+
+/* Red diagonal strike over the toggle icon when its feature is off: the
+   icon sits inside the 22px button with 2px padding, so the overlay covers
+   exactly the 18px icon box. Same danger red as the dimmer off-state. */
+.tray-dimmer-toggle:not(.enabled)::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  background: linear-gradient(to top right, transparent calc(50% - 1px), #ff6b6b calc(50% - 1px), #ff6b6b calc(50% + 1px), transparent calc(50% + 1px));
+  pointer-events: none;
 }
 
 .tray-dimmer-slider-wrap {
@@ -626,11 +646,44 @@
   /* Same fixed width as the other tray value labels, so every slider in
      the menu spans the same width regardless of its unit text. */
   flex: 0 0 48px;
-  color: var(--text-weak);
+  /* Slightly brighter than --text-weak so values read at a glance. */
+  color: #9a9aa4;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+/* Amber warning badge on the Screen Dimmer row: shown when the dimmer is
+   enabled but the session is not elevated (the watcher can't run). It is
+   absolutely positioned over the toggle icon's left edge so it never shifts
+   the icon or slider (the row's flex layout stays identical to the Taskbar
+   Dimmer row above). Matches the Screen Dimmer tab's admin warning tone. */
+.tray-screen-dimmer-warn {
+  position: absolute;
+  left: -2px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #e0a84b;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.1s, transform 0.1s;
+}
+.tray-screen-dimmer-warn:hover,
+.tray-screen-dimmer-warn:focus-visible {
+  color: #f0b95e;
+  outline: none;
+  transform: translateY(-50%) scale(1.1);
+}
+
+.tray-dimmer-row { position: relative; }
 
 /* SDR→HDR inverse tone mapping mode row: a short label plus the mode
    choices (Off / Auto HDR / RTX HDR) inline as a segmented control, sitting
@@ -656,7 +709,9 @@
   border: 1px solid var(--divider);
   border-radius: 6px;
   background: transparent;
-  color: var(--text-weak);
+  /* #e3e3e3 instead of --text-weak: at this small size the muted grey
+     made the Off / Auto HDR / RTX HDR labels hard to read. */
+  color: #e3e3e3;
   font-size: 11px;
   cursor: pointer;
   white-space: nowrap;
@@ -706,6 +761,7 @@
 }
 
 .tray-quick-toggle {
+  position: relative;
   color: var(--text-weak);
   cursor: pointer;
   transition: background 0.1s, color 0.1s;
@@ -718,6 +774,13 @@
   height: 18px;
   opacity: 0.65;
   transition: opacity 0.1s, transform 0.1s;
+}
+/* The SDR Content Brightness icon is already drawn in the 227,227,227
+   letter tone; the shared 0.65 opacity above made it read as dim grey on
+   the dark panel. Render it at full opacity (the Black Level toggle keeps
+   its own dimmed/off states). */
+.tray-quick-icon img {
+  opacity: 1;
 }
 
 .tray-quick-toggle:hover,
@@ -735,6 +798,16 @@
 
 .tray-quick-toggle.enabled img {
   opacity: 1;
+}
+
+/* Same red diagonal strike as the dimmer toggles: the Black Level icon is
+   off unless the feature is enabled. */
+.tray-quick-toggle:not(.enabled)::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  background: linear-gradient(to top right, transparent calc(50% - 1px), #ff6b6b calc(50% - 1px), #ff6b6b calc(50% + 1px), transparent calc(50% + 1px));
+  pointer-events: none;
 }
 
 .tray-quick-icon {
@@ -790,7 +863,8 @@
   /* Same fixed width as the other tray value labels, so every slider in
      the menu spans the same width regardless of its unit text. */
   flex: 0 0 48px;
-  color: var(--text-weak);
+  /* Slightly brighter than --text-weak so values read at a glance. */
+  color: #9a9aa4;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-align: right;

@@ -165,7 +165,7 @@
 </script>
 
 <div class="tab-body">
-  <TabHeading icon={tabSystemIcon} title="System Info" subtitle="Browser & display environment" />
+  <TabHeading icon={tabSystemIcon} title="System Info" subtitle="Browser & display environment." />
   <div class="separator"></div>
 
   <div class="diag-section">
