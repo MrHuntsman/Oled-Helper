@@ -62,11 +62,12 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::CallNextHookEx;
 
-// Shared memory layout (1124 bytes): the app writes the mode at offset 0 and
-// the DLL writes its own state back at offsets 4 and 8 so the app can verify
-// the hook is really installed in the CURRENT explorer.exe instead of
-// trusting that the module merely loaded. Offset 12 holds the hook-scope
-// flags (bit 0 = "apply to all apps"; 13..23 padding). The per-monitor table
+// Shared memory layout (5348 bytes): the app writes the mode at offset 0 and the DLL
+// writes its own state back at offsets 4 and 8 so the app can verify the hook
+// is really installed in the CURRENT explorer.exe instead of trusting that
+// the module merely loaded. Offset 12 holds the hook-scope flags (bit 0 =
+// "apply to all apps"); offset 16 is the loaded-process counter. The
+// per-monitor table
 // lives at 24/28/32+ (flag, count, up to 8 entries x 72 bytes), each entry
 // carrying the monitor's mode, knob pair (boldness, damping; the lcd
 // filter / crosstalk / gamma / filter-width slots are reserved, always 0),
@@ -78,6 +79,8 @@ const STATE_MODE: usize = 0;
 const STATE_STATUS: usize = 4;
 const STATE_PID: usize = 8;
 const STATE_SCOPE: usize = 12;
+const STATE_PROCESS_COUNT: usize = 16;
+const STATE_PRIMARY_EXPLORER_PID: usize = 20;
 const STATE_PER_MONITOR: usize = 24;
 const STATE_MONITOR_COUNT: usize = 28;
 const STATE_MONITORS: usize = 32;
@@ -88,7 +91,16 @@ const STATE_BLOCKLIST_ENTRIES: usize = 612;
 const BLOCKLIST_ENTRY_WORDS: usize = 32;
 const BLOCKLIST_ENTRY_STRIDE: usize = BLOCKLIST_ENTRY_WORDS * 2;
 const MAX_BLOCKLIST: usize = 8;
-const STATE_SIZE: usize = STATE_BLOCKLIST_ENTRIES + MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE;
+const PROCESS_NAME_WORDS: usize = 64;
+const PROCESS_SLOT_STRIDE: usize = 4 + PROCESS_NAME_WORDS * 2;
+const MAX_PROCESS_SLOTS: usize = 32;
+const STATE_PROCESS_SLOTS: usize =
+    STATE_BLOCKLIST_ENTRIES + MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE;
+const STATE_SIZE: usize = STATE_PROCESS_SLOTS + MAX_PROCESS_SLOTS * PROCESS_SLOT_STRIDE;
+const PROCESS_SLOT_WRITING: u32 = 0x8000_0000;
+const NO_PROCESS_SLOT: u32 = u32::MAX;
+static PROCESS_SLOT: AtomicU32 = AtomicU32::new(NO_PROCESS_SLOT);
+static PROCESS_REGISTERING: AtomicBool = AtomicBool::new(false);
 // Scope flag bits at STATE_SCOPE.
 const SCOPE_HOOK_ALL: u32 = 1;
 // Status bit written by the DLL once the ExtTextOutW detour is installed.
@@ -102,7 +114,7 @@ const STATUS_HOOK_INSTALLED: u32 = 1;
 // it whenever STATE_SIZE / the shared-memory layout changes.
 #[used]
 #[no_mangle]
-pub static HOOK_LAYOUT_MARKER: [u8; 13] = *b"OH2-SMEM-1124";
+pub static HOOK_LAYOUT_MARKER: [u8; 13] = *b"OH2-SMEM-5349";
 
 #[allow(improper_ctypes_definitions)]
 type ExtTextOutWFn = unsafe extern "system" fn(
@@ -265,6 +277,53 @@ fn hdc_caps_sig(hdc: HDC) -> (u32, u32, u32) {
             (caps(LOGPIXELSX) & 0xFFFF) | (caps(LOGPIXELSY) << 16),
         )
     }
+}
+
+// Whether this draw's DC is a DPI-virtualized surface: the DC reports a
+// LOWER DPI than the monitor it belongs to. System-DPI-aware processes like
+// mmc.exe render into a 96-DPI surface that Windows stretches to the
+// monitor's scale, so whatever we rasterize at the logical pixel size gets
+// upscaled with the whole window and reads as low-resolution (the log shows
+// mmc at px=12 while Explorer draws at px=24-27 on the same monitor). GDI's
+// hinted ClearType survives that stretch far better than swash coverage, so
+// those draws pass through untouched. Per-monitor-aware processes (Explorer,
+// the Control Panel host) draw into DCs at the monitor DPI and stay hooked.
+fn hdc_dpi_virtualized(hdc: HDC) -> bool {
+    unsafe {
+        let dc_dpi = GetDeviceCaps(Some(hdc), LOGPIXELSX).max(0) as u32;
+        if dc_dpi == 0 {
+            return false;
+        }
+        // Window DC: attribute by HWND → HMONITOR and compare with the
+        // table entry's DPI (x dpi in the low 16 bits).
+        let hwnd = WindowFromDC(hdc);
+        if !hwnd.0.is_null() {
+            let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if !hmon.0.is_null() {
+                let want = hmon.0 as usize as u32;
+                for i in 0..state_monitor_count() {
+                    if let Some((h, _, _, dpi, ..)) = state_monitor_entry(i) {
+                        if h == want {
+                            return dc_dpi < (dpi & 0xFFFF);
+                        }
+                    }
+                }
+            }
+        }
+        // Memory DC: match by physical size. The mm size is a monitor
+        // property and unaffected by virtualization, while the resolution
+        // and DPI slots are scaled, so a virtualized DC's caps signature
+        // cannot match on those (that is why these draws fall to this path).
+        let (_, phys, _) = hdc_caps_sig(hdc);
+        for i in 0..state_monitor_count() {
+            if let Some((_, _, ep, ed, ..)) = state_monitor_entry(i) {
+                if ep == phys {
+                    return dc_dpi < (ed & 0xFFFF);
+                }
+            }
+        }
+        false
+    }
 }// Per-monitor render options for this draw's DC, when per-monitor is enabled:
 // the attributed monitor's mode (0 = system default / passthrough), its knob
 // pair (boldness, damping; 0 = no adjustment), and its custom subpixel
@@ -373,6 +432,15 @@ fn report_state(status: u32) {
     let Some(addr) = STATE.get() else {
         return;
     };
+    // Only the Explorer instance owning the taskbar may publish the single
+    // shared status report. Secondary Explorer hosts must never make the app
+    // lose verification when a Control Panel window opens.
+    let primary_pid = unsafe {
+        std::ptr::read_volatile((addr + STATE_PRIMARY_EXPLORER_PID) as *const u32)
+    };
+    if primary_pid == 0 || primary_pid != std::process::id() {
+        return;
+    };
     // SAFETY: the mapped view is valid for the process lifetime; both fields
     // are plain u32s at fixed offsets we own.
     unsafe {
@@ -380,6 +448,115 @@ fn report_state(status: u32) {
         std::ptr::write_volatile((addr + STATE_PID) as *mut u32, pid);
         std::ptr::write_volatile((addr + STATE_STATUS) as *mut u32, status);
     }
+}
+
+// Loaded-process counter at STATE_PROCESS_COUNT: incremented when a process
+// enters the active hook scope, decremented when it leaves or detaches, so
+// the app can show how many scoped processes currently carry the hook. The shared-memory word is a plain u32, but x86/x64
+// interlocked ops make fetch_add/fetch_sub safe across processes. A crashed
+// process skips DETACH, so the count can drift slightly upward; it resets
+// whenever the mapping is recreated (app start).
+fn bump_process_count(delta: i32) {
+    let Some(addr) = STATE.get() else {
+        return;
+    };
+    // SAFETY: STATE is written once in map_state; the mapped view stays valid
+    // for the process lifetime, and the counter slot is a u32 at a fixed
+    // offset we own. Only atomic ops touch it.
+    unsafe {
+        let cell = (addr + STATE_PROCESS_COUNT) as *const AtomicU32;
+        if delta > 0 {
+            (*cell).fetch_add(1, Ordering::SeqCst);
+        } else {
+            (*cell).fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// Publish this process's executable name in one of the bounded shared-memory
+// slots. The high bit marks a slot while its UTF-16 name is being written, so
+// the backend only reads fully published names.
+fn register_process_name() -> bool {
+    if PROCESS_SLOT.load(Ordering::Acquire) != NO_PROCESS_SLOT
+        || PROCESS_REGISTERING.swap(true, Ordering::AcqRel)
+    {
+        return false;
+    }
+    let Some(addr) = STATE.get() else {
+        PROCESS_SLOT.store(NO_PROCESS_SLOT, Ordering::Release);
+        PROCESS_REGISTERING.store(false, Ordering::Release);
+        return false;
+    };
+    let pid = std::process::id();
+    let process_name = process_base_name();
+    if process_name.is_empty() {
+        PROCESS_REGISTERING.store(false, Ordering::Release);
+        return false;
+    }
+    let name: Vec<u16> = process_name
+        .encode_utf16()
+        .take(PROCESS_NAME_WORDS - 1)
+        .collect();
+    unsafe {
+        for index in 0..MAX_PROCESS_SLOTS {
+            let slot = addr + STATE_PROCESS_SLOTS + index * PROCESS_SLOT_STRIDE;
+            let cell = slot as *const AtomicU32;
+            if (*cell)
+                .compare_exchange(
+                    0,
+                    pid | PROCESS_SLOT_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let name_ptr = (slot + 4) as *mut u16;
+            for i in 0..PROCESS_NAME_WORDS {
+                std::ptr::write_volatile(name_ptr.add(i), name.get(i).copied().unwrap_or(0));
+            }
+            (*cell).store(pid, Ordering::Release);
+            PROCESS_SLOT.store(index as u32, Ordering::Release);
+            PROCESS_REGISTERING.store(false, Ordering::Release);
+            return true;
+        }
+    }
+    PROCESS_REGISTERING.store(false, Ordering::Release);
+    false
+}
+
+fn unregister_process_name() -> bool {
+    let Some(addr) = STATE.get() else {
+        return false;
+    };
+    let index = PROCESS_SLOT.load(Ordering::Acquire);
+    if index == NO_PROCESS_SLOT || PROCESS_REGISTERING.load(Ordering::Acquire) {
+        return false;
+    }
+    let pid = std::process::id();
+    unsafe {
+        let slot = addr + STATE_PROCESS_SLOTS + index as usize * PROCESS_SLOT_STRIDE;
+        let cell = slot as *const AtomicU32;
+        if (*cell)
+            .compare_exchange(
+                pid,
+                pid | PROCESS_SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let name_ptr = (slot + 4) as *mut u16;
+            for i in 0..PROCESS_NAME_WORDS {
+                std::ptr::write_volatile(name_ptr.add(i), 0);
+            }
+            (*cell).store(0, Ordering::Release);
+            PROCESS_SLOT.store(NO_PROCESS_SLOT, Ordering::Release);
+            return true;
+        }
+    }
+    false
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -491,7 +668,7 @@ fn in_hook_scope() -> bool {
 
 fn map_state() {
     unsafe {
-        let name = wide(r"Local\OledHelperExplorerHookState");
+        let name = wide(r"Local\OledHelperExplorerHookStateV3");
         let Ok(mapping) =
             OpenFileMappingW(FILE_MAP_READ.0 | FILE_MAP_WRITE.0, false, PCWSTR(name.as_ptr()))
         else {
@@ -854,6 +1031,11 @@ unsafe extern "system" fn try_render_swash(
     count: u32,
     dx: *const i32,
 ) -> bool {
+    // DPI-virtualized surfaces can't carry swash at native quality (see
+    // hdc_dpi_virtualized): let GDI draw those so the text stays sharp.
+    if hdc_dpi_virtualized(hdc) {
+        return false;
+    }
     let global_mode = state_mode();
     // Per-monitor render options: when enabled, attribute this draw's DC to
     // a monitor and use its mode + knob triplet. Unattributable draws (or
@@ -1041,6 +1223,12 @@ unsafe fn try_render_glyph_indices(
     mode: text_raster::RenderMode,
     opts: text_raster::RenderOptions,
 ) -> bool {
+    // Same DPI-virtualization passthrough as try_render_swash: mmc.exe and
+    // other system-DPI-aware hosts render into a 96-DPI surface that Windows
+    // stretches, so swash there would be upscaled and read as low-res.
+    if hdc_dpi_virtualized(hdc) {
+        return false;
+    }
     let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
     let verbose = n < 100 || n % 10000 == 0;
     if verbose {
@@ -1312,6 +1500,19 @@ pub unsafe extern "system" fn hook_callback(
     // gets the detour without a restart. INSTALL_ATTEMPTED stays false for
     // out-of-scope processes so a later scope change still installs; it only
     // latches once the install is attempted (or succeeded).
+    // Process-name lookup is deferred here instead of DllMain, keeping the
+    // loader lock free of filesystem and allocation work.
+    if in_hook_scope() {
+        if PROCESS_SLOT.load(Ordering::Acquire) == NO_PROCESS_SLOT
+            && register_process_name()
+        {
+            bump_process_count(1);
+        }
+    } else if PROCESS_SLOT.load(Ordering::Acquire) != NO_PROCESS_SLOT
+        && unregister_process_name()
+    {
+        bump_process_count(-1);
+    }
     if in_hook_scope() && !INSTALL_ATTEMPTED.swap(true, Ordering::SeqCst) {
         log("hook_callback: first window event, installing detour");
         if !install_detour() {
@@ -1444,6 +1645,14 @@ pub unsafe extern "system" fn DllMain(
             // re-evaluated per draw in in_hook_scope.
             map_state();
             IS_TARGET.store(is_target(), Ordering::Release);
+            // Register immediately for in-scope processes (shell hosts like
+            // control.exe and mmc.exe may never receive a hook callback), so
+            // the name list reflects every process the detour applies to.
+            // The callback path re-registers if the mapping was not reachable
+            // at attach time.
+            if in_hook_scope() && register_process_name() {
+                bump_process_count(1);
+            }
             BOOL(1)
         }
         DLL_PROCESS_DETACH => {
@@ -1453,6 +1662,11 @@ pub unsafe extern "system" fn DllMain(
             // jump into unmapped memory on the next ExtTextOutW call.
             if DETOUR.get().is_some() {
                 disable_detours();
+            }
+            // Matches the attach increment. Processes that never published a
+            // name were not included in the counter.
+            if unregister_process_name() {
+                bump_process_count(-1);
             }
             BOOL(1)
         }

@@ -1084,10 +1084,16 @@ pub fn run() {
                         entry.fade_in_duration_ms = saved_config.taskbar_dimmer_fade_in_duration_ms;
                         entry.fade_out_duration_ms =
                             saved_config.taskbar_dimmer_fade_out_duration_ms;
-                        entry.hover_detection = saved_config.taskbar_dimmer_hover_detection.clone();
-                        entry.poll_interval_ms = saved_config.taskbar_dimmer_poll_interval_ms.clamp(16, 200) as u32;
                     }
                 }
+                // Detection Method is global, not per monitor: seed the
+                // runtime statics from the persisted config so the hook and
+                // tick cadence match the user's setting before any command
+                // re-applies them.
+                crate::taskbar_dimmer::sync_detection(
+                    &saved_config.taskbar_dimmer_hover_detection,
+                    saved_config.taskbar_dimmer_poll_interval_ms.clamp(16, 200) as u32,
+                );
             }
 
             // Apply the persisted Explorer-hook state (Text tab) at startup

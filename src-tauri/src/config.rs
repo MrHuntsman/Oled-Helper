@@ -202,8 +202,11 @@ pub struct AppConfig {
     // Per-monitor taskbar dimmer profiles, keyed by the monitor's stable
     // identity (monitor_id || sig). One entry per connected monitor; a
     // monitor without an entry falls back to DimmerProfile::default(). The
-    // flat taskbar_dimmer_* fields above remain as the legacy/primary
-    // fallback written by older versions and read for migration.
+    // flat taskbar_dimmer_opacity / fade_* fields remain as the legacy/
+    // primary fallback written by older versions and read for migration.
+    // The hover/poll fields (taskbar_dimmer_hover_detection /
+    // taskbar_dimmer_poll_interval_ms) are global, not per monitor, so they
+    // live only in the flat fields and never in a profile.
     #[serde(default)]
     pub taskbar_dimmer_profiles: HashMap<String, crate::taskbar_dimmer::DimmerProfile>,
     #[serde(default = "default_resolution_sort")]

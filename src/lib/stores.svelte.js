@@ -317,7 +317,9 @@ export const taskbarDimmer = $state({
 // sliders edit the selected monitor's entry through the helpers below, and
 // switching monitors reloads the view from this map. A monitor without an
 // entry uses TASKBAR_DIMMER_DEFAULTS (mirroring the backend's
-// DimmerProfile::default()).
+// DimmerProfile::default()). The detection fields (hoverDetection /
+// pollIntervalMs) are global, not per monitor, so they never live in a
+// profile entry.
 export const taskbarDimmerProfiles = $state({});
 
 // The profile key for a monitor: the resolution-independent EDID device id
@@ -329,6 +331,8 @@ export function dimmerMonKey(mon = activeMonitor.mon) {
 
 // Load the active monitor's profile into the view fields. Called when the
 // monitor selector changes and after config load resolves the selection.
+// The detection fields (hoverDetection / pollIntervalMs) are global, so
+// switching monitors leaves them untouched.
 export function syncTaskbarDimmerView() {
   const key = dimmerMonKey();
   const p = key ? taskbarDimmerProfiles[key] : null;
@@ -336,8 +340,6 @@ export function syncTaskbarDimmerView() {
     taskbarDimmer.opacity = p.opacity;
     taskbarDimmer.fadeInDurationMs = p.fadeInDurationMs;
     taskbarDimmer.fadeOutDurationMs = p.fadeOutDurationMs;
-    taskbarDimmer.hoverDetection = p.hoverDetection;
-    taskbarDimmer.pollIntervalMs = p.pollIntervalMs;
   }
 }
 
@@ -352,8 +354,6 @@ function currentDimmerProfile() {
       opacity: TASKBAR_DIMMER_DEFAULTS.opacity,
       fadeInDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs,
       fadeOutDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs,
-      hoverDetection: TASKBAR_DIMMER_DEFAULTS.hoverDetection,
-      pollIntervalMs: TASKBAR_DIMMER_DEFAULTS.pollIntervalMs,
     };
     taskbarDimmerProfiles[key] = p;
   }
@@ -760,8 +760,6 @@ function backfillTaskbarDimmerProfiles() {
         opacity: taskbarDimmer.opacity,
         fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
         fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs,
-        hoverDetection: taskbarDimmer.hoverDetection,
-        pollIntervalMs: taskbarDimmer.pollIntervalMs,
       };
       changed = true;
     }
@@ -1119,14 +1117,16 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
     if (cfg && typeof cfg.taskbar_dimmer_fade_out_duration_ms === 'number') taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_out_duration_ms)));
     if (cfg && typeof cfg.taskbar_dimmer_fade_linked === 'boolean') taskbarDimmer.fadeLinked = cfg.taskbar_dimmer_fade_linked;
+    // Detection Method is global, not per monitor, so these are the only
+    // place it lives in the config; the backend also seeds it at startup.
     if (cfg && typeof cfg.taskbar_dimmer_hover_detection === 'string') {
       taskbarDimmer.hoverDetection = cfg.taskbar_dimmer_hover_detection;
       Object.assign(dimmerDetections, detectionDefaultsForMode(cfg.taskbar_dimmer_hover_detection));
-      invoke('set_taskbar_dimmer_hover_mode', { monitorKey: dimmerMonKey(), mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
+      invoke('set_taskbar_dimmer_hover_mode', { mode: cfg.taskbar_dimmer_hover_detection }).catch(() => {});
     }
     if (cfg && typeof cfg.taskbar_dimmer_poll_interval_ms === 'number' && Number.isFinite(cfg.taskbar_dimmer_poll_interval_ms)) {
       taskbarDimmer.pollIntervalMs = Math.max(16, Math.min(200, Math.round(cfg.taskbar_dimmer_poll_interval_ms)));
-      invoke('set_taskbar_dimmer_poll_interval', { monitorKey: dimmerMonKey(), ms: taskbarDimmer.pollIntervalMs }).catch(() => {});
+      invoke('set_taskbar_dimmer_poll_interval', { ms: taskbarDimmer.pollIntervalMs }).catch(() => {});
     }
     if (cfg && typeof cfg.taskbar_dimmer_profiles === 'object' && cfg.taskbar_dimmer_profiles) {
       // Per-monitor profiles win over the flat legacy fields above (which
@@ -1138,8 +1138,6 @@ export async function loadConfig(prefetchedCfg = null) {
           opacity: Math.max(0, Math.min(1, Number(p.opacity) || TASKBAR_DIMMER_DEFAULTS.opacity)),
           fadeInDurationMs: Math.max(0, Math.min(1000, Math.round(Number(p.fadeInDurationMs) || TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs))),
           fadeOutDurationMs: Math.max(0, Math.min(1000, Math.round(Number(p.fadeOutDurationMs) || TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs))),
-          hoverDetection: typeof p.hoverDetection === 'string' ? p.hoverDetection : TASKBAR_DIMMER_DEFAULTS.hoverDetection,
-          pollIntervalMs: Math.max(16, Math.min(200, Math.round(Number(p.pollIntervalMs) || TASKBAR_DIMMER_DEFAULTS.pollIntervalMs))),
         };
       }
     }
@@ -1308,8 +1306,10 @@ export function saveConfig() {
     taskbar_dimmer_fade_in_duration_ms: primaryDimmerProfile?.fadeInDurationMs ?? taskbarDimmer.fadeInDurationMs,
     taskbar_dimmer_fade_out_duration_ms: primaryDimmerProfile?.fadeOutDurationMs ?? taskbarDimmer.fadeOutDurationMs,
     taskbar_dimmer_fade_linked: taskbarDimmer.fadeLinked,
-    taskbar_dimmer_hover_detection: primaryDimmerProfile?.hoverDetection ?? (taskbarDimmer.hoverDetection || 'event'),
-    taskbar_dimmer_poll_interval_ms: primaryDimmerProfile?.pollIntervalMs ?? taskbarDimmer.pollIntervalMs,
+    // Detection Method is global, written straight from the view (the
+    // backend stores it only in these flat fields, never in a profile).
+    taskbar_dimmer_hover_detection: taskbarDimmer.hoverDetection || 'event',
+    taskbar_dimmer_poll_interval_ms: taskbarDimmer.pollIntervalMs,
     taskbar_dimmer_profiles: { ...taskbarDimmerProfiles },
     display_menu_resolution_sort: displayMenuPrefs.resolutionSort,
     display_menu_resolution_group_by: displayMenuPrefs.resolutionGroupBy,
@@ -1604,26 +1604,23 @@ export function setDimmerSuspendedForFullscreen(suspended) { invoke('set_taskbar
 export function setHoverDetection(mode) {
   const previous = taskbarDimmer.hoverDetection;
   taskbarDimmer.hoverDetection = mode;
-  // Persist into the active monitor's profile (Detection Method is per
-  // monitor, like the other dimmer settings).
-  const profile = currentDimmerProfile();
-  if (profile) profile.hoverDetection = mode;
+  // Detection Method is global, so there is no per-monitor profile to write.
   Object.assign(dimmerDetections, detectionDefaultsForMode(mode));
-  invoke('set_taskbar_dimmer_hover_mode', { monitorKey: dimmerMonKey(), mode }).catch((e) => { console.warn('[hover-detection] toggle failed', e); taskbarDimmer.hoverDetection = previous; if (profile) profile.hoverDetection = previous; Object.assign(dimmerDetections, detectionDefaultsForMode(previous)); });
+  invoke('set_taskbar_dimmer_hover_mode', { mode }).catch((e) => { console.warn('[hover-detection] toggle failed', e); taskbarDimmer.hoverDetection = previous; Object.assign(dimmerDetections, detectionDefaultsForMode(previous)); });
 }
 let pollIntervalSaveTimer = null;
 let pollIntervalInvokeTimer = null;
 export function setPollIntervalMs(ms) {
   const clamped = Math.max(16, Math.min(200, Math.round(ms)));
   taskbarDimmer.pollIntervalMs = clamped;
-  const profile = currentDimmerProfile();
-  if (profile) profile.pollIntervalMs = clamped;
-  // Debounce the IPC call too: the slider fires on every input event during a
-  // drag, and the polling cadence only matters once the user settles on one.
+  // Detection Method is global, so there is no per-monitor profile to write.
+  // Debounce the IPC call too: the slider fires on every input event during
+  // a drag, and the polling cadence only matters once the user settles on
+  // one.
   clearTimeout(pollIntervalInvokeTimer);
   pollIntervalInvokeTimer = setTimeout(() => {
     pollIntervalInvokeTimer = null;
-    invoke('set_taskbar_dimmer_poll_interval', { monitorKey: dimmerMonKey(), ms: clamped }).catch((e) => console.warn('[poll-interval] update failed', e));
+    invoke('set_taskbar_dimmer_poll_interval', { ms: clamped }).catch((e) => console.warn('[poll-interval] update failed', e));
   }, 150);
   clearTimeout(pollIntervalSaveTimer);
   pollIntervalSaveTimer = setTimeout(() => saveConfig(), 400);

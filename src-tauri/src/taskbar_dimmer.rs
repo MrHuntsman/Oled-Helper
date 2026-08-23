@@ -35,27 +35,24 @@ pub struct TaskbarDimmerStatus {
 // Per-monitor dimmer settings, keyed by the monitor's stable identity
 // (monitor_id || sig) in the profiles map. One entry per connected monitor;
 // a monitor without an entry uses DimmerProfile::default(). The master
-// enabled toggle is separate (global).
+// enabled toggle and the detection method (hover mode + poll interval) are
+// separate (global), the rest is per monitor.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DimmerProfile {
     pub opacity: f64,
     pub fade_in_duration_ms: u64,
     pub fade_out_duration_ms: u64,
-    pub hover_detection: String,
-    pub poll_interval_ms: u32,
 }
 
 impl Default for DimmerProfile {
     fn default() -> Self {
         // Must match config.rs's default_dimmer_ease_duration() (300 ms) and
-        // the UI defaults for opacity / hover mode / poll interval.
+        // the UI defaults for opacity.
         Self {
             opacity: 0.95,
             fade_in_duration_ms: 300,
             fade_out_duration_ms: 300,
-            hover_detection: "event".into(),
-            poll_interval_ms: 100,
         }
     }
 }
@@ -72,7 +69,7 @@ mod platform {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::{
-        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering},
         Condvar, Mutex, OnceLock,
     };
     use std::thread::JoinHandle;
@@ -141,6 +138,13 @@ mod platform {
     const DEFAULT_EASE_DURATION_MS: u64 = 300; // must match config.rs default_dimmer_ease_duration()
     const MIN_EASE_DURATION_MS: u64 = 0;
     const MAX_EASE_DURATION_MS: u64 = 1000;
+    // Hover hysteresis margin (logical px): while the overlay is hovered
+    // (faded out), the cursor must leave the taskbar rect expanded by this
+    // margin before hover clears, and while not hovered it must enter the
+    // strict rect. This absorbs GetCursorPos jitter at the taskbar edge
+    // that would otherwise flip the fade on every tick (the visible
+    // throbbing). Both the mouse hook and the tick poll use the same rule.
+    const HOVER_HYSTERESIS_MARGIN: i32 = 3;
 
     struct FadeState {
         enabled: bool,
@@ -202,6 +206,13 @@ mod platform {
     static OVERLAYS: OnceLock<Mutex<HashMap<isize, OverlayInfo>>> = OnceLock::new();
     static TICK_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
     static VERBOSE_LOGGING: AtomicBool = AtomicBool::new(false);
+    // Temporary flicker diagnostics: cumulative counters for fade reversals,
+    // overlay hides, and overlay re-shows. Logged with a running total so a
+    // flicker storm shows up as a burst of increasing counters instead of a
+    // single one-off line. Remove these once the flicker source is confirmed.
+    static FLICKER_REVERSAL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FLICKER_HIDE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static FLICKER_RESHOW_COUNT: AtomicU64 = AtomicU64::new(0);
     // Per-detection toggle flags, settable from the Debug tab to isolate
     // which tick-time Win32 call is causing poll-gap stutter.
     static FULLSCREEN_DETECTION: AtomicBool = AtomicBool::new(true);
@@ -281,7 +292,11 @@ mod platform {
     // polls cursor at the idle cadence, a universal fallback for users
     // whose security software, remote desktop, or other edge cases
     // conflict with WH_MOUSE_LL.
-    static PREFER_EVENT_HOVER: AtomicBool = AtomicBool::new(true);
+    // Runtime source of truth for the global Detection Method setting, read
+    // by the commands above and the tick/hook threads. pub(super) so the
+    // Tauri commands can read the current counterpart when the user changes
+    // only the mode or only the interval.
+    pub(super) static PREFER_EVENT_HOVER: AtomicBool = AtomicBool::new(true);
     // Set by the WinEvent hooks (foreground switch, move/size, minimize/
     // restore, location change). In event hover mode this is the ONLY
     // trigger for a fullscreen recheck, the timer stands down entirely,
@@ -314,7 +329,7 @@ mod platform {
     // poll interval in event mode. Default matches the previous hardcoded
     // IDLE_TIMER_INTERVAL_MS. Bounds enforced in the Tauri command below.
     const DEFAULT_POLL_INTERVAL_MS: u32 = 100; // must match config.rs default_poll_interval() and the frontend store
-    static POLL_INTERVAL_MS: AtomicU32 = AtomicU32::new(DEFAULT_POLL_INTERVAL_MS);
+    pub(super) static POLL_INTERVAL_MS: AtomicU32 = AtomicU32::new(DEFAULT_POLL_INTERVAL_MS);
 
     // Controls ONLY this module's own verbose diagnostics (tick, winevent,
     // fullscreen/taskbar-cache refreshes, fade summaries). The general
@@ -801,7 +816,7 @@ mod platform {
         // floods); warn/error records are real failures and always pass
         // through, otherwise the exact clues needed to diagnose a broken
         // hook or slow overlay update would be invisible by default.
-        let verbose_only = level != "warn" && level != "error";
+        let verbose_only = level != "warn" && level != "error" && level != "flicker";
         if verbose_only && !VERBOSE_LOGGING.load(Ordering::Relaxed) {
             return;
         }
@@ -810,6 +825,28 @@ mod platform {
             "error" => log::error!("{message}"),
             _ => log::info!("{message}"),
         }
+    }
+
+    // Temporary flicker diagnostics (remove with the counters above): log
+    // every fade reversal and every overlay hide/re-show with the running
+    // total, so a flicker storm is visible as a burst of incrementing
+    // numbers. Uses the "flicker" level which always passes through the
+    // verbose gate (the whole point is seeing these without enabling
+    // verbose diagnostics).
+    fn log_flicker_event(kind: &str, hwnd: isize, detail: &str) {
+        let count = match kind {
+            "reversal" => FLICKER_REVERSAL_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
+            "hide" => FLICKER_HIDE_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
+            "reshow" => FLICKER_RESHOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
+            _ => return,
+        };
+        emit_runtime(
+            "flicker",
+            format!(
+                "[taskbar-dimmer] flicker_debug kind={} count={} hwnd=0x{:x} {}",
+                kind, count, hwnd, detail,
+            ),
+        );
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -1247,6 +1284,7 @@ mod platform {
                 unsafe {
                     if IsWindowVisible(hwnd).as_bool() {
                         let _ = ShowWindow(hwnd, SW_HIDE);
+                        log_flicker_event("hide", raw, "fullscreen (event callback)");
                         if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                             emit_runtime(
                                 "info",
@@ -1264,20 +1302,41 @@ mod platform {
             && fullscreen_app_active_for_monitor(None, Some(hmonitor))
     }
 
-    fn cursor_over_rect(rect: RECT) -> (bool, windows::Win32::Foundation::POINT) {
-        let mut point = windows::Win32::Foundation::POINT::default();
-        unsafe {
-            if GetCursorPos(&mut point).is_err() {
-                return (false, point);
-            }
-        }
-        (
+    // Hover hit-test with hysteresis. The rect is expanded by
+    // HOVER_HYSTERESIS_MARGIN while the overlay is currently hovered and
+    // strict otherwise, so the cursor must commit past the boundary before
+    // the state flips. Pass the overlay's current hover state so a cursor
+    // parked right at the taskbar edge (GetCursorPos jitters a pixel or two
+    // across the boundary) doesn't reverse the fade on every tick.
+    fn hover_hit_test(
+        rect: RECT,
+        point: windows::Win32::Foundation::POINT,
+        currently_hovered: bool,
+    ) -> bool {
+        if currently_hovered {
+            point.x >= rect.left - HOVER_HYSTERESIS_MARGIN
+                && point.x < rect.right + HOVER_HYSTERESIS_MARGIN
+                && point.y >= rect.top - HOVER_HYSTERESIS_MARGIN
+                && point.y < rect.bottom + HOVER_HYSTERESIS_MARGIN
+        } else {
             point.x >= rect.left
                 && point.x < rect.right
                 && point.y >= rect.top
-                && point.y < rect.bottom,
-            point,
-        )
+                && point.y < rect.bottom
+        }
+    }
+
+    fn cursor_over_rect(
+        rect: RECT,
+        currently_hovered: bool,
+    ) -> (bool, windows::Win32::Foundation::POINT) {
+        let mut point = windows::Win32::Foundation::POINT::default();
+        unsafe {
+            if GetCursorPos(&mut point).is_err() {
+                return (currently_hovered, point);
+            }
+        }
+        (hover_hit_test(rect, point, currently_hovered), point)
     }
 
     fn rect_text(rect: Option<RECT>) -> String {
@@ -1412,6 +1471,7 @@ mod platform {
                 // else re-shows it except this SetWindowPos(SWP_SHOWWINDOW),
                 // so a hidden→visible transition here marks the restore.
                 if !IsWindowVisible(hwnd).as_bool() {
+                    log_flicker_event("reshow", hwnd.0 as isize, "zorder repair");
                     emit_runtime(
                         "info",
                         "[taskbar-dimmer] overlay_reshown via zorder repair".into(),
@@ -1636,12 +1696,7 @@ mod platform {
                             continue;
                         }
                         let hovered = match fade.cached_taskbar {
-                            Some((_, rect)) => {
-                                point.x >= rect.left
-                                    && point.x < rect.right
-                                    && point.y >= rect.top
-                                    && point.y < rect.bottom
-                            }
+                            Some((_, rect)) => hover_hit_test(rect, point, fade.hover),
                             None => false,
                         };
                         if fade.hover != hovered {
@@ -1853,6 +1908,7 @@ mod platform {
             unsafe {
                 if IsWindowVisible(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_HIDE);
+                    log_flicker_event("hide", hwnd_raw, "fullscreen (tick)");
                     if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                         emit_runtime(
                             "info",
@@ -1988,9 +2044,20 @@ mod platform {
                 // tick; event-mode overlays use the hook's cached hover.
                 let should_poll = CURSOR_POLLING.load(Ordering::Relaxed)
                     || (hook_active && elevated)
-                    || !fade.hover_event;
+                    || !fade.hover_event
+                    // Event mode with the mouse hook expected but not
+                    // actually installed (install failed, or the hook thread
+                    // has not registered yet): fall back to the cursor poll
+                    // so hover detection never silently stops, matching the
+                    // promise on mouse_hook_thread_loop. Gated on
+                    // MOUSE_HOOK_TOGGLE so the Debug-tab A/B switch (hook
+                    // deliberately off) still stands as an explicit test
+                    // configuration.
+                    || (fade.hover_event
+                        && MOUSE_HOOK_TOGGLE.load(Ordering::Relaxed)
+                        && MOUSE_HOOK.load(Ordering::Acquire) == 0);
                 if should_poll {
-                    let (is_hovered, point) = cursor_over_rect(rect);
+                    let (is_hovered, point) = cursor_over_rect(rect, fade.hover);
                     hovered = is_hovered;
                     cursor = point;
                     cursor_polled = true;
@@ -2031,6 +2098,11 @@ mod platform {
             if (fade.target_alpha - new_target).abs() > 0.01 {
                 if fade.fade_tick_count > 0 {
                     transition_log = Some(transition_summary(&fade, "reversed", now));
+                    log_flicker_event(
+                        "reversal",
+                        hwnd_raw,
+                        &format!("alpha {:.0} -> {:.0}", fade.current_alpha, new_target),
+                    );
                 }
                 fade.start_alpha = fade.current_alpha;
                 fade.fade_start_time = now;
@@ -2147,6 +2219,7 @@ mod platform {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
+            log_flicker_event("reshow", hwnd_raw, "self-heal");
             if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                 emit_runtime("info", "[taskbar-dimmer] overlay_reshown self-heal".into());
             }
@@ -2320,38 +2393,30 @@ mod platform {
         }
     }
 
+    // Detection Method is global, not per monitor: the mouse hook either
+    // installs or it doesn't, and the tick cadence is a single value. This
+    // syncs the runtime statics from the global config (called on startup
+    // and whenever the Settings-tab control changes). Event mode uses the
+    // mouse hook as the hover detector and stands the cursor poll down;
+    // poll mode uses the cursor poll and no hook. The Debug tab can still
+    // override either live (set_detection), a later mode/interval change
+    // just re-syncs these defaults.
+    pub fn sync_detection(mode: &str, poll_ms: u32) {
+        let event = mode == "event";
+        let poll_ms = poll_ms.clamp(16, 200);
+        PREFER_EVENT_HOVER.store(event, Ordering::Relaxed);
+        POLL_INTERVAL_MS.store(poll_ms, Ordering::Relaxed);
+        CURSOR_POLLING.store(!event, Ordering::Relaxed);
+        MOUSE_HOOK_TOGGLE.store(event, Ordering::Relaxed);
+        // Wake the tick thread so a poll-interval change takes effect
+        // immediately instead of waiting out the previous cadence.
+        let guard = TICK_WAKE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        TICK_INTERVAL_MS.store(poll_ms, Ordering::Relaxed);
+        TICK_WAKE_CONDVAR.notify_all();
+        drop(guard);
+    }
+
     pub fn apply(enabled: bool, immediate: bool) -> Result<(), String> {
-        // Sync the global hover/poll defaults from the per-monitor profiles:
-        // the mouse hook installs when ANY monitor uses event detection, and
-        // the idle tick cadence is the fastest poll interval in use. This
-        // replaces the old global set_hover_mode/set_poll_interval_ms: every
-        // profile change flows through apply(), so the flags and the tick
-        // cadence follow the profiles.
-        {
-            let profiles = super::profiles_map().lock().unwrap_or_else(|e| e.into_inner());
-            let min_poll = profiles
-                .values()
-                .map(|p| p.poll_interval_ms)
-                .min()
-                .unwrap_or(DEFAULT_POLL_INTERVAL_MS)
-                .clamp(16, 200);
-            let any_event = profiles.values().any(|p| p.hover_detection == "event");
-            POLL_INTERVAL_MS.store(min_poll, Ordering::Relaxed);
-            PREFER_EVENT_HOVER.store(any_event, Ordering::Relaxed);
-            // Keep the per-detection toggles aligned with the profiles: event
-            // mode uses the mouse hook as the hover detector and stands the
-            // cursor poll down; poll mode uses the cursor poll and no hook.
-            // The Debug tab can still override either live (set_detection),
-            // a later apply() just re-syncs these defaults.
-            CURSOR_POLLING.store(!any_event, Ordering::Relaxed);
-            MOUSE_HOOK_TOGGLE.store(any_event, Ordering::Relaxed);
-            // Wake the tick thread so a poll-interval change takes effect
-            // immediately instead of waiting out the previous cadence.
-            let guard = TICK_WAKE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            TICK_INTERVAL_MS.store(min_poll, Ordering::Relaxed);
-            TICK_WAKE_CONDVAR.notify_all();
-            drop(guard);
-        }
         // Same transient-miss retry as before: right after a tray restart
         // the taskbars can be missing, and the frontend would otherwise treat
         // the toggle as off and never persist the setting. Absorb the hiccup.
@@ -2430,7 +2495,7 @@ mod platform {
                 .unwrap_or_default()
         };
         let alpha = opacity_to_alpha(profile.opacity);
-        let hovered = enabled && cursor_over_rect(rect).0;
+        let hovered = enabled && cursor_over_rect(rect, false).0;
 
         let mut immediate_alpha = None;
         let fades = fades_map();
@@ -2441,9 +2506,9 @@ mod platform {
                 .ok_or_else(|| "overlay fade state missing".to_string())?;
             fade.enabled = enabled;
             fade.base_alpha = alpha;
-            // Per-monitor hover mode from the profile. The poll cadence is
-            // shared (fastest across profiles, set in apply()).
-            fade.hover_event = profile.hover_detection == "event";
+            // Detection method is global (set in sync_detection), not per
+            // monitor, so every overlay shares the same hover mode.
+            fade.hover_event = PREFER_EVENT_HOVER.load(Ordering::Relaxed);
             // Seed the overlay's hover cache so it doesn't fire a spurious
             // poke for a state that predates the hook's installation.
             fade.hover = hovered;
@@ -2569,6 +2634,7 @@ mod platform {
     }
     pub fn set_verbose_logging(_enabled: bool) {}
     pub fn set_detection(_name: &str, _enabled: bool) {}
+    pub fn sync_detection(_mode: &str, _poll_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
     pub fn set_flyout_hwnd(_raw: isize) {}
     pub fn fullscreen_active_on_monitor(_hmonitor: u32) -> bool {
@@ -2646,17 +2712,21 @@ pub fn set_taskbar_dimmer_suspended(suspended: bool) {
     platform::set_suspended(suspended);
 }
 
+// Startup seed for the global Detection Method setting (hover mode + poll
+// interval), called from lib.rs after the persisted config is loaded so the
+// hook and tick cadence match before any command re-applies them.
+pub(crate) fn sync_detection(mode: &str, poll_ms: u32) {
+    platform::sync_detection(mode, poll_ms);
+}
+
 #[tauri::command]
 pub fn set_taskbar_dimmer_hover_mode(
     state: State<TaskbarDimmerState>,
-    monitor_key: Option<String>,
     mode: String,
 ) -> Result<(), String> {
-    let key = resolve_profile_key(monitor_key.as_deref());
-    {
-        let mut profiles = profiles_map().lock().unwrap_or_else(|e| e.into_inner());
-        profiles.entry(key).or_default().hover_detection = mode;
-    }
+    // Detection Method is global: keep the current poll interval, swap the
+    // mode, then apply so the overlay/tick behavior follows immediately.
+    platform::sync_detection(&mode, platform::POLL_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed));
     let enabled = *state.enabled.lock().unwrap_or_else(|e| e.into_inner());
     platform::apply(enabled, false)
 }
@@ -2664,17 +2734,19 @@ pub fn set_taskbar_dimmer_hover_mode(
 #[tauri::command]
 pub fn set_taskbar_dimmer_poll_interval(
     state: State<TaskbarDimmerState>,
-    monitor_key: Option<String>,
     ms: u32,
 ) -> Result<(), String> {
     // UI bounds: the frontend slider clamps 16..200, so keep the backend
     // clamp identical instead of allowing a hidden 2000 ms ceiling.
     let ms = ms.clamp(16, 200);
-    let key = resolve_profile_key(monitor_key.as_deref());
-    {
-        let mut profiles = profiles_map().lock().unwrap_or_else(|e| e.into_inner());
-        profiles.entry(key).or_default().poll_interval_ms = ms;
-    }
+    // Keep the current detection mode, swap the interval, then apply so the
+    // tick cadence changes immediately.
+    let mode = if platform::PREFER_EVENT_HOVER.load(std::sync::atomic::Ordering::Relaxed) {
+        "event"
+    } else {
+        "poll"
+    };
+    platform::sync_detection(mode, ms);
     let enabled = *state.enabled.lock().unwrap_or_else(|e| e.into_inner());
     platform::apply(enabled, false)
 }
@@ -2696,8 +2768,13 @@ pub fn get_taskbar_dimmer_status(
         opacity: profile.opacity,
         fade_in_duration_ms: profile.fade_in_duration_ms,
         fade_out_duration_ms: profile.fade_out_duration_ms,
-        hover_detection: profile.hover_detection,
-        poll_interval_ms: profile.poll_interval_ms,
+        // Detection method is global, not per monitor.
+        hover_detection: if platform::PREFER_EVENT_HOVER.load(std::sync::atomic::Ordering::Relaxed) {
+            "event".to_string()
+        } else {
+            "poll".to_string()
+        },
+        poll_interval_ms: platform::POLL_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed),
         available: platform::available()
             && state
                 .overlay

@@ -14,6 +14,7 @@
   --control-border: #3A3A44;
   --control-border-strong: #555563;
   --success: #62C779;
+  --warning: #E0A93C;
   --hover: #24242A;
   --font: 'Inter', system-ui, -apple-system, sans-serif;
   color-scheme: dark;
@@ -428,7 +429,7 @@ select,
 /* Admin-required warning badge beside the Screen Dimmer nav switch, between
    the label and the switch. Shown only when the dimmer is enabled but the
    session is not elevated; the triangle glyph matches the app's other amber
-   warning icons (see .text-render-explorer-warning). Right edge tracks the
+   warning icons. Right edge tracks the
    smaller nav switch (26px at right:10px ends at 36px), so 38px keeps the
    2px gap. */
 .nav-item-shield {
@@ -1053,13 +1054,11 @@ select,
    shield prevents descendant hover/focus styles and native controls from
    responding before that handler runs. */
 .dimmer-control-group.disabled,
-.dimmer-hover-section.disabled,
 .dimmer-control.disabled,
 .fs-black-slider.disabled {
   cursor: not-allowed;
 }
 .dimmer-control-group.disabled::after,
-.dimmer-hover-section.disabled::after,
 .dimmer-control.disabled::after,
 .fs-black-slider.disabled::after {
   content: '';
@@ -1069,7 +1068,6 @@ select,
   cursor: not-allowed;
   background: transparent;
 }
-.dimmer-hover-section { position: relative; }
 .dimmer-control {
   position: relative;
   padding: 10px 12px;
@@ -1104,7 +1102,6 @@ select,
 .dimmer-control.disabled,
 .fs-black-slider.disabled { opacity: 0.5; }
 .dimmer-control-group.disabled .slider-tooltip,
-.dimmer-hover-section.disabled .slider-tooltip,
 .dimmer-control.disabled .slider-tooltip,
 .fs-black-slider.disabled .slider-tooltip { opacity: 0 !important; transform: translateX(-50%) translateY(4px) scale(0.92); }
 .disabled-section-hit-area {
@@ -2042,163 +2039,135 @@ select,
   border-color: #ff6b6b;
 }
 
-/* Two-line settings row: label on top, a full-width control (e.g. the
-   hover-detection segmented switch) on its own row below, instead of the
-   label-left/control-right layout the single-line .settings-row uses. */
-.settings-row-2line {
+/* Detection Method: compact two-line settings row. The label (description
+   lives in an Info tooltip) with, in poll mode, the inline poll-interval
+   slider sits on the first line; the two-option switch gets its own
+   narrower row below, aligned left so it reads as a control under the
+   label rather than a full-width bar. */
+.hover-detect-settings-row {
   flex-direction: column;
-  align-items: stretch;
+  align-items: flex-start;
   gap: 8px;
   cursor: default;
   background: rgba(0, 0, 0, 0.12);
 }
-.settings-row-2line:hover,
-.settings-row-2line:hover:not(:disabled) { background: rgba(0, 0, 0, 0.12); }
+.hover-detect-settings-row:hover,
+.hover-detect-settings-row:hover:not(:disabled) { background: rgba(0, 0, 0, 0.12); }
+.hover-detect-left {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+.hover-detect-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+/* The switch and the poll-interval slider share one controls row, so in
+   poll mode the slider sits to the right of the two option buttons. */
+.hover-detect-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+.hover-detect-controls .hover-detect-poll-rate {
+  width: auto;
+  min-width: 0;
+  margin-top: 0;
+  flex: 1 1 auto;
+}
+.hover-detect-controls .hover-detect-poll-rate input[type=range] { min-width: 90px; }
 
-/* Detection Method section on the Dimmer tab, mirrors the spacing/heading
-   pattern of the fade-duration row above it (margin-top: 16px) rather than
-   the bordered .settings-row-2line wrapper used when this lived in Settings. */
-.dimmer-hover-section { margin-top: 16px; }
-/* Keep the section hit-testable while disabled so its interaction shield can
-   explain that the master switch is off. The shield below prevents changes
-   and the native controls remain disabled; only `pointer-events: none` would
-   make an attempted click disappear before the feedback handler runs. */
-.dimmer-hover-section.disabled { opacity: 0.5; }
 .dimmer-section-heading { display: block; margin-bottom: 8px; }
 .dimmer-section-desc { display: block; margin-bottom: 8px; }
 
-/* Segmented hover-detection switch, both options and their descriptions
-   are visible at once so the user can compare before switching, instead of
-   the old pill toggle which only showed the currently active description. */
+/* Detection Method on the Settings tab. The track fills the row, while the
+   two options remain equal width so the active indicator never changes the
+   layout. */
 .hover-detect-switch {
-  display: flex;
-  gap: 8px;
-}
-.hover-detect-opt {
-  flex: 1 1 50%;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  text-align: left;
-  padding: 10px 12px;
-  border: 1px solid var(--divider);
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.12);
-  transition: background 0.1s, border-color 0.1s;
-}
-.hover-detect-opt:hover:not(:disabled) { background: var(--hover); border-color: color-mix(in srgb, var(--accent) 30%, var(--divider)); }
-.hover-detect-opt.active {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, rgba(0, 0, 0, 0.12));
-}
-.hover-detect-opt-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-weak);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.hover-detect-opt.active .hover-detect-opt-title { color: var(--accent); }
-.hover-detect-opt.active .hover-detect-opt-title::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  flex-shrink: 0;
-}
-.hover-detect-opt-desc {
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-weak);
-}
-.hover-detect-opt.active .hover-detect-opt-desc { color: var(--text); }
-
-/* Option 2: stacked full-width radio rows, dot on the left, more room per
-   option than the segmented cards, better for longer descriptions. */
-.hover-detect-radios {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.hover-detect-radio-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  text-align: left;
-  width: 100%;
-  user-select: none;
-  transition: background 0.1s, border-color 0.1s;
-}
-.hover-detect-radio-row.active {
-  background: color-mix(in srgb, var(--accent) 8%, rgba(0, 0, 0, 0.12));
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--divider));
-}
-.hover-detect-radio-row:hover:not(.active):not(:disabled) { background: var(--hover); }
-.hover-detect-radio-dot {
-  flex-shrink: 0;
-  width: 16px;
-  height: 16px;
-  margin-top: 1px;
-  border-radius: 50%;
-  border: 1.5px solid var(--text-weak);
+  --track-height: 24px;
   position: relative;
-  transition: border-color 0.1s;
+  display: flex;
+  width: 200px;
+  min-width: 0;
+  gap: 2px;
+  padding: 3px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--divider);
+  border-radius: 7px;
+  isolation: isolate;
 }
-.hover-detect-radio-row.active .hover-detect-radio-dot { border-color: var(--accent); }
-.hover-detect-radio-dot::after {
+.hover-detect-switch::before {
   content: '';
   position: absolute;
-  inset: 3px;
-  border-radius: 50%;
+  z-index: 0;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc(50% - 4px);
   background: var(--accent);
-  transform: scale(0);
-  transition: transform 0.12s cubic-bezier(0.34, 1.3, 0.64, 1);
+  border-radius: 5px;
+  transform: translateX(0);
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
 }
-.hover-detect-radio-row.active .hover-detect-radio-dot::after { transform: scale(1); }
-.hover-detect-radio-text {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+.hover-detect-switch.poll::before { transform: translateX(100%); }
+.hover-detect-opt {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 50%;
   min-width: 0;
-}
-.hover-detect-radio-title {
-  font-size: 13px;
+  min-height: var(--track-height);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 11px;
   font-weight: 600;
   color: var(--text-weak);
+  cursor: pointer;
+  transition: color 0.14s;
 }
-.hover-detect-radio-row.active .hover-detect-radio-title { color: var(--accent); }
-.hover-detect-radio-desc {
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-weak);
-}
-.hover-detect-radio-row.active .hover-detect-radio-desc { color: var(--text); }
+.hover-detect-opt:hover:not(:disabled):not(.active) { color: var(--text); }
+.hover-detect-opt:disabled { cursor: default; opacity: 0.5; }
+.hover-detect-opt.active { color: var(--bg); }
 
-/* Small inline slider for the polling interval, nested inside the Polling
-   radio row. Reuses the .slider-track-wrap thumb/track look at a smaller
-   scale, matching .zoom-track-compact's proportions. stopPropagation on the
-   wrapper (see TabSettings.svelte) keeps dragging the slider from also
-   toggling the parent radio row's onclick. */
+.hover-detect-opt:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Poll interval stays in the same bounded row as the switch, with a flexible
+   slider so the value remains visible on narrow windows. */
 .hover-detect-poll-rate {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 6px;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  margin-top: 1px;
   cursor: default;
 }
 .hover-detect-poll-rate-label {
+  flex: 0 0 auto;
   font-size: 11px;
   color: var(--text-weak);
-  flex-shrink: 0;
 }
 .hover-detect-poll-rate input[type=range] {
   -webkit-appearance: none;
   appearance: none;
-  flex: 0 0 120px;
-  width: 120px;
+  flex: 1 1 auto;
+  min-width: 80px;
+  width: auto;
   height: 4px;
   border-radius: 2px;
   background: linear-gradient(to right, var(--accent) 0%, var(--accent) var(--fill,50%), #31313f var(--fill,50%), #31313f 100%);
@@ -2219,13 +2188,13 @@ select,
 .hover-detect-poll-rate input[type=range]::-webkit-slider-thumb:hover { transform: scale(1.15); }
 .hover-detect-poll-rate input[type=range]:disabled::-webkit-slider-thumb:hover { transform: none; }
 .hover-detect-poll-rate-val {
+  flex: 0 0 44px;
   font-size: 11px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--text-weak);
-  min-width: 40px;
+  text-align: right;
 }
-.hover-detect-radio-row.active .hover-detect-poll-rate-val { color: var(--text); }
 
 /* ── Calibration strip ────────────────────────────────────────────── */
 /* ── Calibration strip panel ────────────────────────────────── */
@@ -2878,7 +2847,7 @@ select,
 /* High Nits grid labels, each cell is a spreadsheet-style box with the
    number centered. Grid geometry (--grid-cols/--grid-rows) must match the
    shader's row-major cell layout exactly, and the 0.8% gap matches
-   GAP_FRACTION. Font scales with column width since nits values (up to
+   HIGH_NITS_GAP_FRACTION. Font scales with column width since nits values (up to
    5 digits) are wider than the 2-3 digit PQ/RGB codes. */
 .grid-labels {
   position: absolute;
@@ -3629,6 +3598,15 @@ select,
   background: color-mix(in srgb, var(--hover) 45%, transparent);
   border: 1px solid var(--divider);
   border-radius: 6px;
+}
+/* Text-hook status bar (Text tab): sits on the Custom renderer heading
+   line, pushed to the right by the heading's space-between layout. No
+   margins, compact chip, so it reads as a status badge beside the title. */
+.text-hook-status-bar {
+  margin: 0;
+  flex-shrink: 1;
+  min-width: 0;
+  justify-content: flex-end;
 }
 .diag-detection-label {
   color: var(--text-weak);
@@ -4546,100 +4524,215 @@ select,
   color: var(--text-weak);
   margin: 0;
 }
-/* Antivirus false-positive heads-up: amber, with the warning glyph. Shown
-   inline in the Text coverage heading, right after the Info button.
-   Declared after .restart-explorer-hint so the amber color wins when both
-   classes apply. */
-.text-render-explorer-warning {
-  color: #E0A93C;
-}
-/* Standalone variant: full-width note above the Custom renderer panel
-   (kept out of the section heading so the row stays one line). */
-.text-render-av-warning {
-  display: block;
-  margin: 0 0 6px;
-  font-size: 12px;
-  line-height: 1.4;
-}
-/* Custom renderer coverage: three buttons on their own row under the
-   section heading, the same compact segmented look as the other tab
-   selectors. */
+/* Custom renderer coverage: one compact track with three equal slots. The
+   labels stay readable, and the active fill moves without changing width. */
 .text-render-scope-inline {
+  --track-height: 24px;
+  position: relative;
   display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
+  align-items: stretch;
+  width: 100%;
+  min-width: 0;
+  gap: 2px;
+  padding: 3px;
   margin-top: 6px;
+  border: 1px solid var(--divider);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.25);
+  isolation: isolate;
+}
+.text-render-scope-inline::before {
+  content: '';
+  position: absolute;
+  z-index: 0;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 10px) / 3);
+  border-radius: 5px;
+  background: var(--accent);
+  transform: translateX(0);
+  transition: transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+  pointer-events: none;
+}
+.text-render-scope-inline.shell::before {
+  transform: translateX(calc(100% + 2px));
+  background: var(--success);
+}
+.text-render-scope-inline.all::before {
+  transform: translateX(calc((100% + 2px) * 2));
+  background: var(--warning);
+}
+.text-render-scope-inline.off::before {
+  background: var(--text-weak);
+}
+.text-render-scope-inline > .text-render-scope-inline-btn {
+  flex: 1 1 0;
+  min-width: 0;
 }
 .text-render-scope-inline-btn {
-  display: inline-flex;
+  position: relative;
+  z-index: 1;
+  display: flex;
   align-items: center;
+  justify-content: center;
   gap: 5px;
-  padding: 4px 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--track-height);
+  padding: 3px 8px;
+  border: none;
   border-radius: 5px;
-  border: 1px solid var(--divider);
   background: transparent;
   color: var(--text-weak);
   font-size: 11px;
-  font-weight: 500;
-  white-space: nowrap;
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+  white-space: normal;
   cursor: pointer;
-  transition: color 0.12s, background 0.12s, border-color 0.12s, opacity 0.12s;
+  transition: color 0.14s;
 }
-/* The On pair is visually grouped and separated from Off by a divider, so
-   the row reads as "default | custom renderer (shell / all apps)". */
-.text-render-scope-on-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding-left: 8px;
-  margin-left: 4px;
-  border-left: 1px solid var(--divider);
-}
-/* The inactive family dims so the current on/off state reads at a glance:
-   Off selected fades the On pair, an On option selected fades Off. Hover
-   returns the alternative to full so it stays obviously clickable. */
-.text-render-scope-inline.off .text-render-scope-on-group .text-render-scope-inline-btn { opacity: 0.5; }
-.text-render-scope-inline.off .text-render-scope-on-group .text-render-scope-inline-btn:hover { opacity: 1; }
-.text-render-scope-inline:not(.off) > .text-render-scope-inline-btn { opacity: 0.5; }
-.text-render-scope-inline:not(.off) > .text-render-scope-inline-btn:hover { opacity: 1; }
-/* Status dot on the two On buttons, marking the custom renderer family:
-   hollow when the option is inactive, filled accent when it is live. The
-   Off (default) button has no dot, so the on/off split reads at a glance. */
-.text-render-scope-dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 7px;
-  border-radius: 50%;
-  border: 1px solid color-mix(in srgb, var(--success) 50%, var(--text-weak));
-  background: transparent;
-  box-sizing: border-box;
-}
-.text-render-scope-inline-btn.active .text-render-scope-dot {
-  background: var(--success);
-  border-color: var(--success);
-}
-.text-render-scope-inline-btn:hover {
-  color: var(--text);
-  background: var(--hover);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--divider));
-}
+.text-render-scope-inline-btn:hover:not(.active) { color: var(--text); }
 .text-render-scope-inline-btn:focus-visible {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
 }
-.text-render-scope-inline-btn.active {
+.text-render-scope-inline-btn.active { color: var(--bg); }
+/* Custom renderer coverage tooltip (viewport-anchored, replaces the native
+   title tooltip whose single-line rendering can't show the rich content).
+   Position is measured in TabText.svelte so it clamps to the WebView edges
+   and flips above the buttons when it would overflow the bottom; fixed
+   positioning escapes the scrollable tab container that would clip an
+   absolute child. white-space: pre-line turns the \n line breaks in the
+   content into real line breaks. */
+.text-render-tip {
+  position: fixed;
+  top: 50%;
+  left: 0;
+  /* Comfortable floor so the three lines each fit on one row; the
+     positioner still clamps to the window, and min() keeps very narrow
+     windows from overflowing. */
+  min-width: min(320px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  background: color-mix(in srgb, var(--panel) 92%, var(--bg));
+  border: 1px solid var(--divider);
   color: var(--text);
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  padding: 10px 12px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  white-space: pre-line;
+  pointer-events: none;
+  z-index: 20;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: translateY(2px) scale(0.96);
+  transform-origin: left top;
+  transition: opacity 0.12s ease, transform 0.12s ease;
 }
-.text-render-scope-applied {
-  color: #4CD964;
+.text-render-tip.visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+.text-render-tip-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--divider);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text-weak);
+}
+.text-render-tip-status-dot {
+  font-size: 10px;
+  line-height: 1;
+}
+.text-render-tip-status.active {
+  color: var(--success);
+}
+.text-render-tip-status.pending {
+  color: var(--warning);
+}
+.text-render-tip-status.muted {
+  color: var(--text-weak);
+}
+.text-render-tip-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text);
+  line-height: 1.5;
+}
+.text-render-tip-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.text-render-tip-label {
+  flex: 0 0 94px;
+  color: var(--text-weak);
   font-size: 10px;
   font-weight: 600;
-  line-height: 1.25;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.text-render-tip-row strong {
+  color: var(--text);
+  font-weight: 700;
+}
+.text-render-tip-tuning {
+  gap: 8px;
+}
+.text-render-tip-tuning > span:not(.text-render-tip-label) {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+}
+.text-render-tip-row em {
+  color: var(--text-weak);
+  font-size: 11px;
+  font-style: italic;
+}
+.text-render-tip-processes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 1px;
+  padding-left: 102px;
+}
+.text-render-tip-process,
+.text-render-tip-process-more {
+  padding: 2px 6px;
+  border: 1px solid var(--divider);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--hover) 75%, transparent);
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.3;
   white-space: nowrap;
+}
+.text-render-tip-process-more {
+  color: var(--text-weak);
+  font-style: italic;
+}
+/* Instance multiplier on a process chip (e.g. "explorer.exe ×2" when the
+   Control Panel host runs as a second explorer.exe). Accent-tinted so the
+   second instance is visible at a glance without dominating the chip. */
+.text-render-tip-process-mult {
+  margin-left: 2px;
+  color: var(--accent);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 .text-render-blocklist {
   display: flex;

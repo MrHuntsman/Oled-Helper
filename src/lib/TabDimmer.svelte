@@ -5,7 +5,7 @@
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
   import ShieldBadge from './ShieldBadge.svelte';
   import ScreenDimmerState from './ScreenDimmerState.svelte';
-  import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, setHoverDetection, setPollIntervalMs, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
+  import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
 
   // The heading tag showing which monitor this tab's settings apply to (the
   // one selected in the top-bar monitor selector), labeled like the selector.
@@ -624,45 +624,6 @@
         </div>
         <div class="dimmer-scale"><span>Fast</span><span>Slow</span></div>
       </div>
-    </div>
-  </div>
-
-  <div class="dimmer-hover-section" class:disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}>
-    {#if !taskbarDimmer.available || !taskbarDimmer.enabled}
-      <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Detection Method disabled" onclick={handleDisabledDimmerInteraction} onwheel={handleDisabledDimmerWheel}></button>
-    {/if}
-    <span class="settings-row-label dimmer-section-heading">Detection Method</span>
-    <span class="settings-row-desc dimmer-section-desc">How the app detects the cursor, fullscreen mode, and taskbar changes.</span>
-    <div class="hover-detect-radios" role="radiogroup" aria-label="Detection method">
-      <button type="button" class="hover-detect-radio-row dimmer-control" class:active={taskbarDimmer.hoverDetection === 'event'}
-        role="radio" aria-checked={taskbarDimmer.hoverDetection === 'event'}
-        disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
-        onclick={() => setHoverDetection('event')}>
-        <span class="hover-detect-radio-dot" aria-hidden="true"></span>
-        <span class="hover-detect-radio-text">
-          <span class="hover-detect-radio-title">Event-driven</span>
-          <span class="hover-detect-radio-desc">Recommended. Instant response. Falls back to polling for elevated (admin) windows.</span>
-        </span>
-      </button>
-      <button type="button" class="hover-detect-radio-row dimmer-control" class:active={taskbarDimmer.hoverDetection === 'poll'}
-        role="radio" aria-checked={taskbarDimmer.hoverDetection === 'poll'}
-        disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
-        onclick={() => setHoverDetection('poll')}>
-        <span class="hover-detect-radio-dot" aria-hidden="true"></span>
-        <span class="hover-detect-radio-text">
-          <span class="hover-detect-radio-title">Polling</span>
-          <span class="hover-detect-radio-desc">Checks on a timer. Use it if Event-driven has problems, probably negligible CPU impact.</span>
-          <span class="hover-detect-poll-rate" role="presentation" onclick={(e) => e.stopPropagation()}>
-            <span class="hover-detect-poll-rate-label">Poll interval</span>
-            <input type="range" min="16" max="200" step="1"
-              value={taskbarDimmer.pollIntervalMs}
-              disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
-              oninput={(e) => setPollIntervalMs(Number(e.currentTarget.value))}
-              style={`--fill: ${((taskbarDimmer.pollIntervalMs - 16) / (200 - 16)) * 100}%`} />
-            <span class="hover-detect-poll-rate-val">{taskbarDimmer.pollIntervalMs} ms</span>
-          </span>
-        </span>
-      </button>
     </div>
   </div>
 

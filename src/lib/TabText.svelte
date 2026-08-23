@@ -49,7 +49,7 @@
 
   // Explorer hook state from the backend's explorer_hook_status command
   // (polled while mounted): active = DLL verified in the running explorer.exe.
-  let hookStatus = $state({ enabled: false, active: false, applied: false });
+  let hookStatus = $state({ enabled: false, active: false, applied: false, processCount: 0, processNames: [] });
   async function refreshHookStatus() {
     try {
       hookStatus = await invoke('explorer_hook_status');
@@ -312,10 +312,10 @@
   // hosts, with the all-apps option extending it to every GDI process. Three
   // inline buttons over the two persisted booleans (explorerHookEnabled +
   // hookAllApps), so the storage and backend are unchanged.
-  const COVERAGE_OFF = { value: 'off', label: 'Off (default)' };
+  const COVERAGE_OFF = { value: 'off', label: 'Off', desc: 'Apps follow Windows text settings (browsers, DirectWrite apps...).' };
   const COVERAGE_ON = [
-    { value: 'shell', label: 'On (Windows shell)' },
-    { value: 'all', label: 'On (All apps)' },
+    { value: 'shell', label: 'Normal', desc: 'Live rendering for Explorer, Control Panel and MMC via the custom hook.' },
+    { value: 'all', label: 'Extended', desc: 'Hooks every GDI process.' },
   ];
 
   function coverageOption() {
@@ -323,16 +323,119 @@
     return textSettings.hookAllApps ? 'all' : 'shell';
   }
 
+  // Tooltip detail for the hook status bar: return structured values so the
+  // markup can emphasize labels, values, and qualifiers independently.
+  function hookSummary() {
+    const m = previewMode();
+    const modeLabel = MODES.find((x) => x.id === m)?.label || m;
+    const { boldness, damping } = effectiveKnobs();
+    return {
+      modeLabel,
+      boldness,
+      damping,
+      processGroups: (() => {
+        const groups = [];
+        const seen = new Map(); // key -> group index
+        const names = Array.isArray(hookStatus.processNames) ? hookStatus.processNames : [];
+        const shellOnly = !textSettings.hookAllApps;
+        const shellNames = new Set([
+          'explorer.exe',
+          'control.exe',
+          'rundll32.exe',
+          'mmc.exe',
+        ]);
+        for (const name of names) {
+          const raw = String(name);
+          const key = raw.toLowerCase();
+          if (shellOnly && !shellNames.has(key) && !key.startsWith('systemproperties')) continue;
+          const idx = seen.get(key);
+          if (idx !== undefined) {
+            groups[idx].count += 1;
+            continue;
+          }
+          seen.set(key, groups.length);
+          const displayName = /\.exe$/i.test(raw)
+            ? `${raw.slice(0, -4)}.exe`
+            : raw;
+          groups.push({ key, name: displayName, count: 1 });
+        }
+        return groups;
+      })(),
+    };
+  }
+
+  function hookStatusTone() {
+    if (!hookStatus.enabled || hookStatus.pid === 0) return 'muted';
+    if (!hookStatus.active) return 'pending';
+    return 'active';
+  }
+
+  function hookStatusLabel() {
+    if (!hookStatus.enabled) return 'Hook off';
+    if (hookStatus.pid === 0) return 'Explorer not running';
+    if (!hookStatus.active) return 'Hook installing';
+    return 'Hook active';
+  }
+
+  // Custom tooltip for the hook status bar. The native title tooltip can't
+  // reliably show the multi-line content, so this mirrors ShieldBadge's
+  // viewport-anchored pattern: fixed positioning escapes the scrollable tab
+  // container (which would clip an absolute child), and the measured
+  // placement clamps to the WebView edges and flips above when it would
+  // overflow the bottom edge.
+  let tipEl = $state(null);
+  let tipVisible = $state(false);
+  let tipStyle = $state('');
+  let tipContent = $state(null);
+  let hoverBtn = null;
+  let positionFrame = 0;
+
+  function positionTip(remeasure = false) {
+    cancelAnimationFrame(positionFrame);
+    positionFrame = requestAnimationFrame(() => {
+      if (!hoverBtn || !tipEl || !tipVisible) return;
+      const btn = hoverBtn.getBoundingClientRect();
+      const tip = tipEl.getBoundingClientRect();
+      const margin = 8;
+      const gap = 8;
+      const maxLeft = Math.max(margin, window.innerWidth - tip.width - margin);
+      const left = Math.max(margin, Math.min(btn.left + btn.width / 2 - tip.width / 2, maxLeft));
+      const maxWidth = Math.max(0, window.innerWidth - left - margin);
+      const belowTop = btn.bottom + gap;
+      const aboveTop = btn.top - tip.height - gap;
+      const top = belowTop + tip.height <= window.innerHeight - margin
+        ? belowTop
+        : Math.max(margin, aboveTop);
+      tipStyle = `left:${Math.round(left)}px;top:${Math.round(top)}px;max-width:${Math.floor(maxWidth)}px;`;
+      // Applying the available width can wrap the message and change its
+      // height, so measure once more before the below/above decision holds.
+      if (!remeasure) positionTip(true);
+    });
+  }
+
+  function showTip(btn, content) {
+    if (!content) return;
+    hoverBtn = btn;
+    tipContent = content;
+    tipVisible = true;
+    positionTip();
+    window.addEventListener('resize', positionTip);
+    window.addEventListener('scroll', positionTip, true);
+  }
+
+  function hideTip() {
+    tipVisible = false;
+    cancelAnimationFrame(positionFrame);
+    window.removeEventListener('resize', positionTip);
+    window.removeEventListener('scroll', positionTip, true);
+  }
+
   // Registry-only mode: the registry path (GDI FontSmoothing* + DirectWrite
   // Avalon params) can express grayscale/RGB/BGR/off but NOT the 2D subpixel
   // offsets (Custom) or the swash filter knobs, so those controls hide.
   function isRegistryOnly() {
     return !textSettings.explorerHookEnabled;
-  }  // Whether the most recent coverage selection was applied successfully. The
-  // confirmation is deliberately transient so picking stays clear without
-  // adding another persistent row to the panel.
-  let scopeApplied = $state(false);
-  let scopeAppliedTimer = null;
+  }
 
   // Pick a coverage level and push the matching backend state immediately.
   // Off disables the hook entirely (mode 0 → passthrough); shell/all enable
@@ -351,9 +454,6 @@
     invoke('explorer_hook_set_enabled', { enabled: textSettings.explorerHookEnabled })
       .then(refreshHookStatus)
       .catch((e) => console.warn('[text] explorer hook toggle failed', e));
-    scopeApplied = true;
-    clearTimeout(scopeAppliedTimer);
-    scopeAppliedTimer = setTimeout(() => { scopeApplied = false; }, 2000);
   }
 
   // Blocklist editor: comma/semicolon/newline-separated exe names, applied
@@ -617,8 +717,8 @@
     return () => {
       disposed = true;
       clearInterval(hookStatusPoll);
-      clearTimeout(scopeAppliedTimer);
       resizeObserver?.disconnect();
+      hideTip();
     };
   });
 </script>
@@ -640,51 +740,108 @@
     <button class="restore-defaults-btn" onclick={resetDefaults} disabled={busy}>↻ Restore defaults</button>
   </div>
   <div class="separator"></div>
-  <span class="text-render-explorer-warning text-render-av-warning">⚠ Custom text renderer may trigger antivirus false positives.</span>
   <div class="dimmer-control">
       <div class="dimmer-control-heading">
         <span class="hdr-control-title">
-          <span class="settings-row-label">Custom renderer</span>
+          <span class="settings-row-label">Custom text engine</span>
           <span class="info-tip-wrap">
-            <button class="info-tip-btn" aria-label="About the custom renderer" tabindex="0">Info</button>
+            <button class="info-tip-btn" aria-label="About the custom text engine" tabindex="0">Info</button>
             <span class="info-tip info-tip-right">
               <span>
-                Off: apps follow Windows text settings (browsers, DirectWrite apps...).<br>
+                <b>Off</b>: Apps follow Windows text settings (browsers, DirectWrite apps...).<br>
                 <br>
-                On: live re-rendering for Explorer, Control Panel and MMC via the custom hook.<br>
+                <b>Normal</b>: Live rendering for Explorer, Control Panel and MMC via the custom hook.<br>
                 <br>
-                <b>On, all apps</b>: hooks every GDI process (2D remap + filters); browsers and games aren't affected.
+                <b>Extended</b>: Hooks every GDI process.
               </span>
             </span>
           </span>
         </span>
+        <div class="diag-detection-bar text-hook-status-bar" tabindex="0"
+          onmouseenter={(e) => showTip(e.currentTarget, hookSummary())}
+          onmouseleave={hideTip}
+          onfocus={(e) => showTip(e.currentTarget, hookSummary())}
+          onblur={hideTip}>
+          {#if !hookStatus.enabled}
+            <span class="diag-dim-status diag-dim-off">● Off</span>
+          {:else if hookStatus.pid === 0}
+            <span class="diag-dim-status diag-dim-blocked">● Blocked</span>
+            <span class="diag-dim-reason">• Explorer not running</span>
+          {:else if !hookStatus.active}
+            <span class="diag-dim-status">● Installing…</span>
+          {:else}
+            <span class="diag-dim-status diag-dim-on">● Active</span>
+          {/if}
+        </div>
       </div>
-      <div class="text-render-scope-inline" class:off={coverageOption() === 'off'} role="radiogroup" aria-label="Custom renderer coverage">
+      <div class="text-render-scope-inline" class:off={coverageOption() === 'off'} class:shell={coverageOption() === 'shell'} class:all={coverageOption() === 'all'} role="radiogroup" aria-label="Custom text engine coverage">
         <button
           type="button"
           role="radio"
           class="text-render-scope-inline-btn"
           class:active={coverageOption() === 'off'}
           aria-checked={coverageOption() === 'off'}
+          title={COVERAGE_OFF.desc}
           onclick={() => selectCoverage('off')}>
           {COVERAGE_OFF.label}
         </button>
-        <span class="text-render-scope-on-group">
-          {#each COVERAGE_ON as option (option.value)}
-            <button
-              type="button"
-              role="radio"
-              class="text-render-scope-inline-btn"
-              class:active={coverageOption() === option.value}
-              aria-checked={coverageOption() === option.value}
-              onclick={() => selectCoverage(option.value)}>
-              <span class="text-render-scope-dot" aria-hidden="true"></span>
-              {option.label}
-            </button>
-          {/each}
-        </span>
-        {#if scopeApplied}<span class="text-render-scope-applied">✓ Applied</span>{/if}
+        {#each COVERAGE_ON as option (option.value)}
+          <button
+            type="button"
+            role="radio"
+            class="text-render-scope-inline-btn"
+            class:active={coverageOption() === option.value}
+            aria-checked={coverageOption() === option.value}
+            title={option.desc}
+            onclick={() => selectCoverage(option.value)}>
+            {option.label}
+          </button>
+        {/each}
       </div>
+      <span
+        class="text-render-tip"
+        class:visible={tipVisible}
+        style={tipStyle}
+        bind:this={tipEl}
+        role="tooltip">
+        <span class="text-render-tip-status" class:active={hookStatusTone() === 'active'} class:pending={hookStatusTone() === 'pending'} class:muted={hookStatusTone() === 'muted'}>
+          <span class="text-render-tip-status-dot">●</span>
+          {hookStatusLabel()}
+        </span>
+        <span class="text-render-tip-detail">
+          <span class="text-render-tip-row">
+            <span class="text-render-tip-label">Rendering</span>
+            <strong>{tipContent?.modeLabel}</strong>
+          </span>
+          {#if tipContent?.boldness > 0 || tipContent?.damping > 0}
+            <span class="text-render-tip-row text-render-tip-tuning">
+              <span class="text-render-tip-label">Filters</span>
+              {#if tipContent?.boldness > 0}<span>Bold <strong>{tipContent.boldness}</strong></span>{/if}
+              {#if tipContent?.damping > 0}<span>Damp <strong>{tipContent.damping}</strong></span>{/if}
+            </span>
+          {/if}
+          <span class="text-render-tip-row">
+            <span class="text-render-tip-label">Processes</span>
+            <strong>{tipContent?.processGroups.length}</strong>
+            <em>currently loaded</em>
+          </span>
+          {#if tipContent?.processGroups?.length}
+            <span class="text-render-tip-processes">
+              {#each tipContent.processGroups.slice(0, 8) as group (group.key)}
+                <span class="text-render-tip-process">
+                  {group.name}
+                  {#if group.key === 'explorer.exe' && group.count > 1}
+                    <em class="text-render-tip-process-mult">×{group.count}</em>
+                  {/if}
+                </span>
+              {/each}
+              {#if tipContent.processGroups.length > 8}
+                <span class="text-render-tip-process-more">+{tipContent.processGroups.length - 8} more</span>
+              {/if}
+            </span>
+          {/if}
+        </span>
+      </span>
     {#if coverageOption() === 'all'}
       <label class="text-render-blocklist">
         <span class="text-render-explorer-toggle-label">Excluded apps</span>

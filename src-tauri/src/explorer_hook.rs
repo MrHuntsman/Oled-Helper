@@ -36,6 +36,10 @@ use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBO
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClassNameW, GetWindowThreadProcessId, PostMessageW,
     SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HWND_BROADCAST, WH_CBT, WM_FONTCHANGE,
@@ -45,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 
 // The mapped view of the shared state (created once, leaked for app
-// lifetime). Layout (608 bytes):
+// lifetime). Layout (5348 bytes):
 //    0  u32 global mode (app->explorer; the system effective mode, synced
 //       on Text-tab load)
 //    4  u32 status + 8 u32 pid (explorer->app, written by the DLL at attach
@@ -53,7 +57,9 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //       explorer.exe instead of trusting its own bookkeeping, the DLL
 //       loading only proves the module mapped, not that the detour
 //       installed)
-//   12  unused padding (old global knob slots, kept at 0)
+//   12  u32 hook-scope flags (bit 0 = all apps)
+//   16  u32 loaded-process counter, written atomically by the DLL
+//   20  primary taskbar explorer.exe PID for status-report ownership
 //   24  u32 per-monitor flag (0/1)
 //   28  u32 monitor count
 //   32  monitor table: up to 8 entries x 72 bytes
@@ -67,7 +73,8 @@ type HookProcFn = unsafe extern "system" fn(i32, WPARAM, LPARAM) -> LRESULT;
 //           slots likewise reserved at 0, removed filters)
 //       u32 custom subpixel centers r/g/b x/y (f32 bits; all-zero = not set)
 // After the table, the hook-scope blocklist (count + up to 8 exe names x 32
-// UTF-16 units); offset 12 holds the hook-scope flags (bit 0 = all apps).
+// UTF-16 units), followed by 8 process slots. Each slot contains an atomic
+// pid marker and a 64-character UTF-16 executable name.
 // The DLL reads the table on every draw to pick the mode + knob sextet +
 // custom offsets for the monitor the DC belongs to (see
 // explorer-hook/src/lib.rs, resolve_draw_options).
@@ -75,6 +82,8 @@ static STATE_VIEW: OnceLock<usize> = OnceLock::new();
 const STATE_STATUS_OFFSET: usize = 4;
 const STATE_PID_OFFSET: usize = 8;
 const STATE_SCOPE_OFFSET: usize = 12;
+const STATE_PROCESS_COUNT_OFFSET: usize = 16;
+const STATE_PRIMARY_EXPLORER_PID_OFFSET: usize = 20;
 const STATE_PER_MONITOR_OFFSET: usize = 24;
 const STATE_MONITOR_COUNT_OFFSET: usize = 28;
 const STATE_MONITORS_OFFSET: usize = 32;
@@ -85,7 +94,13 @@ const STATE_BLOCKLIST_ENTRIES_OFFSET: usize = 612;
 const BLOCKLIST_ENTRY_WORDS: usize = 32;
 const BLOCKLIST_ENTRY_STRIDE: usize = BLOCKLIST_ENTRY_WORDS * 2;
 const MAX_BLOCKLIST: usize = 8;
-const STATE_SIZE: usize = STATE_BLOCKLIST_ENTRIES_OFFSET + MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE;
+const PROCESS_NAME_WORDS: usize = 64;
+const PROCESS_SLOT_STRIDE: usize = 4 + PROCESS_NAME_WORDS * 2;
+const MAX_PROCESS_SLOTS: usize = 32;
+const STATE_PROCESS_SLOTS_OFFSET: usize =
+    STATE_BLOCKLIST_ENTRIES_OFFSET + MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE;
+const STATE_SIZE: usize = STATE_PROCESS_SLOTS_OFFSET + MAX_PROCESS_SLOTS * PROCESS_SLOT_STRIDE;
+const PROCESS_SLOT_WRITING: u32 = 0x8000_0000;
 const SCOPE_HOOK_ALL: u32 = 1;
 // The ExtTextOutW detour is what makes the fix real; the app requires this
 // status bit for a hook to count as active.
@@ -153,10 +168,42 @@ fn ensure_state_mapped() -> Result<*mut u32, String> {
     // leaked so they stay valid for the process lifetime (explorer.exe must be
     // able to open the mapping by name while the app is running).
     unsafe {
-        let name = wide(r"Local\OledHelperExplorerHookState");
+        // The app can relaunch itself elevated (Settings → always elevated,
+        // or the dimmer's UAC prompt). A mapping created by an elevated
+        // process would inherit a High mandatory label, and non-elevated
+        // hosts (explorer.exe, mmc.exe, 7-Zip...) cannot open it: the hook
+        // silently loses the mode and never registers. Pin the label to
+        // Medium and grant Everyone access so the mapping works no matter
+        // which integrity level created it.
+        let mut sd: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        let sddl = wide(r"D:(A;;GA;;;WD)S:(ML;;NW;;;ME)");
+        let sd_ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .is_ok()
+            && !sd.is_invalid();
+        // Intentionally leaked on success: the descriptor must outlive the
+        // CreateFileMappingW call (the object copies it at creation, so the
+        // one-time ~200-byte leak is the simple safe lifetime).
+        let sa = if sd_ok {
+            Some(SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd.0,
+                bInheritHandle: BOOL(0),
+            })
+        } else {
+            log::warn!(
+                "[explorer-hook] could not build mapping security descriptor, falling back to default"
+            );
+            None
+        };
+        let name = wide(r"Local\OledHelperExplorerHookStateV3");
         let mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE,
-            None,
+            sa.as_ref().map(|s| s as *const SECURITY_ATTRIBUTES),
             PAGE_READWRITE,
             0,
             STATE_SIZE as u32,
@@ -294,6 +341,21 @@ fn write_state_table() -> Result<(), String> {
     Ok(())
 }
 
+// Refresh the Explorer PID that owns the single DLL status report. This must
+// run independently of settings changes because Explorer can restart while
+// the hook remains installed.
+fn write_primary_explorer_pid() -> Result<(), String> {
+    let ptr = ensure_state_mapped()?;
+    let primary_pid = explorer_target().map(|(pid, _)| pid).unwrap_or(0);
+    unsafe {
+        std::ptr::write_volatile(
+            (ptr as *mut u8).add(STATE_PRIMARY_EXPLORER_PID_OFFSET) as *mut u32,
+            primary_pid,
+        );
+    }
+    Ok(())
+}
+
 // Normalize a blocklist exe name: trim, lowercase, and append ".exe" when
 // the user typed a bare name (e.g. "notepad" → "notepad.exe").
 fn normalize_exe(name: &str) -> String {
@@ -333,6 +395,14 @@ fn write_scope() -> Result<(), String> {
                 0
             },
         );
+        // The status report has one pid/status pair. Tell the DLL which
+        // explorer.exe generation owns that report so a secondary Explorer
+        // host cannot overwrite the primary taskbar verification.
+        let primary_pid = explorer_target().map(|(pid, _)| pid).unwrap_or(0);
+        std::ptr::write_volatile(
+            base.add(STATE_PRIMARY_EXPLORER_PID_OFFSET) as *mut u32,
+            primary_pid,
+        );
         std::ptr::write_volatile(
             base.add(STATE_BLOCKLIST_COUNT_OFFSET) as *mut u32,
             entries.len() as u32,
@@ -371,6 +441,162 @@ fn read_hook_report() -> (u32, u32) {
     }
 }
 
+// Read the DLL's loaded-process counter (STATE_PROCESS_COUNT): incremented
+// on DLL attach, decremented on detach, so the status can show how many
+// processes currently carry the hook. 0 when nothing is mapped.
+fn read_process_count() -> u32 {
+    let Ok(ptr) = ensure_state_mapped() else {
+        return 0;
+    };
+    // SAFETY: ptr is the mapped view, valid for the process lifetime; the
+    // counter is a plain u32 at a fixed offset we own.
+    unsafe {
+        let base = ptr as *const u8;
+        std::ptr::read_volatile(base.add(STATE_PROCESS_COUNT_OFFSET) as *const u32)
+    }
+}
+
+// Whether an executable is in the shell target set. Mirrors the DLL's
+// is_target() so the app can sweep slots when the scope flag changes.
+fn shell_target(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "explorer.exe"
+        || lower == "control.exe"
+        || lower == "rundll32.exe"
+        || lower == "mmc.exe"
+        || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
+}
+
+// Clear every process slot whose executable is not in the current hook
+// scope, without touching in-scope slots. Runs from the watchdog so a scope
+// switch (Normal vs Extended) converges the name list even for processes
+// that never fire a hook callback again.
+fn sweep_process_slots() {
+    let Ok(ptr) = ensure_state_mapped() else {
+        return;
+    };
+    let all = HOOK_ALL_APPS.load(Ordering::Acquire);
+    unsafe {
+        let base = ptr as *const u8;
+        for index in 0..MAX_PROCESS_SLOTS {
+            let slot = base.add(STATE_PROCESS_SLOTS_OFFSET + index * PROCESS_SLOT_STRIDE);
+            let first_pid = std::ptr::read_volatile(slot as *const u32);
+            if first_pid == 0 || first_pid & PROCESS_SLOT_WRITING != 0 {
+                continue;
+            }
+            let words = std::slice::from_raw_parts(
+                slot.add(4) as *const u16,
+                PROCESS_NAME_WORDS,
+            );
+            let mut len = 0;
+            while len < words.len() && words[len] != 0 {
+                len += 1;
+            }
+            let name = String::from_utf16_lossy(&words[..len]);
+            let second_pid = std::ptr::read_volatile(slot as *const u32);
+            if first_pid != second_pid || name.is_empty() {
+                continue;
+            }
+            if all || shell_target(&name) {
+                continue;
+            }
+            // Out of scope: CAS the PID to the writing marker so a concurrent
+            // DLL republish cannot race the clear. A failed CAS means the DLL
+            // already moved the slot, its own count bookkeeping is current.
+            let cell = slot as *const AtomicU32;
+            if (*cell)
+                .compare_exchange(
+                    first_pid,
+                    PROCESS_SLOT_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let name_ptr = slot.add(4) as *mut u16;
+            for i in 0..PROCESS_NAME_WORDS {
+                std::ptr::write_volatile(name_ptr.add(i), 0);
+            }
+            (*cell).store(0, Ordering::Release);
+            // SAFETY: the counter is a u32 at a fixed offset we own; x86/x64
+            // interlocked ops make fetch_sub safe across processes.
+            let counter = base.add(STATE_PROCESS_COUNT_OFFSET) as *const AtomicU32;
+            (*counter).fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+// Read the bounded process-name table. A slot is valid only when its PID is a
+// published value both before and after the UTF-16 read, which prevents a
+// tooltip poll from displaying a partially written name.
+fn read_process_names() -> Vec<String> {
+    let Ok(ptr) = ensure_state_mapped() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    unsafe {
+        let base = ptr as *const u8;
+        for index in 0..MAX_PROCESS_SLOTS {
+            let slot = base.add(STATE_PROCESS_SLOTS_OFFSET + index * PROCESS_SLOT_STRIDE);
+            let first_pid = std::ptr::read_volatile(slot as *const u32);
+            if first_pid == 0 || first_pid & PROCESS_SLOT_WRITING != 0 {
+                continue;
+            }
+            let words = std::slice::from_raw_parts(
+                slot.add(4) as *const u16,
+                PROCESS_NAME_WORDS,
+            );
+            let mut len = 0;
+            while len < words.len() && words[len] != 0 {
+                len += 1;
+            }
+            let name = String::from_utf16_lossy(&words[..len]);
+            let second_pid = std::ptr::read_volatile(slot as *const u32);
+            if first_pid == second_pid && !name.is_empty() {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+// Read the process table as (pid, name) pairs with the same double-read
+// validation as read_process_names. Used by the live-repaint sweep so every
+// hooked shell host (Control Panel's second explorer.exe, MMC, ...) gets its
+// windows invalidated on a mode change, not just the primary Explorer.
+fn read_hooked_processes() -> Vec<(u32, String)> {
+    let Ok(ptr) = ensure_state_mapped() else {
+        return Vec::new();
+    };
+    let mut processes = Vec::new();
+    unsafe {
+        let base = ptr as *const u8;
+        for index in 0..MAX_PROCESS_SLOTS {
+            let slot = base.add(STATE_PROCESS_SLOTS_OFFSET + index * PROCESS_SLOT_STRIDE);
+            let first_pid = std::ptr::read_volatile(slot as *const u32);
+            if first_pid == 0 || first_pid & PROCESS_SLOT_WRITING != 0 {
+                continue;
+            }
+            let words = std::slice::from_raw_parts(
+                slot.add(4) as *const u16,
+                PROCESS_NAME_WORDS,
+            );
+            let mut len = 0;
+            while len < words.len() && words[len] != 0 {
+                len += 1;
+            }
+            let name = String::from_utf16_lossy(&words[..len]);
+            let second_pid = std::ptr::read_volatile(slot as *const u32);
+            if first_pid == second_pid && !name.is_empty() {
+                processes.push((first_pid, name));
+            }
+        }
+    }
+    processes
+}
+
 // The main Explorer shell: its taskbar window gives us the pid used for status
 // verification. Explorer is the primary target whose report we trust, since
 // the shared memory has a single report slot that only Explorer writes.
@@ -390,35 +616,68 @@ fn explorer_target() -> Option<(u32, u32)> {
     }
 }
 
-// Force Explorer's text-bearing windows to repaint after a mode change so the
-// hook's new mode shows immediately instead of waiting for a natural repaint
-// (hover, scroll, resize). The hook reads the mode on every draw, so this only
-// has to make Explorer draw again. EnumWindows/RedrawWindow are safe from any
-// thread; RDW_INVALIDATE (no RDW_UPDATENOW) only queues a repaint.
+// Force every hooked process to repaint after a mode change so the hook's
+// new mode shows immediately instead of waiting for a natural repaint
+// (hover, scroll, resize). The hook reads the mode on every draw, so this
+// only has to make the hosts draw again. EnumWindows/RedrawWindow are safe
+// from any thread; RDW_INVALIDATE (no RDW_UPDATENOW) only queues a repaint.
+// The primary taskbar Explorer keeps the class filter (taskbar + shell
+// views); every other process — the Control Panel's second explorer.exe,
+// MMC consoles, rundll32 applets, and Extended-scope apps like 7-Zip — gets
+// all its top-level windows invalidated, since those hosts ignore the
+// WM_SETTINGCHANGE/WM_FONTCHANGE broadcast below and their window classes
+// vary (CabinetWClass, MMCMainFrame, ...). The pids come from the
+// shared-memory process table, so this covers exactly the processes the
+// detour is live in.
 fn invalidate_explorer_windows() {
-    let Some((pid, _)) = explorer_target() else {
-        return;
-    };
-    unsafe {
-        let _ = EnumWindows(Some(invalidate_proc), LPARAM(pid as isize));
+    let primary = explorer_target().map(|(pid, _)| pid).unwrap_or(0);
+    let mut pids: Vec<u32> = Vec::new();
+    // Every process the detour is live in, shell or not: in Extended scope
+    // that includes third-party GDI apps (7-Zip, ...), which ignore the
+    // WM_SETTINGCHANGE/WM_FONTCHANGE broadcast just like the shell hosts do,
+    // so the targeted invalidate is what makes their mode change live.
+    for (pid, _name) in read_hooked_processes() {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    if primary != 0 && !pids.contains(&primary) {
+        pids.insert(0, primary);
+    }
+    for pid in pids {
+        // Low 32 bits: the pid; bit 32: primary flag (class filter). On a
+        // 32-bit build the flag is lost, which only widens the primary's
+        // invalidate set, never narrows it.
+        let packed = (pid as i64) | ((pid == primary) as i64) << 32;
+        unsafe {
+            let _ = EnumWindows(Some(invalidate_proc), LPARAM(packed as isize));
+        }
     }
 }
 
 unsafe extern "system" fn invalidate_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let target_pid = lparam.0 as u32;
+    let target_pid = (lparam.0 & 0xFFFF_FFFF) as u32;
+    let primary = (lparam.0 >> 32) & 1 != 0;
     let mut pid = 0u32;
     if GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 || pid != target_pid {
         return BOOL(1);
     }
-    let mut class = [0u16; 64];
-    let len = GetClassNameW(hwnd, &mut class);
-    if len <= 0 {
+    if primary {
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class);
+        if len <= 0 {
+            return BOOL(1);
+        }
+        let class = String::from_utf16_lossy(&class[..len as usize]);
+        if class == "Shell_TrayWnd"
+            || class == "Shell_SecondaryTrayWnd"
+            || class == "CabinetWClass"
+        {
+            let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
         return BOOL(1);
     }
-    let class = String::from_utf16_lossy(&class[..len as usize]);
-    if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" || class == "CabinetWClass" {
-        let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
-    }
+    let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
     BOOL(1)
 }
 
@@ -457,7 +716,7 @@ static EMBEDDED_HOOK_DLL: &[u8] =
 // diagnostic: a stale copy on disk that lacks the marker means a running
 // process holds a build predating the current layout and will keep
 // misreading the shared memory until it restarts.
-const HOOK_LAYOUT_MARKER: &[u8] = b"OH2-SMEM-1124";
+const HOOK_LAYOUT_MARKER: &[u8] = b"OH2-SMEM-5349";
 
 // Hook DLL naming: one file per build, named by an FNV-1a hash of the
 // embedded bytes (explorer_hook-<hash>.dll). A new build is always a NEW
@@ -995,11 +1254,14 @@ pub fn explorer_hook_set_enabled(app: tauri::AppHandle, enabled: bool) -> Result
 /// explorer.exe generation is verified hooked (the watchdog detects the
 /// restart via a pid change); any mode/toggle change resets it until then.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExplorerHookStatus {
     enabled: bool,
     active: bool,
     applied: bool,
     pid: u32,
+    process_count: u32,
+    process_names: Vec<String>,
 }
 
 #[tauri::command]
@@ -1017,6 +1279,8 @@ pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
         active,
         applied,
         pid: current,
+        process_count: read_process_count(),
+        process_names: read_process_names(),
     })
 }
 
@@ -1082,6 +1346,10 @@ fn watchdog_loop(app: tauri::AppHandle) {
             return;
         }
         if ENABLED.load(Ordering::Acquire) {
+            if let Err(e) = write_primary_explorer_pid() {
+                log::warn!("[explorer-hook] failed to refresh primary Explorer pid: {e}");
+            }
+            sweep_process_slots();
             if let Err(e) = ensure_hooked(&app) {
                 log::warn!("[explorer-hook] hook install failed, will retry: {e}");
             }

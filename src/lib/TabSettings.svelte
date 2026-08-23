@@ -4,7 +4,7 @@
   import tabDebugIcon from './icons/tab_debug.png?inline';
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
-  import { app, appSettings, setAlwaysElevated, restoreAllDefaults } from './stores.svelte.js';
+  import { app, appSettings, setAlwaysElevated, restoreAllDefaults, taskbarDimmer, setHoverDetection, setPollIntervalMs, TASKBAR_DIMMER_DEFAULTS } from './stores.svelte.js';
 
   let startOnBoot = $state(false);
   let ready = $state(false);
@@ -66,6 +66,11 @@
         console.warn('[settings] restore defaults could not disable autostart', e);
       }
     }
+    // Detection Method (Taskbar Dimmer) is global and lives in Settings, so
+    // reset it to defaults here too. setPollIntervalMs persists the config
+    // (debounced), so the reset survives a restart.
+    setHoverDetection(TASKBAR_DIMMER_DEFAULTS.hoverDetection);
+    setPollIntervalMs(TASKBAR_DIMMER_DEFAULTS.pollIntervalMs);
   }
 
   function openResetAllConfirm() {
@@ -148,7 +153,7 @@
     <img class="tab-icon" src={tabSystemIcon} alt="" />
     <h2>Settings</h2>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={restoreDefaults} title="Resets the Start on Boot option">↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={restoreDefaults} title="Resets the Start on Boot and Detection Method options">↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -176,6 +181,44 @@
   {#if alwaysElevatedError}
     <p class="reset-all-error" role="status">{alwaysElevatedError}</p>
   {/if}
+
+  <div class="settings-row hover-detect-settings-row">
+    <div class="hover-detect-left">
+      <span class="settings-row-label hover-detect-label">Detection Method
+        <span class="info-tip-wrap">
+          <button type="button" class="info-tip-btn" aria-label="About the detection method" tabindex="0">Info</button>
+          <span class="info-tip info-tip-right">
+            <span>How the app detects the cursor, fullscreen mode, and taskbar changes for the Taskbar Dimmer.<br><br>Event-driven: instant response, falls back to polling for elevated (admin) windows.<br><br>Polling: checks on a timer, use it if Event-driven has problems.</span>
+          </span>
+        </span>
+      </span>
+    </div>
+    <div class="hover-detect-controls">
+      <div class="hover-detect-switch" class:poll={taskbarDimmer.hoverDetection === 'poll'} role="radiogroup" aria-label="Taskbar Dimmer detection method">
+        <button type="button" class="hover-detect-opt" class:active={taskbarDimmer.hoverDetection === 'event'}
+          role="radio" aria-checked={taskbarDimmer.hoverDetection === 'event'}
+          disabled={!taskbarDimmer.available}
+          title="Recommended. Instant response. Falls back to polling for elevated (admin) windows."
+          onclick={() => setHoverDetection('event')}>Event-driven</button>
+        <button type="button" class="hover-detect-opt" class:active={taskbarDimmer.hoverDetection === 'poll'}
+          role="radio" aria-checked={taskbarDimmer.hoverDetection === 'poll'}
+          disabled={!taskbarDimmer.available}
+          title="Checks on a timer. Use it if Event-driven has problems, probably negligible CPU impact."
+          onclick={() => setHoverDetection('poll')}>Polling</button>
+      </div>
+      {#if taskbarDimmer.hoverDetection === 'poll'}
+        <div class="hover-detect-poll-rate">
+          <span class="hover-detect-poll-rate-label">Poll interval</span>
+          <input type="range" min="16" max="200" step="1"
+            value={taskbarDimmer.pollIntervalMs}
+            disabled={!taskbarDimmer.available}
+            oninput={(e) => setPollIntervalMs(Number(e.currentTarget.value))}
+            style={`--fill: ${((taskbarDimmer.pollIntervalMs - 16) / (200 - 16)) * 100}%`} />
+          <span class="hover-detect-poll-rate-val">{taskbarDimmer.pollIntervalMs} ms</span>
+        </div>
+      {/if}
+    </div>
+  </div>
 
   <button class="settings-row reset-all-row" bind:this={resetAllBtnEl} onclick={openResetAllConfirm}>
     <div class="settings-row-text">
