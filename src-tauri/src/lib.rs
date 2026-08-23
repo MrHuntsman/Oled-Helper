@@ -620,8 +620,10 @@ pub fn run() {
     gamma_watch::start();
 
     // Tray-restart child: let the old instance release the user-data folder
-    // before we start WebView2. If the parent remains alive or its state cannot
-    // be verified, abort this child rather than competing for the profile.
+    // before we start WebView2. The wait is bounded (see
+    // wait_for_restart_parent): a parent stuck in teardown is terminated so
+    // the restart can complete, and only an unverifiable parent aborts this
+    // child rather than competing for the profile.
     let is_restart_child = std::env::args().any(|arg| arg == process::ARG_RESTART_PARENT);
     #[cfg(target_os = "windows")]
     {

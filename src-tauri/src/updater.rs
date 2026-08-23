@@ -304,6 +304,12 @@ pub fn handle_apply_update_mode() -> bool {
         launch_args.push(args[index].clone());
         index += 1;
     }
+    // Strip every one-shot handoff flag forwarded from an earlier UAC
+    // relaunch (see process::strip_handoff_args): the relaunched app must not
+    // wait on the original launcher's pid, which may long since have been
+    // reused by another process, nor re-apply stale intent (tab, RTX HDR,
+    // screen dimmer) the user has since changed.
+    launch_args = crate::process::strip_handoff_args(launch_args);
     // Every failure path after the old process has exited relaunches the app
     // (with the old exe restored where needed), so a failed update never
     // leaves the user with nothing running.

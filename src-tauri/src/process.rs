@@ -28,6 +28,42 @@ const KNOWN_TABS: [&str; 11] = [
     "about",
 ];
 
+// Removes one-shot handoff arguments from a forwarded command line. These
+// flags describe a single immediate handoff (a UAC relaunch or a restart) and
+// must not be carried into later launches:
+//   - "--restart-parent <pid>" pairs: only the caller-appended current
+//     parent pid may be present, otherwise a restart child waits on (or skips
+//     waiting for) the wrong process and races its shutdown, so the restarted
+//     app never comes back.
+//   - "--open-tab=...", "--rtx-hdr-flags=...", "--rtx-hdr-enabled=...",
+//     "--hdr-mode=...", "--screen-dimmer-enabled=...": one-shot intent that
+//     was already applied (or that the user changed since). Re-forwarding it
+//     would force the old tab on every restart of an always-elevated session
+//     and re-apply the old setting even after the user disabled it.
+// The caller re-appends the flags it actually wants for the new process.
+pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut stripped = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == ARG_RESTART_PARENT {
+            // Drop the pid that follows the flag too.
+            let _ = iter.next();
+            continue;
+        }
+        let text = arg.to_string_lossy();
+        if text.starts_with(ARG_OPEN_TAB_PREFIX)
+            || text.starts_with(ARG_RTX_HDR_FLAGS_PREFIX)
+            || text.starts_with(ARG_RTX_HDR_ENABLED_PREFIX)
+            || text.starts_with(ARG_HDR_MODE_PREFIX)
+            || text.starts_with(ARG_SCREEN_DIMMER_ENABLED_PREFIX)
+        {
+            continue;
+        }
+        stripped.push(arg);
+    }
+    stripped
+}
+
 pub(crate) fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
     // Always perform a real process restart, including when launched through
     // `tauri dev`. Spawn first so a failure leaves the current instance fully
@@ -39,7 +75,12 @@ pub(crate) fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
             return;
         }
     };
-    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Forward the original launch arguments minus every one-shot handoff
+    // flag (see strip_handoff_args): only the current parent pid and the
+    // requested tab below may be present, so the replacement waits for THIS
+    // process and never re-applies stale intent from an earlier UAC relaunch.
+    let mut args: Vec<std::ffi::OsString> =
+        strip_handoff_args(std::env::args_os().skip(1).collect());
     args.push(ARG_RESTART_PARENT.into());
     args.push(std::process::id().to_string().into());
     if let Some(tab) = open_tab {
@@ -147,7 +188,11 @@ pub fn is_process_elevated() -> bool {
 // the caller keeps running in that case.
 pub(crate) fn spawn_elevated(extra_args: &[String]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Strip every one-shot handoff flag from a previous relaunch (see
+    // strip_handoff_args) so the elevated replacement only ever waits on
+    // THIS process and receives only the extra_args intent below.
+    let mut args: Vec<std::ffi::OsString> =
+        strip_handoff_args(std::env::args_os().skip(1).collect());
     args.push(ARG_RESTART_PARENT.into());
     args.push(std::process::id().to_string().into());
     args.extend(extra_args.iter().map(|arg| arg.into()));
@@ -697,20 +742,36 @@ pub(crate) fn start_single_instance_watcher(app: AppHandle) {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn start_single_instance_watcher(_app: AppHandle) {}
 
+// How long a restart/update child waits for the old instance to exit before
+// declaring it stuck. Bounded so a hung teardown (WebView2, a driver call)
+// cannot block the restart or update forever.
+pub(crate) const RESTART_PARENT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // When this instance was spawned by a tray Restart, --restart-parent carries
 // the old process's PID. Wait for it to fully exit before creating the
 // WebView2 environment. A vanished parent is success; a live parent remains
 // polled with low-frequency warnings until it exits. Also used by the
 // updater's --apply-update mode to wait for the old process to release the
 // exe file before swapping it.
+//
+// The wait is bounded (RESTART_PARENT_MAX_WAIT). If the old instance is
+// still alive past it, the teardown is stuck, and waiting any longer only
+// guarantees the restart never completes. The old instance is our own exe,
+// and the watchdog children make a hard kill survivable (the gamma watchdog
+// restores the ramp, the display-mode watchdog restores the mode), so
+// terminate it and let the replacement proceed. Returns false only when the
+// parent's state cannot be inspected or it survives termination, in which
+// case the caller must abort rather than compete with it.
 #[cfg(target_os = "windows")]
 pub(crate) fn wait_for_restart_parent(parent_pid: u32) -> bool {
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
     };
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess, WaitForSingleObject,
     };
+    let deadline = std::time::Instant::now() + RESTART_PARENT_MAX_WAIT;
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, parent_pid) {
             Ok(handle) => handle,
@@ -740,6 +801,43 @@ pub(crate) fn wait_for_restart_parent(parent_pid: u32) -> bool {
             }
             if exit_code != STILL_ACTIVE.0 as u32 {
                 let _ = CloseHandle(handle);
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                log::error!(
+                    "restart parent {parent_pid} did not exit within {:?}; terminating it to complete the restart",
+                    RESTART_PARENT_MAX_WAIT
+                );
+                let terminate_handle = match OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    false,
+                    parent_pid,
+                ) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let _ = CloseHandle(handle);
+                        log::error!(
+                            "could not open restart parent {parent_pid} for termination: {error}; aborting replacement"
+                        );
+                        return false;
+                    }
+                };
+                let terminated = TerminateProcess(terminate_handle, 1).is_ok();
+                let _ = CloseHandle(terminate_handle);
+                if !terminated {
+                    let _ = CloseHandle(handle);
+                    log::error!(
+                        "could not terminate the stuck restart parent {parent_pid}; aborting replacement"
+                    );
+                    return false;
+                }
+                // Wait for the terminated process to fully exit: its handles,
+                // including the single-instance mutex, close only then.
+                let _ = WaitForSingleObject(handle, 5000);
+                let _ = CloseHandle(handle);
+                log::warn!(
+                    "restart parent {parent_pid} was terminated after the shutdown timeout to complete the restart"
+                );
                 return true;
             }
             if last_warning.elapsed() >= std::time::Duration::from_secs(5) {

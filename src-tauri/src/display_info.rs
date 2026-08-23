@@ -293,6 +293,12 @@ fn restore_recovery_record(record: &RecoveryRecord) -> Result<(), String> {
 }
 
 pub fn run_recovery_watchdog() {
+    // A restore the driver keeps rejecting must not retry forever: the
+    // recovery record blocks every future mode change (begin_mode_change
+    // refuses while it exists), so a permanently rejected restore would wedge
+    // the app even across restarts. Give up after RECOVERY_GIVE_UP_MS of
+    // continuous failure and quarantine the record so mode changes work again.
+    let mut give_up_at: Option<u64> = None;
     loop {
         let path = recovery_path();
         let Ok(data) = fs::read(&path) else {
@@ -361,6 +367,16 @@ pub fn run_recovery_watchdog() {
             },
             Err(error) => {
                 log::error!("[display-info] recovery watchdog failed: {error}");
+                let now = now_ms();
+                let give_up = *give_up_at.get_or_insert(now + RECOVERY_GIVE_UP_MS);
+                if now >= give_up {
+                    log::error!(
+                        "[display-info] recovery watchdog could not restore the display mode within {} ms; quarantining the recovery record so mode changes are possible again",
+                        RECOVERY_GIVE_UP_MS
+                    );
+                    let _ = quarantine_recovery_record();
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -1370,6 +1386,12 @@ fn query_native_resolution(target: &DisplayTarget) -> Option<(u32, u32, &'static
 // took.
 const MODE_CONFIRMATION_SECONDS: u32 = 15;
 
+// How long the recovery watchdog keeps retrying a restore the driver rejects
+// before quarantining the record. A restore that fails this long can never
+// succeed by retrying, and the record would otherwise block every future mode
+// change forever.
+const RECOVERY_GIVE_UP_MS: u64 = 30_000;
+
 #[derive(Clone, serde::Serialize)]
 pub struct AppliedMode {
     pub width: u32,
@@ -1489,6 +1511,54 @@ fn recovery_mode_for(
                 width, height, hz
             )
         })
+}
+
+// Rebuilds a complete, driver-accepted DEVMODE for the mode that was active
+// before a pending change, instead of replaying the DEVMODE captured when the
+// change started. The captured structure can go stale while the confirmation
+// window is open (a streaming session ending, a hotplug, a driver re-
+// negotiation) and the driver then rejects it with DISP_CHANGE_FAILED even
+// though the same resolution and refresh rate are still perfectly valid.
+fn previous_mode_for(target: &DisplayTarget, previous: &DEVMODEW) -> Result<DEVMODEW, String> {
+    let current = current_devmode(&target.device_name)
+        .ok_or_else(|| "unable to re-read the current display mode for rollback".to_string())?;
+    recovery_mode_for(
+        target,
+        &current,
+        previous.dmPelsWidth,
+        previous.dmPelsHeight,
+        previous.dmDisplayFrequency,
+        previous.dmBitsPerPel,
+    )
+    .map_err(|error| format!("the previous mode could not be re-enumerated: {error}"))
+}
+
+// Applies the previous mode on rollback, re-enumerating it from the driver's
+// current mode list and retrying briefly. The driver can be mid-transition
+// when the confirmation expires (streaming session teardown, hotplug), so a
+// single immediate apply can fail with DISP_CHANGE_FAILED even though the
+// mode is valid; a short pause and a fresh DEVMODE usually succeed once the
+// driver settles.
+fn apply_previous_mode(target: &DisplayTarget, previous: &DEVMODEW) -> Result<(), String> {
+    let mut last_error: Option<String> = None;
+    for attempt in 0..3 {
+        let applied = previous_mode_for(target, previous).and_then(|mode| {
+            unsafe { change_mode(target, &mode, CDS_UPDATEREGISTRY) }?;
+            wait_for_mode(target, &mode)
+                .map(|_| ())
+                .ok_or_else(|| "display driver did not restore the previous mode".to_string())
+        });
+        match applied {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "previous mode restore failed".to_string()))
 }
 
 fn complete_mode_for(
@@ -1709,8 +1779,8 @@ fn begin_mode_change(
                 log::error!("[display-info] automatic rollback refused: {error}");
                 return;
             }
-            match unsafe { change_mode(&entry.target, &entry.previous, CDS_UPDATEREGISTRY) } {
-                Ok(()) if wait_for_mode(&entry.target, &entry.previous).is_some() => {
+            match apply_previous_mode(&entry.target, &entry.previous) {
+                Ok(()) => {
                     invalidate_mode_cache();
                     // Keep the in-memory transaction until recovery cleanup
                     // has succeeded. If cleanup fails, the watchdog and manual
@@ -1728,13 +1798,30 @@ fn begin_mode_change(
                         "[display-info] display mode confirmation timed out; restored previous mode"
                     );
                 }
-                Ok(()) => {
-                    log::error!("[display-info] automatic display-mode rollback did not reach the previous mode; keeping recovery state");
-                }
                 Err(error) => {
-                    // Keep the pending transaction available for a manual
-                    // retry instead of silently losing the only recovery mode.
-                    log::error!("[display-info] automatic display-mode rollback failed: {error}");
+                    // The restore was rejected even after re-enumeration
+                    // retries, so retrying it again cannot succeed. Leaving
+                    // the transaction pending would block every future mode
+                    // change with "another display-mode change is awaiting
+                    // confirmation". Clear the in-memory transaction and the
+                    // on-disk recovery record so the user can start a fresh
+                    // change: the unconfirmed mode is still active (it applied
+                    // successfully), a known working state, and a recovery
+                    // record whose restore the driver refuses can never be
+                    // fulfilled anyway.
+                    log::error!(
+                        "[display-info] automatic display-mode rollback failed: {error}; clearing the stuck mode transaction so further changes are possible"
+                    );
+                    if let Ok(mut guard) = pending_mode().lock() {
+                        if guard.as_ref().is_some_and(|current| current.token == token) {
+                            guard.take();
+                        }
+                    }
+                    if let Err(cleanup_error) = clear_recovery_record_for(token) {
+                        log::error!(
+                            "[display-info] automatic rollback failed and the recovery record could not be cleared: {cleanup_error}"
+                        );
+                    }
                 }
             }
         };
@@ -1878,25 +1965,44 @@ pub fn rollback_mode_change() -> Result<(), String> {
         return Ok(());
     };
     let _recovery_guard = lock_recovery_state()?;
-    target_is_current(&entry.target)?;
-    unsafe {
-        change_mode(&entry.target, &entry.previous, CDS_UPDATEREGISTRY)?;
+    // Any failure below must clear the stuck transaction, otherwise a
+    // restore the driver keeps rejecting permanently blocks every future
+    // mode change (the same wedge the automatic rollback now escapes).
+    let result = (|| {
+        target_is_current(&entry.target)?;
+        apply_previous_mode(&entry.target, &entry.previous)?;
+        clear_recovery_record_for(entry.token)?;
+        invalidate_mode_cache();
+        let mut guard = pending_mode()
+            .lock()
+            .map_err(|_| "display mode state was poisoned".to_string())?;
+        if guard
+            .as_ref()
+            .is_some_and(|current| current.token == entry.token)
+        {
+            guard.take();
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        log::error!(
+            "[display-info] manual rollback failed: {error}; clearing the stuck mode transaction so further changes are possible"
+        );
+        if let Ok(mut guard) = pending_mode().lock() {
+            if guard
+                .as_ref()
+                .is_some_and(|current| current.token == entry.token)
+            {
+                guard.take();
+            }
+        }
+        if let Err(cleanup_error) = clear_recovery_record_for(entry.token) {
+            log::error!(
+                "[display-info] manual rollback failed and the recovery record could not be cleared: {cleanup_error}"
+            );
+        }
     }
-    if wait_for_mode(&entry.target, &entry.previous).is_none() {
-        return Err("display driver did not restore the previous mode".into());
-    }
-    clear_recovery_record_for(entry.token)?;
-    invalidate_mode_cache();
-    let mut guard = pending_mode()
-        .lock()
-        .map_err(|_| "display mode state was poisoned".to_string())?;
-    if guard
-        .as_ref()
-        .is_some_and(|current| current.token == entry.token)
-    {
-        guard.take();
-    }
-    Ok(())
+    result
 }
 
 pub fn launch_recovery_watchdog_if_needed() {
