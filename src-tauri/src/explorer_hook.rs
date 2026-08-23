@@ -464,6 +464,9 @@ fn shell_target(name: &str) -> bool {
         || lower == "control.exe"
         || lower == "rundll32.exe"
         || lower == "mmc.exe"
+        || lower == "regedit.exe"
+        || lower == "sndvol.exe"
+        || lower == "conhost.exe"
         || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
 }
 

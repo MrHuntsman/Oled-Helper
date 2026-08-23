@@ -314,7 +314,7 @@
   // hookAllApps), so the storage and backend are unchanged.
   const COVERAGE_OFF = { value: 'off', label: 'Off', desc: 'Apps follow Windows text settings (browsers, DirectWrite apps...).' };
   const COVERAGE_ON = [
-    { value: 'shell', label: 'Normal', desc: 'Live rendering for Explorer, Control Panel and MMC via the custom hook.' },
+    { value: 'shell', label: 'Normal', desc: 'Live rendering for Explorer, Control Panel, MMC and classic Windows tools (Registry Editor, consoles, Volume Mixer) via the custom hook.' },
     { value: 'all', label: 'Extended', desc: 'Hooks every GDI process.' },
   ];
 
@@ -343,6 +343,9 @@
           'control.exe',
           'rundll32.exe',
           'mmc.exe',
+          'regedit.exe',
+          'sndvol.exe',
+          'conhost.exe',
         ]);
         for (const name of names) {
           const raw = String(name);

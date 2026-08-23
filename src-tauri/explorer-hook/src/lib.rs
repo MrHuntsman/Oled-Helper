@@ -598,16 +598,21 @@ fn is_explorer() -> bool {
 }
 
 // Everything the app wants the detour in: Explorer plus the classic Control
-// Panel host processes and the MMC admin consoles. SystemProperties is a
-// family of executables, matched by prefix. Third-party apps (7-Zip, ...)
-// are intentionally NOT here, they're covered by the all-apps scope stop
-// instead, so the shell stop stays a shell-only list.
+// Panel host processes, the MMC admin consoles, and the per-monitor-aware
+// classic Windows tools that draw real-DPI GDI text (Registry Editor,
+// console windows, Volume Mixer). SystemProperties is a family of
+// executables, matched by prefix. Third-party apps (7-Zip, ...) are
+// intentionally NOT here, they're covered by the all-apps scope stop
+// instead, so the shell stop stays a Windows-only list.
 fn is_target() -> bool {
     let lower = proc_name().to_ascii_lowercase();
     lower == "explorer.exe"
         || lower == "control.exe"
         || lower == "rundll32.exe"
         || lower == "mmc.exe"
+        || lower == "regedit.exe"
+        || lower == "sndvol.exe"
+        || lower == "conhost.exe"
         || (lower.starts_with("systemproperties") && lower.ends_with(".exe"))
 }
 
