@@ -146,12 +146,9 @@
         </label>
       </div>
       <div class="diag-header-actions">
-        <button class="copy-btn" class:success={logCopied} class:error={logCopyFailed} onclick={copyGpuLog} title={logCopied ? 'Copied!' : logCopyFailed ? 'Copy failed' : 'Copy runtime log'} aria-label="Copy runtime log">
-          {#if logCopied}
-            <svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          {:else}
-            <svg viewBox="0 0 16 16" fill="none"><rect x="5.5" y="5.5" width="8" height="8" rx="1.3" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.8C3.5 3.36 3.86 3 4.3 3H10.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          {/if}
+        <button class="copy-btn copy-btn-label" class:success={logCopied} class:error={logCopyFailed} onclick={copyGpuLog} title={logCopied ? 'Copied!' : logCopyFailed ? 'Copy failed' : 'Copy log text'} aria-label="Copy log text">
+          <svg viewBox="0 0 16 16" fill="none"><rect x="5.5" y="5.5" width="8" height="8" rx="1.3" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.8C3.5 3.36 3.86 3 4.3 3H10.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <span>{logCopied ? 'Copied!' : 'Copy log'}</span>
         </button>
         <button class="copy-btn" onclick={clearGpuLog} title="Clear log" aria-label="Clear log">
           <svg viewBox="0 0 16 16" fill="none"><path d="M3.5 4.5H12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M6 4.5V3.3C6 2.9 6.3 2.6 6.7 2.6H9.3C9.7 2.6 10 2.9 10 3.3V4.5" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 4.5L5 12.4C5 12.8 5.4 13.1 5.8 13.1H10.2C10.6 13.1 11 12.8 11 12.4L11.5 4.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>

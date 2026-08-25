@@ -579,31 +579,56 @@ pub fn tray_menu_set_resolution(
     height: u32,
     hz: Option<u32>,
     monitor_id: Option<String>,
+    monitor_device: Option<String>,
+    skip_confirmation: Option<bool>,
 ) {
     std::thread::spawn(move || {
         // Resolve the favorite's saved monitor to its GDI device name. A
         // favorite whose monitor is not currently connected must not be
         // applied to the primary instead, that would silently change the
         // wrong display; skip it with a log line, mirroring the main app's
-        // "Monitor not connected" guard.
-        let device_name = match monitor_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
-            Some(id) => {
+        // "Monitor not connected" guard. The GDI device name is unique per
+        // physical monitor, so it wins when the favorite carries one: two
+        // identical panels share the EDID id, and matching on it alone would
+        // target the first sibling instead of the saved panel.
+        let target_device = monitor_device
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let device_name = match target_device {
+            Some(device) => {
                 let resolved = crate::monitors::all_monitors()
                     .into_iter()
-                    .find(|m| {
-                        !m.monitor_id.is_empty() && m.monitor_id.eq_ignore_ascii_case(id)
-                    })
+                    .find(|m| m.device_name.eq_ignore_ascii_case(device))
                     .map(|m| m.device_name)
                     .filter(|name| !name.is_empty());
                 if resolved.is_none() {
                     log::warn!(
-                        "[tray-menu] favorite target monitor {id} is not connected; skipping mode change"
+                        "[tray-menu] favorite target monitor {device} is not connected; skipping mode change"
                     );
                     return;
                 }
                 resolved
             }
-            None => None,
+            None => match monitor_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+                Some(id) => {
+                    let resolved = crate::monitors::all_monitors()
+                        .into_iter()
+                        .find(|m| {
+                            !m.monitor_id.is_empty() && m.monitor_id.eq_ignore_ascii_case(id)
+                        })
+                        .map(|m| m.device_name)
+                        .filter(|name| !name.is_empty());
+                    if resolved.is_none() {
+                        log::warn!(
+                            "[tray-menu] favorite target monitor {id} is not connected; skipping mode change"
+                        );
+                        return;
+                    }
+                    resolved
+                }
+                None => None,
+            },
         };
         // The no-op check must compare against the TARGET monitor's live
         // mode, not the primary's, so an already-active favorite on a
@@ -619,8 +644,14 @@ pub fn tray_menu_set_resolution(
         {
             return;
         }
-        match crate::display_info::set_resolution(width, height, target_hz, device_name) {
+        match crate::display_info::set_resolution(width, height, target_hz, device_name, skip_confirmation.unwrap_or(false)) {
             Ok(mode) => {
+                if mode.skip_confirmation {
+                    if let Err(error) = crate::display_info::confirm_mode_change() {
+                        log::warn!("[tray-menu] trusted favorite confirmation failed: {error}");
+                    }
+                    return;
+                }
                 crate::flyout_window::show_after_ready(&app, mode).ok();
             }
             Err(e) => log::warn!("[tray-menu] resolution change failed: {e}"),

@@ -613,31 +613,35 @@ fn resolve_profile_key(monitor_key: Option<&str>) -> String {
     if let Some(key) = monitor_key {
         let key = key.trim();
         if !key.is_empty() {
+            // Callers (the main window and the tray) send the monitor's
+            // current profile identity; pass it through. Topology re-keys
+            // are handled by rekey_profiles on display changes, so the hot
+            // slider paths never pay for a monitor enumeration.
             return key.to_string();
         }
     }
     for m in crate::monitors::all_monitors() {
         if m.primary {
-            return if !m.monitor_id.is_empty() {
-                m.monitor_id
-            } else {
-                m.sig()
-            };
+            return m.profile_id;
         }
     }
     String::new()
 }
 
-// The profile-map key for a connected monitor: EDID id when present, sig
-// fallback. Must match resolve_profile_key / the frontend's dimmerMonKey,
-// or the watcher would look its own profiles up under a different key and
-// fall back to the defaults for every monitor.
-fn monitor_profile_key(monitor: &crate::monitors::AppMonitor) -> String {
-    if !monitor.monitor_id.is_empty() {
-        monitor.monitor_id.clone()
-    } else {
-        monitor.sig()
+// Re-key the shared profile map to the current monitor identities after a
+// display-topology change (see monitors::rekey_profile_map).
+pub(crate) fn rekey_profiles() {
+    if let Ok(mut profiles) = screen_dimmer_profiles_map().lock() {
+        crate::monitors::rekey_profile_map(&mut profiles);
     }
+}
+
+// The profile-map key for a connected monitor: its profile identity (EDID
+// id, disambiguated for identical panels). Must match resolve_profile_key /
+// the frontend's dimmerMonKey, or the watcher would look its own profiles
+// up under a different key and fall back to the defaults for every monitor.
+fn monitor_profile_key(monitor: &crate::monitors::AppMonitor) -> String {
+    monitor.profile_id.clone()
 }
 
 // Tick count of the most recent gamepad input. GetLastInputInfo does not see
@@ -1072,10 +1076,12 @@ fn apply_dim_levels(levels: &HashMap<String, u32>, restore_unconfigured: bool) {
 }
 
 fn uniform_dim_levels(level: u32) -> HashMap<String, u32> {
+    // Keyed by the device name (unique per physical monitor), matching the
+    // dim watcher's per-tick maps.
     crate::monitors::all_monitors()
         .into_iter()
         .filter(|monitor| !monitor.device_name.is_empty())
-        .map(|monitor| (monitor.sig(), level))
+        .map(|monitor| (monitor.device_name, level))
         .collect()
 }
 
@@ -1281,14 +1287,17 @@ fn dim_watcher_loop() {
                 // Per-monitor fullscreen suppression: only monitors whose
                 // profile keeps detection on are checked, the rest stay
                 // absent from the map so the dim runs over fullscreen
-                // content like any other.
+                // content like any other. Keyed by the device name (unique
+                // per physical monitor): the sig is shared by two identical
+                // panels, so keying by it would make one panel's fullscreen
+                // suppress the dim on its sibling.
                 let profile = profiles
                     .get(&monitor_profile_key(monitor))
                     .cloned()
                     .unwrap_or_default();
-                if profile.fullscreen_detection {
+                if profile.fullscreen_detection && !monitor.device_name.is_empty() {
                     fullscreen_by_monitor.insert(
-                        monitor.sig(),
+                        monitor.device_name.clone(),
                         crate::taskbar_dimmer::fullscreen_active_on_monitor(monitor.hmonitor),
                     );
                 }
@@ -1372,8 +1381,11 @@ fn dim_watcher_loop() {
             if monitor.device_name.is_empty() {
                 continue;
             }
-            let sig = monitor.sig();
-            seen.insert(sig.clone());
+            // Per-tick state keyed by the device name (unique per physical
+            // monitor), so two identical panels keep independent dim levels,
+            // fades, and fullscreen suppression.
+            let key = monitor.device_name.clone();
+            seen.insert(key.clone());
             // This monitor's own profile: its timeout, dim strength, fade
             // durations, and fullscreen suppression. Looked up by the same
             // key the frontend writes (monitor_id || sig); missing = defaults.
@@ -1381,8 +1393,8 @@ fn dim_watcher_loop() {
                 .get(&monitor_profile_key(monitor))
                 .cloned()
                 .unwrap_or_default();
-            let current = levels.get(&sig).copied().unwrap_or(1000);
-            let fullscreen = fullscreen_by_monitor.get(&sig).copied().unwrap_or(false);
+            let current = levels.get(&key).copied().unwrap_or(1000);
+            let fullscreen = fullscreen_by_monitor.get(&key).copied().unwrap_or(false);
             let target = if enabled
                 && !fullscreen
                 && !display_request_active
@@ -1394,7 +1406,7 @@ fn dim_watcher_loop() {
             };
 
             let transition = transitions
-                .entry(sig.clone())
+                .entry(key.clone())
                 .or_insert((current, target, now));
             if transition.1 != target {
                 // A fullscreen transition or input interruption reverses from
@@ -1416,10 +1428,10 @@ fn dim_watcher_loop() {
                     duration,
                 )
             };
-            next_levels.insert(sig, next);
+            next_levels.insert(key, next);
         }
 
-        transitions.retain(|sig, _| seen.contains(sig));
+        transitions.retain(|key, _| seen.contains(key));
         if next_levels != levels {
             levels = next_levels;
             // `true` restores all monitors whose fullscreen suppression just
@@ -1493,8 +1505,11 @@ pub fn init(
         let mut profiles = screen_dimmer_profiles_map()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Re-key persisted entries (legacy sigs or bare EDID ids) to the
+        // monitors' current profile identities, so the watcher's lookups
+        // match even before the frontend's backfill rewrites the config.
         for (key, profile) in screen_dimmer_profiles {
-            profiles.insert(key, profile);
+            profiles.insert(crate::monitors::canonical_profile_id(&key), profile);
         }
     }
     sync_primary_mirror();

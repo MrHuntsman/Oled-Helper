@@ -93,22 +93,26 @@ mod display_change_events {
             }
             WM_DISPLAYCHANGE => {
                 if let Some(app) = APP.get() {
-                    notify_display_changed(app, "WM_DISPLAYCHANGE");
+                    notify_display_changed(app, "WM_DISPLAYCHANGE", true);
                 }
             }
             WM_DEVICECHANGE => {
                 if let Some(app) = APP.get() {
-                    notify_display_changed(app, "WM_DEVICECHANGE");
+                    notify_display_changed(app, "WM_DEVICECHANGE", true);
                 }
             }
             // Display topology changes can also arrive as a settings
             // broadcast, especially when a virtual display driver updates
             // the active display configuration without changing the primary
             // mode first. Treat it as a display invalidation rather than
-            // polling for changes.
+            // polling for changes. The hook table is NOT refreshed here:
+            // WM_SETTINGCHANGE fires for every app on the system changing
+            // any setting, and the monitor caps only change on real
+            // topology/mode changes, which broadcast WM_DISPLAYCHANGE or
+            // WM_DEVICECHANGE.
             WM_SETTINGCHANGE => {
                 if let Some(app) = APP.get() {
-                    notify_display_changed(app, "WM_SETTINGCHANGE");
+                    notify_display_changed(app, "WM_SETTINGCHANGE", false);
                 }
             }
             // Minimize/restore tracking for the Text tab's native preview. On
@@ -151,7 +155,7 @@ mod display_change_events {
         DefSubclassProc(hwnd, message, wparam, lparam)
     }
 
-    fn notify_display_changed(app: &AppHandle, source: &str) {
+    fn notify_display_changed(app: &AppHandle, source: &str, refresh_hook_table: bool) {
         // Fires for EVERY system-wide WM_SETTINGCHANGE broadcast (any app on
         // the system changing any setting), so it is noise at Debug: log it
         // only when detailed logging is enabled.
@@ -165,6 +169,19 @@ mod display_change_events {
         // extremely laggy, so ignore notifications right after a write.
         if hdr_toggle::recent_sdr_white_write() {
             return;
+        }
+        // The Explorer-hook shared monitor table embeds each monitor's
+        // current resolution/DPI caps; a real mode or topology change makes
+        // them stale for memory-DC attribution and the DPI-virtualization
+        // gate, so refresh the table while the hook feature is on.
+        if refresh_hook_table {
+            explorer_hook::refresh_monitor_table();
+            // A topology change can shift the per-monitor profile identities
+            // (one of two identical panels unplugged, or a second one
+            // plugged in), so re-key the dimmer maps to the current keys
+            // before the watchers look them up again.
+            crate::taskbar_dimmer::rekey_profiles();
+            crate::power::rekey_profiles();
         }
         let _ = app.emit("display-changed", source);
         // The vendor caches (primary-GPU adapter info, NVAPI context and its
@@ -338,8 +355,13 @@ async fn set_resolution(
     height: u32,
     preferred_hz: u32,
     device_name: Option<String>,
+    skip_confirmation: Option<bool>,
 ) -> Result<display_info::AppliedMode, String> {
-    display_info::set_resolution(width, height, preferred_hz, device_name)
+    let result = display_info::set_resolution(width, height, preferred_hz, device_name, skip_confirmation.unwrap_or(false))?;
+    if result.skip_confirmation {
+        display_info::confirm_mode_change()?;
+    }
+    Ok(result)
 }
 
 // Async (not sync) commands: confirm/rollback persist or restore the display
@@ -1063,8 +1085,11 @@ pub fn run() {
                 let mut profiles = crate::taskbar_dimmer::profiles_map()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                // Re-key persisted entries (legacy sigs or bare EDID ids) to
+                // the monitors' current profile identities, so the runtime
+                // map matches the frontend's keys before it rewrites config.
                 for (key, profile) in &saved_config.taskbar_dimmer_profiles {
-                    profiles.insert(key.clone(), profile.clone());
+                    profiles.insert(crate::monitors::canonical_profile_id(key), profile.clone());
                 }
                 if profiles.is_empty() {
                     // Legacy config (or first run): seed the primary monitor's
@@ -1073,13 +1098,7 @@ pub fn run() {
                     let primary_key = crate::monitors::all_monitors()
                         .into_iter()
                         .find(|m| m.primary)
-                        .map(|m| {
-                            if !m.monitor_id.is_empty() {
-                                m.monitor_id
-                            } else {
-                                m.sig()
-                            }
-                        });
+                        .map(|m| m.profile_id.clone());
                     if let Some(key) = primary_key {
                         let entry = profiles.entry(key).or_default();
                         entry.opacity = saved_config.taskbar_dimmer_opacity.clamp(0.0, 1.0);
@@ -1121,13 +1140,7 @@ pub fn run() {
                     let primary_key = crate::monitors::all_monitors()
                         .into_iter()
                         .find(|m| m.primary)
-                        .map(|m| {
-                            if !m.monitor_id.is_empty() {
-                                m.monitor_id
-                            } else {
-                                m.sig()
-                            }
-                        });
+                        .map(|m| m.profile_id.clone());
                     if let Some(key) = primary_key {
                         let entry = screen_profiles.entry(key).or_default();
                         entry.seconds = saved_config.screen_protector_seconds;

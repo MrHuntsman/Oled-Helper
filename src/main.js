@@ -233,6 +233,7 @@ try {
       app.displayInfo.height = info.height || 0;
       app.displayInfo.deviceName = typeof info.device_name === 'string' ? info.device_name : '';
       app.displayInfo.monitorId = typeof info.monitor_id === 'string' ? info.monitor_id : '';
+      app.displayInfo.profileId = typeof info.profile_id === 'string' ? info.profile_id : '';
       app.displayInfo.refreshRateHz = info.refresh_hz || null;
     }).catch(() => {}),
   ]).then(() => {

@@ -36,7 +36,7 @@ export const app = $state({
   // the live slider makes the strip drift whenever the SDR brightness moves.
   // Captured on the first successful read (null → fallback 80).
   sdrWhiteBaseNits: null,
-  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', gpuModel: '', vendor: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, dynamicRange: '', vrr: '', referenceMode: false, refreshRateHz: null, refreshRates: [], resolutions: [] },
+  displayInfo: { width: 0, height: 0, deviceName: '', monitorName: '', monitorId: '', profileId: '', nativeWidth: 0, nativeHeight: 0, nativeSource: '', gpuModel: '', vendor: '', connector: '', colorFormat: '', bitsPerChannel: 0, desktopBits: 0, dynamicRange: '', vrr: '', referenceMode: false, refreshRateHz: null, refreshRates: [], resolutions: [] },
   refreshRateBusy: false,
   displayModeBusy: false,
   // Actual canvas rendering path reported by the WebGPU calibration surfaces.
@@ -96,10 +96,26 @@ export const crush = $state({
 export const monitors = $state([]);
 export const activeMonitor = $state({ mon: null });
 
-export async function loadMonitors() {
+export async function loadMonitors({ retry = true } = {}) {
   try {
     const list = await invoke('list_monitors');
-    monitors.splice(0, monitors.length, ...(list || []));
+    // Sunshine and other virtual-display drivers can briefly report no
+    // attached monitors while the topology is being rebuilt. Treat that as
+    // an incomplete snapshot: keep the last valid list and retry instead of
+    // making the selector permanently empty.
+    if (!Array.isArray(list) || list.length === 0) {
+      if (monitors.length === 0) {
+        console.warn('[monitors] enumeration returned no monitors');
+      } else {
+        console.warn('[monitors] transient empty enumeration; retaining current monitor list');
+      }
+      if (retry) scheduleMonitorRefreshRetry();
+      return false;
+    }
+    monitorRefreshRetryCount = 0;
+    clearTimeout(monitorRefreshRetryTimer);
+    monitorRefreshRetryTimer = null;
+    monitors.splice(0, monitors.length, ...list);
     // A selected monitor that disappeared (unplug/reconnect) falls back to
     // the primary rather than pointing at a stale signature.
     if (activeMonitor.mon && !monitors.some((m) => m.sig === activeMonitor.mon.sig)) {
@@ -122,9 +138,22 @@ export async function loadMonitors() {
     // profiles (legacy flat fields seed the primary, sig entries re-keyed).
     backfillScreenDimmerProfiles();
     syncScreenDimmerView();
+    return true;
   } catch (e) {
     console.warn('[monitors] list failed', e);
+    if (retry) scheduleMonitorRefreshRetry();
+    return false;
   }
+}
+
+function scheduleMonitorRefreshRetry() {
+  if (monitorRefreshRetryTimer !== null || monitorRefreshRetryCount >= 8) return;
+  const attempt = monitorRefreshRetryCount++;
+  const delay = Math.min(8000, 500 * (2 ** attempt));
+  monitorRefreshRetryTimer = setTimeout(() => {
+    monitorRefreshRetryTimer = null;
+    loadMonitors().catch(() => {});
+  }, delay);
 }
 
 export function setActiveMonitor(mon) {
@@ -199,10 +228,16 @@ export function activeMonitorSig() {
 
 // Route a black-lift apply to the selected monitor's device; before the
 // selector has a monitor (or with none connected), fall back to the primary.
-// One decision point for every caller.
+// One decision point for every caller. The GDI device name is passed too so
+// the backend can tell two identical panels apart even when they share the
+// same sig and EDID id.
 export function applyGamma(blackLiftValue) {
   if (activeMonitor.mon) {
-    return invoke('apply_gamma_ramp_for', { sig: activeMonitor.mon.sig, blackLift: blackLiftValue });
+    return invoke('apply_gamma_ramp_for', {
+      sig: activeMonitor.mon.sig,
+      deviceName: activeMonitor.mon.device_name || null,
+      blackLift: blackLiftValue,
+    });
   }
   return invoke('apply_gamma_ramp', { blackLift: blackLiftValue });
 }
@@ -311,8 +346,8 @@ export const taskbarDimmer = $state({
   available: true,
 });
 
-// Per-monitor Taskbar Dimmer profiles, keyed by the monitor's stable
-// identity (monitor_id || sig), same keying as the Text-tab profiles.
+// Per-monitor Taskbar Dimmer profiles, keyed by the monitor's profile
+// identity (see monProfileId), same keying as the Text-tab profiles.
 // `taskbarDimmer` above is the *view* of the active monitor's profile: the
 // sliders edit the selected monitor's entry through the helpers below, and
 // switching monitors reloads the view from this map. A monitor without an
@@ -322,11 +357,16 @@ export const taskbarDimmer = $state({
 // profile entry.
 export const taskbarDimmerProfiles = $state({});
 
-// The profile key for a monitor: the resolution-independent EDID device id
-// when available, falling back to the sig. The backend normalizes to the
-// same key (monitor_key_for_taskbar / resolve_profile_key).
+// The profile key for a monitor: the backend-computed profile identity (the
+// EDID device id, suffixed with the connector when identical panels share
+// the id so each resolves as its own profile), falling back to the id/sig.
+// The backend normalizes to the same key (monitor_key_for_taskbar /
+// resolve_profile_key / canonical_profile_id).
+export function monProfileId(mon) {
+  return (mon && (mon.profile_id || mon.monitor_id || mon.sig)) || '';
+}
 export function dimmerMonKey(mon = activeMonitor.mon) {
-  return (mon && (mon.monitor_id || mon.sig)) || '';
+  return monProfileId(mon);
 }
 
 // Load the active monitor's profile into the view fields. Called when the
@@ -395,8 +435,8 @@ export const screenDimmer = $state({
   ...SCREEN_DIMMER_DEFAULTS,
 });
 
-// Per-monitor Screen Dimmer profiles, keyed by the monitor's stable
-// identity (monitor_id || sig), same keying as the Taskbar Dimmer profiles.
+// Per-monitor Screen Dimmer profiles, keyed by the monitor's profile
+// identity (see monProfileId), same keying as the Taskbar Dimmer profiles.
 // `screenDimmer` above is the *view* of the active monitor's profile: the
 // sliders edit the selected monitor's entry through the helpers below, and
 // switching monitors reloads the view from this map. A monitor without an
@@ -443,6 +483,7 @@ function currentScreenDimmerProfile() {
 // window exists, so this just needs to persist the flag.
 export const appSettings = $state({
   alwaysElevated: false,
+  skipFavoriteConfirmation: false,
 });
 
 // Debug-tab logging switches, independent of each other:
@@ -595,13 +636,15 @@ function emitFavoritesChanged() {
     fav_id: fav.favId,
     monitor_id: fav.monitorId,
     monitor_sig: fav.monitorSig,
+    monitor_device: fav.monitorDevice,
     monitor_name: fav.monitorName,
+    confirmed_monitor_id: fav.confirmedMonitorId || '',
   }))).catch(() => {});
 }
 // Accepts both the internal camelCase shape and the config/tray snake_case
-// shape (fav_id, monitor_id, monitor_sig, monitor_name), so config loads and
-// favorites-changed events from the tray round-trip without losing the
-// monitor-scoping fields.
+// shape (fav_id, monitor_id, monitor_sig, monitor_device, monitor_name), so
+// config loads and favorites-changed events from the tray round-trip without
+// losing the monitor-scoping fields.
 function normalizeFavorite(fav) {
   const w = Math.round(Number(fav?.width) || 0);
   const h = Math.round(Number(fav?.height) || 0);
@@ -616,6 +659,9 @@ function normalizeFavorite(fav) {
   const sig = typeof fav?.monitorSig === 'string'
     ? fav.monitorSig
     : (typeof fav?.monitor_sig === 'string' ? fav.monitor_sig : '');
+  const device = typeof fav?.monitorDevice === 'string'
+    ? fav.monitorDevice
+    : (typeof fav?.monitor_device === 'string' ? fav.monitor_device : '');
   const name = typeof fav?.monitorName === 'string'
     ? fav.monitorName
     : (typeof fav?.monitor_name === 'string' ? fav.monitor_name : '');
@@ -626,15 +672,26 @@ function normalizeFavorite(fav) {
     favId: favoriteIdFor(w, h, r, sig, favId),
     monitorId: monId,
     monitorSig: sig,
+    monitorDevice: device,
     monitorName: name,
+    confirmedMonitorId: typeof fav?.confirmedMonitorId === 'string'
+      ? fav.confirmedMonitorId
+      : (typeof fav?.confirmed_monitor_id === 'string' ? fav.confirmed_monitor_id : ''),
   };
 }
-export function addFavoriteDisplayMode(width, height, hz, monitorSig = '', monitorName = '', monitorId = '') {
+export function markFavoriteConfirmed(fav, monitorId) {
+  if (!fav || !monitorId) return;
+  fav.confirmedMonitorId = monitorId;
+  scheduleFavoritesSave();
+}
+
+export function addFavoriteDisplayMode(width, height, hz, monitorSig = '', monitorName = '', monitorId = '', monitorDevice = '') {
   const w = Math.round(Number(width) || 0);
   const h = Math.round(Number(height) || 0);
   const r = Math.round(Number(hz) || 0);
   const sig = typeof monitorSig === 'string' ? monitorSig : '';
   const monId = typeof monitorId === 'string' ? monitorId : '';
+  const device = typeof monitorDevice === 'string' ? monitorDevice : '';
   if (w <= 0 || h <= 0 || r <= 0) return;
   if (isDisplayModeFavorited(w, h, r, monId, sig)) return;
   displayFavorites.push({
@@ -644,7 +701,9 @@ export function addFavoriteDisplayMode(width, height, hz, monitorSig = '', monit
     favId: newFavoriteId(),
     monitorId: monId,
     monitorSig: sig,
+    monitorDevice: device,
     monitorName: typeof monitorName === 'string' ? monitorName : '',
+    confirmedMonitorId: '',
   });
   emitFavoritesChanged();
   scheduleFavoritesSave();
@@ -686,15 +745,58 @@ function stableSigPartForBackfill(sig) {
   const parts = String(sig || '').split('|');
   return parts.length >= 3 ? `${parts[1]}|${parts[2]}` : String(sig || '');
 }
+// The model identity shared by identical panels: the MONITOR\<EDID base> part
+// of the device id (r"MONITOR\LGD05XX\5&...&UID1" -> r"MONITOR\LGD05XX").
+function monitorIdBase(id) {
+  const parts = String(id || '').split('\\');
+  return parts.length >= 2 ? `${parts[0]}\\${parts[1]}` : String(id || '');
+}
+// EDID ids shared by more than one connected monitor: an @-suffixed old key
+// embedding a SHARED id is ambiguous between the siblings, so it only
+// migrates when the panel is no longer duplicated.
+function sharedMonitorIds() {
+  const counts = new Map();
+  for (const mon of monitors) counts.set(mon.monitor_id, (counts.get(mon.monitor_id) || 0) + 1);
+  const shared = new Set();
+  for (const [id, count] of counts) if (count > 1 && id) shared.add(id);
+  return shared;
+}
+// Whether a stored per-monitor profile key belongs to this monitor: its
+// current profile identity, its bare EDID id, a serial-keyed identity
+// ("<base>@serial=<serial>", matched precisely on the serial so a sibling's
+// entry can't be stolen), a legacy sig (or its stable physical-size+DPI
+// portion), or a stale disambiguated id ("<id>@connector" / "<id>@dev=...")
+// from before a duplicate-count change. The stale composite only matches
+// while this monitor is NOT itself disambiguated or its id is not shared, so
+// a still-duplicated sibling cannot steal its entry.
+function monitorMatchesKey(m, key) {
+  if (m.profile_id && m.profile_id === key) return true;
+  if (m.monitor_id && m.monitor_id === key) return true;
+  if (m.monitor_id) {
+    const serialPrefix = monitorIdBase(m.monitor_id) + '@serial=';
+    if (m.edid_serial && key.startsWith(serialPrefix) && key.slice(serialPrefix.length) === m.edid_serial) return true;
+    if (key.startsWith(m.monitor_id + '@')) {
+      const shared = sharedMonitorIds().has(m.monitor_id);
+      if (m.profile_id === m.monitor_id || !shared) return true;
+    }
+  }
+  if (m.sig === key) return true;
+  return stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key);
+}
 function backfillFavoriteMonitorIds() {
   let changed = false;
   for (const fav of displayFavorites) {
     if (fav.monitorId || !fav.monitorSig) continue;
-    const mon = monitors.find((m) =>
+    const matches = monitors.filter((m) =>
       m.sig === fav.monitorSig
       || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(fav.monitorSig));
+    const mon = matches[0];
     if (mon && mon.monitor_id) {
       fav.monitorId = mon.monitor_id;
+      // Attach the GDI device name only when the panel match is unambiguous
+      // (exactly one monitor): with two identical panels the sig matches both,
+      // and attaching the wrong sibling's device would mis-route applies.
+      if (matches.length === 1 && mon.device_name) fav.monitorDevice = mon.device_name;
       changed = true;
     }
   }
@@ -716,13 +818,10 @@ function backfillTextMonitorKeys() {
   let changed = false;
   for (const map of [textSettings.perMonitorModes, textSettings.perMonitorKnobs, textSettings.perMonitorCustom]) {
     for (const [key, value] of Object.entries(map)) {
-      const mon = monitors.find((m) =>
-        m.monitor_id === key
-        || m.sig === key
-        || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key));
-      if (!mon || !mon.monitor_id || mon.monitor_id === key) continue;
+      const mon = monitors.find((m) => monitorMatchesKey(m, key));
+      if (!mon || !mon.monitor_id || monProfileId(mon) === key) continue;
       delete map[key];
-      map[mon.monitor_id] = value;
+      map[monProfileId(mon)] = value;
       changed = true;
     }
   }
@@ -737,16 +836,14 @@ function backfillTextMonitorKeys() {
 // backfill.
 function backfillTaskbarDimmerProfiles() {
   if (!monitors.length) return;
-  // Re-key sig entries to the EDID id (resolution-independent).
+  // Re-key entries to the profile identity (EDID id, disambiguated for
+  // identical panels), so each monitor keeps its own profile.
   let changed = false;
   for (const [key, value] of Object.entries(taskbarDimmerProfiles)) {
-    const mon = monitors.find((m) =>
-      m.monitor_id === key
-      || m.sig === key
-      || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key));
-    if (!mon || !mon.monitor_id || mon.monitor_id === key) continue;
+    const mon = monitors.find((m) => monitorMatchesKey(m, key));
+    if (!mon || !mon.monitor_id || monProfileId(mon) === key) continue;
     delete taskbarDimmerProfiles[key];
-    taskbarDimmerProfiles[mon.monitor_id] = value;
+    taskbarDimmerProfiles[monProfileId(mon)] = value;
     changed = true;
   }
   // Legacy flat fields (written by configs predating per-monitor profiles):
@@ -754,7 +851,7 @@ function backfillTaskbarDimmerProfiles() {
   // primary taskbar keep the user's old values.
   const primary = monitors.find((m) => m.primary) || monitors[0];
   if (primary && !Object.keys(taskbarDimmerProfiles).length) {
-    const key = primary.monitor_id || primary.sig;
+    const key = monProfileId(primary);
     if (key) {
       taskbarDimmerProfiles[key] = {
         opacity: taskbarDimmer.opacity,
@@ -775,16 +872,14 @@ function backfillTaskbarDimmerProfiles() {
 // Dimmer backfill.
 function backfillScreenDimmerProfiles() {
   if (!monitors.length) return;
-  // Re-key sig entries to the EDID id (resolution-independent).
+  // Re-key entries to the profile identity (EDID id, disambiguated for
+  // identical panels), so each monitor keeps its own profile.
   let changed = false;
   for (const [key, value] of Object.entries(screenDimmerProfiles)) {
-    const mon = monitors.find((m) =>
-      m.monitor_id === key
-      || m.sig === key
-      || stableSigPartForBackfill(m.sig) === stableSigPartForBackfill(key));
-    if (!mon || !mon.monitor_id || mon.monitor_id === key) continue;
+    const mon = monitors.find((m) => monitorMatchesKey(m, key));
+    if (!mon || !mon.monitor_id || monProfileId(mon) === key) continue;
     delete screenDimmerProfiles[key];
-    screenDimmerProfiles[mon.monitor_id] = value;
+    screenDimmerProfiles[monProfileId(mon)] = value;
     changed = true;
   }
   // Legacy flat fields (written by configs predating per-monitor profiles):
@@ -792,7 +887,7 @@ function backfillScreenDimmerProfiles() {
   // user's old values and the no-selector paths stay truthful.
   const primary = monitors.find((m) => m.primary) || monitors[0];
   if (primary && !Object.keys(screenDimmerProfiles).length) {
-    const key = primary.monitor_id || primary.sig;
+    const key = monProfileId(primary);
     if (key) {
       screenDimmerProfiles[key] = {
         seconds: screenDimmer.seconds,
@@ -878,20 +973,37 @@ export function blackLift() { return crush.blackEnabled ? crush.adjustment : 0; 
 function crushInfo() {
   if (activeMonitor.mon) {
     return {
-      monitorId: activeMonitor.mon.monitor_id || '',
+      monitorId: monProfileId(activeMonitor.mon),
       deviceName: activeMonitor.mon.device_name || '',
       width: activeMonitor.mon.width,
       height: activeMonitor.mon.height,
+      hz: Number(activeMonitor.mon.refresh_hz) || undefined,
     };
   }
   return app.displayInfo;
+}
+// The refresh rate that scopes the current black-lift profile: a SECONDARY
+// monitor's own live rate (the monitor list is its only Hz source, and it can
+// differ from the primary's), else the primary display's rate. The primary is
+// deliberately sourced from app.displayInfo rather than the list: its value
+// updates optimistically during a refresh-rate change, while the list only
+// refreshes after the display-changed event lands.
+function currentProfileHz() {
+  const mon = activeMonitor.mon;
+  if (mon && !mon.primary) {
+    const monHz = Number(mon.refresh_hz);
+    if (Number.isFinite(monHz) && monHz > 0) return monHz;
+  }
+  return app.displayInfo.refreshRateHz || null;
 }
 function hzKey(hz) {
   const value = Number(hz);
   return Number.isFinite(value) && value > 0 ? String(Math.round(value)) : null;
 }
 function displayIdentity(info = app.displayInfo) {
-  const identity = String(info.monitorId || info.deviceName || '').trim();
+  // Prefer the profile identity (EDID id, disambiguated for identical
+  // panels) so two same-model monitors key separate black-lift profiles.
+  const identity = String(info.profileId || info.monitorId || info.deviceName || '').trim();
   return identity || 'unknown-display';
 }
 function profileKey(hz, info = crushInfo()) {
@@ -936,8 +1048,13 @@ function profileValue(key) {
     ? clampAdjustment(crush.blackProfiles[key])
     : null;
 }
+// The status bar and its refresh-rate dropdown are primary-scoped (they show
+// the primary's rates and change the primary's mode), so their profile values
+// are looked up under the primary display's identity, NOT the selected
+// monitor's. The selected monitor's own profiles are keyed by its own hz via
+// currentProfileHz in the persist/apply paths.
 export function blackLevelForRefreshRate(hz) {
-  const key = profileKey(hz);
+  const key = profileKey(hz, app.displayInfo);
   const value = profileValue(key);
   if (value !== null) return value;
   const legacyKey = hzKey(hz);
@@ -946,9 +1063,13 @@ export function blackLevelForRefreshRate(hz) {
     : 0;
 }
 export function blackLevelDisplayForRefreshRate(hz) {
-  const key = profileKey(hz);
-  const currentKey = profileKey(app.displayInfo.refreshRateHz);
-  const value = key && key === currentKey
+  const key = profileKey(hz, app.displayInfo);
+  const currentKey = profileKey(app.displayInfo.refreshRateHz, app.displayInfo);
+  // The live slider value only corresponds to the status bar while the
+  // primary is the selection; with a secondary selected, show the stored
+  // primary profile (or nothing) instead of the secondary's live value.
+  const primarySelected = !activeMonitor.mon || activeMonitor.mon.primary;
+  const value = key && key === currentKey && primarySelected
     ? crush.adjustment
     : profileValue(key) ?? (hzKey(hz) && legacyBlackProfiles[hzKey(hz)]);
   // `null` (rather than '') so callers can distinguish "no profile" from a
@@ -959,12 +1080,16 @@ export function blackLevelDisplayForRefreshRate(hz) {
 export function setHideCalibrationInterface(enabled) { crush.hideCalibrationInterface = enabled; saveConfig(); }
 export function setBlackStripGapEnabled(enabled) { crush.blackStripGapEnabled = enabled; saveConfig(); }
 export function persistCurrentBlackLevelProfile() {
-  const key = profileKey(app.displayInfo.refreshRateHz);
+  const key = profileKey(currentProfileHz());
   if (key) crush.blackProfiles[key] = clampAdjustment(crush.adjustment);
 }
 export function applyBlackLevelProfileForRefreshRate(hz) {
   if (!configLoaded.v) return;
-  const key = profileKey(hz);
+  // A selected secondary monitor scopes the profile by its OWN refresh rate;
+  // the hz parameter is the primary's (from the status-bar and apply paths)
+  // and only applies when no monitor is selected or the rate is unknown.
+  const effectiveHz = currentProfileHz() ?? hz;
+  const key = profileKey(effectiveHz);
   if (!key) return;
   const existing = profileValue(key);
   if (existing !== null) {
@@ -972,7 +1097,7 @@ export function applyBlackLevelProfileForRefreshRate(hz) {
     applyGamma(blackLift()).catch((e) => console.warn('[profile] gamma apply failed', e));
     return;
   }
-  const legacyKey = hzKey(hz);
+  const legacyKey = hzKey(effectiveHz);
   const fallback = legacyKey && Object.prototype.hasOwnProperty.call(legacyBlackProfiles, legacyKey)
     ? clampAdjustment(legacyBlackProfiles[legacyKey])
     : (legacyBlackLift !== null ? clampAdjustment(legacyBlackLift) : 0);
@@ -986,7 +1111,7 @@ export function applyBlackLevelProfileForRefreshRate(hz) {
 }
 
 export function currentBlackLevelProfileKey() {
-  return profileKey(app.displayInfo.refreshRateHz);
+  return profileKey(currentProfileHz());
 }
 
 export const configLoaded = $state({ v: false });
@@ -1112,6 +1237,9 @@ export async function loadConfig(prefetchedCfg = null) {
     }
     if (cfg && typeof cfg.always_elevated === 'boolean') {
       appSettings.alwaysElevated = cfg.always_elevated;
+    }
+    if (cfg && typeof cfg.skip_favorite_confirmation === 'boolean') {
+      appSettings.skipFavoriteConfirmation = cfg.skip_favorite_confirmation;
     }
     if (cfg && typeof cfg.taskbar_dimmer_opacity === 'number') taskbarDimmer.opacity = Math.max(0, Math.min(1, cfg.taskbar_dimmer_opacity));
     if (cfg && typeof cfg.taskbar_dimmer_fade_in_duration_ms === 'number') taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(cfg.taskbar_dimmer_fade_in_duration_ms)));
@@ -1298,6 +1426,7 @@ export function saveConfig() {
     screen_protector_fullscreen_detection: primaryScreenDimmerProfile?.fullscreenDetection ?? screenDimmer.fullscreenDetection,
     screen_dimmer_profiles: { ...screenDimmerProfiles },
     always_elevated: appSettings.alwaysElevated,
+    skip_favorite_confirmation: appSettings.skipFavoriteConfirmation,
     // The flat legacy fields stay in sync with the PRIMARY monitor's profile
     // (the tray menu, which has no monitor selector, reads these as its
     // fallback and the backend seeds the primary from them at startup). The
@@ -1324,6 +1453,7 @@ export function saveConfig() {
       monitor_id: f.monitorId,
       monitor_sig: f.monitorSig,
       monitor_name: f.monitorName,
+      confirmed_monitor_id: f.confirmedMonitorId || '',
     })),
   } }).catch((e) => {
     console.warn('[config] save failed', e);
@@ -1594,9 +1724,10 @@ export async function restoreAllDefaults() {
   crush.fullscreen = 'normal';
   crush.blackStripGapEnabled = true;
   await resetHotkeys();
-  // Restore defaults resets gamma on every monitor, not just the selected one.
+  // Restore defaults resets gamma on every monitor, not just the selected
+  // one. The device name disambiguates identical panels sharing a sig.
   for (const m of monitors) {
-    invoke('apply_gamma_ramp_for', { sig: m.sig, blackLift: 0 }).catch(() => {});
+    invoke('apply_gamma_ramp_for', { sig: m.sig, deviceName: m.device_name || null, blackLift: 0 }).catch(() => {});
   }
   invoke('apply_gamma_ramp', { blackLift: 0 }).catch((e) => console.warn('[restore-all] gamma reset failed', e));
 }
@@ -1738,6 +1869,8 @@ export function stopReferenceModePolling() {
 let displayPollSequence = 0;
 let displayInfoRetryCount = 0;
 let displayInfoRefreshTimer = null;
+let monitorRefreshRetryTimer = null;
+let monitorRefreshRetryCount = 0;
 
 // Coalesce a burst of native display notifications (virtual-monitor attach
 // and detach commonly produces several WM_* messages) into one query. This is
@@ -1798,7 +1931,7 @@ export function pollDisplayInfo() {
       // the scoped profile for the newly detected display/mode.
       persistCurrentBlackLevelProfile();
     }
-    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', gpuModel: typeof info.gpu_model === 'string' && info.gpu_model ? info.gpu_model : prevGpuModel, vendor: prevVendor, connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, dynamicRange: typeof info.dynamic_range === 'string' ? info.dynamic_range : '', vrr: typeof info.vrr === 'string' ? info.vrr : '', referenceMode: info.reference_mode === true, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
+    app.displayInfo = { width: nextWidth, height: nextHeight, deviceName: nextDeviceName, monitorName: typeof info.monitor_name === 'string' ? info.monitor_name : '', monitorId: nextMonitorId, profileId: typeof info.profile_id === 'string' ? info.profile_id : '', nativeWidth: Number(info.native_width) || 0, nativeHeight: Number(info.native_height) || 0, nativeSource: typeof info.native_source === 'string' ? info.native_source : '', gpuModel: typeof info.gpu_model === 'string' && info.gpu_model ? info.gpu_model : prevGpuModel, vendor: prevVendor, connector: typeof info.connector === 'string' ? info.connector : '', colorFormat: typeof info.color_format === 'string' ? info.color_format : '', bitsPerChannel: Number(info.bits_per_channel) || 0, desktopBits: Number(info.desktop_bits) || 0, dynamicRange: typeof info.dynamic_range === 'string' ? info.dynamic_range : '', vrr: typeof info.vrr === 'string' ? info.vrr : '', referenceMode: info.reference_mode === true, refreshRateHz: nextRefreshRate, refreshRates: Array.isArray(info.refresh_rates) ? info.refresh_rates : [], resolutions: Array.isArray(info.resolutions) ? info.resolutions : [] };
     if (nextRefreshRate && (nextRefreshRate !== previousRefreshRate || displayOrModeChanged)) applyBlackLevelProfileForRefreshRate(nextRefreshRate);
   }).catch(() => scheduleDisplayInfoRetry());
 }

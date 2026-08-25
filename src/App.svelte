@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling } from './lib/stores.svelte.js';
+  import { app, appSettings, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -474,7 +474,7 @@
   // current rate, matching the resolution dropdown's behavior. deviceName is
   // null for the primary monitor (the dropdown path); per-monitor favorites
   // pass the GDI device name of the monitor they were saved on.
-  async function applyModeCombo(width, height, preferredHz, deviceName = null) {
+  async function applyModeCombo(width, height, preferredHz, deviceName = null, skipConfirmation = false) {
     const primaryTarget = !deviceName;
     const currentWidth = app.displayInfo.width;
     const currentHeight = app.displayInfo.height;
@@ -504,11 +504,18 @@
         height,
         preferredHz,
         deviceName,
+        skipConfirmation,
       });
       // The backend only returns after the temporary mode has stabilized, so
       // load the profile for the newly active display/mode immediately.
       applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
-      showFlyoutConfirmation(result);
+      if (skipConfirmation) {
+        app.displayModeBusy = false;
+        app.refreshRateBusy = false;
+        pollDisplayInfo();
+      } else {
+        showFlyoutConfirmation(result);
+      }
     } catch (e) {
       resolutionError = String(e);
       app.displayInfo.width = currentWidth;
@@ -571,6 +578,9 @@
   }
   function currentMonitorName() {
     return activeMonitor.mon?.friendly_name || '';
+  }
+  function currentMonitorDevice() {
+    return activeMonitor.mon?.device_name || '';
   }
   const isCurrentFavorited = $derived(
     favoriteOfCurrent.width > 0 && favoriteOfCurrent.height > 0 && favoriteOfCurrent.hz > 0
@@ -645,6 +655,7 @@
       currentMonitorSig(),
       currentMonitorName(),
       currentMonitorId(),
+      currentMonitorDevice(),
     );
     flashFavoritesStatus('Saved', false);
   }
@@ -663,9 +674,14 @@
   // stable across resolution changes); the sig and its physical-size+DPI
   // portion are fallbacks for legacy favorites.
   function favoriteTargetDevice(fav) {
-    if (!fav.monitorId && !fav.monitorSig) return null;
+    if (!fav.monitorId && !fav.monitorSig && !fav.monitorDevice) return null;
+    // The GDI device name is the unique per-physical-monitor identity: two
+    // identical panels share the EDID id and (at the same resolution) the
+    // sig, so the device name must win when the favorite carries one, or an
+    // apply would hit the first matching sibling instead of the saved panel.
     const mon = monitors.find((m) =>
-      (fav.monitorId && m.monitor_id === fav.monitorId)
+      (fav.monitorDevice && m.device_name === fav.monitorDevice)
+      || (fav.monitorId && m.monitor_id === fav.monitorId)
       || m.sig === fav.monitorSig
       || (fav.monitorSig && stableSigPart(m.sig) === stableSigPart(fav.monitorSig)));
     return mon && mon.device_name ? mon.device_name : 'disconnected';
@@ -689,6 +705,10 @@
   // this exact mode), and flashes a status message when the target is gone.
   async function applyFavoriteMode(fav) {
     const deviceName = favoriteTargetDevice(fav);
+    const skipConfirmation = appSettings.skipFavoriteConfirmation
+      && Boolean(fav.confirmedMonitorId)
+      && Boolean(fav.monitorId)
+      && fav.confirmedMonitorId === fav.monitorId;
     if (deviceName === 'disconnected') {
       flashFavoritesStatus('Monitor not connected', true);
       return;
@@ -707,7 +727,10 @@
         // The backend validates the mode anyway; never block on this check.
       }
     }
-    await applyModeCombo(fav.width, fav.height, fav.hz, deviceName);
+    if (!skipConfirmation) {
+      window.__pendingFavoriteConfirmation = { favorite: fav, monitorId: fav.monitorId };
+    }
+    await applyModeCombo(fav.width, fav.height, fav.hz, deviceName, skipConfirmation);
   }
   function applyFavorite(fav) {
     closeFavoritesMenu();
@@ -1080,7 +1103,23 @@
       scheduleDisplayInfoRefresh();
       // Hotplug/mode changes can add or remove monitors; keep the selector
       // list in sync so a stale entry is never shown.
-      loadMonitors().catch(() => {});
+      const selectedSigBefore = activeMonitor.mon?.sig || '';
+      loadMonitors()
+        .then((loaded) => {
+          // A mode change on the SELECTED monitor (including a per-monitor
+          // favorite hotkey on a secondary display) changes its sig, which
+          // re-keys its per-mode black-lift profile. The apply right after
+          // set_resolution runs with the stale sig and is skipped, so apply
+          // again now that the list reflects the new mode. Guarded on the sig
+          // actually changing, so the noisy settings broadcasts that also
+          // reach this listener never disturb the screen dimmer's active
+          // ramp with a redundant gamma write.
+          if (loaded && selectedSigBefore && activeMonitor.mon?.sig && selectedSigBefore !== activeMonitor.mon.sig
+            && configLoaded.v && app.displayInfo.refreshRateHz) {
+            applyBlackLevelProfileForRefreshRate(app.displayInfo.refreshRateHz);
+          }
+        })
+        .catch(() => {});
       // A mode change can briefly make the full display query incomplete, and
       // that query rebuilds displayInfo. Re-check the lightweight GPU payload
       // after the driver has settled so NVIDIA-only controls do not depend on
@@ -1195,6 +1234,11 @@
     // clear busy flags and re-poll display info.
     let unlistenFlyoutCompleted;
     listen('flyout-completed', () => {
+      if (window.__pendingFavoriteConfirmation) {
+        const { favorite, monitorId } = window.__pendingFavoriteConfirmation;
+        markFavoriteConfirmed(favorite, monitorId);
+        window.__pendingFavoriteConfirmation = null;
+      }
       app.displayModeBusy = false;
       app.refreshRateBusy = false;
       pollDisplayInfo();

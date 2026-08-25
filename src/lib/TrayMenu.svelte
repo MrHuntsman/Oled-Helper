@@ -60,6 +60,11 @@
   let sdrApplyInFlight = false;
   let pendingSdrNits = null;
   let sdrApplyTimer = null;
+  // Leading-edge throttle for the SDR brightness slider, matching the main
+  // window's APPLY_THROTTLE_MS so both sliders update the screen live while
+  // dragging instead of only after a pause.
+  const SDR_APPLY_THROTTLE_MS = 50;
+  let sdrLastApplyTime = 0;
   let dimmerSaveQueued = false;
 
   async function persistTrayDimmerSettings() {
@@ -100,7 +105,10 @@
       const blackProfiles = {
         ...(cfg?.black_lift_profiles && typeof cfg.black_lift_profiles === 'object' ? cfg.black_lift_profiles : {}),
       };
-      const displayIdentity = String(display?.monitor_id || display?.device_name || '').trim();
+      // The primary's profile identity (EDID id, disambiguated for identical
+      // panels) so the tray's primary-scoped black-lift edit lands on the
+      // same key the main window reads.
+      const displayIdentity = String(display?.profile_id || display?.monitor_id || display?.device_name || '').trim();
       if (displayIdentity && display?.width && display?.height && display?.refresh_hz) {
         blackProfiles[`${displayIdentity}|${display.width}x${display.height}|${Math.round(display.refresh_hz)}`] = trayBlack.adjustment / 10;
       }
@@ -206,7 +214,9 @@
   // monitor's taskbar. Its profile key is the primary's EDID id (what
   // tray_menu_get_display_info reports), matching the main window's keying.
   function trayDimmerMonKey() {
-    return String(display?.monitor_id || '').trim();
+    // The primary's profile identity (EDID id, disambiguated for identical
+    // panels), matching the main window's key builders.
+    return String(display?.profile_id || display?.monitor_id || '').trim();
   }
 
   function toggleTaskbarDimmer() {
@@ -306,8 +316,8 @@
     if (!status) return;
     // The tray menu is primary-scoped: ignore dimmer edits the main window
     // made on a secondary monitor (their monitorKey won't match the primary's
-    // EDID id the tray reports).
-    const trayKey = String(display?.monitor_id || '').trim();
+    // profile identity the tray reports).
+    const trayKey = String(display?.profile_id || display?.monitor_id || '').trim();
     if (trayKey && status.monitorKey && trayKey !== status.monitorKey) return;
     quickInteractionVersion++;
     if (typeof status.enabled === 'boolean') taskbarDimmer.enabled = status.enabled;
@@ -488,6 +498,7 @@
     const requestedNits = pendingSdrNits;
     pendingSdrNits = null;
     sdrApplyInFlight = true;
+    sdrLastApplyTime = Date.now();
     invoke('set_sdr_brightness_nits', { nits: requestedNits })
       .then((result) => {
         const applied = Number(result?.nits);
@@ -497,6 +508,9 @@
       .catch((e) => console.error('tray-menu: failed to apply SDR Content Brightness', e))
       .finally(() => {
         sdrApplyInFlight = false;
+        // A newer value queued while this write was in flight applies right
+        // away so the final value always lands (trailing guarantee), same as
+        // the main window's slider.
         if (pendingSdrNits !== null) drainSdrBrightnessApply();
       });
   }
@@ -507,11 +521,18 @@
     const nits = Math.max(80, Math.min(480, Math.round(Number(event.currentTarget.value))));
     traySdrBrightness.nits = nits;
     pendingSdrNits = nits;
+    // Leading-edge throttle, matching the main app's slider: during a
+    // continuous drag the screen updates live instead of waiting for a pause.
+    // A pure trailing debounce never fires while inputs arrive faster than
+    // the delay (a drag emits ~16-33ms apart), which is why the tray slider
+    // lagged behind the main window one.
+    const since = Date.now() - sdrLastApplyTime;
+    const delay = since >= SDR_APPLY_THROTTLE_MS ? 0 : SDR_APPLY_THROTTLE_MS - since;
     clearTimeout(sdrApplyTimer);
     sdrApplyTimer = setTimeout(() => {
       sdrApplyTimer = null;
       drainSdrBrightnessApply();
-    }, 50);
+    }, delay);
   }
 
   function applyBlackLevelEvent(status) {
@@ -529,7 +550,8 @@
   }
 
   let display = $state(null); // { width, height, refresh_hz, refresh_rates, resolutions: [{width,height}], ... }
-  let favorites = $state([]); // [{ width, height, hz }]
+  let favorites = $state([]);
+  let skipFavoriteConfirmation = $state(false); // [{ width, height, hz }]
   // Keep the tray's resolution labels in sync with the main app's persisted
   // "Show tags (4K, QHD, UW)" preference.
   let showResolutionTags = $state(true);
@@ -581,6 +603,7 @@
     try {
       const cfg = await invoke('load_config');
       showResolutionTags = cfg?.display_menu_show_tags !== false;
+      skipFavoriteConfirmation = cfg?.skip_favorite_confirmation === true;
       trayBlack.enabled = cfg?.black_enabled !== false;
       trayBlack.adjustment = Math.max(-150, Math.min(150, Math.round((Number(cfg?.black_lift) || 0) * 10)));
       trayBlackProfiles = cfg?.black_lift_profiles && typeof cfg.black_lift_profiles === 'object'
@@ -602,7 +625,9 @@
               fav_id: typeof f.fav_id === 'string' ? f.fav_id : '',
               monitor_id: typeof f.monitor_id === 'string' ? f.monitor_id : '',
               monitor_sig: typeof f.monitor_sig === 'string' ? f.monitor_sig : '',
+              monitor_device: typeof f.monitor_device === 'string' ? f.monitor_device : '',
               monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
+              confirmed_monitor_id: typeof f.confirmed_monitor_id === 'string' ? f.confirmed_monitor_id : '',
             }))
         : [];
       syncHitRegion();
@@ -612,8 +637,8 @@
   }
 
   // Preserve the monitor-scoping fields (fav_id, monitor_id, monitor_sig,
-  // monitor_name) so a tray-side add/remove never strips them from the saved
-  // favorites.
+  // monitor_device, monitor_name) so a tray-side add/remove never strips
+  // them from the saved favorites.
   function normalizeFavorites(list) {
     return Array.isArray(list)
       ? list
@@ -625,8 +650,9 @@
             fav_id: typeof f.fav_id === 'string' ? f.fav_id : '',
             monitor_id: typeof f.monitor_id === 'string' ? f.monitor_id : '',
             monitor_sig: typeof f.monitor_sig === 'string' ? f.monitor_sig : '',
-            monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
-          }))
+            monitor_device: typeof f.monitor_device === 'string' ? f.monitor_device : '',              monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
+              confirmed_monitor_id: typeof f.confirmed_monitor_id === 'string' ? f.confirmed_monitor_id : '',
+            }))
       : [];
   }
 
@@ -773,7 +799,9 @@
   }
 
   function trayBlackProfileKey(hz) {
-    const identity = String(display?.monitor_id || display?.device_name || '').trim() || 'unknown-display';
+    // The primary's profile identity (EDID id, disambiguated for identical
+    // panels) so the tray keys like the main window.
+    const identity = String(display?.profile_id || display?.monitor_id || display?.device_name || '').trim() || 'unknown-display';
     if (!display?.width || !display?.height || !hz) return null;
     return `${identity}|${display.width}x${display.height}|${Math.round(Number(hz))}`;
   }
@@ -992,13 +1020,16 @@
       return;
     }
     // Save scoped to the primary monitor (the tray's scope), so the main
-    // app's star/dedupe and the tray agree on which modes are favorited.
+    // app's star/dedupe and the tray agree on which modes are favorited. The
+    // GDI device name pins the panel even when two identical monitors share
+    // the EDID id.
     await saveFavorites([...favorites, {
       ...fav,
       fav_id: newTrayFavoriteId(),
       monitor_id: trayMonitorIdentity(),
       monitor_sig: '',
-      monitor_name: String(display?.monitor_name || ''),
+      monitor_device: String(display?.device_name || ''),              monitor_name: String(display?.monitor_name || ''),
+              confirmed_monitor_id: '',
     }]);
   }
 
@@ -1020,13 +1051,20 @@
     if (isCurrentFavorite(fav)) return;
     closeSubmenu();
     // Target the monitor the favorite was saved on (the backend resolves the
-    // EDID id to that display), so a secondary-monitor favorite is never
-    // silently applied to the primary; the backend skips it if disconnected.
+    // device name, falling back to the EDID id, to that display), so a
+    // secondary-monitor favorite is never silently applied to the primary;
+    // the backend skips it if disconnected. The device name disambiguates
+    // two identical panels sharing the EDID id.
     await invoke('tray_menu_set_resolution', {
       width: fav.width,
       height: fav.height,
       hz: fav.hz,
       monitorId: fav.monitor_id || null,
+      monitorDevice: fav.monitor_device || null,
+      skipConfirmation: skipFavoriteConfirmation
+        && Boolean(fav.confirmed_monitor_id)
+        && Boolean(fav.monitor_id)
+        && fav.confirmed_monitor_id === fav.monitor_id,
     });
     await invoke('tray_menu_hide');
   }

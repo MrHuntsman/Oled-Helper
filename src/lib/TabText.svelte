@@ -89,7 +89,7 @@
   // so saving under it would orphan the profile on a hotkey resolution
   // change). The backend normalizes to the same key.
   function monKey() {
-    return activeMonitor.mon.monitor_id || activeMonitor.mon.sig;
+    return activeMonitor.mon.profile_id || activeMonitor.mon.monitor_id || activeMonitor.mon.sig;
   }
 
   // The knob the sliders show: the selected monitor's per-monitor value.

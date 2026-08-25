@@ -47,6 +47,16 @@
   // toggle only flips back if the prompt is declined.
   let alwaysElevatedBusy = $state(false);
   let alwaysElevatedError = $state('');
+  async function toggleSkipFavoriteConfirmation() {
+    appSettings.skipFavoriteConfirmation = !appSettings.skipFavoriteConfirmation;
+    try {
+      await import('./stores.svelte.js').then(({ saveConfig }) => saveConfig());
+    } catch (e) {
+      appSettings.skipFavoriteConfirmation = !appSettings.skipFavoriteConfirmation;
+      console.warn('[settings] favorite confirmation setting failed', e);
+    }
+  }
+
   async function toggleAlwaysElevated() {
     if (alwaysElevatedBusy) return;
     const next = !appSettings.alwaysElevated;
@@ -168,7 +178,7 @@
     <img class="tab-icon" src={tabSystemIcon} alt="" />
     <h2>Settings</h2>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={() => restoreConfirmOpen = true} title="Resets the Start on Boot, Always open as administrator and Detection Method options">↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={() => restoreConfirmOpen = true} title="Resets the Start on Boot, Always open as administrator, trusted favorites and Detection Method options">↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -196,6 +206,16 @@
   {#if alwaysElevatedError}
     <p class="reset-all-error" role="status">{alwaysElevatedError}</p>
   {/if}
+
+  <button class="settings-row" onclick={toggleSkipFavoriteConfirmation}>
+    <div class="settings-row-text">
+      <span class="settings-row-label">Skip confirmation for trusted favorites</span>
+      <span class="settings-row-desc">Previously confirmed favorites on the same monitor apply faster. Recovery protection remains enabled.</span>
+    </div>
+    <div class="pill-wrap">
+      <span class={`pill${appSettings.skipFavoriteConfirmation ? '' : ' off'}`} aria-hidden="true"></span>
+    </div>
+  </button>
 
   <div class="settings-row hover-detect-settings-row">
     <div class="hover-detect-left">
@@ -258,7 +278,7 @@
   {#if restoreConfirmOpen}
     <ConfirmModal
       title="Restore Settings defaults?"
-      desc="This resets the Start on Boot, Always open as administrator and Detection Method options to their defaults."
+      desc="This resets the Start on Boot, Always open as administrator, trusted favorites and Detection Method options to their defaults."
       confirmLabel="Restore"
       onConfirm={restoreDefaults}
       onClose={() => restoreConfirmOpen = false} />

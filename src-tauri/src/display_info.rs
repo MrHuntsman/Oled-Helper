@@ -2,6 +2,7 @@
 // Browser APIs (window.screen) can report resolution but never expose the real
 // refresh rate or the complete set of supported display modes.
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
@@ -57,6 +58,12 @@ pub struct DisplayInfo {
     pub device_name: String,
     pub monitor_name: String,
     pub monitor_id: String,
+    // The identity per-monitor profile keys use (the EDID id, disambiguated
+    // for identical panels — serial first, then connector, then device name).
+    // Same source as
+    // list_monitors' profile_id so the tray/status bar key like the main
+    // window. Empty when the monitor could not be matched.
+    pub profile_id: String,
     // The monitor's true native (EDID preferred timing) resolution, which is
     // what Windows marks as "(Recommended)". 0 when it could not be read.
     pub native_width: u32,
@@ -91,6 +98,7 @@ pub struct DisplayTargetInfo {
     pub device_name: String,
     pub monitor_name: String,
     pub monitor_id: String,
+    pub profile_id: String,
 }
 
 #[derive(Clone)]
@@ -675,12 +683,14 @@ pub fn query_display_for(device_name: &str) -> Option<DisplayInfo> {
             cached_edid_monitor_name(&target).unwrap_or_else(|| target.monitor_name.clone())
         });
     let output = crate::hdr_toggle::query_display_output_info(&monitor_name);
+    let profile_id = crate::monitors::profile_id_for_device(&target.device_name);
     Some(DisplayInfo {
         width: devmode.dmPelsWidth,
         height: devmode.dmPelsHeight,
         device_name: target.device_name,
         monitor_name,
         monitor_id: target.monitor_id,
+        profile_id,
         native_width,
         native_height,
         native_source,
@@ -1095,6 +1105,15 @@ fn compatible_monitor_id(a: &str, b: &str) -> bool {
 }
 
 unsafe fn read_name_from_registry_key(key: HKEY) -> Option<String> {
+    read_edid_blob_from_registry_key(key).and_then(|blob| edid_monitor_name(&blob))
+}
+
+// Reads the raw EDID blob (128-4096 bytes) from a monitor device's registry
+// key, shared by the name, serial and native-resolution readers. The EDID
+// value's location varies by driver generation: most store it at the device
+// key root (DIREG_DEV), but some put it in the "Device Parameters" subkey, so
+// try both before giving up.
+unsafe fn read_edid_blob_from_registry_key(key: HKEY) -> Option<Vec<u8>> {
     let read = |key: HKEY| {
         let edid_name = wide("EDID");
         let mut required = 0u32;
@@ -1125,7 +1144,7 @@ unsafe fn read_name_from_registry_key(key: HKEY) -> Option<String> {
         {
             return None;
         }
-        edid_monitor_name(&bytes[..(size as usize).min(bytes.len())])
+        Some(bytes[..(size as usize).min(bytes.len())].to_vec())
     };
     read(key).or_else(|| {
         let params_name = wide("Device Parameters");
@@ -1147,6 +1166,138 @@ unsafe fn read_name_from_registry_key(key: HKEY) -> Option<String> {
             None
         }
     })
+}
+
+// The "Display Product Serial Number" descriptor (tag 0xFF) from a raw EDID
+// blob: 13 bytes of ASCII at bytes 5..18 of the first descriptor block that
+// carries the tag. The per-unit unique panel id Windows itself derives its
+// per-instance monitor UID from, and the one field that stays identical
+// across ports, replugs, driver resets and reboots. None when the panel ships
+// no serial descriptor (common on budget and some DP panels).
+pub(crate) fn edid_serial_from_blob(blob: &[u8]) -> Option<String> {
+    if blob.len() < 128 {
+        return None;
+    }
+    // Four 18-byte descriptor blocks live at 54..=125; a non-timing
+    // descriptor has a zero pixel clock (bytes 0-1), making byte 3 its tag.
+    for base in (54..=108).step_by(18) {
+        if blob[base] == 0 && blob[base + 1] == 0 && blob[base + 3] == 0xFF {
+            let raw = &blob[base + 5..base + 18];
+            let serial: String = raw
+                .iter()
+                .take_while(|&&b| b != 0 && b != 0x0A)
+                .map(|&b| b as char)
+                .collect();
+            let serial = serial.trim().to_string();
+            if !serial.is_empty() {
+                return Some(serial);
+            }
+        }
+    }
+    None
+}
+
+// The EDID serial read walks SetupAPI like the name read, so cache it per
+// monitor (keyed by the device instance id, which changes on plug/unplug) for
+// the same window instead of re-walking the device tree on every monitor
+// enumeration (the monitor list feeds per-slider-event gamma applies).
+struct CachedEdidSerial {
+    serial: String,
+    captured_at: Instant,
+}
+
+static EDID_SERIAL_CACHE: OnceLock<Mutex<HashMap<String, CachedEdidSerial>>> = OnceLock::new();
+
+/// EDID "Display Product Serial Number" for the monitor with the given EDID
+/// device id (MONITOR\...), the per-unit unique panel identity used to tell
+/// identical panels apart. Empty when the panel ships no serial or the EDID
+/// can't be read.
+pub(crate) fn edid_serial_for_monitor(monitor_id: &str) -> Option<String> {
+    if monitor_id.is_empty() {
+        return None;
+    }
+    let cache = EDID_SERIAL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.get(monitor_id).filter(|cached| {
+            let max_age = if cached.serial.is_empty() {
+                // A transient SetupAPI/registry failure should not re-walk the
+                // device tree on every enumeration, but it must recover
+                // promptly after resume or hot-plug.
+                Duration::from_secs(5)
+            } else {
+                Duration::from_secs(60)
+            };
+            cached.captured_at.elapsed() < max_age
+        }) {
+            return (!cached.serial.is_empty()).then(|| cached.serial.clone());
+        }
+    }
+    let serial = unsafe { edid_serial_for_monitor_uncached(monitor_id) };
+    if let Ok(mut guard) = cache.lock() {
+        // Drop stale entries so panels unplugged weeks ago don't accumulate.
+        guard.retain(|_, cached| cached.captured_at.elapsed() < Duration::from_secs(300));
+        guard.insert(
+            monitor_id.to_string(),
+            CachedEdidSerial {
+                serial: serial.clone().unwrap_or_default(),
+                captured_at: Instant::now(),
+            },
+        );
+    }
+    serial
+}
+
+unsafe fn edid_serial_for_monitor_uncached(monitor_id: &str) -> Option<String> {
+    let devices = SetupDiGetClassDevsW(
+        Some(&GUID_CLASS_MONITOR),
+        PCWSTR::null(),
+        None,
+        DIGCF_PRESENT,
+    )
+    .ok()?;
+    let mut sole_device = None;
+    let mut matched = None;
+    let mut index = 0u32;
+    loop {
+        let mut data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        if SetupDiEnumDeviceInfo(devices, index, &mut data).is_err() {
+            break;
+        }
+        let mut buffer = [0u16; 256];
+        let mut required = 0u32;
+        if SetupDiGetDeviceInstanceIdW(devices, &data, Some(&mut buffer), Some(&mut required))
+            .is_ok()
+        {
+            let id = text(&buffer);
+            if sole_device.is_none() {
+                sole_device = Some(data);
+            } else {
+                sole_device = None;
+            }
+            if id.eq_ignore_ascii_case(monitor_id) || compatible_monitor_id(&id, monitor_id) {
+                matched = Some(data);
+                break;
+            }
+        }
+        index += 1;
+    }
+    let data = matched.or(sole_device)?;
+    let key = SetupDiOpenDevRegKey(
+        devices,
+        &data,
+        DICS_FLAG_GLOBAL.0,
+        0,
+        DIREG_DEV,
+        KEY_QUERY_VALUE.0,
+    )
+    .ok()?;
+    let result = read_edid_blob_from_registry_key(key).and_then(|blob| edid_serial_from_blob(&blob));
+    let _ = RegCloseKey(key);
+    let _ = SetupDiDestroyDeviceInfoList(devices);
+    result
 }
 
 fn native_resolution_for(target: &DisplayTarget) -> Option<(u32, u32, &'static str)> {
@@ -1400,6 +1551,8 @@ pub struct AppliedMode {
     pub monitor_name: String,
     pub confirmation_seconds: u32,
     pub confirmation_deadline_ms: u64,
+    #[serde(default)]
+    pub skip_confirmation: bool,
 }
 
 #[derive(Clone)]
@@ -1752,8 +1905,30 @@ fn begin_mode_change(
             confirmation_deadline_ms.saturating_sub(now_ms()),
         ));
         // Roll back inside a closure so the forced flyout hide below always
-        // runs, even on the early-return error paths.
-        let rollback = || {
+        // runs when THIS transaction is still pending.
+        //
+        // Returns whether this transaction was still awaiting confirmation
+        // when the deadline hit. When the user already resolved it (Keep or
+        // Revert), the pending entry is gone and the flyout may already be
+        // showing a NEWER transaction's confirmation: a stale timeout from an
+        // earlier mode change must not hide that newer dialog. Without this
+        // gate, resolving one confirmation and immediately starting another
+        // let the first transaction's timeout thread yank away the second
+        // confirmation with seconds still on its countdown, leaving the user
+        // unable to Keep or Revert until the second timeout restored the
+        // mode.
+        let expired = (|| -> bool {
+            // Decide before taking any lock: if the user already resolved
+            // this transaction, do nothing and leave the flyout alone. A
+            // poisoned lock is treated as still-pending so the fallback hide
+            // still runs.
+            let entry_exists = pending_mode()
+                .lock()
+                .map(|guard| guard.as_ref().is_some_and(|entry| entry.token == token))
+                .unwrap_or(true);
+            if !entry_exists {
+                return false;
+            }
             // Serialize the automatic rollback with confirmation and manual
             // rollback. Without this guard, the timeout thread could restore
             // the old mode while the user is simultaneously committing the
@@ -1762,22 +1937,22 @@ fn begin_mode_change(
                 log::error!(
                     "[display-info] automatic rollback could not acquire the mode operation lock"
                 );
-                return;
+                return true;
             };
             let Ok(_recovery_guard) = lock_recovery_state() else {
                 log::error!("[display-info] automatic rollback could not lock recovery state");
-                return;
+                return true;
             };
             let entry = pending_mode()
                 .lock()
                 .ok()
                 .and_then(|guard| guard.as_ref().filter(|entry| entry.token == token).cloned());
             let Some(entry) = entry else {
-                return;
+                return false;
             };
             if let Err(error) = target_is_current(&entry.target) {
                 log::error!("[display-info] automatic rollback refused: {error}");
-                return;
+                return true;
             }
             match apply_previous_mode(&entry.target, &entry.previous) {
                 Ok(()) => {
@@ -1787,7 +1962,7 @@ fn begin_mode_change(
                     // retry still retain the only recovery path.
                     if let Err(error) = clear_recovery_record_for(token) {
                         log::error!("[display-info] automatic rollback succeeded but recovery cleanup failed: {error}");
-                        return;
+                        return true;
                     }
                     if let Ok(mut guard) = pending_mode().lock() {
                         if guard.as_ref().is_some_and(|current| current.token == token) {
@@ -1824,25 +1999,27 @@ fn begin_mode_change(
                     }
                 }
             }
-        };
-        rollback();
-        // The confirmation window expired without the user deciding. The
-        // frontend countdown normally hides the flyout itself, but when the
-        // flyout was shown blank (missed flyout-show) nothing else would hide
-        // it, leaving a transparent always-on-top window blocking clicks on
-        // the main window underneath. Force-hide it here as the authoritative
-        // fallback.
-        if let Some(app) = APP_HANDLE.get() {
-            crate::flyout_window::hide(app);
-            // The main window only learns the confirmation is over through
-            // the frontend's flyout_hidden -> flyout-completed path, which
-            // never runs when the flyout was shown blank or its webview
-            // wedged. Emit the completion here too so the main window's busy
-            // flags always clear and display info is re-polled, even if the
-            // JS countdown never fired. A duplicate emit alongside the
-            // frontend's own is harmless (the handler just clears flags and
-            // re-polls).
-            let _ = app.emit("flyout-completed", ());
+            true
+        })();
+        if expired {
+            // The confirmation window expired without the user deciding. The
+            // frontend countdown normally hides the flyout itself, but when
+            // the flyout was shown blank (missed flyout-show) nothing else
+            // would hide it, leaving a transparent always-on-top window
+            // blocking clicks on the main window underneath. Force-hide it
+            // here as the authoritative fallback.
+            if let Some(app) = APP_HANDLE.get() {
+                crate::flyout_window::hide(app);
+                // The main window only learns the confirmation is over
+                // through the frontend's flyout_hidden -> flyout-completed
+                // path, which never runs when the flyout was shown blank or
+                // its webview wedged. Emit the completion here too so the
+                // main window's busy flags always clear and display info is
+                // re-polled, even if the JS countdown never fired. A
+                // duplicate emit alongside the frontend's own is harmless
+                // (the handler just clears flags and re-polls).
+                let _ = app.emit("flyout-completed", ());
+            }
         }
     });
     Ok(AppliedMode {
@@ -1854,6 +2031,7 @@ fn begin_mode_change(
         monitor_name: cached_edid_monitor_name(&target).unwrap_or(target.monitor_name),
         confirmation_seconds: MODE_CONFIRMATION_SECONDS,
         confirmation_deadline_ms,
+        skip_confirmation: false,
     })
 }
 
@@ -1876,6 +2054,7 @@ pub fn set_resolution(
     height: u32,
     preferred_hz: u32,
     device_name: Option<String>,
+    skip_confirmation: bool,
 ) -> Result<AppliedMode, String> {
     let target = resolve_target(device_name.as_deref())?;
     let current = current_devmode(&target.device_name)
@@ -1884,7 +2063,9 @@ pub fn set_resolution(
     // freshly enumerated complete DEVMODE. Never infer target-resolution Hz
     // support from the rates of the resolution we are leaving.
     let mode = complete_mode_for(&target, &current, width, height, preferred_hz)?;
-    begin_mode_change(target, current, mode)
+    let mut applied = begin_mode_change(target, current, mode)?;
+    applied.skip_confirmation = skip_confirmation;
+    Ok(applied)
 }
 
 fn same_mode(a: &DEVMODEW, b: &DEVMODEW) -> bool {
@@ -2043,10 +2224,14 @@ pub fn launch_recovery_watchdog_if_needed() {
 }
 
 pub fn display_target_info() -> Option<DisplayTargetInfo> {
-    primary_display_target().map(|target| DisplayTargetInfo {
-        device_name: target.device_name,
-        monitor_name: target.monitor_name,
-        monitor_id: target.monitor_id,
+    primary_display_target().map(|target| {
+        let profile_id = crate::monitors::profile_id_for_device(&target.device_name);
+        DisplayTargetInfo {
+            device_name: target.device_name,
+            monitor_name: target.monitor_name,
+            monitor_id: target.monitor_id,
+            profile_id,
+        }
     })
 }
 
@@ -2169,5 +2354,64 @@ mod tests {
         assert_eq!(resolution_for_vic(98), Some((4096, 2160)));
         assert_eq!(resolution_for_vic(0), None);
         assert_eq!(resolution_for_vic(255), None);
+    }
+
+    fn serial_descriptor(serial: &str) -> [u8; 18] {
+        let mut d = [0u8; 18];
+        d[3] = 0xFF; // Display Product Serial Number tag
+        for (i, b) in serial.bytes().take(13).enumerate() {
+            d[5 + i] = b;
+        }
+        d
+    }
+
+    #[test]
+    fn edid_serial_parses_ff_descriptor() {
+        let mut edid = base_block(0, None);
+        edid[54..54 + 18].copy_from_slice(&serial_descriptor("ABC1234567890"));
+        assert_eq!(edid_serial_from_blob(&edid), Some("ABC1234567890".to_string()));
+    }
+
+    #[test]
+    fn edid_serial_scans_all_four_descriptor_blocks() {
+        let mut edid = base_block(0, None);
+        // Serial lives in the third block (offset 90) instead of the first.
+        edid[90..90 + 18].copy_from_slice(&serial_descriptor("SN-7788"));
+        assert_eq!(edid_serial_from_blob(&edid), Some("SN-7788".to_string()));
+    }
+
+    #[test]
+    fn edid_serial_trims_padding() {
+        let mut edid = base_block(0, None);
+        let mut d = serial_descriptor("SN-5   "); // 13 bytes, trailing spaces
+        d[12] = 0x0A; // some panels pad with a newline instead of spaces
+        edid[54..54 + 18].copy_from_slice(&d);
+        assert_eq!(edid_serial_from_blob(&edid), Some("SN-5".to_string()));
+    }
+
+    #[test]
+    fn edid_serial_absent_returns_none() {
+        // Name descriptor (0xFC) and range descriptor (0xFD), no serial.
+        let mut edid = base_block(0, None);
+        let mut name = serial_descriptor("LG OLED C4");
+        name[3] = 0xFC;
+        edid[54..54 + 18].copy_from_slice(&name);
+        edid[72..72 + 18].copy_from_slice(&serial_descriptor("            ")); // blank serial
+        assert_eq!(edid_serial_from_blob(&edid), None);
+    }
+
+    #[test]
+    fn edid_serial_ignores_dtd_with_tag_byte() {
+        // A video timing whose tag byte happens to be 0xFF must not be read as
+        // a serial: nonzero pixel clock disqualifies it.
+        let mut edid = base_block(0, Some(dtd_3840x2160()));
+        edid[57] = 0xFF; // force the tag byte (pixel clock bytes 0-1 nonzero)
+        assert_eq!(edid_serial_from_blob(&edid), None);
+    }
+
+    #[test]
+    fn edid_serial_rejects_truncated_blob() {
+        assert_eq!(edid_serial_from_blob(&[0u8; 64]), None);
+        assert_eq!(edid_serial_from_blob(&[]), None);
     }
 }

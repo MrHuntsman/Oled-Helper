@@ -26,7 +26,9 @@ use windows::Win32::Storage::FileSystem::{
 // stable identity slot hotkeys bind against, monitor_id is the EDID device
 // id (resolution-independent, so a favorite survives resolution changes on
 // the same panel), monitor_sig is the monitor's signature (resolution+
-// physical size+DPI) resolved to a device name at apply time, and
+// physical size+DPI) resolved to a device name at apply time, monitor_device
+// is the GDI device name (r"\\.\DISPLAY1", the unique per-physical-monitor
+// disambiguator when two identical panels share the EDID id and sig), and
 // monitor_name is a display-only snapshot kept so the UI can label a
 // favorite even when that monitor is currently disconnected.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -41,7 +43,11 @@ pub struct FavoriteDisplayMode {
     #[serde(default)]
     pub monitor_sig: String,
     #[serde(default)]
+    pub monitor_device: String,
+    #[serde(default)]
     pub monitor_name: String,
+    #[serde(default)]
+    pub confirmed_monitor_id: String,
 }
 
 // A monitor's render knob pair (Text tab): faux boldness and fringe
@@ -231,6 +237,11 @@ pub struct AppConfig {
     // write this field.
     #[serde(default)]
     pub favorite_hotkey_slots: HashMap<String, String>,
+    // When enabled, only favorites that were explicitly confirmed on the
+    // same monitor may skip the visible confirmation dialog. The crash-safe
+    // recovery watchdog remains active regardless.
+    #[serde(default)]
+    pub skip_favorite_confirmation: bool,
 }
 
 /// Deserialize `per_monitor_custom`: accepts the current 2D shape
@@ -348,6 +359,7 @@ impl Default for AppConfig {
             hotkeys: HashMap::new(),
             favorite_display_modes: Vec::new(),
             favorite_hotkey_slots: HashMap::new(),
+            skip_favorite_confirmation: false,
         }
     }
 }

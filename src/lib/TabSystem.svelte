@@ -171,12 +171,9 @@
   <div class="diag-section">
     <div class="diag-section-header">
       <h3>System Info</h3>
-      <button class="copy-btn" class:success={copied} class:error={copyFailed} onclick={copySystemInfo} title={copied ? 'Copied!' : copyFailed ? 'Copy failed' : 'Copy system info'} aria-label="Copy system info">
-        {#if copied}
-          <svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5L6.5 12L13 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        {:else}
-          <svg viewBox="0 0 16 16" fill="none"><rect x="5.5" y="5.5" width="8" height="8" rx="1.3" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.8C3.5 3.36 3.86 3 4.3 3H10.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-        {/if}
+      <button class="copy-btn copy-btn-label" class:success={copied} class:error={copyFailed} onclick={copySystemInfo} title={copied ? 'Copied!' : copyFailed ? 'Copy failed' : 'Copy system info'} aria-label="Copy system info">
+        <svg viewBox="0 0 16 16" fill="none"><rect x="5.5" y="5.5" width="8" height="8" rx="1.3" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 10.5V3.8C3.5 3.36 3.86 3 4.3 3H10.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        <span>{copied ? 'Copied!' : 'Copy info'}</span>
       </button>
     </div>
     {#each sections as section}

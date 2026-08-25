@@ -617,6 +617,7 @@ pub fn show_mode_confirmation(
         // verbatim so the countdown matches the automatic rollback. Falls
         // back to a fresh now+seconds deadline for any caller that did not
         // round-trip an AppliedMode.
+        skip_confirmation: false,
         confirmation_deadline_ms: confirmation_deadline_ms
             .unwrap_or_else(|| {
                 std::time::SystemTime::now()

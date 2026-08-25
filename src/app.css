@@ -3716,6 +3716,15 @@ select,
   transition: color 0.12s, background 0.12s, border-color 0.12s;
 }
 .copy-btn svg { width: 15px; height: 15px; }
+/* Labeled copy button (Debug tab log copy): auto width with padding and a
+   text label instead of the icon-only square, so the action is self-evident. */
+.copy-btn-label {
+  width: auto;
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+}
 .copy-btn:hover, .copy-btn:focus-visible {
   color: var(--text);
   background: var(--hover);

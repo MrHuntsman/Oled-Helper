@@ -56,8 +56,27 @@ pub struct AppMonitor {
     /// for per-monitor gamma. Empty when the device could not be matched.
     pub device_name: String,
     /// EDID device ID (e.g. r"MONITOR\LGD05XX\{...}"), the frontend's
-    /// per-monitor profile keys use this. Empty when unavailable.
+    /// per-monitor profile keys use this. Empty when unavailable. Two
+    /// identical panels (same model, no unique EDID serial) can share it,
+    /// which is why profiles key off `profile_id` instead.
     pub monitor_id: String,
+    /// CCD connector instance (DISPLAYCONFIG_TARGET_DEVICE_NAME
+    /// connectorInstance): the OS's per-connector unique id that tells two
+    /// identical panels apart. 0 when CCD is unavailable.
+    pub connector_instance: u32,
+    /// EDID "Display Product Serial Number" (descriptor tag 0xFF), the
+    /// per-unit unique panel id: stable across ports, replugs, driver resets
+    /// and reboots. Empty when the panel ships no serial or the EDID can't be
+    /// read. This is the first-choice disambiguator for identical panels; the
+    /// connector instance and device name are the fallbacks.
+    pub edid_serial: String,
+    /// The identity per-monitor profiles are keyed against. Same as
+    /// monitor_id (or the sig) normally; when two connected monitors share
+    /// the same model (EDID base), the panel's serial wins as the suffix
+    /// ("<base>@serial=<serial>"), with the connector instance ("<id>@<hex>") or
+    /// GDI device name ("<id>@dev=<name>") as fallbacks, so each identical
+    /// panel resolves as its own profile instead of sharing one.
+    pub profile_id: String,
 }
 
 impl AppMonitor {
@@ -105,6 +124,9 @@ unsafe extern "system" fn monitor_enum_proc(
         friendly_name: String::new(),
         device_name: String::new(),
         monitor_id: String::new(),
+        connector_instance: 0,
+        edid_serial: String::new(),
+        profile_id: String::new(),
     });
     BOOL(1)
 }
@@ -128,7 +150,7 @@ pub fn all_monitors() -> Vec<AppMonitor> {
             let _ = ReleaseDC(None, screen);
         }
     }
-    let names = ccd_names_by_rect();
+    let ccd = ccd_info_by_rect();
     for m in &mut list {
         let key = (
             m.rect.left,
@@ -136,8 +158,8 @@ pub fn all_monitors() -> Vec<AppMonitor> {
             m.rect.right - m.rect.left,
             m.rect.bottom - m.rect.top,
         );
-        if let Some(name) = names.get(&key) {
-            m.friendly_name = name.clone();
+        if let Some(info) = ccd.get(&key) {
+            m.friendly_name = info.name.clone();
         }
     }
     let devices = display_devices_by_position();
@@ -147,12 +169,123 @@ pub fn all_monitors() -> Vec<AppMonitor> {
             m.monitor_id = id.clone();
         }
     }
+    // EDID serials: read for every monitor (cached per device instance id in
+    // display_info). The identity uses them only for duplicate-model groups,
+    // but every monitor carries one so the frontend/backend matchers can
+    // re-key a serial-based entry when a duplicated panel ends up alone (one
+    // of a pair unplugged) and for diagnostics.
+    for m in &mut list {
+        if !m.monitor_id.is_empty() {
+            m.edid_serial =
+                crate::display_info::edid_serial_for_monitor(&m.monitor_id).unwrap_or_default();
+        }
+    }
+    // Profile identities, serial-first. Identical panels share the EDID base
+    // (the MONITOR\<model> part of the id, and in the worst case the whole
+    // id), so group by base and disambiguate each group jointly: the EDID
+    // serial (per-unit unique, stable across ports/replugs) wins when every
+    // member has its own; the CCD connector instance distinguishes same-type
+    // connectors next; the GDI device name (port-ordered but unique while
+    // connected) is the last resort. Only duplicate-model panels get a
+    // suffix, so single-monitor profiles keep their exact keys (no
+    // migration). A group whose disambiguation fails (e.g. both panels
+    // report the same serial) falls back to the per-panel ids rather than
+    // merging two panels into one profile.
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, m) in list.iter().enumerate() {
+        if !m.monitor_id.is_empty() {
+            groups.entry(monitor_base(&m.monitor_id)).or_default().push(i);
+        }
+    }
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let serials: Vec<&str> = members
+            .iter()
+            .filter_map(|&i| {
+                let serial = list[i].edid_serial.as_str();
+                (!serial.is_empty()).then_some(serial)
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let serials_distinct = serials.len() == members.len()
+            && serials.iter().all(|s| seen.insert(*s));
+        for &i in members {
+            let m = &mut list[i];
+            let key = (
+                m.rect.left,
+                m.rect.top,
+                m.rect.right - m.rect.left,
+                m.rect.bottom - m.rect.top,
+            );
+            m.connector_instance = ccd.get(&key).map(|c| c.connector_instance).unwrap_or(0);
+            let base = m.monitor_id.clone();
+            if serials_distinct {
+                m.profile_id = format!("{}@serial={}", monitor_base(&m.monitor_id), m.edid_serial);
+            } else if m.connector_instance != 0 {
+                m.profile_id = format!("{base}@{:x}", m.connector_instance);
+            } else if !m.device_name.is_empty() {
+                m.profile_id = format!("{base}@dev={}", m.device_name);
+            } else {
+                m.profile_id = base;
+            }
+        }
+    }
+    // Monitors outside a duplicate-model group keep their exact identity
+    // keys: the bare EDID id when available, else the sig. The duplicate
+    // loop above only assigns profile_id for grouped (same-model) panels, so
+    // without this a single monitor would resolve to an EMPTY key and every
+    // per-monitor profile lookup (taskbar dimmer, screen dimmer, gamma)
+    // would miss the frontend's EDID-id keys and silently fall back to
+    // defaults — sliders that do nothing, and a dimmer that ignores live
+    // seconds changes.
+    for m in &mut list {
+        if m.profile_id.is_empty() {
+            m.profile_id = if !m.monitor_id.is_empty() {
+                m.monitor_id.clone()
+            } else {
+                m.sig()
+            };
+        }
+    }
     list
 }
 
+// The first two components of a monitor device id (MONITOR\<EDID base>): the
+// model identity shared by identical panels. e.g. r"MONITOR\LGD05XX\5&...&UID1"
+// -> r"MONITOR\LGD05XX".
+fn monitor_base(monitor_id: &str) -> String {
+    let mut parts = monitor_id.split('\\');
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}\\{b}"),
+        _ => monitor_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::monitor_base;
+
+    #[test]
+    fn monitor_base_extracts_model_prefix() {
+        assert_eq!(
+            monitor_base(r"MONITOR\LGD05XX\5&2b2d6f29&0&UID43567"),
+            r"MONITOR\LGD05XX"
+        );
+        // Two components only (no instance part) is its own base.
+        assert_eq!(monitor_base(r"MONITOR\LGD05XX"), r"MONITOR\LGD05XX");
+        // Malformed / empty ids pass through untouched.
+        assert_eq!(monitor_base(""), "");
+        assert_eq!(monitor_base("SINGLE"), "SINGLE");
+    }
+}
+
 /// The connected monitors for the frontend monitor selector. `sig` is the
-/// stable key per-monitor settings are persisted against; `monitor_id` is the
-/// EDID device id the Black Crush profile keys use.
+/// stable key per-monitor settings are persisted against; `profile_id` is the
+/// identity per-monitor profile keys use (the EDID id, disambiguated for
+/// identical panels — serial first, then connector, then device name — so
+/// each resolves as its own profile); `monitor_id` is the bare EDID id.
 #[derive(serde::Serialize)]
 pub struct ListedMonitor {
     pub sig: String,
@@ -162,6 +295,14 @@ pub struct ListedMonitor {
     pub height: u32,
     pub monitor_id: String,
     pub device_name: String,
+    /// EDID serial (per-unit unique panel id), empty when the panel ships
+    /// none. Diagnostics: the identity itself is `profile_id`.
+    pub edid_serial: String,
+    pub profile_id: String,
+    /// Current refresh rate in Hz (0 when the device is not queryable), so
+    /// the frontend can key per-monitor profiles by the monitor's OWN rate
+    /// instead of the primary's.
+    pub refresh_hz: u32,
 }
 
 #[tauri::command]
@@ -169,6 +310,7 @@ pub fn list_monitors() -> Vec<ListedMonitor> {
     all_monitors()
         .into_iter()
         .map(|m| ListedMonitor {
+            refresh_hz: current_refresh_hz(&m.device_name),
             sig: m.sig(),
             friendly_name: m.friendly_name,
             primary: m.primary,
@@ -176,19 +318,156 @@ pub fn list_monitors() -> Vec<ListedMonitor> {
             height: m.height,
             monitor_id: m.monitor_id,
             device_name: m.device_name,
+            edid_serial: m.edid_serial,
+            profile_id: m.profile_id,
         })
         .collect()
 }
 
-/// Maps each connected monitor's stable signature to its GDI display device
-/// name (r"\\.\DISPLAY1"), for per-monitor gamma writes. Monitors whose
-/// device could not be matched are omitted.
-pub fn monitor_device_names() -> HashMap<String, String> {
+// Current refresh rate (Hz) of a GDI display device, from its current-mode
+// DEVMODE. 0 when the device name is empty or the query fails.
+fn current_refresh_hz(device_name: &str) -> u32 {
+    if device_name.is_empty() {
+        return 0;
+    }
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let name_wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let ok = unsafe {
+        EnumDisplaySettingsW(PCWSTR(name_wide.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
+    };
+    if !ok {
+        return 0;
+    }
+    dm.dmDisplayFrequency as u32
+}
+
+/// The resolution-independent runtime key for a monitor: its profile_id (the
+/// EDID device id, disambiguated for identical panels), falling back to the
+/// sig. Matches the frontend's key builders and the
+/// persisted per-monitor profile keying, so the gamma table behaves like
+/// every other per-monitor feature instead of embedding the current
+/// resolution (which orphans entries on every mode switch).
+pub(crate) fn monitor_key(m: &AppMonitor) -> String {
+    m.profile_id.clone()
+}
+
+/// Resolve a persisted per-monitor key to its current canonical profile id:
+/// match the connected monitors by profile id, EDID id, sig, or the
+/// resolution-independent physical-size+DPI portion of a legacy sig, and
+/// return the monitor's profile_id. This migrates entries saved under a bare
+/// EDID id (before identical panels were disambiguated) or an old sig to the
+/// identity the live monitors now use; unresolved keys pass through
+/// unchanged. For a duplicated id the first matching monitor wins, so a
+/// previously shared entry follows one panel and the other starts at the
+/// defaults.
+pub(crate) fn canonical_profile_id(key: &str) -> String {
+    let monitors = all_monitors();
+    // Which EDID ids are shared by more than one connected monitor: an
+    // @-suffixed old key embedding a SHARED id is ambiguous between the
+    // siblings, so it only migrates when the panel is no longer duplicated.
+    let mut id_counts: HashMap<&str, u32> = HashMap::new();
+    for m in &monitors {
+        if !m.monitor_id.is_empty() {
+            *id_counts.entry(m.monitor_id.as_str()).or_insert(0) += 1;
+        }
+    }
+    if let Some(monitor) = monitors.iter().find(|m| {
+        m.profile_id == key
+            || (!m.monitor_id.is_empty() && m.monitor_id == key)
+            || m.sig() == key
+            // A serial-keyed identity ("<base>@serial=<serial>") matches the
+            // panel whose serial it carries — the serial is per-unit, so the
+            // match is precise even when the panel is currently alone (one of
+            // a duplicated pair unplugged) or re-keyed differently.
+            || (!m.monitor_id.is_empty()
+                && !m.edid_serial.is_empty()
+                && key == format!("{}@serial={}", monitor_base(&m.monitor_id), m.edid_serial))
+            // A stale @-suffixed variant ("<id>@connector" / "<id>@dev=...")
+            // from before a duplicate-count change. Only matches while this
+            // monitor is NOT itself disambiguated (profile_id == monitor_id)
+            // or its id is not shared, so a still-duplicated sibling cannot
+            // steal its entry.
+            || (!m.monitor_id.is_empty()
+                && key.starts_with(&format!("{}@", m.monitor_id))
+                && (m.profile_id == m.monitor_id
+                    || id_counts.get(m.monitor_id.as_str()).copied().unwrap_or(0) <= 1))
+    }) {
+        return monitor.profile_id.clone();
+    }
+    let stable = stable_sig_part(key);
+    monitors
+        .into_iter()
+        .find(|m| stable_sig_part(&m.sig()) == stable)
+        .map(|m| m.profile_id)
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// Re-key a persisted per-monitor profile map to the monitors' current
+/// profile identities. Called when the display topology changes so a
+/// duplicate-count shift (one of two identical panels unplugged, or a second
+/// one plugged in) cannot strand the runtime maps on stale keys.
+pub(crate) fn rekey_profile_map<T>(map: &mut HashMap<String, T>) {
+    if map.is_empty() {
+        return;
+    }
+    let rekeyed: Vec<(String, T)> = map
+        .drain()
+        .map(|(key, value)| (canonical_profile_id(&key), value))
+        .collect();
+    map.extend(rekeyed);
+}
+
+// The resolution-independent portion of a sig ("WxH|PxP|DxD" -> "PxP|DxD"):
+// physical size + DPI survive mode switches, so a legacy sig key still
+// identifies its panel after a resolution change.
+fn stable_sig_part(sig: &str) -> String {
+    let parts: Vec<&str> = sig.split('|').collect();
+    if parts.len() >= 3 {
+        format!("{}|{}", parts[1], parts[2])
+    } else {
+        sig.to_string()
+    }
+}
+
+/// The profile identity for the monitor on the given GDI device
+/// (e.g. r"\\.\DISPLAY1"), so display-info consumers (the tray, the status
+/// bar) key by the same identity the monitor list uses. Empty when the
+/// device is not connected.
+pub fn profile_id_for_device(device_name: &str) -> String {
     all_monitors()
         .into_iter()
-        .filter(|m| !m.device_name.is_empty())
-        .map(|m| (m.sig(), m.device_name))
-        .collect()
+        .find(|m| m.device_name.eq_ignore_ascii_case(device_name))
+        .map(|m| m.profile_id)
+        .unwrap_or_default()
+}
+
+/// Resolve the monitor a per-monitor gamma apply targets. The GDI device
+/// name (r"\\.\DISPLAY1") uniquely identifies a physical monitor even when
+/// two identical panels share the same EDID id AND the same device-caps
+/// signature (same resolution, same physical size, same DPI), so it wins
+/// when the caller has it; the sig/id match is the fallback for callers
+/// without a device name. A stale sig (the frontend racing a mode change)
+/// does not match, so the caller gets an error rather than misapplying a
+/// value to an identically-sized panel.
+pub(crate) fn resolve_monitor_for_apply(
+    sig: &str,
+    device_name: Option<&str>,
+) -> Option<AppMonitor> {
+    let monitors = all_monitors();
+    if let Some(device) = device_name {
+        if let Some(monitor) = monitors
+            .iter()
+            .find(|m| m.device_name.eq_ignore_ascii_case(device))
+        {
+            return Some(monitor.clone());
+        }
+    }
+    monitors.into_iter().find(|m| {
+        m.sig() == sig || (!m.monitor_id.is_empty() && m.monitor_id == sig)
+    })
 }
 
 // GDI display devices (adapter device name + monitor EDID id) keyed by the
@@ -313,11 +592,16 @@ pub fn friendly_name_for_device(device_name: &str) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
-// CCD friendly names keyed by (left, top, width, height) of the monitor's
-// desktop rect, so they can be joined to the EnumDisplayMonitors pass (the
-// source-mode position/size is the same virtual-desktop coordinate space as
-// the monitor rect).
-fn ccd_names_by_rect() -> HashMap<(i32, i32, i32, i32), String> {
+// CCD per-target info (friendly name + connector instance) keyed by
+// (left, top, width, height) of the monitor's desktop rect, so they can be
+// joined to the EnumDisplayMonitors pass (the source-mode position/size is
+// the same virtual-desktop coordinate space as the monitor rect).
+struct CcdTargetInfo {
+    name: String,
+    connector_instance: u32,
+}
+
+fn ccd_info_by_rect() -> HashMap<(i32, i32, i32, i32), CcdTargetInfo> {
     let mut map = HashMap::new();
     let Ok((paths, modes)) = query_active_paths() else {
         return map;
@@ -334,7 +618,13 @@ fn ccd_names_by_rect() -> HashMap<(i32, i32, i32, i32), String> {
         }
         let src = unsafe { modes[idx].Anonymous.sourceMode };
         let key = (src.position.x, src.position.y, src.width as i32, src.height as i32);
-        map.insert(key, target_monitor_name(&name));
+        map.insert(
+            key,
+            CcdTargetInfo {
+                name: target_monitor_name(&name),
+                connector_instance: name.connectorInstance,
+            },
+        );
     }
     map
 }

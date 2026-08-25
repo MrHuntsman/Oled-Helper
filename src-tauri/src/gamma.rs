@@ -20,11 +20,12 @@ pub(crate) struct GammaShutdown {
 
 pub(crate) struct GammaState {
     pub(crate) desired: Arc<AtomicI32>,
-    // Per-monitor black-lift values keyed by the monitor's stable signature
-    // (see monitors::AppMonitor::sig). The safety thread re-applies these to
-    // their own devices alongside the global value, and shutdown resets every
-    // affected monitor. Entries may contain an explicit zero so the screen
-    // protector can distinguish it from an uninitialized profile.
+    // Per-monitor black-lift values keyed by the monitor's resolution-
+    // independent identity (EDID device id, sig fallback; see
+    // monitors::monitor_key). The safety thread re-applies these to their own
+    // devices alongside the global value, and shutdown resets every affected
+    // monitor. Entries may contain an explicit zero so the screen protector
+    // can distinguish it from an uninitialized profile.
     pub(crate) per_monitor: Arc<Mutex<HashMap<String, i32>>>,
     // Current screen-protector gamma brightness per monitor: 1000 = unmodified.
     pub(crate) screen_dim_brightness: Arc<Mutex<HashMap<String, u32>>>,
@@ -49,6 +50,13 @@ impl Drop for GammaState {
 }
 
 // Restores every monitor that has a per-monitor lift entry to the linear ramp.
+// Entries are keyed by the resolution-independent monitor identity (EDID id,
+// sig fallback), so a monitor whose resolution changed since the lift was
+// applied still resolves to its current device; a monitor that is no longer
+// connected cannot be reset (the driver clears its ramp on unplug anyway).
+// Two identical panels can SHARE a key (same EDID id, same caps), so every
+// connected monitor matching the key is reset, not just the first, or the
+// sibling's ramp would stay applied.
 pub(crate) fn reset_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>) {
     let Ok(map) = per_monitor.lock() else {
         return;
@@ -56,11 +64,14 @@ pub(crate) fn reset_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>)
     if map.is_empty() {
         return;
     }
-    let devices = crate::monitors::monitor_device_names();
-    for sig in map.keys() {
-        if let Some(device) = devices.get(sig) {
-            unsafe {
-                crate::gamma_ramp::reset_monitor_ramp(device);
+    for key in map.keys() {
+        for monitor in crate::monitors::all_monitors() {
+            if crate::monitors::monitor_key(&monitor) == *key
+                && !monitor.device_name.is_empty()
+            {
+                unsafe {
+                    crate::gamma_ramp::reset_monitor_ramp(&monitor.device_name);
+                }
             }
         }
     }
@@ -93,17 +104,30 @@ pub(crate) fn apply_screen_gamma_ramps(
         if monitor.device_name.is_empty() {
             continue;
         }
+        let key = crate::monitors::monitor_key(&monitor);
         let sig = monitor.sig();
-        let brightness_thousandths = brightness_by_monitor.get(&sig).copied().unwrap_or(1000);
+        // The dimmer writes its brightness map keyed by the current sig (it
+        // rebuilds it every tick), while lift entries are keyed by the stable
+        // monitor id, so look up both keys.
+        // The dimmer writes its brightness map keyed by the monitor's device
+        // name (unique per physical monitor, so identical panels stay
+        // distinct), while lift entries are keyed by the stable monitor id,
+        // so look up all three keys.
+        let brightness_thousandths = brightness_by_monitor
+            .get(&monitor.device_name)
+            .or_else(|| brightness_by_monitor.get(&key))
+            .or_else(|| brightness_by_monitor.get(&sig))
+            .copied()
+            .unwrap_or(1000);
         let brightness = (brightness_thousandths.min(1000) as f32) / 1000.0;
         let dimmed = brightness_thousandths < 1000;
         // The primary fallback preserves the existing global Black Crush
         // value during startup. Every write below is still per-monitor; the
         // global SetDeviceGammaRamp path is never used for screen dimming.
-        let lift = values.get(&sig).copied().unwrap_or_else(|| {
+        let lift = values.get(&key).copied().unwrap_or_else(|| {
             if monitor.primary { primary_fallback } else { 0 }
         });
-        let has_profile = values.contains_key(&sig);
+        let has_profile = values.contains_key(&key);
         if (has_profile && (lift != 0 || dimmed || restore_unconfigured))
             || (!has_profile && monitor.primary && primary_fallback != 0)
             || dimmed
@@ -170,7 +194,16 @@ pub(crate) fn gamma_safety_loop(
             let primary_brightness = crate::monitors::all_monitors()
                 .iter()
                 .find(|m| m.primary)
-                .and_then(|m| brightness.get(&m.sig()).copied())
+                .and_then(|m| {
+                    // The dim brightness map is keyed by the monitor's GDI
+                    // device name (unique per physical monitor, so identical
+                    // panels stay distinct); fall back to the sig for any
+                    // stale entry written before the device-name re-key.
+                    brightness
+                        .get(&m.device_name)
+                        .or_else(|| brightness.get(&m.sig()))
+                        .copied()
+                })
                 .unwrap_or(1000);
             let ramp = crate::gamma_ramp::build_dimmed_ramp(
                 global_lift,
@@ -228,29 +261,46 @@ pub fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(),
 }
 
 // Same as apply_gamma_ramp but targets a specific monitor (by stable
-// signature) instead of the primary. Used by per-monitor Black Crush when the
-// frontend has a monitor selected; the primary monitor goes through the global
-// path above. The per-monitor table keeps explicit zero values too.
+// signature, plus the GDI device name which uniquely identifies a physical
+// monitor even when two identical panels share the same sig and EDID id)
+// instead of the primary. Used by per-monitor Black Crush when the frontend
+// has a monitor selected; the primary monitor goes through the global path
+// above. The per-monitor table keeps explicit zero values too.
 #[tauri::command]
-pub fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i32) -> Result<(), String> {
+pub fn apply_gamma_ramp_for(
+    state: State<GammaState>,
+    sig: String,
+    device_name: Option<String>,
+    black_lift: i32,
+) -> Result<(), String> {
     let black_lift = black_lift.clamp(-150, 150);
     if crate::vendor_info::nvidia_reference_mode_enabled() {
         return Err("NVIDIA Override to reference mode is enabled; disable it in your NVIDIA driver settings under System → Displays to use Black Crush Tweak".into());
     }
     let _gamma_guard = crate::hotkeys::gamma_write_guard();
+    // Resolve the input sig (or device name) to the live monitor and use the
+    // stable resolution-independent key (EDID id, sig fallback) for the
+    // table, so a mode switch cannot orphan the entry or strand the monitor's
+    // ramp. A stale sig (the frontend racing a mode change) fails here; the
+    // frontend re-applies with the fresh sig once the monitor list catches
+    // up. The device name disambiguates identical panels that share the sig.
+    let monitor = crate::monitors::resolve_monitor_for_apply(&sig, device_name.as_deref())
+        .ok_or_else(|| format!("no display device for monitor {sig}"))?;
+    let key = crate::monitors::monitor_key(&monitor);
     if !crate::hotkeys::is_hold_compare_active() {
-        let device = crate::monitors::monitor_device_names()
-            .get(&sig)
-            .cloned()
-            .ok_or_else(|| format!("no display device for monitor {sig}"))?;
         let brightness = state
             .screen_dim_brightness
             .lock()
             .ok()
-            .and_then(|map| map.get(&sig).copied())
+            .and_then(|map| {
+                map.get(&monitor.device_name)
+                    .or_else(|| map.get(&key))
+                    .or_else(|| map.get(&sig))
+                    .copied()
+            })
             .unwrap_or(1000);
         let ramp = crate::gamma_ramp::build_dimmed_ramp(black_lift, brightness as f32 / 1000.0);
-        let applied = unsafe { crate::gamma_ramp::set_monitor_ramp(&device, &ramp) };
+        let applied = unsafe { crate::gamma_ramp::set_monitor_ramp(&monitor.device_name, &ramp) };
         if !applied {
             return Err("SetDeviceGammaRamp failed".into());
         }
@@ -263,7 +313,7 @@ pub fn apply_gamma_ramp_for(state: State<GammaState>, sig: String, black_lift: i
         // Keep zero as an explicit per-monitor value. Removing it would make
         // the screen protector fall back to the primary/global profile and
         // could reintroduce an old lift on a monitor intentionally set to 0.
-        map.insert(sig, black_lift);
+        map.insert(key, black_lift);
     }
     // Reflect the new state in the external gamma watch record.
     crate::gamma_watch::sync(

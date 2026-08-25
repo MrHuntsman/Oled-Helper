@@ -840,13 +840,17 @@ mod platform {
             "reshow" => FLICKER_RESHOW_COUNT.fetch_add(1, Ordering::Relaxed) + 1,
             _ => return,
         };
-        emit_runtime(
-            "flicker",
-            format!(
-                "[taskbar-dimmer] flicker_debug kind={} count={} hwnd=0x{:x} {}",
-                kind, count, hwnd, detail,
-            ),
-        );
+        // Keep the counters available for diagnostics, but do not emit the
+        // high-frequency flicker trace during normal use.
+        if crate::detailed_logging_enabled() {
+            emit_runtime(
+                "flicker",
+                format!(
+                    "[taskbar-dimmer] flicker_debug kind={} count={} hwnd=0x{:x} {}",
+                    kind, count, hwnd, detail,
+                ),
+            );
+        }
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -1100,10 +1104,10 @@ mod platform {
                 let want = hmon.0 as usize as u32;
                 for m in crate::monitors::all_monitors() {
                     if m.hmonitor == want {
-                        if !m.monitor_id.is_empty() {
-                            return m.monitor_id;
-                        }
-                        return m.sig();
+                        // The profile identity (EDID id, disambiguated for
+                        // identical panels) so each taskbar resolves its own
+                        // profile.
+                        return m.profile_id.clone();
                     }
                 }
             }
@@ -2430,16 +2434,26 @@ mod platform {
         {
             let mut overlays = overlays_map().lock().unwrap_or_else(|e| e.into_inner());
             for (taskbar, rect) in &taskbars {
-                let key = monitor_key_for_taskbar(*taskbar, *rect);
                 let existing = overlays
                     .iter()
                     .find(|(_, info)| info.taskbar == taskbar.0 as isize)
                     .map(|(h, _)| *h);
                 let hwnd = match existing {
-                    Some(h) => {
-                        if let Some(info) = overlays.get_mut(&h) {
+                    Some(h) => {                        if let Some(info) = overlays.get_mut(&h) {
+                            // monitor_key_for_taskbar enumerates the whole
+                            // monitor table (Win32 + CCD + SetupAPI), which is
+                            // far too expensive to run on every slider tick
+                            // (apply runs once per input event). Resolve it
+                            // only when the overlay is first created or its
+                            // taskbar moved to another monitor (rect change);
+                            // a slider drag keeps the same rect, so the
+                            // stored key stays valid and the hot path skips
+                            // the enumeration entirely.
+                            let moved = info.rect != *rect;
                             info.rect = *rect;
-                            info.monitor_key = key;
+                            if moved {
+                                info.monitor_key = monitor_key_for_taskbar(*taskbar, *rect);
+                            }
                         }
                         h
                     }
@@ -2449,6 +2463,7 @@ mod platform {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(raw, new_fade_state());
+                        let key = monitor_key_for_taskbar(*taskbar, *rect);
                         overlays.insert(
                             raw,
                             OverlayInfo {
@@ -2578,41 +2593,64 @@ mod platform {
                     .map_err(|e| format!("could not hide overlay: {e}"))?;
             }
 
-            // Context menus no longer change overlay visibility. They only
-            // pause the repair path, so enabling the dimmer while a menu is
-            // already open still shows the overlay normally.
-            let visibility = if enabled {
-                SWP_SHOWWINDOW
-            } else {
-                SWP_HIDEWINDOW
-            };
-            // Same flyout-priority reasoning as maintain_overlay_zorder: don't
-            // blindly claim the front of the topmost band if the mode-change
-            // flyout is currently showing. An active native menu is handled
-            // specially: apply() may be called while a menu is open, so keep
-            // the move/size/show operation but explicitly preserve its current
-            // z-order and let the menu-safe repair path handle ordering.
-            let popup_active = MENU_POPUP_OPEN.load(Ordering::Relaxed);
-            let insert_after = active_flyout_window().unwrap_or(HWND_TOPMOST);
-            let zorder_flags = if popup_active {
-                SWP_NOZORDER
-            } else {
-                SET_WINDOW_POS_FLAGS(0)
-            };
-            SetWindowPos(
-                hwnd,
-                Some(insert_after),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                visibility | zorder_flags | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-            )
-            .map_err(|e| format!("could not position taskbar overlay: {e}"))?;
+            // Only reposition / re-show when the overlay isn't already
+            // correctly on screen. During a slider drag apply() runs once per
+            // input tick and only the alpha changed; re-inserting the window
+            // at the front of the topmost band and re-showing it every tick
+            // makes the layered window flicker (each z-order touch triggers a
+            // DWM re-composite). The periodic z-order repair still handles
+            // structural changes (taskbar geometry, flyout, menus), and the
+            // !enabled path below still force-hides.
+            let mut already_placed = false;
             if enabled {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-            } else {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                let visible = IsWindowVisible(hwnd).as_bool();
+                let mut current = RECT::default();
+                let geometry_ok = GetWindowRect(hwnd, &mut current).is_ok();
+                already_placed = visible
+                    && geometry_ok
+                    && current.left == rect.left
+                    && current.top == rect.top
+                    && current.right == rect.right
+                    && current.bottom == rect.bottom;
+            }
+            if !already_placed {
+                // Context menus no longer change overlay visibility. They only
+                // pause the repair path, so enabling the dimmer while a menu
+                // is already open still shows the overlay normally.
+                let visibility = if enabled {
+                    SWP_SHOWWINDOW
+                } else {
+                    SWP_HIDEWINDOW
+                };
+                // Same flyout-priority reasoning as maintain_overlay_zorder:
+                // don't blindly claim the front of the topmost band if the
+                // mode-change flyout is currently showing. An active native
+                // menu is handled specially: apply() may be called while a
+                // menu is open, so keep the move/size/show operation but
+                // explicitly preserve its current z-order and let the
+                // menu-safe repair path handle ordering.
+                let popup_active = MENU_POPUP_OPEN.load(Ordering::Relaxed);
+                let insert_after = active_flyout_window().unwrap_or(HWND_TOPMOST);
+                let zorder_flags = if popup_active {
+                    SWP_NOZORDER
+                } else {
+                    SET_WINDOW_POS_FLAGS(0)
+                };
+                SetWindowPos(
+                    hwnd,
+                    Some(insert_after),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    visibility | zorder_flags | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+                )
+                .map_err(|e| format!("could not position taskbar overlay: {e}"))?;
+                if enabled {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                } else {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
             }
         }
         // Apply can run while a native menu is already open. Run the shared
@@ -2649,28 +2687,37 @@ mod platform {
 }
 
 // The per-monitor profile map lives at crate level so the Tauri commands and
-// the platform module share it. Key = the monitor's stable identity
-// (monitor_id || sig), resolved the same way monitor_key_for_taskbar does.
+// the platform module share it. Key = the monitor's profile identity
+// (EDID id, disambiguated for identical panels), resolved the same way
+// monitor_key_for_taskbar does.
 fn resolve_profile_key(monitor_key: Option<&str>) -> String {
     if let Some(key) = monitor_key {
         let key = key.trim();
         if !key.is_empty() {
+            // Callers (the main window and the tray) send the monitor's
+            // current profile identity; pass it through. Topology re-keys
+            // are handled by rekey_profiles on display changes, so the hot
+            // slider paths never pay for a monitor enumeration.
             return key.to_string();
         }
     }
     // No key supplied (e.g. the tray menu, which has no monitor selector):
-    // fall back to the primary monitor's stable identity so the tray's
+    // fall back to the primary monitor's profile identity so the tray's
     // global controls keep operating on the primary taskbar.
     for m in crate::monitors::all_monitors() {
         if m.primary {
-            return if !m.monitor_id.is_empty() {
-                m.monitor_id
-            } else {
-                m.sig()
-            };
+            return m.profile_id;
         }
     }
     String::new()
+}
+
+// Re-key the shared profile map to the current monitor identities after a
+// display-topology change (see monitors::rekey_profile_map).
+pub(crate) fn rekey_profiles() {
+    if let Ok(mut profiles) = profiles_map().lock() {
+        crate::monitors::rekey_profile_map(&mut profiles);
+    }
 }
 
 #[tauri::command]
