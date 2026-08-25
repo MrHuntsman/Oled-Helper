@@ -752,11 +752,29 @@
     removeFavorite(favoritePendingRemove);
     favoritePendingRemove = null;
   }
+  // Trap Tab between the two dialog buttons so focus never escapes to the
+  // page behind the backdrop, mirroring ConfirmModal's trap.
+  function trapModalTab(e) {
+    if (e.key !== 'Tab') return;
+    const buttons = e.currentTarget ? [...e.currentTarget.querySelectorAll('button:not(:disabled)')] : [];
+    if (buttons.length === 0) return;
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
   function onFavoriteConfirmKeydown(e) {
     if (e.key === 'Escape') {
       e.preventDefault();
       cancelRemoveFavorite();
+      return;
     }
+    trapModalTab(e);
   }
   // Focus the safe action (Cancel) when the dialog opens, like the mode
   // confirm modal defaults to Revert so Enter/Escape do the safe thing.
@@ -1372,7 +1390,9 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       cancelQuit();
+      return;
     }
+    trapModalTab(e);
   }
   // Focus the safe action (Cancel) when the dialog opens, so Enter and
   // Escape both take the safe path (Enter activates the focused button).
@@ -1393,10 +1413,10 @@
       </div>
     </div>
     <div class="spacer"></div>
-    <button class="top-btn" class:active={app.activeTab === 'settings'} onclick={() => app.activeTab = 'settings'}>
+    <button class="top-btn" class:active={app.activeTab === 'settings'} aria-current={app.activeTab === 'settings' ? 'page' : undefined} onclick={() => app.activeTab = 'settings'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabSystemIcon} alt="" /> Settings</span>
     </button>
-    <button class="top-btn" class:active={app.activeTab === 'about'} onclick={() => app.activeTab = 'about'}>
+    <button class="top-btn" class:active={app.activeTab === 'about'} aria-current={app.activeTab === 'about' ? 'page' : undefined} onclick={() => app.activeTab = 'about'}>
       <span class="top-btn-inner"><img class="top-btn-icon" src={tabAboutIcon} alt="" /> About</span>
     </button>
     <button class="top-btn top-exit-btn" title="Exit OLED Helper" aria-label="Exit OLED Helper" onclick={askQuit}>
@@ -1412,7 +1432,7 @@
 
   <nav class="sidebar">
     <div class="nav-item">
-      <button class="nav-btn" class:active={app.activeTab === 'crush'} onclick={() => app.activeTab = 'crush'}>
+      <button class="nav-btn" class:active={app.activeTab === 'crush'} aria-current={app.activeTab === 'crush' ? 'page' : undefined} onclick={() => app.activeTab = 'crush'}>
         <img class="nav-icon" src={tabCrushIcon} alt="" /> Black Crush Tweak
       </button>
       <button type="button" class="nav-switch" class:on={crush.blackEnabled} aria-pressed={crush.blackEnabled} onclick={toggleBlackCrushFromNav} title="Toggle Black Crush Tweak" aria-label="Toggle Black Crush Tweak">
@@ -1420,7 +1440,7 @@
       </button>
     </div>
     <div class="nav-item">
-      <button class="nav-btn" class:active={app.activeTab === 'dimmer'} onclick={() => app.activeTab = 'dimmer'}>
+      <button class="nav-btn" class:active={app.activeTab === 'dimmer'} aria-current={app.activeTab === 'dimmer' ? 'page' : undefined} onclick={() => app.activeTab = 'dimmer'}>
         <img class="nav-icon" src={tabDimmerIcon} alt="" /> Taskbar Dimmer
       </button>
       <button type="button" class="nav-switch" class:on={taskbarDimmer.enabled} aria-pressed={taskbarDimmer.enabled} onclick={toggleTaskbarDimmerFromNav} title="Toggle Taskbar Dimmer" aria-label="Toggle Taskbar Dimmer">
@@ -1428,7 +1448,7 @@
       </button>
     </div>
     <div class="nav-item">
-      <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} onclick={() => app.activeTab = 'screen-dimmer'}>
+      <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} aria-current={app.activeTab === 'screen-dimmer' ? 'page' : undefined} onclick={() => app.activeTab = 'screen-dimmer'}>
         <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> Screen Dimmer
       </button>
       <button type="button" class="nav-switch" class:on={screenDimmer.enabled} aria-pressed={screenDimmer.enabled} onclick={toggleScreenDimmerFromNav} title="Toggle Screen Dimmer" aria-label="Toggle Screen Dimmer">
@@ -1439,20 +1459,20 @@
       {/if}
     </div>
     <div class="sidebar-sep" role="separator"></div>
-    <button class="nav-btn" class:active={app.activeTab === 'text'} onclick={() => app.activeTab = 'text'}>
+    <button class="nav-btn" class:active={app.activeTab === 'text'} aria-current={app.activeTab === 'text' ? 'page' : undefined} onclick={() => app.activeTab = 'text'}>
       <TabTextIcon class="nav-icon" /> Text Rendering
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'windows-font'} onclick={() => app.activeTab = 'windows-font'}>
+    <button class="nav-btn" class:active={app.activeTab === 'windows-font'} aria-current={app.activeTab === 'windows-font' ? 'page' : undefined} onclick={() => app.activeTab = 'windows-font'}>
       <TabWindowsFontIcon class="nav-icon" /> Windows Font <span class="nav-global-tag">Global</span>
     </button>
     <div class="sidebar-sep" role="separator"></div>
-    <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} onclick={() => app.activeTab = 'windows-hdr'}>
+    <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} aria-current={app.activeTab === 'windows-hdr' ? 'page' : undefined} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR <span class="nav-global-tag">Global</span>
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'power'} onclick={() => app.activeTab = 'power'}>
+    <button class="nav-btn" class:active={app.activeTab === 'power'} aria-current={app.activeTab === 'power' ? 'page' : undefined} onclick={() => app.activeTab = 'power'}>
       <TabPowerIcon class="nav-icon" /> Power Saving <span class="nav-global-tag">Global</span>
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} onclick={() => app.activeTab = 'hotkeys'}>
+    <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} aria-current={app.activeTab === 'hotkeys' ? 'page' : undefined} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys <span class="nav-global-tag">Global</span>
     </button>
 

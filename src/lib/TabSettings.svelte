@@ -247,6 +247,7 @@
           <input type="range" min="16" max="200" step="1"
             value={taskbarDimmer.pollIntervalMs}
             disabled={!taskbarDimmer.available}
+            aria-label="Poll interval"
             oninput={(e) => setPollIntervalMs(Number(e.currentTarget.value))}
             style={`--fill: ${((taskbarDimmer.pollIntervalMs - 16) / (200 - 16)) * 100}%`} />
           <span class="hover-detect-poll-rate-val">{taskbarDimmer.pollIntervalMs} ms</span>

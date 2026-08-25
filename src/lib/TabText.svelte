@@ -910,6 +910,7 @@
         <span class="text-render-knob-label">Boldness</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
           <input type="range" class="slider-sm has-ticks-bold" min="0" max={BOLDNESS_MAX} step="5" value={knobValue('boldness')}
+            aria-label="Boldness"
             style="--fill:{(knobValue('boldness') / BOLDNESS_MAX) * 100}%"
             oninput={(e) => onKnobInput('boldness', e.currentTarget.value)} />
         </div>
@@ -920,6 +921,7 @@
         <span class="text-render-knob-label">Fringe reduction</span>
         <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
           <input type="range" class="slider-sm" min="0" max="100" step="5" value={knobValue('damping')}
+            aria-label="Fringe reduction"
             style="--fill:{knobValue('damping')}%"
             oninput={(e) => onKnobInput('damping', e.currentTarget.value)} />
         </div>
@@ -938,6 +940,7 @@
             <span class="text-render-knob-label">{axis.label}</span>
             <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
               <input type="range" class="slider-sm" min={CUSTOM_OFFSET_MIN} max={CUSTOM_OFFSET_MAX} step={CUSTOM_OFFSET_STEP} value={customValue(axis.key)}
+                aria-label={axis.label}
                 style="--fill:{((customValue(axis.key) - CUSTOM_OFFSET_MIN) / (CUSTOM_OFFSET_MAX - CUSTOM_OFFSET_MIN)) * 100}%"
                 oninput={(e) => onCustomInput(axis.key, e.currentTarget.value)} />
             </div>

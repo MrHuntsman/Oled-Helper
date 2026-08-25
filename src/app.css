@@ -97,6 +97,24 @@ select,
   user-select: none;
 }
 
+/* Consistent keyboard focus ring, the app-wide fallback. Individual
+   controls with their own :focus-visible rules (accent border, background
+   change, or a dedicated outline) have higher specificity and keep their
+   look; this guarantees every other interactive element still shows where
+   focus is. */
+button:focus-visible,
+[role='button']:focus-visible,
+[role='radio']:focus-visible,
+[role='menuitem']:focus-visible,
+[role='option']:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
 /* ── Layout grid ──────────────────────────────────────────────────── */
 .app-shell {
   display: grid;
@@ -824,6 +842,12 @@ select,
   outline: none;
   transition: height 0.12s;
   position: relative;
+}
+/* Keyboard focus on a slider: the thumb is the handle, so the ring sits
+   around the whole track with a little extra offset to stay visible. */
+.slider-track-wrap input[type=range]:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
 }
 .slider-track-wrap:hover input[type=range]:not(:disabled) { height: 8px; }
 .slider-track-wrap input[type=range]::-webkit-slider-thumb {

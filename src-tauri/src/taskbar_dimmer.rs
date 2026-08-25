@@ -98,11 +98,11 @@ mod platform {
         PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW,
         SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
         GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT,
-        HWND_TOPMOST, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-        SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP,
-        WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
-        WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
+        HWND_TOPMOST, IDC_ARROW, LoadCursorW, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS,
+        SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+        SW_SHOW, WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT,
+        WM_QUIT, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
     };
 
     // One adaptive timer handles both cursor polling and animation. It runs
@@ -985,6 +985,15 @@ mod platform {
         let class = WNDCLASSW {
             lpfnWndProc: Some(overlay_window_proc),
             lpszClassName: PCWSTR(name.as_ptr()),
+            // The overlay sits over the taskbar and must never swallow the
+            // cursor: Windows hides the cursor over a window whose class has
+            // no cursor (NULL hCursor, no WM_SETCURSOR handler), which showed
+            // up as an invisible pointer whenever the overlay was dimmed under
+            // it (e.g. right after a Sunshine stream restore, where the
+            // overlay is still faded in while the cursor is parked over the
+            // taskbar). IDC_ARROW is a system stock cursor, no ownership to
+            // manage.
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
             ..Default::default()
         };
         unsafe {

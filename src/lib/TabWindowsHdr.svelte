@@ -558,6 +558,7 @@
             min={MIN_NITS}
             max={MAX_NITS}
             step="1"
+            aria-label="SDR Content Brightness"
             value={Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS)}
             style="--fill:{((Math.min(Number(currentNits ?? MIN_NITS), MAX_NITS) - MIN_NITS) / (MAX_NITS - MIN_NITS)) * 100}%;--tick-bg:linear-gradient(to right,{ticksBackground})"
             disabled={!hdrAvailable || currentNits === null}

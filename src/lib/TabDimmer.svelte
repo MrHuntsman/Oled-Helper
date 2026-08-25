@@ -439,7 +439,7 @@
         <div class="slider-track-wrap dimmer-slider-track">
           <input class="dimmer-opacity" type="range" min="5" max="180" step="1"
             value={screenDimmer.seconds} style="--fill:{((screenDimmer.seconds - 5) / 175) * 100}%"
-            disabled={!screenDimmer.enabled}
+            aria-label="Dim display after"            disabled={!screenDimmer.enabled}
             oninput={handleScreenTimeoutInput} onchange={() => { applyScreenDimmer(true); }}
             onpointerdown={() => screenTimeoutDragging = true} onpointerup={() => screenTimeoutDragging = false} />
         </div>
@@ -454,7 +454,7 @@
       <div class="slider-track-wrap dimmer-slider-track">
         <input class="dimmer-opacity has-ticks-dimmer" type="range" min="0" max="80" step="1"
           value={Math.round(screenDimmer.opacity * 80)} style="--fill:{screenDimmer.opacity * 100}%"
-          disabled={!screenDimmer.enabled}
+          aria-label="Dim strength"          disabled={!screenDimmer.enabled}
           oninput={handleScreenOpacityInput} onchange={() => { applyScreenDimmer(true); }}
           onpointerdown={() => screenOpacityDragging = true} onpointerup={() => screenOpacityDragging = false}
           onpointerenter={() => screenOpacityHovering = true} onpointerleave={() => screenOpacityHovering = false} />
@@ -472,7 +472,7 @@
         <div class="slider-track-wrap dimmer-slider-track">
           <input class="dimmer-opacity has-ticks-dimmer-fade" type="range" min="0" max="5000" step="50"
             value={screenDimmer.fadeInDurationMs} style="--fill:{(screenDimmer.fadeInDurationMs / 5000) * 100}%"
-            disabled={!screenDimmer.enabled}
+            aria-label="Fade in duration"            disabled={!screenDimmer.enabled}
             oninput={handleScreenFadeInInput} onchange={() => { applyScreenDimmer(true); }}
             onpointerdown={() => screenFadeInDragging = true} onpointerup={() => screenFadeInDragging = false}
             onpointerenter={() => screenFadeInHovering = true} onpointerleave={() => screenFadeInHovering = false} />
@@ -499,7 +499,7 @@
         <div class="slider-track-wrap dimmer-slider-track">
           <input class="dimmer-opacity has-ticks-dimmer-fade" type="range" min="0" max="5000" step="50"
             value={screenDimmer.fadeOutDurationMs} style="--fill:{(screenDimmer.fadeOutDurationMs / 5000) * 100}%"
-            disabled={!screenDimmer.enabled}
+            aria-label="Fade out duration"            disabled={!screenDimmer.enabled}
             oninput={handleScreenFadeOutInput} onchange={() => { applyScreenDimmer(true); }}
             onpointerdown={() => screenFadeOutDragging = true} onpointerup={() => screenFadeOutDragging = false}
             onpointerenter={() => screenFadeOutHovering = true} onpointerleave={() => screenFadeOutHovering = false} />
@@ -559,7 +559,7 @@
           step="1"
           value={Math.round(taskbarDimmer.opacity * 100)}
           style="--fill:{taskbarDimmer.opacity * 100}%"
-          disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+          aria-label="Overlay opacity"          disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
           oninput={handleOpacityInput}
           onpointerdown={() => opacityDragging = true}
           onpointerup={() => opacityDragging = false}
@@ -585,7 +585,7 @@
             step="10"
             value={taskbarDimmer.fadeInDurationMs}
             style="--fill:{(taskbarDimmer.fadeInDurationMs / 1000) * 100}%"
-            disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+            aria-label="Fade in duration"            disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
             oninput={handleFadeInInput}
             onchange={commitFadeIn}
             onpointerdown={() => fadeInDragging = true}
@@ -621,7 +621,7 @@
             step="10"
             value={taskbarDimmer.fadeOutDurationMs}
             style="--fill:{(taskbarDimmer.fadeOutDurationMs / 1000) * 100}%"
-            disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
+            aria-label="Fade out duration"            disabled={!taskbarDimmer.available || !taskbarDimmer.enabled}
             oninput={handleFadeOutInput}
             onchange={commitFadeOut}
             onpointerdown={() => fadeOutDragging = true}

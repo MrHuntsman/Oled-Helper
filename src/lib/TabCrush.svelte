@@ -1087,7 +1087,7 @@
           <h2>Black Crush Tweak</h2>
           {#if monitorTagLabel}<span class="tab-monitor-tag">{monitorTagLabel}</span>{/if}
         </div>
-        <span class="subtitle">Adjust visibility in dark ares. Preserves pure black.</span>
+        <span class="subtitle">Adjust visibility in dark areas. Preserves pure black.</span>
       </div>
       <div class="tab-heading-spacer"></div>
       <span class={`pill${crush.blackEnabled ? '' : ' off'}`} aria-hidden="true"></span>
@@ -1108,6 +1108,7 @@
     <div class="slider-track-wrap dimmer-slider-track" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, mainSliderInput, (v) => sliderDragging = v)}>
       <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={mainSliderInput}
         class="has-ticks"
+        aria-label="Black Level"
         style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
         oninput={handleBlackLevelInput}
         onpointerdown={() => sliderDragging = true}
@@ -1252,6 +1253,7 @@
           <div class="slider-track-wrap" role="presentation" onpointerdown={(e) => handleTrackWrapPointerdown(e, fsSliderInput, (v) => fsSliderDragging = v)}>
             <input type="range" min="-150" max="150" bind:value={crush.adjustment} bind:this={fsSliderInput}
               class="has-ticks"
+              aria-label="Black Level"
               style="--fill:{((crush.adjustment + 150) / 300) * 100}%"
               oninput={handleBlackLevelInput}
               onpointerdown={() => fsSliderDragging = true}
@@ -1308,6 +1310,7 @@
         <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />
         <div class="slider-track-wrap zoom-track-compact">
           <input type="range" min="2" max={MAX_SQUARES} bind:value={crush.squareCounts[crush.stripType]} bind:this={zoomSliderInput}
+            aria-label="Zoom"
             style="--fill:{((activeSquareCount() - 2) / (MAX_SQUARES - 2)) * 100}%" />
         </div>
         <span class="slider-val zoom-val-compact">{activeSquareCount()}</span>

@@ -3,6 +3,10 @@
 
   let { onclose = () => {} } = $props();
   let installError = $state('');
+  let modalEl = $state(null);
+  // Element that had focus when the modal opened, restored on close so
+  // keyboard and screen-reader users land back where they left off.
+  let lastFocused = null;
 
   async function onInstall() {
     if (updateState.installing) return;
@@ -20,10 +24,44 @@
     if (!iso) return '';
     try { return new Date(iso).toLocaleDateString(); } catch { return ''; }
   }
+
+  // Trap Tab inside the dialog and close on Escape, mirroring ConfirmModal's
+  // behavior, so focus can never escape to the page behind the backdrop.
+  function onModalKeydown(e) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (!updateState.installing) onclose();
+      return;
+    }
+    if (e.key === 'Tab') {
+      const buttons = modalEl ? [...modalEl.querySelectorAll('button:not(:disabled)')] : [];
+      if (buttons.length === 0) return;
+      const first = buttons[0];
+      const last = buttons[buttons.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
+  // Move focus to the safe action (Later) when the dialog opens, and return
+  // it to the element that opened the modal when it closes.
+  $effect(() => {
+    lastFocused = document.activeElement;
+    const focusId = setTimeout(() => modalEl?.querySelector('.modal-actions .modal-btn-cancel')?.focus(), 0);
+    return () => {
+      clearTimeout(focusId);
+      if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus();
+    };
+  });
 </script>
 
 <div class="modal-backdrop" onclick={(e) => { if (e.target === e.currentTarget && !updateState.installing) onclose(); }}>
-  <div class="modal update-modal" role="dialog" aria-modal="true" aria-label="App update">
+  <div class="modal update-modal" role="dialog" aria-modal="true" aria-label="App update" tabindex="-1" bind:this={modalEl} onkeydown={onModalKeydown}>
     <div class="update-modal-header">
       <div>
         <div class="modal-title">Update available</div>

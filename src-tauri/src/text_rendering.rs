@@ -446,11 +446,10 @@ mod native_preview {
         DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
     };    use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos, ShowWindow,
-        WNDCLASSW, HWND_TOP, SW_HIDE, SWP_NOCOPYBITS, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_APP,
-        WM_ERASEBKGND, GetClientRect, WM_NCHITTEST, WM_PAINT, WM_SIZE, WS_EX_NOACTIVATE,
-
-        WS_EX_TOOLWINDOW, WS_POPUP,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassW,
+        SetWindowPos, ShowWindow, WNDCLASSW, HWND_TOP, SW_HIDE, SWP_NOCOPYBITS, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, WM_APP, WM_ERASEBKGND, GetClientRect, WM_NCHITTEST, WM_PAINT, WM_SIZE,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     const CLASS_NAME: &str = "OledHelperNativeTextPreview";
@@ -685,6 +684,12 @@ mod native_preview {
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
             lpszClassName: PCWSTR(name.as_ptr()),
+            // The preview sits over the Text tab and must not swallow the
+            // cursor: Windows hides the cursor over a window whose class has
+            // no cursor (NULL hCursor, no WM_SETCURSOR handler), the same
+            // pattern that hid the pointer over the taskbar dimmer overlay.
+            // IDC_ARROW is a system stock cursor, no ownership to manage.
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
             ..Default::default()
         };
         unsafe {

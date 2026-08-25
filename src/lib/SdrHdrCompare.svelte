@@ -290,6 +290,7 @@
   <div class="sdr-hdr-canvas-wrap">
     <canvas
       bind:this={canvas}
+      role="img"
       aria-label="SDR white level comparison ramp: top row SDR content, bottom row HDR reference, over shared nits levels"></canvas>
     <div class="sdr-hdr-column-labels">
       {#each COLUMN_NITS as nits, i}
