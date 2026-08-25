@@ -4574,14 +4574,16 @@ select:focus-visible,
   color: var(--text-weak);
   margin: 0;
 }
-/* Custom renderer coverage: one compact track with three equal slots. The
-   labels stay readable, and the active fill moves without changing width. */
+/* Custom renderer coverage: one compact track with three equal slots, sized
+   like the Detection Method switch in Settings instead of stretching across
+   the whole panel. The labels stay readable, and the active fill moves
+   without changing width. */
 .text-render-scope-inline {
   --track-height: 24px;
   position: relative;
   display: flex;
   align-items: stretch;
-  width: 100%;
+  width: 240px;
   min-width: 0;
   gap: 2px;
   padding: 3px;

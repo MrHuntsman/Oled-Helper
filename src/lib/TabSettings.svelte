@@ -209,8 +209,8 @@
 
   <button class="settings-row" onclick={toggleSkipFavoriteConfirmation}>
     <div class="settings-row-text">
-      <span class="settings-row-label">Skip confirmation for trusted favorites</span>
-      <span class="settings-row-desc">Previously confirmed favorites on the same monitor apply faster. Recovery protection remains enabled.</span>
+      <span class="settings-row-label">Skip favorites confirmations</span>
+      <span class="settings-row-desc">After the first confirmation it won't ask again on the same monitor.</span>
     </div>
     <div class="pill-wrap">
       <span class={`pill${appSettings.skipFavoriteConfirmation ? '' : ' off'}`} aria-hidden="true"></span>

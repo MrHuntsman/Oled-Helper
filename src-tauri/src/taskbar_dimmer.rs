@@ -116,6 +116,12 @@ mod platform {
     // stale cache can't persist if an event is ever missed (e.g. Explorer
     // recreating the taskbar with a new HWND mid-transition).
     const TASKBAR_CACHE_CATCHALL_MS: u64 = 5000;
+    // After a display-change broadcast the taskbar may not have reached its
+    // final geometry yet (Explorer settles a beat later). Refresh the cache
+    // on every tick for this long so the overlay tracks the taskbar to its
+    // final position instead of sampling once and then waiting out the
+    // periodic cadence.
+    const DISPLAY_CHANGE_SETTLE_MS: u64 = 500;
     const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
     // Fullscreen detection runs the expensive Win32 foreground-window chain
     // (GetForegroundWindow → GetWindowThreadProcessId → GetWindowRect →
@@ -313,6 +319,15 @@ mod platform {
     // WinEvent hook) keeps the plain timer cadence; the flag is simply
     // never set there.
     static TASKBAR_CACHE_RECHECK_REQUESTED: AtomicBool = AtomicBool::new(false);
+    // Set by the display-change notification (WM_DISPLAYCHANGE / WM_DEVICECHANGE,
+    // wired from lib.rs). Unlike TASKBAR_CACHE_RECHECK_REQUESTED this is consumed
+    // in BOTH hover modes, so a resolution/DPI change repositions the overlay
+    // immediately even in poll mode, where the WinEvent flag is never set.
+    static TASKBAR_CACHE_FORCE_REFRESH: AtomicBool = AtomicBool::new(false);
+    // Timestamp of the last display-change broadcast; while younger than
+    // DISPLAY_CHANGE_SETTLE_MS the taskbar cache refreshes on every tick so the
+    // overlay follows the taskbar through the transition to its final geometry.
+    static DISPLAY_CHANGE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
     // After a foreground/minimize transition (Show Desktop, task switch),
     // Explorer can reorder the topmost band, leaving the overlay behind the
     // taskbar. This counter forces the next few z-order repairs to run
@@ -1676,6 +1691,25 @@ mod platform {
         }
     }
 
+    // React to a Windows display-change broadcast (WM_DISPLAYCHANGE /
+    // WM_DEVICECHANGE, wired from lib.rs). During a resolution/DPI change the
+    // taskbar moves to its new geometry, and the periodic cache cadence (1s
+    // in poll mode, the 5s catch-all in event mode) would otherwise leave the
+    // overlay floating at the old position for a visible beat. Force an
+    // immediate refresh and reposition, and keep refreshing through the
+    // settle window so the overlay tracks the taskbar to its final position.
+    pub fn on_display_change() {
+        TASKBAR_CACHE_FORCE_REFRESH.store(true, Ordering::Relaxed);
+        FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
+        *DISPLAY_CHANGE_SINCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        // Explorer can reorder the topmost band after a display change; the
+        // forced-repair window re-asserts the overlay's position and z-order
+        // a few times at the 250ms cadence, covering a late shell reflow.
+        request_forced_repairs();
+        post_dimmer_tick();
+        post_dimmer_repair();
+    }
+
     // WH_MOUSE_LL callback. The system delivers every mouse event to this
     // procedure on the installing thread, which is what makes hover response
     // instant. The hover hit-test itself uses GetCursorPos rather than
@@ -1983,14 +2017,31 @@ mod platform {
                 // regular timer cadence.
                 let event_driven_cache = PREFER_EVENT_HOVER.load(Ordering::Relaxed)
                     && ELEVATION_WINEVENT_HOOK.load(Ordering::Acquire) != 0;
-                let cache_recheck_requested = event_driven_cache
-                    && TASKBAR_CACHE_RECHECK_REQUESTED.swap(false, Ordering::Relaxed);
+                // The display-change notification forces a refresh in both
+                // modes; the WinEvent flag below only ever fires in event
+                // mode (poll mode has no hook to set it).
+                let force_recheck = TASKBAR_CACHE_FORCE_REFRESH.swap(false, Ordering::Relaxed);
+                let cache_recheck_requested = force_recheck
+                    || (event_driven_cache
+                        && TASKBAR_CACHE_RECHECK_REQUESTED.swap(false, Ordering::Relaxed));
                 let cache_interval = if event_driven_cache {
                     TASKBAR_CACHE_CATCHALL_MS
                 } else {
                     TASKBAR_CACHE_REFRESH_MS
                 };
+                // Right after a display change the taskbar can still be
+                // settling; refresh on every tick for the settle window so
+                // the overlay tracks it to its final geometry instead of
+                // sampling once and then waiting out the cadence.
+                let settling = DISPLAY_CHANGE_SINCE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|since| {
+                        (now.duration_since(since).as_millis() as u64) < DISPLAY_CHANGE_SETTLE_MS
+                    })
+                    .unwrap_or(false);
                 let refresh_cache = fade.cached_taskbar.is_none()
+                    || settling
                     || cache_recheck_requested
                     || now
                         .duration_since(fade.last_taskbar_cache_refresh)
@@ -1999,8 +2050,12 @@ mod platform {
                 if refresh_cache {
                     let trigger = if fade.cached_taskbar.is_none() {
                         "initial"
+                    } else if force_recheck {
+                        "display"
                     } else if cache_recheck_requested {
                         "event"
+                    } else if settling {
+                        "settle"
                     } else if event_driven_cache {
                         "catchall"
                     } else {
@@ -2684,6 +2739,7 @@ mod platform {
     pub fn sync_detection(_mode: &str, _poll_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
     pub fn set_flyout_hwnd(_raw: isize) {}
+    pub fn on_display_change() {}
     pub fn fullscreen_active_on_monitor(_hmonitor: u32) -> bool {
         false
     }
@@ -2855,6 +2911,13 @@ pub fn shutdown() {
 // z-order repair never fights the flyout for the front of the topmost band.
 pub fn set_flyout_hwnd(raw: isize) {
     platform::set_flyout_hwnd(raw);
+}
+
+// Called by lib.rs's display-change notification so a resolution/DPI change
+// repositions the overlay immediately instead of waiting out the periodic
+// taskbar-cache cadence.
+pub fn on_display_change() {
+    platform::on_display_change();
 }
 
 

@@ -24,8 +24,8 @@
     { title: 'Black Crush Tweak', keys: ['toggle_black_crush', 'decrease_black_crush', 'increase_black_crush', 'hold_compare'] },
     { title: 'Taskbar Dimmer', keys: ['toggle_taskbar_dimmer'] },
     { title: 'Screen Dimmer', keys: ['toggle_screen_dimmer'] },
-    { title: 'System', keys: ['toggle_hdr', 'turn_off_display'] },
     { title: 'Windows HDR', keys: ['decrease_sdr_brightness', 'increase_sdr_brightness'] },
+    { title: 'Misc', keys: ['toggle_hdr', 'turn_off_display'] },
   ];
 
   // Capturing state: the key of the row currently listening for a combo.

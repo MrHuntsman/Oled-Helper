@@ -181,6 +181,12 @@ mod display_change_events {
             // plugged in), so re-key the dimmer maps to the current keys
             // before the watchers look them up again.
             crate::taskbar_dimmer::rekey_profiles();
+            // The taskbar moves to its new geometry during a resolution/DPI
+            // change; poke the dimmer so the overlay repositions immediately
+            // instead of waiting out the periodic taskbar-cache cadence (1s
+            // in poll mode, the 5s catch-all in event mode), which left it
+            // floating at the old position for a visible beat.
+            crate::taskbar_dimmer::on_display_change();
             crate::power::rekey_profiles();
         }
         let _ = app.emit("display-changed", source);
