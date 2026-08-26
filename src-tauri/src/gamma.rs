@@ -242,6 +242,18 @@ pub fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(),
     }
     state.desired.store(black_lift, Ordering::Relaxed);
     crate::hotkeys::update_hold_restore_locked(black_lift);
+    // Keep the primary monitor's per-monitor entry in step with the global
+    // value. The frontend routes the primary through apply_gamma_ramp_for
+    // whenever a monitor is selected, so a later global write (tray menu,
+    // no-selection fallback) must overwrite that entry, otherwise the safety
+    // thread re-applies the stale per-monitor lift within five seconds.
+    if let Some(primary) = crate::monitors::all_monitors().iter().find(|m| m.primary) {
+        let mut map = state
+            .per_monitor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        map.insert(crate::monitors::monitor_key(primary), black_lift);
+    }
     // Reflect the new state in the external gamma watch record (first
     // non-default transition writes the record and spawns the child).
     crate::gamma_watch::sync(
@@ -314,6 +326,17 @@ pub fn apply_gamma_ramp_for(
         // the screen protector fall back to the primary/global profile and
         // could reintroduce an old lift on a monitor intentionally set to 0.
         map.insert(key, black_lift);
+    }
+    // The primary's lift is authoritative in `desired` as well, not just the
+    // per-monitor table: hold-to-compare and the safety thread read the
+    // global value, so a per-monitor write targeting the primary must keep
+    // it in sync. Otherwise a stale non-zero `desired` (seeded at startup or
+    // left by an earlier global write) survives a disable or zero through
+    // this path, and hold-to-compare keeps switching the primary's gamma
+    // while the tweak is off.
+    if monitor.primary {
+        state.desired.store(black_lift, Ordering::Relaxed);
+        crate::hotkeys::update_hold_restore_locked(black_lift);
     }
     // Reflect the new state in the external gamma watch record.
     crate::gamma_watch::sync(

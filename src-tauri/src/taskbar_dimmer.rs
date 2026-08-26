@@ -78,6 +78,7 @@ mod platform {
     use windows::core::{BOOL, PCWSTR};
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, MonitorFromWindow,
         BLACK_BRUSH, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
@@ -124,14 +125,34 @@ mod platform {
     const DISPLAY_CHANGE_SETTLE_MS: u64 = 500;
     const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
     // Fullscreen detection runs the expensive Win32 foreground-window chain
-    // (GetForegroundWindow → GetWindowThreadProcessId → GetWindowRect →
-    // MonitorFromWindow → GetMonitorInfoW → GetWindowLongPtrW). It is
+    // (GetForegroundWindow → GetWindowThreadProcessId → extended frame
+    // bounds → MonitorFromWindow → GetMonitorInfoW → style). It is
     // decoupled from the fade animation tick: the result is cached, so the
     // fade timer can stay as fast as possible without paying the detection
     // cost every tick. This cadence is the detection source in poll hover
-    // mode; in event hover mode the WinEvent hook replaces the timer
-    // entirely, and this timer only takes over if the hook fails to install.
+    // mode; in event hover mode the WinEvent hook is the primary source and
+    // this timer drops to a slow catch-all (FULLSCREEN_CATCHALL_MS) that
+    // only exists to self-heal a missed event, never to poll at the full
+    // cadence.
     const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
+    // Event-mode safety net for fullscreen detection. Even with the WinEvent
+    // hook installed, a borderless transition can slip past every subscribed
+    // event (the events fire while the window is mid-resize with no follow-up),
+    // leaving the overlay floating above the taskbar, which makes the shell
+    // keep the taskbar visible over the game for the whole session. In event
+    // mode the fullscreen check drops to this slow cadence so a missed event
+    // self-heals within a second; poll mode keeps the faster cadence above.
+    // The chain only runs when the foreground changed since the last check or
+    // a window was covering the monitor (see the gate in update_fade), so a
+    // settled desktop never pays for the catch-all at all.
+    const FULLSCREEN_CATCHALL_MS: u64 = 1000;
+    // Slack (logical px) for the coverage comparison. Borderless games are
+    // routinely a pixel or two off the monitor rect (DPI rounding at
+    // 125%/150% scaling, invisible DWM resize borders). Only the chrome-less
+    // branch uses this tolerance; the chrome-retaining exact-monitor branch
+    // stays strict, so a maximized or near-maximized window is never
+    // reclassified.
+    const FULLSCREEN_RECT_TOLERANCE: i32 = 8;
     const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
     const EVENT_SYSTEM_MENUPOPUPSTART: u32 = 0x0004;
     const EVENT_SYSTEM_MENUPOPUPEND: u32 = 0x0005;
@@ -180,8 +201,16 @@ mod platform {
         last_poll_tick: Option<Instant>,
         last_poll_gap_diagnostic: Option<Instant>,
         // Cached fullscreen state, refreshed at FULLSCREEN_CHECK_INTERVAL_MS
-        // so the expensive detection chain doesn't run on every animation tick.
+        // (poll mode) or FULLSCREEN_CATCHALL_MS (event mode) so the expensive
+        // detection chain doesn't run on every animation tick.
         fullscreen_active: bool,
+        // Foreground HWND (raw) the last fullscreen check ran against, and
+        // whether that window covered the monitor. Event mode's catch-all
+        // only re-runs the Win32 chain when one of these changed meaningfully
+        // (foreground switched, or a covering window was seen), so a settled
+        // desktop costs nothing between foreground switches.
+        last_fullscreen_foreground: isize,
+        last_fullscreen_covers: bool,
         last_fullscreen_check: Instant,
         // Raw HWND value keeps this shared state Send + Sync; reconstruct the
         // HWND only at the point where a Win32 call is made.
@@ -1054,6 +1083,8 @@ mod platform {
             last_poll_tick: None,
             last_poll_gap_diagnostic: None,
             fullscreen_active: false,
+            last_fullscreen_foreground: 0,
+            last_fullscreen_covers: false,
             last_fullscreen_check: Instant::now(),
             cached_taskbar: None,
             last_taskbar_cache_refresh: Instant::now(),
@@ -1199,12 +1230,34 @@ mod platform {
         overlay: Option<HWND>,
         target_monitor: Option<u32>,
     ) -> bool {
+        fullscreen_sample(overlay, target_monitor)
+            .map(|sample| sample.active)
+            .unwrap_or(false)
+    }
+
+    // Result of one fullscreen detection pass. Kept as a struct instead of a
+    // bare bool so the verbose diagnostic can report exactly which part of
+    // the chain decided the result; only the active flag is read by the
+    // callers, the remaining fields are diagnostics.
+    struct FullscreenSample {
+        active: bool,
+        covers: bool,
+        has_chrome: bool,
+        is_maximized: bool,
+        frame_rect: RECT,
+        monitor_rect: RECT,
+    }
+
+    fn fullscreen_sample(
+        overlay: Option<HWND>,
+        target_monitor: Option<u32>,
+    ) -> Option<FullscreenSample> {
         unsafe {
             let foreground = GetForegroundWindow();
             if foreground.0.is_null()
                 || overlay.map(|hwnd| foreground == hwnd).unwrap_or(false)
             {
-                return false;
+                return None;
             }
 
             let mut process_id = 0u32;
@@ -1213,7 +1266,7 @@ mod platform {
                 Some(&mut process_id),
             );
             if process_id == 0 || IsIconic(foreground).as_bool() {
-                return false;
+                return None;
             }
 
             // Fullscreen suppression is monitor-local. The foreground window
@@ -1225,16 +1278,16 @@ mod platform {
             // window.
             let foreground_monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
             if foreground_monitor.0.is_null() {
-                return false;
+                return None;
             }
             if let Some(target_monitor) = target_monitor {
                 if foreground_monitor.0 as usize as u32 != target_monitor {
-                    return false;
+                    return None;
                 }
             } else if let Some(overlay) = overlay {
                 let overlay_monitor = MonitorFromWindow(overlay, MONITOR_DEFAULTTONEAREST);
                 if overlay_monitor.0.is_null() || foreground_monitor != overlay_monitor {
-                    return false;
+                    return None;
                 }
             }
 
@@ -1245,42 +1298,91 @@ mod platform {
             // a real window. Exclude it explicitly.
             if let Some(class) = window_class_name(foreground) {
                 if class == "Progman" || class == "WorkerW" {
-                    return false;
+                    return None;
                 }
             }
 
-            let mut window_rect = RECT::default();
-            if GetWindowRect(foreground, &mut window_rect).is_err() {
-                return false;
-            }
             let monitor = MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST);
             if monitor.0.is_null() {
-                return false;
+                return None;
             }
             let mut monitor_info = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
             };
             if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
-                return false;
+                return None;
+            }
+            let monitor_rect = monitor_info.rcMonitor;
+
+            // Visible bounds. Prefer DWM's extended frame bounds: they exclude
+            // the invisible resize border, so a borderless game resized to the
+            // exact monitor size compares cleanly even when GetWindowRect
+            // reports the hidden border (which can differ by a few pixels).
+            // Falls back to GetWindowRect when DWM cannot report (composition
+            // disabled, remote session).
+            let mut frame_rect = RECT::default();
+            let frame_ok = DwmGetWindowAttribute(
+                foreground,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut frame_rect as *mut RECT as *mut c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .is_ok()
+                && frame_rect.right > frame_rect.left
+                && frame_rect.bottom > frame_rect.top;
+            if !frame_ok {
+                if GetWindowRect(foreground, &mut frame_rect).is_err() {
+                    return None;
+                }
             }
 
-            let covers_monitor = window_rect.left <= monitor_info.rcMonitor.left
-                && window_rect.top <= monitor_info.rcMonitor.top
-                && window_rect.right >= monitor_info.rcMonitor.right
-                && window_rect.bottom >= monitor_info.rcMonitor.bottom;
-            if !covers_monitor {
-                return false;
+            // Tolerates windows a few pixels short of the monitor (DPI
+            // rounding at 125%/150% scaling is routinely off by a pixel or
+            // two) and windows that overhang it (invisible borders, shadow).
+            let tolerance = FULLSCREEN_RECT_TOLERANCE;
+            let covers = frame_rect.left <= monitor_rect.left + tolerance
+                && frame_rect.top <= monitor_rect.top + tolerance
+                && frame_rect.right >= monitor_rect.right - tolerance
+                && frame_rect.bottom >= monitor_rect.bottom - tolerance;
+
+            // Most foreground windows never cover the monitor, so skip the
+            // style read entirely unless the frame covers it (or verbose
+            // diagnostics want the full picture).
+            if !covers && !VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                return Some(FullscreenSample {
+                    active: false,
+                    covers,
+                    has_chrome: false,
+                    is_maximized: false,
+                    frame_rect,
+                    monitor_rect,
+                });
             }
 
+            // The classification is the original rule: a chrome-less window
+            // covering the monitor is fullscreen, and a window that keeps its
+            // caption/frame styles only counts when it sits exactly on the
+            // monitor bounds unmaximized. The tolerance above only relaxes
+            // the coverage gate for chrome-less windows; the exact-monitor
+            // branch stays strict, so maximized and near-maximized windows
+            // are never reclassified.
             let style = GetWindowLongPtrW(foreground, GWL_STYLE) as u32;
-            let has_window_chrome = (style & (WS_CAPTION.0 | WS_THICKFRAME.0)) != 0;
-            let exact_monitor = window_rect.left == monitor_info.rcMonitor.left
-                && window_rect.top == monitor_info.rcMonitor.top
-                && window_rect.right == monitor_info.rcMonitor.right
-                && window_rect.bottom == monitor_info.rcMonitor.bottom;
+            let has_chrome = (style & (WS_CAPTION.0 | WS_THICKFRAME.0)) != 0;
+            let exact_monitor = frame_rect.left == monitor_rect.left
+                && frame_rect.top == monitor_rect.top
+                && frame_rect.right == monitor_rect.right
+                && frame_rect.bottom == monitor_rect.bottom;
             let is_maximized = (style & WS_MAXIMIZE.0) != 0;
-            !has_window_chrome || (exact_monitor && !is_maximized)
+            let active = covers && (!has_chrome || (exact_monitor && !is_maximized));
+            Some(FullscreenSample {
+                active,
+                covers,
+                has_chrome,
+                is_maximized,
+                frame_rect,
+                monitor_rect,
+            })
         }
     }
 
@@ -1898,20 +2000,36 @@ mod platform {
             let Some(fade) = fades.get_mut(&hwnd_raw) else {
                 return;
             };
-            // Event mode: the WinEvent hook is the sole fullscreen detector.
-            // The check runs only when an event (foreground switch, move/
-            // size, minimize/restore, location change) requests a recheck ,
-            // no timer polling at all. Poll mode keeps the timer cadence;
-            // event mode falls back to the timer only when the hook failed
-            // to install so detection never silently stops.
+            // Event mode: the WinEvent hook is the primary detector, but a
+            // slow catch-all keeps the check alive even there so a borderless
+            // transition that slips past every event self-heals within a
+            // second. Poll mode keeps the faster cadence. The cadence only
+            // gates when the expensive Win32 chain runs; every tick reads
+            // the cached result.
             let event_driven = PREFER_EVENT_HOVER.load(Ordering::Relaxed)
                 && ELEVATION_WINEVENT_HOOK.load(Ordering::Acquire) != 0;
             let recheck_requested =
                 event_driven && FULLSCREEN_RECHECK_REQUESTED.swap(false, Ordering::Relaxed);
-            let timer_due = !event_driven
-                && now.duration_since(fade.last_fullscreen_check).as_millis() as u64
-                    >= FULLSCREEN_CHECK_INTERVAL_MS;
-            if recheck_requested || timer_due {
+            let fullscreen_cadence_ms = if event_driven {
+                FULLSCREEN_CATCHALL_MS
+            } else {
+                FULLSCREEN_CHECK_INTERVAL_MS
+            };
+            let timer_due =
+                now.duration_since(fade.last_fullscreen_check).as_millis() as u64
+                    >= fullscreen_cadence_ms;
+            // Event mode's catch-all only re-runs the expensive chain when
+            // something might have changed: the foreground switched since the
+            // last check, or the last checked window covered the monitor (a
+            // fullscreen transition in progress). A settled desktop with a
+            // normal foreground window costs nothing between foreground
+            // switches. Poll mode keeps checking unconditionally, that is its
+            // whole contract.
+            let foreground_raw = unsafe { GetForegroundWindow() }.0 as isize;
+            let catchall_relevant = !event_driven
+                || foreground_raw != fade.last_fullscreen_foreground
+                || fade.last_fullscreen_covers;
+            if recheck_requested || (timer_due && catchall_relevant) {
                 // since_last_ms shows the gap between consecutive rechecks ,
                 // during a slow multi-step transition it grows to the full
                 // transition tail before the active flag finally drops.
@@ -1925,14 +2043,20 @@ mod platform {
                 // result back.
                 let _ = fade;
                 drop(fades);
-                let active =
-                    FULLSCREEN_DETECTION.load(Ordering::Relaxed)
-                        && fullscreen_app_active_for_monitor(Some(hwnd), None);
+                let sample = if FULLSCREEN_DETECTION.load(Ordering::Relaxed) {
+                    fullscreen_sample(Some(hwnd), None)
+                } else {
+                    None
+                };
+                let active = sample.as_ref().map(|s| s.active).unwrap_or(false);
                 if let Some(f) = fades_map()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get_mut(&hwnd_raw)
                 {
+                    f.last_fullscreen_foreground = foreground_raw;
+                    f.last_fullscreen_covers =
+                        sample.as_ref().map(|s| s.covers).unwrap_or(false);
                     f.fullscreen_active = active;
                 }
                 if VERBOSE_LOGGING.load(Ordering::Relaxed) {
@@ -1940,11 +2064,20 @@ mod platform {
                     // desktop (WorkerW/Progman) must never count as fullscreen.
                     let fg_class =
                         window_class_name(unsafe { GetForegroundWindow() }).unwrap_or_default();
-                    emit_runtime("info", format!(
-                        "[taskbar-dimmer] fullscreen_check trigger={} active={} prev={} since_last_ms={:.1} fg_class={}",
-                        if recheck_requested { "event" } else { "timer" },
-                        active, prev_active, check_gap_ms, fg_class,
-                    ));
+                    match &sample {
+                        Some(s) => emit_runtime("info", format!(
+                            "[taskbar-dimmer] fullscreen_check trigger={} active={} prev={} since_last_ms={:.1} fg_class={} covers={} chrome={} maximized={} frame={} monitor={}",
+                            if recheck_requested { "event" } else { "timer" },
+                            active, prev_active, check_gap_ms, fg_class,
+                            s.covers, s.has_chrome, s.is_maximized,
+                            rect_text(Some(s.frame_rect)), rect_text(Some(s.monitor_rect)),
+                        )),
+                        None => emit_runtime("info", format!(
+                            "[taskbar-dimmer] fullscreen_check trigger={} active={} prev={} since_last_ms={:.1} fg_class={} rejected",
+                            if recheck_requested { "event" } else { "timer" },
+                            active, prev_active, check_gap_ms, fg_class,
+                        )),
+                    }
                 }
                 active
             } else {

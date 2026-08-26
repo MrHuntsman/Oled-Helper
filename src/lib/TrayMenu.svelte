@@ -394,10 +394,15 @@
   // Read the current SDR→HDR mode the same way the main app's Windows HDR
   // tab derives it: Auto HDR state from the registry, RTX HDR state from the
   // NVIDIA driver (only when the primary GPU is NVIDIA). Both read commands
-  // are registered for this window's IPC.
+  // are registered for this window's IPC. Uses the CACHED vendor query
+  // (query_vendor_display_info, 60 s TTL) instead of the fresh one: the tray
+  // opens on demand, and paying a full NVAPI/ADLX session query per open
+  // made it slower than it needs to be. The display-change path invalidates
+  // the driver context caches, so the first open after a resolution/DPI
+  // change still re-queries fresh.
   async function loadHdrEnhancementMode() {
     try {
-      const vendorInfo = await invoke('refresh_vendor_display_info');
+      const vendorInfo = await invoke('query_vendor_display_info');
       trayHdrIsNvidia = vendorInfo?.vendor === 'nvidia';
       const autoEnabled = !!await invoke('get_auto_hdr_enabled');
       let rtxEnabled = false;

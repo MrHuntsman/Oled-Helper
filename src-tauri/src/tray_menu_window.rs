@@ -307,7 +307,11 @@ fn taskbar_position(
 // Re-anchors the window to the taskbar edge. Called when the menu opens
 // (see toggle below). anchor_x_px is the tray icon's click x-position in
 // physical pixels, used to center the visible base-menu card on the icon
-// when the taskbar runs horizontally (see taskbar_position).
+// when the taskbar runs horizontally (see taskbar_position). scale is the
+// primary monitor's effective DPI scale factor, resolved ONCE per open by
+// toggle() and shared by both passes: the monitor's DPI is stable within
+// one open, so re-querying it per pass only multiplied the transient
+// GetDpiForMonitor failures after a display change into visible blocking.
 //
 // The window's own scale factor can lag the monitor's after a display-mode
 // switch (the first open after a resolution change landed at the wrong y for
@@ -332,10 +336,14 @@ fn taskbar_position(
 // calls this with resize=false once more AFTER show(), when the transition
 // is complete and the position sticks.
 #[cfg(target_os = "windows")]
-fn anchor_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>, resize: bool) {
+fn anchor_to_taskbar(
+    window: &tauri::WebviewWindow,
+    anchor_x_px: Option<i32>,
+    resize: bool,
+    scale: f64,
+) {
     let Ok(hwnd) = window.hwnd() else { return };
     let (width_px, height_px) = if resize {
-        let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
         let width = (FULL_WIDTH * scale).round().max(1.0) as u32;
         let height = (FULL_HEIGHT * scale).round().max(1.0) as u32;
         // Keep Tauri's size bookkeeping in sync so the post-show pass's
@@ -350,7 +358,6 @@ fn anchor_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>, re
             Err(_) => return,
         }
     };
-    let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
     let card_width_px = (BASE_WIDTH * scale).round() as i32;
     let Some((x, y)) = taskbar_position(
         width_px as i32,
@@ -373,7 +380,12 @@ fn anchor_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>, re
 }
 
 #[cfg(not(target_os = "windows"))]
-fn anchor_to_taskbar(_window: &tauri::WebviewWindow, _anchor_x_px: Option<i32>, _resize: bool) {}
+fn anchor_to_taskbar(
+    _window: &tauri::WebviewWindow,
+    _anchor_x_px: Option<i32>,
+    _resize: bool,
+    _scale: f64,
+) {}
 
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(LABEL) {
@@ -494,9 +506,17 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     // synchronous main-thread block, so no intermediate frame is ever
     // painted at the stale position.
     let anchor = Some(anchor_x.round() as i32);
-    anchor_to_taskbar(&window, anchor, true);
+    // Resolve the monitor's effective DPI ONCE per open and share it between
+    // both anchor passes. Each pass used to re-query GetDpiForMonitor up to
+    // twice (size pass + card width), and right after a resolution/DPI
+    // change that query can transiently fail, so the first open after a
+    // change blocked for up to ~1.2 s (6 attempts x 50 ms x 4 queries)
+    // before the menu even appeared. The single query keeps its retry
+    // budget, so the fresh-DPI anchoring after a mode switch still works.
+    let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
+    anchor_to_taskbar(&window, anchor, true, scale);
     let _ = window.show();
-    anchor_to_taskbar(&window, anchor, false);
+    anchor_to_taskbar(&window, anchor, false, scale);
     let _ = window.set_focus();
 }
 

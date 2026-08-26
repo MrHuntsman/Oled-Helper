@@ -331,6 +331,17 @@ fn refresh_vendor_display_info() -> vendor_info::VendorDisplayInfo {
     vendor_info::query_vendor_display_info_fresh()
 }
 
+// Cached variant for low-frequency, informational reads (the tray menu's
+// HDR-mode row). Unlike refresh_vendor_display_info this serves the vendor
+// cache when it is warm, so a tray open does not pay a full NVAPI/ADLX
+// session query every time. The display-change path invalidates the driver
+// context caches, so the first read after a topology/mode change still
+// re-queries fresh.
+#[tauri::command]
+fn query_vendor_display_info() -> vendor_info::VendorDisplayInfo {
+    vendor_info::query_vendor_display_info()
+}
+
 // Cheap NVIDIA reference-mode probe for the Black Crush tab. Unlike
 // refresh_vendor_display_info this does not run the full NVAPI color/VRR
 // query chain; it reads the cached driver-registry flag (5 s TTL), so the tab
@@ -850,6 +861,7 @@ pub fn run() {
             get_display_info,
             get_display_info_for,
             refresh_vendor_display_info,
+            query_vendor_display_info,
             get_nvidia_reference_mode,
             vendor_info::get_rtx_hdr_settings_state,
             set_hdr_enhancement_mode,
