@@ -627,8 +627,15 @@ fn apply_hdr_mode(mode: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_hdr_enhancement_mode(mode: String) -> Result<(), String> {
-    apply_hdr_mode(&mode)
+fn set_hdr_enhancement_mode(app: AppHandle, mode: String) -> Result<(), String> {
+    let result = apply_hdr_mode(&mode);
+    if result.is_ok() {
+        // The HDR enhancement mode has no settings-change broadcast of its
+        // own, so notify listeners (the tray's mode selector) when it
+        // changes instead of leaving them to poll.
+        let _ = app.emit("hdr-mode-changed", mode);
+    }
+    result
 }
 
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
@@ -839,12 +846,16 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
     let gamma_desired = Arc::new(AtomicI32::new(0));
+    let gamma_per_monitor = Arc::new(Mutex::new(HashMap::new()));
+    let gamma_brightness = Arc::new(Mutex::new(HashMap::new()));
     crate::hotkeys::set_current_lift(gamma_desired.clone());
+    crate::hotkeys::set_per_monitor_lifts(gamma_per_monitor.clone());
+    crate::hotkeys::set_screen_dim_brightness(gamma_brightness.clone());
     builder
         .manage(gamma::GammaState {
             desired: gamma_desired,
-            per_monitor: Arc::new(Mutex::new(HashMap::new())),
-            screen_dim_brightness: Arc::new(Mutex::new(HashMap::new())),
+            per_monitor: gamma_per_monitor,
+            screen_dim_brightness: gamma_brightness,
             shutdown: Arc::new(gamma::GammaShutdown {
                 requested: AtomicBool::new(false),
                 wake: Condvar::new(),
@@ -888,6 +899,7 @@ pub fn run() {
             hotkeys::set_hotkey,
             hotkeys::reset_hotkeys,
             taskbar_dimmer::set_taskbar_dimmer,
+            taskbar_dimmer::set_taskbar_dimmer_enabled_for_all,
             taskbar_dimmer::set_taskbar_dimmer_verbose_logging,
             taskbar_dimmer::set_taskbar_dimmer_detection,
             taskbar_dimmer::set_taskbar_dimmer_suspended,
@@ -1095,11 +1107,11 @@ pub fn run() {
             // legacy fields seed the primary monitor so the tray menu (which
             // has no monitor selector) reads real values on first open.
             {
-                let dimmer_state = app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
-                *dimmer_state
-                    .enabled
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = saved_config.taskbar_dimmer_enabled;
+                // The taskbar dimmer's on/off is per monitor (it lives in
+                // each DimmerProfile), so there is no global master toggle to
+                // seed. The flat taskbar_dimmer_enabled field remains the
+                // legacy/primary fallback and seeds the primary profile below
+                // when no per-monitor entries exist yet.
                 let mut profiles = crate::taskbar_dimmer::profiles_map()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
@@ -1108,6 +1120,23 @@ pub fn run() {
                 // map matches the frontend's keys before it rewrites config.
                 for (key, profile) in &saved_config.taskbar_dimmer_profiles {
                     profiles.insert(crate::monitors::canonical_profile_id(key), profile.clone());
+                }
+                // Legacy migration: configs written before on/off became per
+                // monitor had one global flat flag (taskbar_dimmer_enabled)
+                // controlling every taskbar, and their per-monitor profile
+                // entries carry no `enabled` field (so they deserialize to
+                // off). If that legacy flag was on and no profile is on yet,
+                // propagate it to every profile so an upgrade doesn't
+                // silently turn off the user's dimmers. Under the new schema
+                // this can't over-migrate: the frontend keeps the flat field
+                // equal to the primary's enabled, so a config with all
+                // profiles off would have the flat flag off too.
+                if saved_config.taskbar_dimmer_enabled
+                    && !profiles.values().any(|p| p.enabled)
+                {
+                    for profile in profiles.values_mut() {
+                        profile.enabled = true;
+                    }
                 }
                 if profiles.is_empty() {
                     // Legacy config (or first run): seed the primary monitor's
@@ -1119,6 +1148,7 @@ pub fn run() {
                         .map(|m| m.profile_id.clone());
                     if let Some(key) = primary_key {
                         let entry = profiles.entry(key).or_default();
+                        entry.enabled = saved_config.taskbar_dimmer_enabled;
                         entry.opacity = saved_config.taskbar_dimmer_opacity.clamp(0.0, 1.0);
                         entry.fade_in_duration_ms = saved_config.taskbar_dimmer_fade_in_duration_ms;
                         entry.fade_out_duration_ms =

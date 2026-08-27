@@ -22,6 +22,9 @@
 
   let trayBlack = $state({ enabled: true, adjustment: 0 });
   let trayBlackProfiles = $state({});
+  // The monitor the main window's Black Crush hotkeys act on (its bottom-bar
+  // selection), shown so the target is discoverable while the app is hidden.
+  let hotkeyTargetLabel = $state('');
   let trayLegacyBlackProfiles = $state({});
   let traySdrBrightness = $state({ available: false, nits: null });
   // App version for the tray header, read the same way App.svelte reads it
@@ -125,6 +128,9 @@
             ...(cfg?.taskbar_dimmer_profiles && typeof cfg.taskbar_dimmer_profiles === 'object' ? cfg.taskbar_dimmer_profiles : {}),
             ...(trayDimmerMonKey() ? {
               [trayDimmerMonKey()]: {
+                // The primary's on/off lives in its profile now, so persist
+                // it here too or a tray toggle wouldn't survive a reload.
+                enabled: dimmerSettings.enabled,
                 opacity: dimmerSettings.opacity,
                 fadeInDurationMs: dimmerSettings.fadeInDurationMs,
                 fadeOutDurationMs: dimmerSettings.fadeOutDurationMs,
@@ -329,6 +335,24 @@
   function formatTrayBlackLevel() {
     if (!trayBlack.enabled) return 'OFF';
     return `${trayBlack.adjustment > 0 ? '+' : ''}${(trayBlack.adjustment / 10).toFixed(1)}`;
+  }
+
+  // Resolve the main window's persisted monitor selection to a display name
+  // for the "hotkeys act on" hint. Falls back to the primary.
+  async function loadHotkeyTarget() {
+    try {
+      const [cfg, list] = await Promise.all([
+        invoke('load_config'),
+        invoke('list_monitors'),
+      ]);
+      const sig = typeof cfg?.active_monitor_sig === 'string' ? cfg.active_monitor_sig : '';
+      const mon = (sig && list.find((m) => m.sig === sig)) || list.find((m) => m.primary) || null;
+      hotkeyTargetLabel = mon
+        ? (mon.friendly_name || `Monitor ${list.indexOf(mon) + 1}`)
+        : '';
+    } catch (e) {
+      hotkeyTargetLabel = '';
+    }
   }
 
   function queueBlackLevelApply() {
@@ -542,6 +566,11 @@
 
   function applyBlackLevelEvent(status) {
     if (!status) return;
+    // The tray menu is primary-scoped: ignore black-level changes the main
+    // window made on a secondary monitor (their identity won't match the
+    // primary's). The tray's own echoes carry no monitorKey and always pass.
+    const trayKey = String(display?.profile_id || display?.monitor_id || '').trim();
+    if (trayKey && status.monitorKey && trayKey !== status.monitorKey) return;
     quickInteractionVersion++;
     if (typeof status.adjustment === 'number') trayBlack.adjustment = Math.max(-150, Math.min(150, Math.round(status.adjustment)));
     if (typeof status.enabled === 'boolean') trayBlack.enabled = status.enabled;
@@ -1137,8 +1166,13 @@
     await invoke('tray_menu_quit');
   }
 
-  onMount(() => {
-    syncHitRegion();
+  // The tray keeps its data fresh while hidden so the menu opens instantly
+  // with current values: every value the tray shows has a live event backing
+  // it (taskbar dimmer, black level, SDR brightness, favorites, menu prefs,
+  // display changes, HDR status, plus backend events for HDR mode and screen
+  // dimmer settings), so there is no polling. The show-time refresh is then
+  // mostly a no-op, so nothing visibly changes after the menu appears.
+  function refreshMenuData() {
     loadDisplayInfo();
     loadFavorites();
     loadTaskbarDimmer();
@@ -1147,19 +1181,19 @@
     loadHdrEnhancementMode();
     loadSdrContentBrightness();
     pollTrayHdrStatus();
+  }
+
+  onMount(() => {
+    syncHitRegion();
+    refreshMenuData();
+    loadHotkeyTarget();
     getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
     const unlisten = listen('tray-menu-show', () => {
       openSubmenu = null;
       pendingFavoriteRemove = null;
       syncHitRegion();
-      loadDisplayInfo();
-      loadFavorites();
-      loadTaskbarDimmer();
-      loadScreenDimmer();
-      loadTrayElevation();
-      loadHdrEnhancementMode();
-      loadSdrContentBrightness();
-      pollTrayHdrStatus();
+      refreshMenuData();
+      loadHotkeyTarget();
     });
     // Follow external HDR changes (Windows hotkey, Settings, main app switch)
     // so the tray switch and SDR row stay in sync while the popup is open.
@@ -1204,6 +1238,31 @@
     const unlistenSdrMain = listen('sdr-content-brightness-main-changed', (event) => {
       applySdrBrightnessEvent(event.payload);
     });
+    // Display topology/mode changes (hotplug, resolution or refresh-rate
+    // changes, including ones made outside the app) refresh the tray's
+    // display info, black profile, and the SDR/HDR-mode rows: external SDR
+    // white-level edits arrive through the same settings-change broadcast.
+    const unlistenDisplayChanged = listen('display-changed', () => {
+      loadDisplayInfo();
+      loadSdrContentBrightness();
+      loadHdrEnhancementMode();
+    });
+    // Backend notification after set_hdr_enhancement_mode (the main
+    // window's HDR tab or the tray's own selector), so the mode row follows
+    // without polling.
+    const unlistenHdrModeChanged = listen('hdr-mode-changed', () => {
+      loadHdrEnhancementMode();
+    });
+    // Backend notification after the screen dimmer settings change (the
+    // main window's dimmer tab or the tray's own row).
+    const unlistenScreenDimmerChanged = listen('screen-dimmer-changed', () => {
+      loadScreenDimmer();
+    });
+    // The dim watcher notifies the instant the dimmed flag flips; re-read
+    // the full status like the main window's readout does.
+    const unlistenScreenDimmerState = listen('screen-dimmer-state-changed', () => {
+      loadScreenDimmer();
+    });
     return () => {
       unlisten.then((stop) => stop());
       unlistenTags.then((stop) => stop());
@@ -1215,6 +1274,10 @@
       unlistenBlackMain.then((stop) => stop());
       unlistenSdr.then((stop) => stop());
       unlistenSdrMain.then((stop) => stop());
+      unlistenDisplayChanged.then((stop) => stop());
+      unlistenHdrModeChanged.then((stop) => stop());
+      unlistenScreenDimmerChanged.then((stop) => stop());
+      unlistenScreenDimmerState.then((stop) => stop());
       try { hdrMq.removeEventListener('change', onTrayHdrChange); } catch {}
       clearTimeout(dimmerSaveTimer);
       clearTimeout(sdrApplyTimer);
@@ -1274,6 +1337,10 @@
         </div>
       </div>
     </div>
+
+    {#if hotkeyTargetLabel}
+      <div class="tray-hotkey-target">Black Crush hotkeys act on: {hotkeyTargetLabel}</div>
+    {/if}
 
     <div
       class="tray-item"

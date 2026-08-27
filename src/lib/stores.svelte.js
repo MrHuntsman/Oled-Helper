@@ -377,6 +377,7 @@ export function syncTaskbarDimmerView() {
   const key = dimmerMonKey();
   const p = key ? taskbarDimmerProfiles[key] : null;
   if (p) {
+    taskbarDimmer.enabled = p.enabled;
     taskbarDimmer.opacity = p.opacity;
     taskbarDimmer.fadeInDurationMs = p.fadeInDurationMs;
     taskbarDimmer.fadeOutDurationMs = p.fadeOutDurationMs;
@@ -391,6 +392,7 @@ function currentDimmerProfile() {
   let p = taskbarDimmerProfiles[key];
   if (!p) {
     p = {
+      enabled: TASKBAR_DIMMER_DEFAULTS.enabled,
       opacity: TASKBAR_DIMMER_DEFAULTS.opacity,
       fadeInDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs,
       fadeOutDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs,
@@ -854,6 +856,7 @@ function backfillTaskbarDimmerProfiles() {
     const key = monProfileId(primary);
     if (key) {
       taskbarDimmerProfiles[key] = {
+        enabled: taskbarDimmer.enabled,
         opacity: taskbarDimmer.opacity,
         fadeInDurationMs: taskbarDimmer.fadeInDurationMs,
         fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs,
@@ -1263,6 +1266,7 @@ export async function loadConfig(prefetchedCfg = null) {
       for (const [key, p] of Object.entries(cfg.taskbar_dimmer_profiles)) {
         if (!p || typeof p !== 'object') continue;
         taskbarDimmerProfiles[key] = {
+          enabled: typeof p.enabled === 'boolean' ? p.enabled : TASKBAR_DIMMER_DEFAULTS.enabled,
           opacity: Math.max(0, Math.min(1, Number(p.opacity) || TASKBAR_DIMMER_DEFAULTS.opacity)),
           fadeInDurationMs: Math.max(0, Math.min(1000, Math.round(Number(p.fadeInDurationMs) || TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs))),
           fadeOutDurationMs: Math.max(0, Math.min(1000, Math.round(Number(p.fadeOutDurationMs) || TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs))),
@@ -1403,7 +1407,7 @@ export function saveConfig() {
     high_nits_min: crush.highNitsMin,
     high_nits_max: crush.highNitsMax,
     high_nits_step: crush.highNitsStep,
-    taskbar_dimmer_enabled: taskbarDimmer.enabled,
+    taskbar_dimmer_enabled: primaryDimmerProfile?.enabled ?? taskbarDimmer.enabled,
     explorer_hook_enabled: textSettings.explorerHookEnabled,
     explorer_hook_all_apps: textSettings.hookAllApps,
     explorer_hook_blocklist: [...textSettings.hookBlocklist],
@@ -1630,11 +1634,13 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
   taskbarDimmer.opacity = Math.max(0, Math.min(1, opacity));
   taskbarDimmer.fadeInDurationMs = Math.max(0, Math.min(1000, Math.round(fadeInDurationMs)));
   taskbarDimmer.fadeOutDurationMs = Math.max(0, Math.min(1000, Math.round(fadeOutDurationMs)));
-  // Persist the edit into the active monitor's profile. The master enabled
-  // toggle stays global (one switch for every taskbar); the per-monitor
-  // settings are what vary.
+  // Persist the edit into the active monitor's profile. Nothing is global
+  // here: the on/off switch and the opacity/fades all live per monitor, so
+  // toggling from the Taskbar Dimmer tab turns on/off the selected monitor's
+  // own overlay.
   const profile = currentDimmerProfile();
   if (profile) {
+    profile.enabled = taskbarDimmer.enabled;
     profile.opacity = taskbarDimmer.opacity;
     profile.fadeInDurationMs = taskbarDimmer.fadeInDurationMs;
     profile.fadeOutDurationMs = taskbarDimmer.fadeOutDurationMs;
@@ -1643,15 +1649,43 @@ export function setTaskbarDimmer(enabled = taskbarDimmer.enabled, opacity = task
   pendingTaskbarDimmerUpdate = { monitorKey: dimmerMonKey(), enabled: taskbarDimmer.enabled, opacity: taskbarDimmer.opacity, fadeInDurationMs: taskbarDimmer.fadeInDurationMs, fadeOutDurationMs: taskbarDimmer.fadeOutDurationMs, persist, immediate, version: taskbarDimmerUpdateVersion };
   flushTaskbarDimmerUpdate();
 }
+// Global convenience: turn every monitor's taskbar dimmer on or off at once,
+// while keeping each monitor's own opacity/fades. Used by the nav switch and
+// the hotkey, so the app keeps a one-switch-all way to silence the dimmers
+// even though the per-monitor on/off lives in each profile now.
+export function setTaskbarDimmerEnabledForAll(enabled) {
+  taskbarDimmer.enabled = enabled;
+  // Update every monitor's profile (seeding a default profile for any
+  // monitor without one) so each monitor carries the new on/off state. A
+  // disconnected monitor's profile is covered by the second loop below.
+  for (const mon of monitors) {
+    const key = dimmerMonKey(mon);
+    if (!key) continue;
+    const p = (taskbarDimmerProfiles[key] ||= {
+      enabled: TASKBAR_DIMMER_DEFAULTS.enabled,
+      opacity: TASKBAR_DIMMER_DEFAULTS.opacity,
+      fadeInDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs,
+      fadeOutDurationMs: TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs,
+    });
+    p.enabled = enabled;
+  }
+  for (const p of Object.values(taskbarDimmerProfiles)) p.enabled = enabled;
+  saveConfig();
+  invoke('set_taskbar_dimmer_enabled_for_all', { enabled, immediate: false })
+    .then(() => emitTaskbarDimmerChanged())
+    .catch((e) => console.warn('[taskbar-dimmer] for-all update failed', e));
+}
 export function restoreTaskbarDimmerDefaults() {
   taskbarDimmer.enabled = TASKBAR_DIMMER_DEFAULTS.enabled;
   taskbarDimmer.opacity = TASKBAR_DIMMER_DEFAULTS.opacity;
   taskbarDimmer.fadeInDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs;
   taskbarDimmer.fadeOutDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs;
   taskbarDimmer.fadeLinked = TASKBAR_DIMMER_DEFAULTS.fadeLinked;
-  // Reset the active monitor's profile entry to the canonical defaults.
+  // Reset the active monitor's profile entry (on/off included, so the
+  // selected monitor's dimmer turns off too) to the canonical defaults.
   const profile = currentDimmerProfile();
   if (profile) {
+    profile.enabled = TASKBAR_DIMMER_DEFAULTS.enabled;
     profile.opacity = TASKBAR_DIMMER_DEFAULTS.opacity;
     profile.fadeInDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeInDurationMs;
     profile.fadeOutDurationMs = TASKBAR_DIMMER_DEFAULTS.fadeOutDurationMs;

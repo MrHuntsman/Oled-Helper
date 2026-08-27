@@ -2,7 +2,7 @@
   // Inlined data URI, see App.svelte for why icons never hit the network.
   import tabHotkeysIcon from './icons/tab_hotkeys.png?inline';
   import { emit } from '@tauri-apps/api/event';
-  import { hotkeys, setHotkey, resetHotkeys, displayFavorites, favoriteHotkeyAction, monitors } from './stores.svelte.js';
+  import { hotkeys, setHotkey, resetHotkeys, displayFavorites, favoriteHotkeyAction, monitors, activeMonitor } from './stores.svelte.js';
   import ConfirmModal from './ConfirmModal.svelte';
 
   // The action list mirrors ACTIONS in src-tauri/src/hotkeys.rs. The combo
@@ -11,7 +11,7 @@
     { key: 'toggle_black_crush', label: 'Toggle Black Crush', desc: 'Enable or disable the black level adjustment.' },
     { key: 'decrease_black_crush', label: 'Decrease Black Level', desc: 'Lower the black level. Hold to repeat.' },
     { key: 'increase_black_crush', label: 'Increase Black Level', desc: 'Raise the black level. Hold to repeat.' },
-    { key: 'hold_compare', label: 'Hold to Compare', desc: 'Temporarily disable black level while held. Restores on release.' },
+    { key: 'hold_compare', label: 'Hold to Compare', desc: 'Temporarily disable black level on every monitor while held. Restores on release.' },
     { key: 'toggle_taskbar_dimmer', label: 'Toggle Taskbar Dimmer', desc: 'Enable or disable the taskbar overlay.' },
     { key: 'toggle_screen_dimmer', label: 'Toggle Screen Dimmer', desc: 'Enable or disable the screen dimmer overlay.' },
     { key: 'toggle_hdr', label: 'Toggle HDR/SDR', desc: 'Switch Windows HDR on or off.' },
@@ -20,12 +20,15 @@
     { key: 'increase_sdr_brightness', label: 'Increase SDR Content Brightness (+50 nits)', desc: 'Raise Windows SDR content brightness by 50 nits.' },
   ];
 
+  // scope: 'monitor' sections act on the monitor selected in the bottom-bar
+  // selector; 'global' sections are system-wide (they affect every display
+  // or the whole system, not a single monitor).
   const SECTIONS = [
-    { title: 'Black Crush Tweak', keys: ['toggle_black_crush', 'decrease_black_crush', 'increase_black_crush', 'hold_compare'] },
-    { title: 'Taskbar Dimmer', keys: ['toggle_taskbar_dimmer'] },
-    { title: 'Screen Dimmer', keys: ['toggle_screen_dimmer'] },
-    { title: 'Windows HDR', keys: ['decrease_sdr_brightness', 'increase_sdr_brightness'] },
-    { title: 'Misc', keys: ['toggle_hdr', 'turn_off_display'] },
+    { title: 'Black Crush Tweak', scope: 'monitor', keys: ['toggle_black_crush', 'decrease_black_crush', 'increase_black_crush', 'hold_compare'] },
+    { title: 'Taskbar Dimmer', scope: 'monitor', keys: ['toggle_taskbar_dimmer'] },
+    { title: 'Screen Dimmer', scope: 'global', keys: ['toggle_screen_dimmer'] },
+    { title: 'Windows HDR', scope: 'global', keys: ['decrease_sdr_brightness', 'increase_sdr_brightness'] },
+    { title: 'Misc', scope: 'global', keys: ['toggle_hdr', 'turn_off_display'] },
   ];
 
   // Capturing state: the key of the row currently listening for a combo.
@@ -37,6 +40,13 @@
 
   function binding(action) {
     return hotkeys[action] || 'None';
+  }
+
+  // The monitor the Black Crush hotkeys act on: the one selected in the
+  // bottom-bar monitor selector, falling back to the primary.
+  function selectedMonitorLabel() {
+    if (!activeMonitor.mon) return 'Primary';
+    return activeMonitor.mon.friendly_name || `Monitor ${monitors.indexOf(activeMonitor.mon) + 1}`;
   }
 
   // A favorite whose saved monitor is not currently connected (legacy
@@ -180,9 +190,8 @@
       <div class="tab-heading-titles">
         <div class="tab-heading-title-row">
           <h2>Hotkeys</h2>
-          <span class="tab-monitor-tag">Global</span>
         </div>
-        <span class="subtitle">Global shortcuts for the app's main features.</span>
+        <span class="subtitle">Each section shows what its shortcuts affect, from a single monitor to every display or the whole system.</span>
       </div>
     </div>
     <div class="tab-heading-spacer"></div>
@@ -194,7 +203,17 @@
 
   {#each SECTIONS as section}
     <div class="hotkey-section">
-      <span class="settings-row-label hotkey-section-label">{section.title}</span>
+      <div class="hotkey-section-head">
+        <span class="settings-row-label hotkey-section-label">{section.title}</span>
+        {#if section.scope === 'monitor'}
+          <span class="tab-monitor-tag tab-monitor-tag-right" title="Follows the monitor selected in the bottom bar">Monitor: {selectedMonitorLabel()}</span>
+        {:else}
+          <span class="hotkey-scope-chip">Global</span>
+        {/if}
+      </div>
+      {#if section.scope === 'monitor'}
+        <p class="hotkey-hint">These shortcuts follow the monitor selected in the bottom bar.</p>
+      {/if}
       {#each section.keys as key}
         {@const row = ROWS.find((r) => r.key === key)}
         <div class="hotkey-row">

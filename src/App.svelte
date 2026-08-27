@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, appSettings, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded } from './lib/stores.svelte.js';
+  import { app, appSettings, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -1013,7 +1013,7 @@
   });
 
   function emitBlackLevelMainChanged() {
-    emit('black-level-main-changed', { adjustment: crush.adjustment, enabled: crush.blackEnabled }).catch(() => {});
+    emit('black-level-main-changed', { adjustment: crush.adjustment, enabled: crush.blackEnabled, monitorKey: monProfileId(activeMonitor.mon) }).catch(() => {});
   }
 
   // Sidebar mini-switches: each tab with a master toggle gets a small switch
@@ -1027,7 +1027,9 @@
   }
 
   function toggleTaskbarDimmerFromNav() {
-    setTaskbarDimmer(!taskbarDimmer.enabled);
+    // The nav switch is the global convenience: it flips every monitor's
+    // taskbar dimmer at once, keeping each monitor's own opacity/fades.
+    setTaskbarDimmerEnabledForAll(!taskbarDimmer.enabled);
   }
 
   function toggleScreenDimmerFromNav() {
@@ -1056,6 +1058,8 @@
         emitBlackLevelMainChanged();
         break;
       case 'toggle_taskbar_dimmer':
+        // Hotkey follows the bottom-bar monitor selection, like the Black
+        // Crush hotkeys, so it toggles the selected monitor's own overlay.
         setTaskbarDimmer(!taskbarDimmer.enabled);
         break;
       case 'toggle_screen_dimmer':
@@ -1473,7 +1477,7 @@
       <TabPowerIcon class="nav-icon" /> Power Saving <span class="nav-global-tag">Global</span>
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} aria-current={app.activeTab === 'hotkeys' ? 'page' : undefined} onclick={() => app.activeTab = 'hotkeys'}>
-      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys <span class="nav-global-tag">Global</span>
+      <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
 
     <div class="sidebar-spacer"></div>

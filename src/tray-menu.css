@@ -169,6 +169,18 @@
   white-space: nowrap;
 }
 
+/* Informational line under the header: which monitor the main window's
+   Black Crush hotkeys act on (its bottom-bar selection). */
+.tray-hotkey-target {
+  padding: 3px 8px 6px;
+  color: var(--text-weak);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Flatten only the two facing edges while a submenu is open. This removes
    the tiny visual corner seam that otherwise matches the rounded-region
    hit-test cutout at the pane boundary. */

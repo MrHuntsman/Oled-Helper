@@ -2,7 +2,7 @@
   // Inlined data URIs, see App.svelte for why icons never hit the network.
   import tabCrushIcon from './icons/tab_crush.png?inline';
   import zoomIcon from './icons/zoom.png?inline';
-  import { app, crush, adjustmentDisplay, blackLift, applyGamma, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax, activeMonitor, monitors } from './stores.svelte.js';
+  import { app, crush, adjustmentDisplay, blackLift, applyGamma, saveConfig, setHideCalibrationInterface, setBlackStripGapEnabled, setStripType, activeSquareCount, ctxMenuDismissTick, highNitsMaxValue, setHighNitsMax, activeMonitor, monitors, monProfileId } from './stores.svelte.js';
   import ConfirmModal from './ConfirmModal.svelte';
   // Runtime console output is mirrored to the in-app Debug log and Rust file
   // log by main.js. Keep GPU messages on that single path so they are not
@@ -605,6 +605,9 @@
     emit('black-level-main-changed', {
       adjustment: crush.adjustment,
       enabled: crush.blackEnabled,
+      // The selected monitor's identity so primary-scoped listeners (the
+      // tray menu) can ignore changes made on a secondary monitor.
+      monitorKey: monProfileId(activeMonitor.mon),
     }).catch(() => {});
     // No config save here: the adjustment changes on every pointer event
     // during a drag, and saving is now tied to discrete events only (drag

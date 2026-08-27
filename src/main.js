@@ -3,7 +3,7 @@ import './app.css'
 import App from './App.svelte'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { pushGpuLog, debugSettings, app, crush, taskbarDimmer, handleTaskbarDimmerAvailable, syncFavoritesFromBackend, loadConfig, applyBlackLevelProfileForRefreshRate } from './lib/stores.svelte.js'
+import { pushGpuLog, debugSettings, app, crush, taskbarDimmer, activeMonitor, handleTaskbarDimmerAvailable, syncFavoritesFromBackend, loadConfig, applyBlackLevelProfileForRefreshRate } from './lib/stores.svelte.js'
 
 // The Rust tauri-plugin-log Webview target is the canonical fan-out path:
 // every record is written to stdout/file and emitted as `log://log`. We do not
@@ -150,6 +150,14 @@ listen('taskbar-dimmer-changed', (event) => {
 listen('black-level-changed', (event) => {
   const status = event.payload;
   if (!status) return;
+  // The tray menu is primary-scoped, so its adjustment only maps to the main
+  // window's slider while the primary is selected; with a secondary selected,
+  // adopt the enabled state (the toggle is global) but keep the secondary's
+  // live value on the slider instead of the primary's.
+  if (activeMonitor.mon && !activeMonitor.mon.primary) {
+    if (typeof status.enabled === 'boolean') crush.blackEnabled = status.enabled;
+    return;
+  }
   if (typeof status.adjustment === 'number') crush.adjustment = Math.max(-150, Math.min(150, Math.round(status.adjustment)));
   if (typeof status.enabled === 'boolean') crush.blackEnabled = status.enabled;
 }).catch(() => {});

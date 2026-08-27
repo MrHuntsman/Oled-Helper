@@ -2605,6 +2605,35 @@ select:focus-visible,
   color: var(--text-weak);
   margin-bottom: 6px;
 }
+.hotkey-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hotkey-section-head .hotkey-section-label {
+  margin-bottom: 0;
+}
+.hotkey-scope-chip {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  align-self: center;
+  color: var(--text-weak, #999);
+  background: rgba(128, 128, 128, 0.08);
+  border: 1px solid rgba(128, 128, 128, 0.2);
+}
+/* .tab-monitor-tag used in a flex row (e.g. the Hotkeys tab's section
+   header) where the tag should be pushed to the right edge instead of
+   sitting inline after the title. */
+.tab-monitor-tag-right {
+  margin-left: auto;
+}
 .hotkey-row {
   display: flex;
   align-items: center;

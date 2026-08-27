@@ -241,7 +241,6 @@ pub fn apply_gamma_ramp(state: State<GammaState>, black_lift: i32) -> Result<(),
         }
     }
     state.desired.store(black_lift, Ordering::Relaxed);
-    crate::hotkeys::update_hold_restore_locked(black_lift);
     // Keep the primary monitor's per-monitor entry in step with the global
     // value. The frontend routes the primary through apply_gamma_ramp_for
     // whenever a monitor is selected, so a later global write (tray menu,
@@ -336,7 +335,6 @@ pub fn apply_gamma_ramp_for(
     // while the tweak is off.
     if monitor.primary {
         state.desired.store(black_lift, Ordering::Relaxed);
-        crate::hotkeys::update_hold_restore_locked(black_lift);
     }
     // Reflect the new state in the external gamma watch record.
     crate::gamma_watch::sync(

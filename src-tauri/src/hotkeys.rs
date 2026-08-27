@@ -12,7 +12,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -86,6 +86,11 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 static MAIN_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static BINDINGS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static CURRENT_LIFT: OnceLock<Arc<AtomicI32>> = OnceLock::new();
+// The per-monitor lift table and the screen-dimmer brightness map, registered
+// at startup (lib.rs) so hold-to-compare can flatten and restore EVERY
+// monitor, not just the primary. Same Arcs as gamma::GammaState.
+static PER_MONITOR_LIFTS: OnceLock<Arc<Mutex<HashMap<String, i32>>>> = OnceLock::new();
+static SCREEN_DIM_BRIGHTNESS: OnceLock<Arc<Mutex<HashMap<String, u32>>>> = OnceLock::new();
 // Gamma writes can originate from the IPC command thread or the main-window
 // timer. Serialize them so a slider update cannot interleave with compare's
 // temporary linear ramp or its restoration.
@@ -97,8 +102,6 @@ static HOLD_CONFIG_VK: AtomicU32 = AtomicU32::new(0);
 static HOLD_CONFIG_MODS: AtomicU32 = AtomicU32::new(0);
 static HOLD_ACTIVE_VK: AtomicU32 = AtomicU32::new(0);
 static HOLD_ACTIVE_MODS: AtomicU32 = AtomicU32::new(0);
-static HOLD_RESTORE: AtomicI32 = AtomicI32::new(0);
-static HOLD_HAS_RESTORE: AtomicBool = AtomicBool::new(false);
 static HOLD_STATE: AtomicU32 = AtomicU32::new(0);
 const HOLD_IDLE: u32 = 0;
 const HOLD_ACTIVE: u32 = 1;
@@ -109,6 +112,14 @@ const HOLD_TIMER_INTERVAL_MS: u32 = 40;
 
 pub fn set_current_lift(lift: Arc<AtomicI32>) {
     let _ = CURRENT_LIFT.set(lift);
+}
+
+pub fn set_per_monitor_lifts(per_monitor: Arc<Mutex<HashMap<String, i32>>>) {
+    let _ = PER_MONITOR_LIFTS.set(per_monitor);
+}
+
+pub fn set_screen_dim_brightness(brightness: Arc<Mutex<HashMap<String, u32>>>) {
+    let _ = SCREEN_DIM_BRIGHTNESS.set(brightness);
 }
 
 pub fn is_hold_compare_active() -> bool {
@@ -512,36 +523,37 @@ fn stop_hold_timer() {
 fn finish_hold_restore() -> bool {
     if crate::vendor_info::nvidia_reference_mode_enabled() {
         log::warn!("[hotkeys] skipped hold-to-compare gamma restore because NVIDIA reference mode is enabled");
-        HOLD_RESTORE.store(0, Ordering::Release);
-        HOLD_HAS_RESTORE.store(false, Ordering::Release);
         HOLD_ACTIVE_VK.store(0, Ordering::Release);
         HOLD_ACTIVE_MODS.store(0, Ordering::Release);
         HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
         return true;
     }
-    let _gamma_guard = GAMMA_WRITE_LOCK
+    // Re-apply the CURRENT per-monitor lifts, the primary fallback, and any
+    // screen-dimmer dimming to every monitor. apply_screen_gamma_ramps takes
+    // the gamma write lock itself, so no guard is held here; the non-idle
+    // HOLD_STATE keeps a new hold from interleaving with the restore. Each
+    // device write is best-effort, the safety thread re-applies any failure
+    // on its next tick.
+    let (Some(desired), Some(per_monitor), Some(brightness)) = (
+        CURRENT_LIFT.get(),
+        PER_MONITOR_LIFTS.get(),
+        SCREEN_DIM_BRIGHTNESS.get(),
+    ) else {
+        HOLD_ACTIVE_VK.store(0, Ordering::Release);
+        HOLD_ACTIVE_MODS.store(0, Ordering::Release);
+        HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
+        return true;
+    };
+    let brightness = brightness
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let restore = HOLD_RESTORE.load(Ordering::Acquire);
-    if HOLD_HAS_RESTORE.load(Ordering::Acquire) {
-        let ramp = crate::gamma_ramp::build_ramp(restore);
-        let mut applied = false;
-        for attempt in 0..3 {
-            if unsafe { crate::gamma_ramp::set_display_ramp(&ramp) } {
-                applied = true;
-                break;
-            }
-            if attempt < 2 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        if !applied {
-            log::error!("[hotkeys] hold-to-compare gamma restore failed after 3 attempts; retrying on the safety tick");
-            return false;
-        }
-    }
-    HOLD_RESTORE.store(0, Ordering::Release);
-    HOLD_HAS_RESTORE.store(false, Ordering::Release);
+        .map(|map| map.clone())
+        .unwrap_or_default();
+    crate::gamma::apply_screen_gamma_ramps(
+        desired.as_ref(),
+        per_monitor.as_ref(),
+        &brightness,
+        false,
+    );
     HOLD_ACTIVE_VK.store(0, Ordering::Release);
     HOLD_ACTIVE_MODS.store(0, Ordering::Release);
     HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
@@ -574,6 +586,12 @@ fn apply_hold_gamma() {
         );
         return;
     }
+    let Some(desired) = CURRENT_LIFT.get() else {
+        return;
+    };
+    let Some(per_monitor) = PER_MONITOR_LIFTS.get() else {
+        return;
+    };
     {
         let _gamma_guard = GAMMA_WRITE_LOCK
             .lock()
@@ -584,24 +602,37 @@ fn apply_hold_gamma() {
         {
             return;
         }
-        let Some(lift) = CURRENT_LIFT
-            .get()
-            .map(|value| value.load(Ordering::Acquire))
-            .filter(|value| *value != 0)
-        else {
+        // Compare is only meaningful while at least one monitor has a lift;
+        // with everything at 0 the linear ramp equals the current state, so a
+        // no-op hold would still rewrite every ramp on release.
+        let global_lift = desired.load(Ordering::Acquire);
+        let any_monitor_lift = per_monitor
+            .lock()
+            .map(|map| map.values().any(|value| *value != 0))
+            .unwrap_or(false);
+        if global_lift == 0 && !any_monitor_lift {
             HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
             return;
-        };
-        HOLD_RESTORE.store(lift, Ordering::Release);
-        HOLD_HAS_RESTORE.store(true, Ordering::Release);
+        }
         HOLD_ACTIVE_VK.store(HOLD_CONFIG_VK.load(Ordering::Acquire), Ordering::Release);
         HOLD_ACTIVE_MODS.store(HOLD_CONFIG_MODS.load(Ordering::Acquire), Ordering::Release);
+        // Flatten EVERY monitor to the neutral ramp while held: the global
+        // fallback covers the primary via GetDC(None), each device gets its
+        // own CreateDCW ramp so secondary monitors compare too.
         let neutral = crate::gamma_ramp::build_linear_ramp();
-        let applied = unsafe { crate::gamma_ramp::set_display_ramp(&neutral) };
+        let mut applied = unsafe { crate::gamma_ramp::set_display_ramp(&neutral) };
+        for monitor in crate::monitors::all_monitors() {
+            if monitor.device_name.is_empty() {
+                continue;
+            }
+            if !unsafe { crate::gamma_ramp::set_monitor_ramp(&monitor.device_name, &neutral) } {
+                applied = false;
+            }
+        }
         if !applied {
-            log::warn!("[hotkeys] hold-to-compare could not apply the linear gamma ramp");
-            HOLD_RESTORE.store(0, Ordering::Release);
-            HOLD_HAS_RESTORE.store(false, Ordering::Release);
+            log::warn!(
+                "[hotkeys] hold-to-compare could not apply the linear gamma ramp to every monitor"
+            );
             HOLD_ACTIVE_VK.store(0, Ordering::Release);
             HOLD_ACTIVE_MODS.store(0, Ordering::Release);
             HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
@@ -621,16 +652,6 @@ fn apply_hold_gamma() {
     if timer_failed {
         log::warn!("[hotkeys] hold-to-compare timer could not be started");
         restore_hold_gamma();
-    }
-}
-
-/// Called by the main window subclass for the short period while compare is
-/// active. GetAsyncKeyState checks the complete physical combo, including the
-/// bound key and every required modifier; releasing any one ends the gesture.
-pub(crate) fn update_hold_restore_locked(value: i32) {
-    if HOLD_STATE.load(Ordering::Acquire) != HOLD_IDLE {
-        HOLD_RESTORE.store(value, Ordering::Release);
-        HOLD_HAS_RESTORE.store(true, Ordering::Release);
     }
 }
 

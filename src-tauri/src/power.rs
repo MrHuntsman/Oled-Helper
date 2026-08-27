@@ -22,7 +22,7 @@ use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use tauri::Emitter;
+use tauri::{AppHandle, Emitter};
 
 use serde::{Deserialize, Serialize};
 use windows::core::{GUID, PCWSTR};
@@ -1641,6 +1641,7 @@ pub fn power_set_screensaver(
 
 #[tauri::command]
 pub fn power_set_screen_protector(
+    app: AppHandle,
     monitor_key: Option<String>,
     enabled: bool,
     seconds: u32,
@@ -1658,6 +1659,10 @@ pub fn power_set_screen_protector(
         fade_out_duration_ms,
         fullscreen_detection,
     );
+    // The screen dimmer settings have no settings-change broadcast of their
+    // own, so notify listeners (the tray's dimmer row) when they change
+    // instead of leaving them to poll.
+    let _ = app.emit("screen-dimmer-changed", ());
     Ok(())
 }
 

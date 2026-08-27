@@ -4,18 +4,17 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, State};
 
 pub struct TaskbarDimmerState {
-    // Global master toggle (per-monitor profiles live in the profiles map).
-    pub enabled: Mutex<bool>,
     // Store the native HWND directly. A separate WebView2 window can exist
     // without having a usable HWND during startup, which made the old overlay
-    // fail when the user enabled the dimmer.
+    // fail when the user enabled the dimmer. The on/off state is per monitor
+    // and lives in each monitor's DimmerProfile, so there is no global
+    // master toggle here any more.
     pub overlay: Mutex<Option<isize>>,
 }
 
 impl Default for TaskbarDimmerState {
     fn default() -> Self {
         Self {
-            enabled: Mutex::new(false),
             overlay: Mutex::new(None),
         }
     }
@@ -34,12 +33,13 @@ pub struct TaskbarDimmerStatus {
 
 // Per-monitor dimmer settings, keyed by the monitor's stable identity
 // (monitor_id || sig) in the profiles map. One entry per connected monitor;
-// a monitor without an entry uses DimmerProfile::default(). The master
-// enabled toggle and the detection method (hover mode + poll interval) are
-// separate (global), the rest is per monitor.
+// a monitor without an entry uses DimmerProfile::default(). Enabled is
+// per monitor (a fresh profile is off); only the detection method (hover
+// mode + poll interval) is shared globally.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct DimmerProfile {
+    pub enabled: bool,
     pub opacity: f64,
     pub fade_in_duration_ms: u64,
     pub fade_out_duration_ms: u64,
@@ -48,8 +48,10 @@ pub struct DimmerProfile {
 impl Default for DimmerProfile {
     fn default() -> Self {
         // Must match config.rs's default_dimmer_ease_duration() (300 ms) and
-        // the UI defaults for opacity.
+        // the UI defaults for opacity. Enabled defaults to off: a monitor
+        // the user has never turned on stays off.
         Self {
+            enabled: false,
             opacity: 0.95,
             fade_in_duration_ms: 300,
             fade_out_duration_ms: 300,
@@ -2617,7 +2619,7 @@ mod platform {
         drop(guard);
     }
 
-    pub fn apply(enabled: bool, immediate: bool) -> Result<(), String> {
+    pub fn apply(immediate: bool) -> Result<(), String> {
         // Same transient-miss retry as before: right after a tray restart
         // the taskbars can be missing, and the frontend would otherwise treat
         // the toggle as off and never persist the setting. Absorb the hiccup.
@@ -2676,8 +2678,26 @@ mod platform {
             }
             overlays.retain(|h, _| to_apply.iter().any(|(hw, _, _)| hw.0 as isize == *h));
         }
+        let mut any_enabled = false;
         for (hwnd, taskbar, rect) in to_apply {
-            apply_overlay(hwnd, taskbar, rect, enabled, immediate)?;
+            any_enabled |= apply_overlay(hwnd, taskbar, rect, immediate)?;
+        }
+        // Thread lifecycle is global, not per overlay: the tick, mouse hook,
+        // and elevation WinEvent threads are shared across every overlay, so
+        // start them when any overlay is on and stop them only when all are
+        // off. Deciding this once here (instead of inside apply_overlay)
+        // keeps a mixed-state apply from starting and stopping them
+        // repeatedly.
+        if any_enabled {
+            ensure_tick_thread();
+            if PREFER_EVENT_HOVER.load(Ordering::Relaxed) {
+                ensure_elevation_win_event();
+                ensure_mouse_hook();
+            }
+        } else {
+            stop_tick_thread();
+            stop_mouse_hook();
+            stop_elevation_win_event();
         }
         Ok(())
     }
@@ -2688,11 +2708,11 @@ mod platform {
         hwnd: HWND,
         taskbar: HWND,
         rect: RECT,
-        enabled: bool,
         immediate: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let hwnd_raw = hwnd.0 as isize;
-        // This overlay's per-monitor profile.
+        // This overlay's per-monitor profile (opacity, fades, and the
+        // per-monitor on/off state).
         let profile = {
             let overlays = overlays_map().lock().unwrap_or_else(|e| e.into_inner());
             let key = overlays.get(&hwnd_raw).map(|i| i.monitor_key.clone());
@@ -2706,6 +2726,7 @@ mod platform {
                 })
                 .unwrap_or_default()
         };
+        let enabled = profile.enabled;
         let alpha = opacity_to_alpha(profile.opacity);
         let hovered = enabled && cursor_over_rect(rect, false).0;
 
@@ -2757,22 +2778,9 @@ mod platform {
             if enabled {
                 fade.cached_taskbar = Some((taskbar.0 as isize, rect));
                 fade.last_taskbar_cache_refresh = Instant::now();
-                ensure_tick_thread();
-                // Event mode installs both hooks: the mouse hook for instant
-                // hover, and the WinEvent hook for elevation detection +
-                // event-driven fullscreen. Poll mode installs neither, the
-                // tick thread's cursor poll and fullscreen timer handle
-                // everything.
-                if PREFER_EVENT_HOVER.load(Ordering::Relaxed) {
-                    ensure_elevation_win_event();
-                    ensure_mouse_hook();
-                }
-            } else {
-                stop_tick_thread();
-                stop_mouse_hook();
-                stop_elevation_win_event();
             }
-        }
+        } // Thread lifecycle (tick, hooks) is managed once per apply() call
+        // based on whether any overlay is on, since the threads are global.
 
         unsafe {
             let old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -2858,7 +2866,7 @@ mod platform {
         if enabled {
             update_fade(hwnd);
         }
-        Ok(())
+        Ok(enabled)
     }
 }
 
@@ -2879,7 +2887,7 @@ mod platform {
     pub fn create(_app: &AppHandle) -> Result<isize, String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
-    pub fn apply(_enabled: bool, _immediate: bool) -> Result<(), String> {
+    pub fn apply(_immediate: bool) -> Result<(), String> {
         Err("Taskbar dimmer is only available on Windows".into())
     }
 }
@@ -2920,7 +2928,6 @@ pub(crate) fn rekey_profiles() {
 
 #[tauri::command]
 pub fn set_taskbar_dimmer(
-    state: State<TaskbarDimmerState>,
     monitor_key: Option<String>,
     enabled: bool,
     opacity: f64,
@@ -2931,15 +2938,56 @@ pub fn set_taskbar_dimmer(
     let fade_in_duration_ms = fade_in_duration_ms.clamp(0, 1000);
     let fade_out_duration_ms = fade_out_duration_ms.clamp(0, 1000);
     let key = resolve_profile_key(monitor_key.as_deref());
+    if key.is_empty() {
+        return Err("Could not resolve the target monitor".to_string());
+    }
     {
         let mut profiles = profiles_map().lock().unwrap_or_else(|e| e.into_inner());
         let entry = profiles.entry(key).or_default();
+        // Enabled is per monitor: this toggle turns on/off the target
+        // monitor's own overlay, not every taskbar.
+        entry.enabled = enabled;
         entry.opacity = opacity.clamp(0.0, 1.0);
         entry.fade_in_duration_ms = fade_in_duration_ms;
         entry.fade_out_duration_ms = fade_out_duration_ms;
     }
-    *state.enabled.lock().unwrap_or_else(|e| e.into_inner()) = enabled;
-    platform::apply(enabled, immediate)
+    platform::apply(immediate)
+}
+
+// Global convenience toggle: turn every monitor's taskbar dimmer on or off
+// at once, while keeping each monitor's opacity/fade settings intact. Used by
+// the nav switch and the hotkey, so the app keeps a one-switch-all way to
+// silence the dimmers even though the per-monitor on/off is now per display.
+#[tauri::command]
+pub fn set_taskbar_dimmer_enabled_for_all(
+    enabled: bool,
+    immediate: bool,
+) -> Result<(), String> {
+    let connected: Vec<String> = {
+        let mut profiles = profiles_map().lock().unwrap_or_else(|e| e.into_inner());
+        // Toggle the persisted profiles for current monitors (and guard
+        // against an empty map by seeding nothing; apply() will still work
+        // off the overlays' resolved keys next time a real edit happens).
+        let keys: Vec<String> = profiles.keys().cloned().collect();
+        if keys.is_empty() {
+            // No profile entries yet, so seed one per connected monitor from
+            // the defaults so the per-monitor enable actually sticks.
+            let monitors = crate::monitors::all_monitors();
+            for m in &monitors {
+                profiles.entry(m.profile_id.clone()).or_default().enabled = enabled;
+            }
+            monitors.into_iter().map(|m| m.profile_id).collect()
+        } else {
+            for key in &keys {
+                if let Some(entry) = profiles.get_mut(key) {
+                    entry.enabled = enabled;
+                }
+            }
+            keys
+        }
+    };
+    let _ = connected;
+    platform::apply(immediate)
 }
 
 #[tauri::command]
@@ -2965,22 +3013,15 @@ pub(crate) fn sync_detection(mode: &str, poll_ms: u32) {
 }
 
 #[tauri::command]
-pub fn set_taskbar_dimmer_hover_mode(
-    state: State<TaskbarDimmerState>,
-    mode: String,
-) -> Result<(), String> {
+pub fn set_taskbar_dimmer_hover_mode(mode: String) -> Result<(), String> {
     // Detection Method is global: keep the current poll interval, swap the
     // mode, then apply so the overlay/tick behavior follows immediately.
     platform::sync_detection(&mode, platform::POLL_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed));
-    let enabled = *state.enabled.lock().unwrap_or_else(|e| e.into_inner());
-    platform::apply(enabled, false)
+    platform::apply(false)
 }
 
 #[tauri::command]
-pub fn set_taskbar_dimmer_poll_interval(
-    state: State<TaskbarDimmerState>,
-    ms: u32,
-) -> Result<(), String> {
+pub fn set_taskbar_dimmer_poll_interval(ms: u32) -> Result<(), String> {
     // UI bounds: the frontend slider clamps 16..200, so keep the backend
     // clamp identical instead of allowing a hidden 2000 ms ceiling.
     let ms = ms.clamp(16, 200);
@@ -2992,8 +3033,7 @@ pub fn set_taskbar_dimmer_poll_interval(
         "poll"
     };
     platform::sync_detection(mode, ms);
-    let enabled = *state.enabled.lock().unwrap_or_else(|e| e.into_inner());
-    platform::apply(enabled, false)
+    platform::apply(false)
 }
 
 #[tauri::command]
@@ -3009,7 +3049,7 @@ pub fn get_taskbar_dimmer_status(
         .cloned()
         .unwrap_or_default();
     TaskbarDimmerStatus {
-        enabled: *state.enabled.lock().unwrap_or_else(|e| e.into_inner()),
+        enabled: profile.enabled,
         opacity: profile.opacity,
         fade_in_duration_ms: profile.fade_in_duration_ms,
         fade_out_duration_ms: profile.fade_out_duration_ms,
