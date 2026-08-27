@@ -10,7 +10,7 @@
   const dlog = (msg) => { console.log('[gpu]', msg); };
   const dwarn = (msg) => { console.warn('[gpu]', msg); };
   const derr = (msg) => { console.error('[gpu]', msg); };
-  import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_SDR_RANGE, HIGH_NITS_CELLS, HIGH_NITS_COLS, HIGH_NITS_ROWS, HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_MAX_STOPS, highNitsGridCodes, highNitsSdrCodes, computeHdrValues, computeSdrValues, computeHighNitsValues, CELL_GRID_SHADER } from './calibration.js';
+  import { MAX_SQUARES, ALL_PQ_CODES, ALL_SDR_CODES, GAP_FRACTION, HIGH_NITS_GAP_FRACTION, STRIPS, HIGH_SDR_RANGE, HIGH_NITS_CELLS, HIGH_NITS_COLS, HIGH_NITS_ROWS, HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_MAX_STOPS, highNitsGridCodes, highNitsSdrCodes, computeHdrValues, computeSdrValues, computeHighNitsValues, greyValueFor, CELL_GRID_SHADER } from './calibration.js';
   import { invoke } from '@tauri-apps/api/core';
   import { emit } from '@tauri-apps/api/event';
   import { onDestroy, untrack } from 'svelte';
@@ -78,7 +78,8 @@
 
   // Heading title + square label helpers, driven by the active strip. The
   // High Nits strip shows a windowed nits ladder (HDR) or bright RGB range
-  // (SDR); the black strip keeps the existing PQ/RGB code labels.
+  // (SDR); the black strip keeps the existing PQ/RGB code labels; the grey
+  // strip shows fixed bright-grey levels for uniformity checks.
   function calibrationIsHdr() {
     return app.hdrStatus === 'hdr' && !forceSdrRender && !useSdrCalibration;
   }
@@ -87,6 +88,9 @@
     const isHdr = calibrationIsHdr();
     if (crush.stripType === 'highNits') {
       return isHdr ? 'HDR White' : 'SDR White';
+    }
+    if (crush.stripType === 'grey') {
+      return 'Uniformity Field';
     }
     return isHdr ? 'HDR Black Calibration (PQ)' : 'SDR Black Calibration (RGB)';
   }
@@ -112,6 +116,11 @@
       }
       return highNitsSdrCodes(stripGeom.cells).map((code) => ({ code: String(code), unit: 'RGB', bright: false }));
     }
+    if (crush.stripType === 'grey') {
+      // The uniformity field is a single solid grey, no labels to keep the
+      // view clean while looking for banding and uneven tint.
+      return [];
+    }
     const codes = isHdr ? ALL_PQ_CODES : ALL_SDR_CODES;
     return codes.slice(0, sq).map((code, i) => ({
       code: String(code),
@@ -121,6 +130,7 @@
 
   function labelCount() {
     if (crush.stripType === 'highNits') return stripGeom.cells;
+    if (crush.stripType === 'grey') return stripGeom.cells;
     return activeSquareCount();
   }
 
@@ -175,6 +185,11 @@
       }
       return { cells: HIGH_NITS_CELLS, cols: HIGH_NITS_COLS, rows: HIGH_NITS_ROWS };
     }
+    if (crush.stripType === 'grey') {
+      // A single solid grey cell fills the strip in normal mode and the
+      // whole canvas in fullscreen, the same view in both.
+      return { cells: 1, cols: 1, rows: 1 };
+    }
     const sq = activeSquareCount();
     return { cells: sq, cols: sq, rows: 1 };
   }
@@ -197,6 +212,9 @@
   let mainSliderInput = $state(null);
   let fsSliderInput = $state(null);
   let zoomSliderInput = $state(null);
+  let greySliderInput = $state(null);
+  let greySliderDragging = $state(false);
+  let greySliderHovering = $state(false);
 
   $effect(() => {
     if (!sliderDragging && !fsSliderDragging) return;
@@ -453,6 +471,7 @@
       const sq = activeSquareCount();
       const isHdr = calibrationIsHdr();
       const highNits = crush.stripType === 'highNits';
+      const grey = crush.stripType === 'grey';
       // High Nits: render the aspect-fit grid values (21 cells in normal
       // mode, up to 40 in fullscreen, one value per slot, no empty cells),
       // laid out row-major across a spreadsheet grid.
@@ -465,6 +484,10 @@
         // same frozen base keeps the cells physically stable as the Windows
         // SDR brightness changes.
         vals = computeHighNitsValues(crush.highNitsMax, isHdr, grid.cells, app.sdrWhiteBaseNits ?? 80);
+      } else if (grey) {
+        grid = untrack(() => stripGeom);
+        // One solid grey cell at the selected level, always the same view.
+        vals = [greyValueFor(crush.greyLevel)];
       } else {
         vals = isHdr ? HDR_VALUES : SDR_VALUES;
         grid = { cells: sq, cols: sq, rows: 1 };
@@ -474,7 +497,7 @@
       data[48] = grid.cells;
       data[49] = grid.cols;
       data[50] = grid.rows;
-      data[51] = highNits ? HIGH_NITS_GAP_FRACTION : (crush.blackStripGapEnabled ? GAP_FRACTION : 0);
+      data[51] = highNits ? HIGH_NITS_GAP_FRACTION : (grey ? GAP_FRACTION : (crush.blackStripGapEnabled ? GAP_FRACTION : 0));
       device.queue.writeBuffer(ub, 0, data);
 
       let tex;
@@ -500,7 +523,7 @@
     if (canvas && !initStarted) initGPU();
   });
   $effect(() => {
-    void crush.squareCounts; void crush.stripType; void app.hdrStatus; void useSdrCalibration; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void app.sdrWhiteBaseNits; void canvas;
+    void crush.squareCounts; void crush.stripType; void crush.greyLevel; void crush.fullscreen; void app.hdrStatus; void useSdrCalibration; void crush.blackStripGapEnabled; void crush.highNitsMin; void crush.highNitsStep; void app.sdrWhiteBaseNits; void canvas;
     // untrack the geometry write: stripGeom is a $state read by the template
     // and by render() (high-nits grid). Writing it from inside this effect.
     // whose render() call reads it, would re-schedule the effect on every
@@ -817,6 +840,37 @@
   // scroll-to-zoom conventions (maps, image viewers). The High Nits grid is
   // fixed at 3×7, so wheel instead steps the Max slider through its stops
   // (same behavior as wheeling over the Max control itself).
+  function setGreyLevel(value) {
+    crush.greyLevel = Math.max(0, Math.min(100, Math.round(value)));
+  }
+
+  // Lets a drag start anywhere in the grey slider's buffer zone, mirroring
+  // the black-level track-wrap drag (the native input can only start its
+  // own drag from a trusted event on the thumb itself).
+  function handleGreyTrackPointerdown(e, inputEl, setDragging) {
+    if (e.target === inputEl) return; // already on the real input
+    e.preventDefault();
+    const min = +inputEl.min, max = +inputEl.max;
+    const applyFromClientX = (clientX) => {
+      const rect = inputEl.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      setGreyLevel(min + frac * (max - min));
+    };
+    applyFromClientX(e.clientX);
+    inputEl.focus();
+    setDragging(true);
+    function onMove(ev) { applyFromClientX(ev.clientX); }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      setDragging(false);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }
+
   function handleStripWheel(e) {
     e.preventDefault();
     if (crush.stripType === 'highNits') {
@@ -824,6 +878,12 @@
       return;
     }
     const dir = e.deltaY < 0 ? 1 : -1;
+    if (crush.stripType === 'grey') {
+      // Wheel sweeps the grey level in 5% steps, matching the ladder
+      // spacing, clamped to the full 0-100% range.
+      setGreyLevel(crush.greyLevel + dir * 5);
+      return;
+    }
     crush.squareCounts[crush.stripType] = Math.min(MAX_SQUARES, Math.max(2, activeSquareCount() + dir));
   }
 
@@ -1056,6 +1116,7 @@
     crush.blackProfiles = {};
     crush.hideCalibrationInterface = false;
     crush.squareCounts = { black: 12, highNits: 8 };
+    crush.greyLevel = 50;
     crush.highNitsMin = HIGH_NITS_DEFAULT_MIN;
     crush.highNitsMax = HIGH_NITS_DEFAULT_MAX;
     crush.highNitsStep = HIGH_NITS_DEFAULT_STEP;
@@ -1068,6 +1129,13 @@
   function onKeydown(e) {
     if (app.activeTab !== 'crush') return;
     if (e.key === 'Escape') { if (crush.fullscreen !== 'normal') { exitFullscreen(); return; } }
+    // The grey strip's own keys sweep the level, independent of the black
+    // level tweak (it is a display test, not a calibration adjustment).
+    if (crush.stripType === 'grey') {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { e.preventDefault(); setGreyLevel(crush.greyLevel + 5); }
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { e.preventDefault(); setGreyLevel(crush.greyLevel - 5); }
+      return;
+    }
     if (!crush.blackEnabled) return;
     // crush.adjustment is stored in tenths (adjustmentDisplay() divides by 10),
     // so Left/Right move a whole point (10) and Up/Down move 0.1 (1).
@@ -1130,6 +1198,8 @@
   {#snippet calibrationTip()}
     {#if crush.stripType === 'highNits'}
       <span>Find the max brightness value you can still distinguish.</span>
+    {:else if crush.stripType === 'grey'}
+      <span>Sweep the grey level (wheel or the fullscreen slider) to check for banding, vignetting, or uneven tint. Bright greys (50-95%) show uniformity best.</span>
     {:else}
       <span>Adjust black level until you can start to see the lower columns and still have a smooth gradient.</span>
       <span class="info-tip-note">
@@ -1234,7 +1304,7 @@
         {:else}
           <div class="square-labels" style="--sq-count:{labelCount()}">
             {#each stripLabels() as label, i}
-              <div class="square-label">
+              <div class="square-label" class:square-selected={label.selected}>
                 <div>{label.code}</div>
                 <div class="square-unit">{label.unit}</div>
               </div>
@@ -1248,7 +1318,12 @@
           <div class="fs-help-tip">{@render calibrationTip()}</div>
         </div>
       {/if}
-      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface && crush.stripType !== 'highNits'}
+      {#if crush.fullscreen === 'normal' && !crush.hideCalibrationInterface}
+        <button type="button" class="strip-fs-btn" title="Enter fullscreen" aria-label="Enter fullscreen" onclick={() => crush.fullscreen = 'monitor'}>
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5H13.5V6M13.5 10V13.5H10M6 13.5H2.5V10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      {/if}
+      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface && crush.stripType === 'black'}
         <div class="fs-black-slider" class:disabled={!crush.blackEnabled} onwheel={(e) => {
           if (!crush.blackEnabled) { e.preventDefault(); e.stopPropagation(); flashBlackMasterSwitch(); return; }
           handleSliderWheel(e, fsSliderInput, setBlackLevel, 5);
@@ -1271,6 +1346,22 @@
           {#if !crush.blackEnabled}
             <button type="button" class="disabled-section-hit-area" tabindex="-1" aria-label="Black Level disabled" onclick={handleDisabledBlackInteraction}></button>
           {/if}
+        </div>
+      {/if}
+      {#if crush.fullscreen !== 'normal' && !crush.hideCalibrationInterface && crush.stripType === 'grey'}
+        <div class="fs-black-slider" onwheel={(e) => handleSliderWheel(e, greySliderInput, setGreyLevel, 5)}>
+          <div class="slider-track-wrap" role="presentation" onpointerdown={(e) => handleGreyTrackPointerdown(e, greySliderInput, (v) => greySliderDragging = v)}>
+            <input type="range" min="0" max="100" bind:value={crush.greyLevel} bind:this={greySliderInput}
+              aria-label="Grey Level"
+              style="--fill:{crush.greyLevel}%"
+              onpointerdown={() => greySliderDragging = true}
+              onpointerup={() => greySliderDragging = false}
+              onpointercancel={() => greySliderDragging = false}
+              onpointerenter={() => greySliderHovering = true}
+              onpointerleave={() => greySliderHovering = false} />
+            <div class="slider-tooltip" class:visible={greySliderDragging || greySliderHovering} style="left:calc(9px + ({crush.greyLevel / 100} * (100% - 18px)))">{crush.greyLevel}%</div>
+          </div>
+          <span class="slider-val">{crush.greyLevel}%</span>
         </div>
       {/if}
       {#if crush.stripType === 'highNits' && hoverCell >= 0}
@@ -1308,7 +1399,7 @@
         </div>
       </div>
       {/if}
-    {:else}
+    {:else if crush.stripType === 'black'}
       <div class="zoom-control-compact" onwheel={(e) => handleSliderWheel(e, zoomSliderInput, (value) => crush.squareCounts[crush.stripType] = value)}>
         <img class="slider-label-icon" src={zoomIcon} alt="Zoom" />
         <div class="slider-track-wrap zoom-track-compact">
@@ -1323,10 +1414,9 @@
 
   {#if ctxMenu.open}
     <div class="ctx-menu compact" bind:this={ctxMenuElement} style="left:{ctxMenu.x}px; top:{ctxMenu.y}px;" role="menu" aria-label="Calibration display mode" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleContextMenuKeydown} oncontextmenu={(e) => e.preventDefault()}>
+      <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'normal'} onclick={() => setMode('normal')}><span class="ctx-radio-dot" aria-hidden="true"></span>Normal View</button>
       <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'inApp'} onclick={() => setMode('inApp')}><span class="ctx-radio-dot" aria-hidden="true"></span>In-App Fullscreen</button>
       <button class="ctx-item" role="menuitem" class:active={crush.fullscreen === 'monitor'} onclick={() => setMode('monitor')}><span class="ctx-radio-dot" aria-hidden="true"></span>Monitor Fullscreen</button>
-      <div class="ctx-menu-sep"></div>
-      <button class="ctx-item" role="menuitem" onclick={exitFullscreen} disabled={crush.fullscreen === 'normal'}>Exit Fullscreen</button>
       <div class="ctx-menu-sep"></div>
       <button class="ctx-item" role="menuitem" class:active={crush.hideCalibrationInterface} onclick={toggleHideCalibrationInterface}><span class="ctx-checkbox" aria-hidden="true"></span>Hide interface</button>
       {#if crush.stripType === 'black'}

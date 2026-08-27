@@ -216,6 +216,17 @@ export function highNitsSdrCodes(cells = HIGH_NITS_CELLS) {
 export const HIGH_SDR_RANGE = [];
 for (let c = 232; c <= 255; c++) HIGH_SDR_RANGE.push(c);
 
+// ── Uniformity field ─────────────────────────────────────────────────
+// A single solid grey whose level (percent of SDR white) the user sweeps
+// to check OLED uniformity: banding, vignetting, and uneven tint show best
+// in bright greys.
+
+// The sRGB render value for a grey percentage, the same round-trip the
+// black strip uses for its SDR RGB codes.
+export function greyValueFor(percent) {
+  return linearToSrgb(srgbToLinear(Math.max(0, Math.min(100, percent)) / 100));
+}
+
 // Strip registry, adding a third strip later is one new entry here.
 // `label` is the heading button / context-menu text; `title` its tooltip.
 export const STRIPS = [
@@ -228,6 +239,11 @@ export const STRIPS = [
     id: 'highNits',
     label: 'White',
     title: 'White grid strip: ascending nits cells to judge peak output',
+  },
+  {
+    id: 'grey',
+    label: 'Uniformity',
+    title: 'Uniformity field: a solid grey to spot banding, vignetting, and uneven tint',
   },
 ];
 

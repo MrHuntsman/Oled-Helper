@@ -2276,6 +2276,44 @@ select:focus-visible,
 }
 
 /* ── Fullscreen hint ──────────────────────────────────────────────── */
+/* Fullscreen shortcut on the Uniformity field (normal view): a compact
+   pill in the top-right corner of the strip that jumps straight to monitor
+   fullscreen for the panel-wide uniformity check. */
+.strip-fs-btn {
+  position: absolute;
+  top: 16px; right: 16px;
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  background: rgba(13, 13, 15, 0.6);
+  backdrop-filter: blur(8px);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+.strip-fs-btn:hover, .strip-fs-btn:focus-visible {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.4), 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+  transform: scale(1.05);
+  outline: none;
+}
+.strip-fs-btn svg { width: 15px; height: 15px; }
+
 /* ── Fullscreen controls help (? icon + tooltip) ───────────────── */
 .fs-help-wrap {
   position: absolute;

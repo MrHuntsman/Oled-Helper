@@ -62,12 +62,16 @@ export const crush = $state({
   adjustment: 0,
   blackProfiles: {},
   blackEnabled: true,
-  // Which calibration strip is active ('black' | 'highNits'). Session-only
-  // (never persisted), every launch starts on Black.
+  // Which calibration strip is active ('black' | 'grey' | 'highNits').
+  // Session-only (never persisted), every launch starts on Black.
   stripType: 'black',
   // Per-strip square counts (zoom), session-only like squareCount was.
   // Only the Black strip zooms; the High Nits grid is always fixed.
   squareCounts: { black: 12, highNits: 8 },
+  // Selected grey uniformity level (percent of SDR white), session-only
+  // like stripType. The Grey strip's ladder picks the fixed 50-95% levels;
+  // the fullscreen sweep slider can go anywhere in 0-100%.
+  greyLevel: 50,
   // High Nits strip range. The grid is always a fixed 3 rows × 7 columns
   // (21 cells) with no zoom; Min is fixed and the user picks Max via a
   // single slider. Step (nits between neighboring cells) derives silently
@@ -247,7 +251,7 @@ export function activeSquareCount() {
 }
 
 export function setStripType(type) {
-  if (type === 'black' || type === 'highNits') crush.stripType = type;
+  if (type === 'black' || type === 'highNits' || type === 'grey') crush.stripType = type;
 }
 
 // High Nits range editing. The grid is a fixed 21 cells ending exactly at
