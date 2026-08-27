@@ -2,14 +2,14 @@
 // Run by the GitHub Actions release workflow after `npm run tauri build`.
 //
 // Usage: node scripts/make-latest-json.mjs [expected-version]
-//   expected-version is the git tag without the "v" prefix (e.g. 0.1.1). When
+//   expected-version is the git tag without the "v" prefix (e.g. 1.0.0). When
 //   given, the build fails if it does not match the version in
 //   tauri.conf.json, so a release can never ship a manifest whose version
 //   does not match the exe actually built.
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const REPO = 'MrHuntsman/Oled-Helper-v2';
+const REPO = 'MrHuntsman/Oled-Helper';
 const EXE_RELATIVE_PATH = 'src-tauri/target/release/OledHelper.exe';
 
 const conf = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));

@@ -30,10 +30,10 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 
 const MANIFEST_URL: &str =
-    "https://github.com/MrHuntsman/Oled-Helper-v2/releases/latest/download/latest.json";
+    "https://github.com/MrHuntsman/Oled-Helper/releases/latest/download/latest.json";
 // Used only for release notes/date in the update modal (best effort).
 const RELEASE_API_URL: &str =
-    "https://api.github.com/repos/MrHuntsman/Oled-Helper-v2/releases/latest";
+    "https://api.github.com/repos/MrHuntsman/Oled-Helper/releases/latest";
 // Sanity cap on the staged download. A corrupt/bad manifest must never be able
 // to point the updater at a multi-GB file and exhaust the disk next to the exe.
 const MAX_UPDATE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB

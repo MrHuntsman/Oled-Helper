@@ -12,7 +12,7 @@
   // WebView to it (the backend opens it via ShellExecuteW).
   function openGitHub(event) {
     event.preventDefault();
-    invoke('open_url', { url: 'https://github.com/MrHuntsman/Oled-Helper-v2' }).catch(() => {});
+    invoke('open_url', { url: 'https://github.com/MrHuntsman/Oled-Helper' }).catch(() => {});
   }
   onMount(() => {
     getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
@@ -23,7 +23,7 @@
   <TabHeading icon={tabAboutIcon} title="About" />
   <div class="separator"></div>
   <p style="color: var(--text-weak);">OLED Helper is a Windows desktop utility for OLED display calibration and system control.</p>
-  <p style="color: var(--text-weak); margin-top: 8px;">v{appVersion || '0.1.1'} · <a href="https://github.com/MrHuntsman/Oled-Helper-v2" tabindex="0" rel="noopener" style="color: var(--text-weak);" onclick={openGitHub}>View on GitHub</a></p>
+  <p style="color: var(--text-weak); margin-top: 8px;">v{appVersion || '1.0.0'} · <a href="https://github.com/MrHuntsman/Oled-Helper" tabindex="0" rel="noopener" style="color: var(--text-weak);" onclick={openGitHub}>View on GitHub</a></p>
 
   <div class="update-check-row" class:has-update={updateState.status === 'available'} class:has-error={updateState.status === 'error'}>
     {#if updateState.status === 'available'}
