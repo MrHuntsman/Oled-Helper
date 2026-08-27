@@ -182,8 +182,7 @@ pub fn is_process_elevated() -> bool {
 
 // Startup elevation, consolidated. Called once per process in run() before
 // any Tauri/WebView2 init, this is THE single place the app decides whether
-// to hand off to an elevated replacement. It returns true when the caller
-// must exit (an elevated child was successfully spawned).
+// to hand off to an elevated replacement.
 //
 // Two on-disk config flags can want an elevated session: "Always open as
 // administrator" and the Screen Dimmer's power/media detection. Both are
@@ -196,20 +195,33 @@ pub fn is_process_elevated() -> bool {
 // The child is spawned with --restart-parent <this pid> so it waits for this
 // bare launcher to exit before it touches WebView2. This process has NOT
 // created any WebView2 yet, so exiting here with a hard exit is safe and
-// keeps the window from flashing before the UAC prompt. A declined prompt
-// (or failed spawn) returns false: the caller continues running non-elevated
-// and each non-elevated launch re-asks on the next start. An already-elevated
+// keeps the window from flashing before the UAC prompt. An already-elevated
 // process never re-enters (an elevated replacement of a previous launch finds
 // itself already elevated and stays put, so there is no loop).
-pub(crate) fn startup_elevation_handoff() -> bool {
+pub(crate) enum StartupElevationResult {
+    // An elevated replacement was spawned; the caller must exit immediately.
+    Launched,
+    // No elevation was requested. The caller continues running; the window
+    // comes up without needing a focus grab.
+    None,
+    // Elevation was requested but the prompt was declined (or the launch
+    // failed). The caller continues non-elevated, and the window should grab
+    // the foreground on startup: the UAC secure-desktop interaction tore the
+    // foreground away from this fresh process, so Windows would otherwise
+    // let the window open in the background. Each non-elevated launch re-asks
+    // on the next start.
+    Declined,
+}
+
+pub(crate) fn startup_elevation_handoff() -> StartupElevationResult {
     if process_is_elevated() {
-        return false;
+        return StartupElevationResult::None;
     }
 
     let always = crate::config::always_elevated_on_disk();
     let dimmer = crate::config::screen_protector_enabled_on_disk();
     if !(always || dimmer) {
-        return false;
+        return StartupElevationResult::None;
     }
 
     let mut extra: Vec<String> = Vec::new();
@@ -232,11 +244,11 @@ pub(crate) fn startup_elevation_handoff() -> bool {
     match spawn_elevated(&extra) {
         Ok(()) => {
             log::info!("[elevate] spawned elevated replacement at startup; exiting launcher");
-            true
+            StartupElevationResult::Launched
         }
         Err(error) => {
             log::warn!("[elevate] startup elevation declined ({error}); continuing non-elevated");
-            false
+            StartupElevationResult::Declined
         }
     }
 }

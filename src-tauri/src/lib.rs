@@ -794,15 +794,18 @@ pub fn run() {
     // decision so a single UAC prompt covers the launch (the two separate
     // probe + relaunch blocks this replaces could prompt twice and spawn
     // duplicate replacements, feeding the restart storm that raced the shared
-    // WebView2 user-data folder). Returns true when an elevated replacement
-    // was spawned and this bare launcher (which has not created any WebView2
-    // yet) exits immediately so the window never flashes before the prompt.
-    // On a declined prompt the app continues non-elevated; each non-elevated
-    // launch re-asks on its next start. An already-elevated process skips it
-    // entirely, so there is no relaunch loop.
-    if process::startup_elevation_handoff() {
-        std::process::exit(0);
-    }
+    // WebView2 user-data folder). When a replacement is spawned, only this
+    // bare launcher (which has not created any WebView2 yet) exits immediately
+    // so the window never flashes before the prompt. A declined prompt
+    // continues non-elevated, but the UAC secure-desktop interaction leaves
+    // the fresh window wanting to take the foreground; the declined flag
+    // below grabs it once the window appears. An already-elevated process
+    // skips it entirely, so there is no relaunch loop.
+    let declined_startup_elevation = match process::startup_elevation_handoff() {
+        process::StartupElevationResult::Launched => std::process::exit(0),
+        process::StartupElevationResult::Declined => true,
+        process::StartupElevationResult::None => false,
+    };
 
     let builder = tauri::Builder::default();
     let gamma_desired = Arc::new(AtomicI32::new(0));
@@ -1291,11 +1294,14 @@ pub fn run() {
 
             // A restart child (tray restart, elevated UAC relaunch) can come
             // up without the foreground: an elevated child is spawned by
-            // consent.exe, so Windows refuses its window activation. Grab the
-            // foreground shortly after startup, only for restart children,
-            // never for login/autostart launches where stealing focus would
-            // be wrong.
-            if is_restart_child {
+            // consent.exe, so Windows refuses its window activation. The same
+            // holds for a launch where the startup UAC prompt was declined:
+            // the secure-desktop interaction tears the foreground away from
+            // the fresh process, so its window opens in the background. Grab
+            // the foreground shortly after startup for both cases, never for
+            // plain login/autostart launches where stealing focus would be
+            // wrong.
+            if is_restart_child || declined_startup_elevation {
                 let restart_app = app.handle().clone();
                 std::thread::spawn(move || {
                     process::grab_foreground_after_restart(restart_app);
