@@ -180,6 +180,67 @@ pub fn is_process_elevated() -> bool {
     process_is_elevated()
 }
 
+// Startup elevation, consolidated. Called once per process in run() before
+// any Tauri/WebView2 init, this is THE single place the app decides whether
+// to hand off to an elevated replacement. It returns true when the caller
+// must exit (an elevated child was successfully spawned).
+//
+// Two on-disk config flags can want an elevated session: "Always open as
+// administrator" and the Screen Dimmer's power/media detection. Both are
+// probed here so a single UAC prompt covers the whole launch instead of the
+// two separate probe + relaunch blocks this replaced (which could fire the
+// prompt twice and spawn duplicate replacements, feeding the restart storm
+// and letting overlapping instances race the shared WebView2 user-data
+// folder).
+//
+// The child is spawned with --restart-parent <this pid> so it waits for this
+// bare launcher to exit before it touches WebView2. This process has NOT
+// created any WebView2 yet, so exiting here with a hard exit is safe and
+// keeps the window from flashing before the UAC prompt. A declined prompt
+// (or failed spawn) returns false: the caller continues running non-elevated
+// and each non-elevated launch re-asks on the next start. An already-elevated
+// process never re-enters (an elevated replacement of a previous launch finds
+// itself already elevated and stays put, so there is no loop).
+pub(crate) fn startup_elevation_handoff() -> bool {
+    if process_is_elevated() {
+        return false;
+    }
+
+    let always = crate::config::always_elevated_on_disk();
+    let dimmer = crate::config::screen_protector_enabled_on_disk();
+    if !(always || dimmer) {
+        return false;
+    }
+
+    let mut extra: Vec<String> = Vec::new();
+    if always {
+        // Always-elevated wins the reopen tab: it relaunches onto Settings so
+        // the flag's home is visible. The elevated child is elevated, so the
+        // flag never prompts again.
+        extra.push(format!("{ARG_OPEN_TAB_PREFIX}settings"));
+    }
+    if dimmer {
+        // Carry the persisted dimmer-enabled intent so the elevated child
+        // (re)applies it, and open onto the Screen Dimmer tab if always-
+        // elevated isn't already taking the focus elsewhere.
+        extra.push(format!("{ARG_SCREEN_DIMMER_ENABLED_PREFIX}1"));
+        if !always {
+            extra.push(format!("{ARG_OPEN_TAB_PREFIX}screen-dimmer"));
+        }
+    }
+
+    match spawn_elevated(&extra) {
+        Ok(()) => {
+            log::info!("[elevate] spawned elevated replacement at startup; exiting launcher");
+            true
+        }
+        Err(error) => {
+            log::warn!("[elevate] startup elevation declined ({error}); continuing non-elevated");
+            false
+        }
+    }
+}
+
 // Launches a copy of the current executable elevated (ShellExecuteW "runas",
 // UAC prompt). Forwards the current command-line arguments plus
 // --restart-parent <pid> so the replacement waits for this process to exit

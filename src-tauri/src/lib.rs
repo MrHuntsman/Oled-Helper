@@ -789,59 +789,19 @@ pub fn run() {
         }
     }
 
-    // "Always open as administrator" (Settings tab): relaunch elevated
-    // before any window when the flag is set and this process isn't
-    // elevated. Runs first so a single UAC prompt also covers the Screen
-    // Dimmer check below. If the user dismisses the prompt the app continues
-    // non-elevated and asks again on the next launch, the flag is their
-    // explicit choice, so it stays set. The elevated replacement never
-    // re-enters this branch (process_is_elevated). A dismissed prompt also
-    // skips the Screen Dimmer elevation below: one prompt per launch. The
-    // dimmer is disabled on disk in that case (same as its own decline path)
-    // so a non-elevated session never runs a half-degraded version of it.
-    #[cfg(target_os = "windows")]
-    let mut elevation_declined = false;
-    #[cfg(target_os = "windows")]
-    if !process::process_is_elevated() && config::always_elevated_on_disk() {
-        let extra = [format!("{}settings", process::ARG_OPEN_TAB_PREFIX)];
-        if process::spawn_elevated(&extra).is_ok() {
-            std::process::exit(0);
-        }
-        // The always-elevated prompt covers the dimmer too: it needs admin as
-        // well, so a declined prompt skips the dimmer's own elevation ask
-        // (one UAC prompt per launch). The dimmer's on-disk setting is left
-        // untouched: the tab shows a restart-as-admin prompt instead, so the
-        // user's intent survives a declined prompt.
-        elevation_declined = true;
-        log::warn!("[power] elevation declined; screen dimmer stays enabled but inactive");
-    }
-
-    // Screen Dimmer needs admin for its media-playback detection. Ask for
-    // elevation BEFORE any window is created: the persisted config is probed
-    // directly (no AppHandle exists yet) and a successful UAC relaunch hands
-    // off to the elevated replacement, so a normal close/reopen never flashes
-    // the window open before the prompt. A declined prompt (or any other
-    // failed launch) falls through to a plain non-elevated startup with the
-    // on-disk setting left intact; the dimmer never runs in the half-degraded
-    // state (dimming on, media detection off), and the tab shows a
-    // restart-as-admin prompt instead. The elevated replacement never
-    // re-enters this branch (process_is_elevated). Skipped entirely when the
-    // always-elevated prompt above was declined (it already covers the
-    // dimmer's elevation).
-    #[cfg(target_os = "windows")]
-    if !elevation_declined && !process::process_is_elevated() && config::screen_protector_enabled_on_disk() {
-        let extra = [
-            format!("{}1", process::ARG_SCREEN_DIMMER_ENABLED_PREFIX),
-            format!("{}screen-dimmer", process::ARG_OPEN_TAB_PREFIX),
-        ];
-        match process::spawn_elevated(&extra) {
-            Ok(()) => std::process::exit(0),
-            Err(error) => {
-                log::warn!(
-                    "[power] screen dimmer elevation declined ({error}); dimmer stays enabled but inactive"
-                );
-            }
-        }
+    // Startup elevation, consolidated. "Always open as administrator" and
+    // the Screen Dimmer both want admin rights; they are probed as ONE
+    // decision so a single UAC prompt covers the launch (the two separate
+    // probe + relaunch blocks this replaces could prompt twice and spawn
+    // duplicate replacements, feeding the restart storm that raced the shared
+    // WebView2 user-data folder). Returns true when an elevated replacement
+    // was spawned and this bare launcher (which has not created any WebView2
+    // yet) exits immediately so the window never flashes before the prompt.
+    // On a declined prompt the app continues non-elevated; each non-elevated
+    // launch re-asks on its next start. An already-elevated process skips it
+    // entirely, so there is no relaunch loop.
+    if process::startup_elevation_handoff() {
+        std::process::exit(0);
     }
 
     let builder = tauri::Builder::default();
