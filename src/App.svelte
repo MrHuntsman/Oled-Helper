@@ -1183,9 +1183,14 @@
         // Window hid to the tray (or a self-heal read found it hidden):
         // close any open dropdown so it never greets the user on restore.
         closeAllMenus();
+        scheduleVisibilityReconcile();
         return;
       }
       if (wasVisible) return;
+      if (visibilityReconcileTimer) {
+        clearTimeout(visibilityReconcileTimer);
+        visibilityReconcileTimer = null;
+      }
       // Stamp the restore moment. The Text tab's native preview reads this
       // on mount and holds itself hidden until the window's restore
       // animation has had time to finish, so the text sample never appears
@@ -1230,6 +1235,24 @@
         .catch(() => {});
     }
     window.addEventListener('focus', reconcileWindowVisible);
+    // The focus-based reconcile above cannot fire when the window stays
+    // visible and focused, e.g. a close-to-tray whose hide did not take
+    // effect: the backend emitted window-visibility false, this flag went
+    // false and unmounted the tab, but the window is still on screen. While
+    // the flag is false but the document is genuinely visible, poll the real
+    // state until it converges. A real close-to-tray flips
+    // document.visibilityState to hidden, which pauses the poll, so nothing
+    // runs while the app sits in the tray.
+    let visibilityReconcileTimer = null;
+    function scheduleVisibilityReconcile() {
+      if (visibilityReconcileTimer) return;
+      visibilityReconcileTimer = setTimeout(() => {
+        visibilityReconcileTimer = null;
+        if (windowVisible || document.visibilityState !== 'visible') return;
+        reconcileWindowVisible();
+        scheduleVisibilityReconcile();
+      }, 500);
+    }
     // A dropdown left open when the window is minimized or backgrounded
     // (another app focused) would still be open, and stale, when the user
     // comes back. The window-visibility event covers the close-to-tray path
@@ -1274,6 +1297,10 @@
       unlistenFlyoutCompleted?.();
       window.removeEventListener('focus', reconcileWindowVisible);
       window.removeEventListener('blur', closeAllMenus);
+      if (visibilityReconcileTimer) {
+        clearTimeout(visibilityReconcileTimer);
+        visibilityReconcileTimer = null;
+      }
       document.removeEventListener('visibilitychange', onDocumentVisibilityChange);
     };
   });

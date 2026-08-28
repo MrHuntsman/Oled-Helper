@@ -1326,7 +1326,28 @@ pub fn run() {
                     let _ = window.app_handle().save_window_state(
                         StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED,
                     );
+                    // window.hide() on Windows reports success through the
+                    // runtime's message dispatcher even when the hide did
+                    // not take effect (a re-entrant close dispatch can drop
+                    // the message while still returning Ok), so verify the
+                    // window is actually hidden before telling the frontend.
+                    // Otherwise the frontend unmounts the tab content
+                    // ({#if windowVisible}) while the window is still on
+                    // screen, an empty tab that never goes away.
+                    let mut hidden = false;
                     if window.hide().is_ok() {
+                        hidden = !window.is_visible().unwrap_or(false);
+                        if !hidden {
+                            // One short retry covers transient states; the
+                            // hide is synchronous on the main thread, so
+                            // this is cheap and invisible to the user.
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            if window.hide().is_ok() {
+                                hidden = !window.is_visible().unwrap_or(false);
+                            }
+                        }
+                    }
+                    if hidden {
                         // First close-to-tray ever: tell the user the app is
                         // still running in the tray.
                         show_tray_notice(window.app_handle());
@@ -1339,6 +1360,13 @@ pub fn run() {
                         let _ = window.app_handle().emit(
                             "window-visibility",
                             serde_json::json!({ "visible": false, "animated": false }),
+                        );
+                    } else {
+                        // Leave the window fully visible with its content
+                        // intact: far better than a blank window. The user
+                        // can simply click the X again.
+                        log::warn!(
+                            "[window] close-to-tray hide did not take effect; leaving the window visible"
                         );
                     }
                 }
