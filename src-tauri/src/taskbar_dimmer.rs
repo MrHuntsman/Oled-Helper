@@ -98,13 +98,15 @@ mod platform {
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW,
         GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetTopWindow, GetWindow,
         GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible, PostMessageW,
-        PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW,
-        SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx,
+        PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes,
+        SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+        UnhookWindowsHookEx,
         GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT,
         HWND_TOPMOST, IDC_ARROW, LoadCursorW, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS,
         SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
         SW_SHOW, WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT,
-        WM_QUIT, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WM_QUIT, WM_SETCURSOR, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW,
         WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
     };
 
@@ -916,6 +918,21 @@ mod platform {
     ) -> LRESULT {
         match message {
             WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            // The overlay must never hide the pointer over the taskbar.
+            // DefWindowProc only applies the class cursor for HTCLIENT hit
+            // tests, and this window returns HTTRANSPARENT, so the class
+            // cursor never takes effect and the pointer over the overlay
+            // just inherits whatever was last set system-wide. After a
+            // streaming session (Sunshine) that can be a hidden cursor,
+            // which is exactly the invisible pointer over the dimmed
+            // taskbar. Setting the arrow here guarantees the pointer is
+            // always visible over the taskbar while the dimmer is on.
+            WM_SETCURSOR => {
+                unsafe {
+                    let _ = SetCursor(Some(LoadCursorW(None, IDC_ARROW).unwrap_or_default()));
+                }
+                LRESULT(1)
+            }
             WM_DIMMER_TICK => {
                 // Tick messages are posted by a background thread so the
                 // overlay never owns a WM_TIMER. This avoids SetTimer's
@@ -1032,13 +1049,14 @@ mod platform {
             lpfnWndProc: Some(overlay_window_proc),
             lpszClassName: PCWSTR(name.as_ptr()),
             // The overlay sits over the taskbar and must never swallow the
-            // cursor: Windows hides the cursor over a window whose class has
-            // no cursor (NULL hCursor, no WM_SETCURSOR handler), which showed
-            // up as an invisible pointer whenever the overlay was dimmed under
-            // it (e.g. right after a Sunshine stream restore, where the
-            // overlay is still faded in while the cursor is parked over the
-            // taskbar). IDC_ARROW is a system stock cursor, no ownership to
-            // manage.
+            // cursor. A NULL class cursor would hide the pointer over the
+            // window, and although DefWindowProc only applies the class
+            // cursor for HTCLIENT hit tests (this window returns
+            // HTTRANSPARENT), IDC_ARROW is still the correct class cursor
+            // for any HTCLIENT path, a system stock cursor with no ownership
+            // to manage. The active guarantee is the WM_SETCURSOR arm in
+            // overlay_window_proc, which forces the arrow regardless of the
+            // hit-test result.
             hCursor: unsafe { LoadCursorW(None, IDC_ARROW).unwrap_or_default() },
             ..Default::default()
         };
