@@ -693,8 +693,9 @@ fn run_elevated_power_probe() -> Vec<DisplayRequestInfo> {
             if error.contains("not registered") {
                 let _ = UNREGISTERED_WARNED.get_or_init(|| {
                     log::warn!(
-                        "[power] media detection is off: the privileged helper task is not \
-                         registered. Enable the Screen Dimmer from the app once to set it up."
+                        "[power] media detection is off: the privileged helper task is missing \
+                         or points at an old location (the portable exe may have moved). Toggle \
+                         the Screen Dimmer off and on once to re-register it."
                     );
                 });
             } else {

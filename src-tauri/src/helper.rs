@@ -103,6 +103,15 @@ pub(crate) struct HelperResult {
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+// Set after the first run_request of the process confirms the task is
+// present and pointed at the running exe. Both facts are stable for the
+// life of the process (the exe path of a running image cannot change, and
+// re-registration only happens through ensure_registered), so the probe
+// skips the schtasks query on its hot near-timeout cadence after that.
+// Left unset on a failure so a later ensure_registered self-heal is
+// re-checked on the next run_request.
+static REGISTRATION_VERIFIED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 // ── Task registration ──────────────────────────────────────────────────
 
 fn task_exists() -> bool {
@@ -110,6 +119,37 @@ fn task_exists() -> bool {
         return false;
     };
     output.status.success()
+}
+
+// Whether the registered task launches THIS executable. The app is a
+// portable exe: if the user moves it to a new folder, the task keeps
+// pointing at the old path — it still exists (the name query above passes)
+// but every /Run starts a stale or missing binary. schtasks /V /FO LIST
+// prints the task's full "Task To Run" command verbatim, so a
+// case-insensitive substring match on the current exe path is the check.
+fn task_matches_current_exe() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(exe) = exe.to_str() else {
+        return false;
+    };
+    let Ok(output) = run_hidden(
+        "schtasks",
+        &["/Query", "/TN", HELPER_TASK_NAME, "/V", "/FO", "LIST"],
+    ) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    text.contains(&exe.to_lowercase())
+}
+
+// A usable registration is both present and pointed at this exe.
+fn task_registered_and_current() -> bool {
+    task_exists() && task_matches_current_exe()
 }
 
 // Creates the helper task. The process creating it must be elevated:
@@ -161,7 +201,12 @@ fn create_task() -> Result<(), String> {
 // Non-command entry used by backend fallback paths (RTX HDR writes, font
 // apply) that route through the helper. Same semantics as ensure_helper_task.
 pub(crate) fn ensure_registered() -> Result<(), String> {
-    if task_exists() {
+    // A stale task (portable exe moved) is treated as unregistered: the
+    // existing task would /Run a dead path. Re-registering overwrites it
+    // with the current exe location (/F). Callers are user-initiated
+    // actions (enabling the dimmer, an HDR write, a font apply), so a UAC
+    // prompt here is expected — unlike the background power probe.
+    if task_registered_and_current() {
         return Ok(());
     }
     if crate::process::process_is_elevated() {
@@ -176,7 +221,7 @@ pub(crate) fn ensure_registered() -> Result<(), String> {
     // already reported UAC dismissal, so a missing task after that is a
     // registration failure worth surfacing.
     for _ in 0..25 {
-        if task_exists() {
+        if task_registered_and_current() {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -201,11 +246,13 @@ pub(crate) fn result_into_std(result: HelperResult) -> Result<(), String> {
     }
 }
 
-// Tray/UI probe: is the helper task registered? Surfaced as a small warning
-// on the Screen Dimmer row when it is on but the helper was never set up.
+// Tray/UI probe: is the helper task registered and pointed at this exe?
+// Surfaced as a small warning on the Screen Dimmer row when it is on but
+// the helper was never set up (or points at an old location after the
+// portable exe moved).
 #[tauri::command]
 pub fn helper_task_registered() -> bool {
-    task_exists()
+    task_registered_and_current()
 }
 
 // Runs the registered task and waits for the result file carrying the
@@ -247,12 +294,19 @@ pub(crate) fn run_request(
     // old file that happens to carry the same id after a counter reset.
     let _ = std::fs::remove_file(&result_file);
 
-    if !task_exists() {
-        // Graceful degradation: the caller already knows the task state from
-        // ensure_helper_task, so an op reaching this point without the task
-        // is a surprise; report it rather than hang.
-        let _ = std::fs::remove_file(&request_file);
-        return Err("the privileged helper task is not registered".to_string());
+    if REGISTRATION_VERIFIED.get().is_none() {
+        // Missing task, or a stale one pointing at an old location after the
+        // portable exe moved. The background power probe must never raise a
+        // UAC prompt, so this is a fail-fast error, not a self-heal: the
+        // caller degrades gracefully (the dimmer suppresses on idle alone)
+        // and the next user-initiated action re-registers via
+        // ensure_registered. "not registered" doubles as the marker power.rs
+        // uses to warn exactly once.
+        if !task_registered_and_current() {
+            let _ = std::fs::remove_file(&request_file);
+            return Err("the privileged helper task is not registered".to_string());
+        }
+        let _ = REGISTRATION_VERIFIED.set(());
     }
     let trigger = run_hidden("schtasks", &["/Run", "/TN", HELPER_TASK_NAME])
         .map_err(|error| format!("could not trigger the privileged helper: {error}"))?;
