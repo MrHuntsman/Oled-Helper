@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, appSettings, crush, taskbarDimmer, screenDimmer, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId } from './lib/stores.svelte.js';
+  import { app, appSettings, crush, taskbarDimmer, screenDimmer, screenDimmerHelper, refreshScreenDimmerHelperReady, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -1037,6 +1037,16 @@
       .catch((e) => console.warn('[sidebar] screen dimmer toggle failed', e));
   }
 
+  // One-time setup of the elevated helper task (UAC prompt on first use,
+  // or again after the portable exe moved). The warning glyph next to the
+  // nav switch calls this directly so the user can fix a missing or stale
+  // registration without toggling the dimmer off and on.
+  function setupScreenDimmerHelperFromNav() {
+    invoke('ensure_helper_task')
+      .then(() => { screenDimmerHelper.ready = true; })
+      .catch((e) => console.warn('[sidebar] screen dimmer helper setup failed', e));
+  }
+
   function handleHotkeyAction(action) {
     switch (action) {
       case 'toggle_black_crush':
@@ -1113,6 +1123,10 @@
     getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
     // Silent startup update check; failure never disturbs the UI.
     checkForUpdates();
+    // Whether the Screen Dimmer's one-time elevated helper is set up; when
+    // the dimmer is on but the helper is missing or stale (portable exe
+    // moved), the nav switch shows a warning glyph to re-register it.
+    refreshScreenDimmerHelperReady();
 
     let unlisten;
     let unlistenDisplayChanged;
@@ -1482,6 +1496,15 @@
       <button class="nav-btn" class:active={app.activeTab === 'screen-dimmer'} aria-current={app.activeTab === 'screen-dimmer' ? 'page' : undefined} onclick={() => app.activeTab = 'screen-dimmer'}>
         <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> Screen Dimmer
       </button>
+      {#if screenDimmer.enabled && !screenDimmerHelper.ready && app.isElevated === false}
+        <button
+          type="button"
+          class="nav-screen-dimmer-warn"
+          aria-label="Set up Screen Dimmer media detection"
+          title="Screen Dimmer video-pause detection (pause while video plays) needs a one-time elevated helper setup. Idle dimming works without it. Click to set it up now."
+          onclick={setupScreenDimmerHelperFromNav}
+        >⚠</button>
+      {/if}
       <button type="button" class="nav-switch" class:on={screenDimmer.enabled} aria-pressed={screenDimmer.enabled} onclick={toggleScreenDimmerFromNav} title="Toggle Screen Dimmer" aria-label="Toggle Screen Dimmer">
         <span class="nav-switch-thumb" aria-hidden="true"></span>
       </button>

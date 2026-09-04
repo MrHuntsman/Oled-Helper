@@ -1329,7 +1329,7 @@
     </div>
 
     {#if hotkeyTargetLabel}
-      <div class="tray-hotkey-target">Black Crush hotkeys act on: {hotkeyTargetLabel}</div>
+      <div class="tray-hotkey-target" title="Black Crush hotkeys act on this monitor">{hotkeyTargetLabel}</div>
     {/if}
 
     <div

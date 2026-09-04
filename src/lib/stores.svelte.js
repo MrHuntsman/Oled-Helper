@@ -21,8 +21,9 @@ export const app = $state({
   // minimized restore, so it always animates).
   windowShownAt: 0,
   // Whether this session runs with administrator rights. null until the
-  // startup probe answers; the Screen Dimmer tab shows a restart-as-admin
-  // prompt when the dimmer is enabled but the session is not elevated.
+  // startup probe answers; an elevated session runs the Screen Dimmer's
+  // media probe in-process, so the nav warning glyph (helper task missing)
+  // is gated on this being false.
   isElevated: null,
   hdrStatus: 'unknown',
   hdrLuminance: null,
@@ -440,6 +441,28 @@ export const textSettings = $state({
 export const screenDimmer = $state({
   ...SCREEN_DIMMER_DEFAULTS,
 });
+
+// Whether the one-time elevated helper task (helper.rs) is registered and
+// pointed at this exe. The Screen Dimmer's video-pause detection runs
+// through it; idle dimming works without it. Starts true (no warning) until
+// the startup probe answers, then reflects helper_task_registered — false
+// also covers a stale task after the portable exe moved. Only meaningful in
+// a non-elevated session: an elevated session probes power state in-process
+// and never needs the task, so the UI gates the warning on app.isElevated.
+export const screenDimmerHelper = $state({
+  // Starts true (no warning) until the startup probe answers.
+  ready: true,
+});
+
+export async function refreshScreenDimmerHelperReady() {
+  try {
+    const registered = await invoke('helper_task_registered');
+    screenDimmerHelper.ready = registered === true;
+  } catch (e) {
+    // Keep the last known state on a transient IPC failure.
+    console.warn('[screen-dimmer] helper task probe failed', e);
+  }
+}
 
 // Per-monitor Screen Dimmer profiles, keyed by the monitor's profile
 // identity (see monProfileId), same keying as the Taskbar Dimmer profiles.
@@ -1522,6 +1545,11 @@ export async function setScreenDimmerEnabled(enabled, tab = app.activeTab) {
   } catch (error) {
     console.warn('[screen-dimmer] privileged helper setup unavailable; media detection disabled', error);
   }
+  // Update the nav/tab warning badge: a successful setup (or an existing
+  // registration) clears it; a declined prompt or a stale task after the
+  // portable exe moved leaves it showing so the user knows media detection
+  // is off and how to fix it.
+  await refreshScreenDimmerHelperReady();
 }
 
 let pendingTaskbarDimmerUpdate = null;

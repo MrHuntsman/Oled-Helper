@@ -229,9 +229,9 @@ try {
   // is cheap and harmless once this identity is already seeded.
   Promise.allSettled([
     loadConfig(),
-    // The Screen Dimmer tab shows a restart-as-admin prompt when the dimmer
-    // is enabled but the session lacks admin rights, so resolve the session's
-    // elevation once at startup.
+    // Resolve the session's elevation once at startup: the UI gates the
+    // Screen Dimmer helper-task warning on it (an elevated session runs the
+    // media probe in-process and never needs the helper task).
     invoke('is_process_elevated').then((elevated) => {
       app.isElevated = elevated === true;
     }).catch(() => { app.isElevated = false; }),

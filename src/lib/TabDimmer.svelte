@@ -5,7 +5,7 @@
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
   import ScreenDimmerState from './ScreenDimmerState.svelte';
   import ConfirmModal from './ConfirmModal.svelte';
-  import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
+  import { app, taskbarDimmer, screenDimmer, screenDimmerHelper, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
 
   // The heading tag showing which monitor this tab's settings apply to (the
   // one selected in the top-bar monitor selector), labeled like the selector.
@@ -101,6 +101,27 @@
     } catch (e) {
       screenError = String(e);
       console.warn('[screen-dimmer] toggle failed', e);
+    }
+  }
+
+  let screenHelperBusy = $state(false);
+
+  // One-time setup of the elevated helper task (UAC prompt on first use, or
+  // again after the portable exe moved). The banner shows while the dimmer
+  // is on but the task is missing or stale, so video-pause detection is off
+  // while idle dimming still works; clicking it repairs the registration
+  // without toggling the dimmer off and on.
+  async function setupScreenDimmerHelper() {
+    if (screenHelperBusy) return;
+    screenHelperBusy = true;
+    try {
+      await invoke('ensure_helper_task');
+      screenDimmerHelper.ready = true;
+    } catch (e) {
+      screenError = String(e);
+      console.warn('[screen-dimmer] helper setup failed', e);
+    } finally {
+      screenHelperBusy = false;
     }
   }
 
@@ -388,6 +409,15 @@
       <button class="restore-defaults-btn" onclick={() => screenRestoreConfirmOpen = true}>↻ Restore Tab Defaults</button>
     </div>
     <div class="separator"></div>
+
+    {#if screenDimmer.enabled && !screenDimmerHelper.ready && app.isElevated === false}
+      <div class="dimmer-helper-warning" role="status">
+        <span class="dimmer-helper-warning-text">⚠ Video-pause detection is off: the one-time elevated helper isn't set up (or points at an old location after the app was moved). Idle dimming still works.</span>
+        <button type="button" class="dimmer-helper-warning-btn" disabled={screenHelperBusy} onclick={setupScreenDimmerHelper}>
+          {screenHelperBusy ? 'Setting up…' : 'Set up now'}
+        </button>
+      </div>
+    {/if}
 
     <ScreenDimmerState />
 
