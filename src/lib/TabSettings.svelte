@@ -4,7 +4,7 @@
   import tabDebugIcon from './icons/tab_debug.png?inline';
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
-  import { app, appSettings, setAlwaysElevated, restoreAllDefaults, taskbarDimmer, setHoverDetection, setPollIntervalMs, TASKBAR_DIMMER_DEFAULTS } from './stores.svelte.js';
+  import { app, appSettings, restoreAllDefaults, taskbarDimmer, setHoverDetection, setPollIntervalMs, TASKBAR_DIMMER_DEFAULTS } from './stores.svelte.js';
   import ConfirmModal from './ConfirmModal.svelte';
 
   let startOnBoot = $state(false);
@@ -42,11 +42,6 @@
     }
   }
 
-  // Always open as administrator: enabling from a non-elevated session saves
-  // the flag and relaunches elevated via UAC (the whole app restarts), so the
-  // toggle only flips back if the prompt is declined.
-  let alwaysElevatedBusy = $state(false);
-  let alwaysElevatedError = $state('');
   async function toggleSkipFavoriteConfirmation() {
     appSettings.skipFavoriteConfirmation = !appSettings.skipFavoriteConfirmation;
     try {
@@ -57,21 +52,6 @@
     }
   }
 
-  async function toggleAlwaysElevated() {
-    if (alwaysElevatedBusy) return;
-    const next = !appSettings.alwaysElevated;
-    alwaysElevatedBusy = true;
-    alwaysElevatedError = '';
-    try {
-      await setAlwaysElevated(next, 'settings');
-    } catch (e) {
-      alwaysElevatedError = String(e);
-      console.warn('[settings] always elevated toggle failed', e);
-    } finally {
-      alwaysElevatedBusy = false;
-    }
-  }
-
   async function restoreDefaults() {
     if (startOnBoot) {
       try {
@@ -79,16 +59,6 @@
         startOnBoot = false;
       } catch (e) {
         console.warn('[settings] restore defaults could not disable autostart', e);
-      }
-    }
-    // Always open as administrator defaults to off. setAlwaysElevated only
-    // persists the flag (it never relaunches on its own), so resetting it
-    // here is safe while the app is already running.
-    if (appSettings.alwaysElevated) {
-      try {
-        await setAlwaysElevated(false, 'settings');
-      } catch (e) {
-        console.warn('[settings] restore defaults could not clear always elevated', e);
       }
     }
     // Detection Method (Taskbar Dimmer) is global and lives in Settings, so
@@ -194,19 +164,6 @@
     </div>
   </button>
 
-  <button class="settings-row" disabled={alwaysElevatedBusy} onclick={toggleAlwaysElevated}>
-    <div class="settings-row-text">
-      <span class="settings-row-label">Always open as administrator</span>
-      <span class="settings-row-desc">Start OLED Helper as administrator (UAC prompt on launch).</span>
-    </div>
-    <div class="pill-wrap">
-      <span class={`pill${appSettings.alwaysElevated ? '' : ' off'}`} aria-hidden="true"></span>
-    </div>
-  </button>
-  {#if alwaysElevatedError}
-    <p class="reset-all-error" role="status">{alwaysElevatedError}</p>
-  {/if}
-
   <button class="settings-row" onclick={toggleSkipFavoriteConfirmation}>
     <div class="settings-row-text">
       <span class="settings-row-label">Skip favorites confirmations</span>
@@ -279,7 +236,7 @@
   {#if restoreConfirmOpen}
     <ConfirmModal
       title="Restore Settings defaults?"
-      desc="This resets the Start on Boot, Always open as administrator, trusted favorites and Detection Method options to their defaults."
+      desc="This resets the Start on Boot, trusted favorites and Detection Method options to their defaults."
       confirmLabel="Restore"
       onConfirm={restoreDefaults}
       onClose={() => restoreConfirmOpen = false} />

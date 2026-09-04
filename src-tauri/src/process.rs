@@ -7,10 +7,6 @@ use tauri::AppHandle;
 // Command-line flags shared by the restart/elevation paths and parsed by run().
 pub(crate) const ARG_RESTART_PARENT: &str = "--restart-parent";
 pub(crate) const ARG_OPEN_TAB_PREFIX: &str = "--open-tab=";
-pub(crate) const ARG_RTX_HDR_FLAGS_PREFIX: &str = "--rtx-hdr-flags=";
-pub(crate) const ARG_RTX_HDR_ENABLED_PREFIX: &str = "--rtx-hdr-enabled=";
-pub(crate) const ARG_HDR_MODE_PREFIX: &str = "--hdr-mode=";
-pub(crate) const ARG_SCREEN_DIMMER_ENABLED_PREFIX: &str = "--screen-dimmer-enabled=";
 
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
 // used to validate --open-tab forwarding on restart.
@@ -51,12 +47,7 @@ pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi:
             continue;
         }
         let text = arg.to_string_lossy();
-        if text.starts_with(ARG_OPEN_TAB_PREFIX)
-            || text.starts_with(ARG_RTX_HDR_FLAGS_PREFIX)
-            || text.starts_with(ARG_RTX_HDR_ENABLED_PREFIX)
-            || text.starts_with(ARG_HDR_MODE_PREFIX)
-            || text.starts_with(ARG_SCREEN_DIMMER_ENABLED_PREFIX)
-        {
+        if text.starts_with(ARG_OPEN_TAB_PREFIX) {
             continue;
         }
         stripped.push(arg);
@@ -126,7 +117,7 @@ pub fn open_url(url: String) -> Result<(), String> {
         )
     };
     // ShellExecuteW returns a value greater than 32 on success; values ≤ 32
-    // are failures (same convention as relaunch_elevated above).
+    // are failures (same convention as spawn_elevated).
     let code = result.0 as isize;
     if code <= 32 {
         return Err(format!("could not open link (error code {code})"));
@@ -134,9 +125,9 @@ pub fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
-// The native power-request list and powercfg /requests both require admin
-// rights on current Windows builds. The Screen Dimmer uses this check before
-// deciding whether to request a UAC relaunch.
+// Whether the current process runs with an elevated token. The helper child
+// checks its own token this way to prove real elevation, and the app uses it
+// to decide in-process apply vs. the transient helper round trip.
 #[cfg(target_os = "windows")]
 pub(crate) fn process_is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;
@@ -175,83 +166,7 @@ pub(crate) fn process_is_elevated() -> bool {
     false
 }
 
-#[tauri::command]
-pub fn is_process_elevated() -> bool {
-    process_is_elevated()
-}
 
-// Startup elevation, consolidated. Called once per process in run() before
-// any Tauri/WebView2 init, this is THE single place the app decides whether
-// to hand off to an elevated replacement.
-//
-// Two on-disk config flags can want an elevated session: "Always open as
-// administrator" and the Screen Dimmer's power/media detection. Both are
-// probed here so a single UAC prompt covers the whole launch instead of the
-// two separate probe + relaunch blocks this replaced (which could fire the
-// prompt twice and spawn duplicate replacements, feeding the restart storm
-// and letting overlapping instances race the shared WebView2 user-data
-// folder).
-//
-// The child is spawned with --restart-parent <this pid> so it waits for this
-// bare launcher to exit before it touches WebView2. This process has NOT
-// created any WebView2 yet, so exiting here with a hard exit is safe and
-// keeps the window from flashing before the UAC prompt. An already-elevated
-// process never re-enters (an elevated replacement of a previous launch finds
-// itself already elevated and stays put, so there is no loop).
-pub(crate) enum StartupElevationResult {
-    // An elevated replacement was spawned; the caller must exit immediately.
-    Launched,
-    // No elevation was requested. The caller continues running; the window
-    // comes up without needing a focus grab.
-    None,
-    // Elevation was requested but the prompt was declined (or the launch
-    // failed). The caller continues non-elevated, and the window should grab
-    // the foreground on startup: the UAC secure-desktop interaction tore the
-    // foreground away from this fresh process, so Windows would otherwise
-    // let the window open in the background. Each non-elevated launch re-asks
-    // on the next start.
-    Declined,
-}
-
-pub(crate) fn startup_elevation_handoff() -> StartupElevationResult {
-    if process_is_elevated() {
-        return StartupElevationResult::None;
-    }
-
-    let always = crate::config::always_elevated_on_disk();
-    let dimmer = crate::config::screen_protector_enabled_on_disk();
-    if !(always || dimmer) {
-        return StartupElevationResult::None;
-    }
-
-    let mut extra: Vec<String> = Vec::new();
-    if always {
-        // Always-elevated wins the reopen tab: it relaunches onto Settings so
-        // the flag's home is visible. The elevated child is elevated, so the
-        // flag never prompts again.
-        extra.push(format!("{ARG_OPEN_TAB_PREFIX}settings"));
-    }
-    if dimmer {
-        // Carry the persisted dimmer-enabled intent so the elevated child
-        // (re)applies it, and open onto the Screen Dimmer tab if always-
-        // elevated isn't already taking the focus elsewhere.
-        extra.push(format!("{ARG_SCREEN_DIMMER_ENABLED_PREFIX}1"));
-        if !always {
-            extra.push(format!("{ARG_OPEN_TAB_PREFIX}screen-dimmer"));
-        }
-    }
-
-    match spawn_elevated(&extra) {
-        Ok(()) => {
-            log::info!("[elevate] spawned elevated replacement at startup; exiting launcher");
-            StartupElevationResult::Launched
-        }
-        Err(error) => {
-            log::warn!("[elevate] startup elevation declined ({error}); continuing non-elevated");
-            StartupElevationResult::Declined
-        }
-    }
-}
 
 // Launches a copy of the current executable elevated (ShellExecuteW "runas",
 // UAC prompt). Forwards the current command-line arguments plus
@@ -319,47 +234,6 @@ pub(crate) fn spawn_elevated(extra_args: &[String]) -> Result<(), String> {
         };
         return Err(message);
     }
-    Ok(())
-}
-
-// RTX HDR and Screen Dimmer request elevation through the same UAC relaunch
-// path. The pending operation is forwarded to the replacement process.
-#[tauri::command]
-pub fn relaunch_elevated(
-    app: AppHandle,
-    rtx_hdr_flags: Option<u32>,
-    rtx_hdr_enabled: Option<bool>,
-    hdr_mode: Option<String>,
-    screen_dimmer_enabled: Option<bool>,
-    tab: Option<String>,
-) -> Result<(), String> {
-    let mut extra: Vec<String> = Vec::new();
-    if let Some(flags) = rtx_hdr_flags {
-        extra.push(format!("{ARG_RTX_HDR_FLAGS_PREFIX}{flags}"));
-    }
-    if let Some(enabled) = rtx_hdr_enabled {
-        extra.push(format!("{ARG_RTX_HDR_ENABLED_PREFIX}{}", u8::from(enabled)));
-    }
-    if let Some(mode) = hdr_mode
-        .as_deref()
-        .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
-    {
-        extra.push(format!("{ARG_HDR_MODE_PREFIX}{mode}"));
-    }
-    if let Some(enabled) = screen_dimmer_enabled {
-        extra.push(format!("{ARG_SCREEN_DIMMER_ENABLED_PREFIX}{}", u8::from(enabled)));
-    }
-    // Only forward tab ids the app actually has; anything else is ignored
-    // rather than carried into the command line.
-    if let Some(tab) = tab {
-        if KNOWN_TABS.contains(&tab.as_str()) {
-            extra.push(format!("{ARG_OPEN_TAB_PREFIX}{tab}"));
-        }
-    }
-    spawn_elevated(&extra)?;
-    crate::taskbar_dimmer::shutdown();
-    crate::shutdown_gamma_worker(&app);
-    app.exit(0);
     Ok(())
 }
 

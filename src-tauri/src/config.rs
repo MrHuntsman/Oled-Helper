@@ -155,11 +155,6 @@ pub struct AppConfig {
     // fallback written by older versions and read for migration.
     #[serde(default)]
     pub screen_dimmer_profiles: HashMap<String, crate::power::ScreenDimmerProfile>,
-    // Whether the app relaunches itself elevated at startup (Settings tab
-    // "Always open as administrator"). On by user choice only; a UAC prompt
-    // appears before any window when set and the process isn't elevated.
-    #[serde(default)]
-    pub always_elevated: bool,
     // High Nits strip range: the grid is a fixed 3×7 (21 cells) with no
     // zoom; the user picks Min and Max directly (independently of each
     // other) and Step (nits between neighboring cells) is derived on the
@@ -339,7 +334,6 @@ impl Default for AppConfig {
             screen_protector_fade_linked: true,
             screen_protector_fullscreen_detection: true,
             screen_dimmer_profiles: HashMap::new(),
-            always_elevated: false,
             high_nits_min: default_high_nits_min(),
             high_nits_max: None,
             high_nits_step: default_high_nits_step(),
@@ -490,69 +484,6 @@ fn migrate_legacy_ease_duration(raw_json: &str, config: &mut AppConfig) {
     {
         config.taskbar_dimmer_fade_out_duration_ms = legacy;
     }
-}
-
-// Pre-Tauri startup probe used by run() so the Screen Dimmer can request
-// elevation BEFORE any window exists (no open-then-restart flash). Mirrors
-// local_app_dir's %LOCALAPPDATA%/<identifier> path without needing an
-// AppHandle; the identifier is baked in from the embedded tauri.conf.json.
-// Returns true when the persisted config enables the dimmer (including the
-// legacy pre-toggle shape where a non-zero timeout meant on), so the caller
-// can decide whether a UAC relaunch is warranted.
-pub fn screen_protector_enabled_on_disk() -> bool {
-    read_config_raw(|obj| {
-        // The explicit toggle wins whenever it is present, including an
-        // explicit false. (Falling through to the legacy heuristic on a
-        // present-but-false toggle re-enabled elevation on every launch for
-        // users who turned the dimmer off but kept a non-zero timeout.)
-        if let Some(value) = obj.get("screen_protector_enabled") {
-            return value.as_bool().unwrap_or(false);
-        }
-        // Legacy pre-toggle configs (no enabled key at all) used a non-zero
-        // timeout to mean on.
-        obj.get("screen_protector_seconds")
-            .and_then(|v| v.as_u64())
-            .map_or(false, |seconds| seconds > 0)
-    })
-}
-
-// "Always open as administrator" startup probe: whether the Settings tab's
-// flag is set in the on-disk config, checked before any window exists.
-pub fn always_elevated_on_disk() -> bool {
-    read_config_bool("always_elevated")
-}
-
-fn read_config_bool(key: &str) -> bool {
-    read_config_raw(|obj| obj.get(key).and_then(|v| v.as_bool()).unwrap_or(false))
-}
-
-// Resolves %LOCALAPPDATA%/<identifier>/config.json (identifier baked in from
-// the embedded tauri.conf.json) and hands the parsed object to `f`. Any
-// missing/unreadable/invalid config yields false via the caller's fallback.
-fn read_config_raw(f: impl FnOnce(&serde_json::Map<String, serde_json::Value>) -> bool) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Conf {
-        identifier: String,
-    }
-    let Ok(conf) = serde_json::from_str::<Conf>(include_str!("../tauri.conf.json")) else {
-        return false;
-    };
-    let Ok(localappdata) = std::env::var("LOCALAPPDATA") else {
-        return false;
-    };
-    let path = PathBuf::from(localappdata)
-        .join(conf.identifier)
-        .join("config.json");
-    let Ok(text) = fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    f(obj)
 }
 
 struct PendingConfigWrite {

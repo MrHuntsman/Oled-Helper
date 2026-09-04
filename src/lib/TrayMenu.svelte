@@ -51,10 +51,10 @@
   });
   let windowsHdrBusy = $state(false);
   let windowsHdrError = $state('');
-  // Whether this process is elevated. The Screen Dimmer only runs in an
-  // elevated session; the tray warns on its row when enabled but not
-  // elevated (same rule as the Screen Dimmer tab's admin banner).
-  let trayElevated = $state(true);
+  // Whether the privileged helper task is registered, used by the Screen
+  // Dimmer row's media-detection warning. Defaults true so the warning does
+  // not flash before the tray-open check resolves.
+  let trayHelperReady = $state(true);
   let dimmerSaveTimer = null;
   let dimmerSaveInFlight = false;
   let quickInteractionVersion = 0;
@@ -264,37 +264,36 @@
 
   function toggleScreenDimmer() {
     quickInteractionVersion++;
-    // Route through the elevation-aware toggle (same path the Screen Dimmer
-    // tab uses): the dimmer only runs in an elevated session, so enabling
-    // from a non-elevated tray must trigger the UAC relaunch too, otherwise
-    // the flag flips but the watcher never starts. tab=null because the tray
-    // has no tab context to reopen after the elevated restart.
+    // Route through the shared toggle (same path the Screen Dimmer tab
+    // uses): the dimmer runs in any session now, so no UAC relaunch happens;
+    // enabling registers the one-time privileged helper task for the
+    // media-playback detection. tab=null because the tray has no tab
+    // context.
     setScreenDimmerEnabled(!screenDimmer.enabled, null)
       .catch((e) => console.warn('[screen-dimmer] tray toggle failed', e));
     scheduleTrayDimmerSave();
   }
 
-  async function loadTrayElevation() {
+  // Whether the privileged helper task is registered. The Screen Dimmer's
+  // media-playback detection runs through it, so the tray warns on the row
+  // when the dimmer is on but the helper has not been set up yet (one UAC
+  // prompt the first time, then prompt-free).
+  async function loadTrayHelperReady() {
     try {
-      const elevated = await invoke('is_process_elevated');
-      trayElevated = elevated === true;
+      const registered = await invoke('helper_task_registered');
+      trayHelperReady = registered === true;
     } catch (e) {
-      console.error('tray-menu: failed to check elevation', e);
+      console.error('tray-menu: failed to check helper task', e);
     }
   }
 
-  // The Screen Dimmer only runs elevated. If the user enabled it in a
-  // non-elevated session (declined the UAC prompt, or the startup prompt was
-  // declined), this relaunches the app elevated so the dimmer actually
-  // starts. Same command the Screen Dimmer tab's admin banner uses.
-  function relaunchScreenDimmerElevated() {
-    invoke('relaunch_elevated', {
-      rtxHdrFlags: null,
-      rtxHdrEnabled: null,
-      hdrMode: null,
-      screenDimmerEnabled: true,
-      tab: null,
-    }).catch((e) => console.warn('[screen-dimmer] tray relaunch elevated failed', e));
+  // One-time setup of the elevated helper task (UAC prompt on first use).
+  // Afterwards the dimmer's video-pause detection works without the app
+  // ever running elevated; idle dimming works regardless.
+  function setupScreenDimmerHelper() {
+    invoke('ensure_helper_task')
+      .then(() => { trayHelperReady = true; })
+      .catch((e) => console.warn('[screen-dimmer] helper setup failed', e));
   }
 
   // The tray is narrow, so the timer slider moves in 5-second steps (the
@@ -442,8 +441,9 @@
   }
 
   // Apply an SDR→HDR mode from the tray. Same single backend command as the
-  // main app's selector; RTX writes that need elevation relaunch the app
-  // elevated (the elevated child performs the full transition).
+  // main app's selector; RTX writes that need elevation route through the
+  // one-time elevated helper inside the command, so the app never relaunches
+  // elevated for this.
   async function selectTrayHdrMode(mode) {
     if (trayHdrModeBusy || mode === trayHdrMode) return;
     if (mode === 'rtx' && !trayHdrIsNvidia) return;
@@ -454,16 +454,6 @@
       await loadHdrEnhancementMode();
     } catch (e) {
       trayHdrModeError = String(e);
-      if (trayHdrModeError.startsWith('ADMIN_REQUIRED:')) {
-        // Elevated relaunch applies the pending mode itself; there is no
-        // main-window tab to reopen on from the tray.
-        invoke('relaunch_elevated', {
-          rtxHdrFlags: null,
-          rtxHdrEnabled: null,
-          hdrMode: mode,
-          tab: null,
-        }).catch(() => {});
-      }
     } finally {
       trayHdrModeBusy = false;
     }
@@ -1177,7 +1167,7 @@
     loadFavorites();
     loadTaskbarDimmer();
     loadScreenDimmer();
-    loadTrayElevation();
+    loadTrayHelperReady();
     loadHdrEnhancementMode();
     loadSdrContentBrightness();
     pollTrayHdrStatus();
@@ -1506,13 +1496,13 @@
     </div>
 
     <div class="tray-dimmer-row" class:enabled={screenDimmer.enabled} role="group" aria-label="Screen Dimmer" onmouseenter={closeSubmenu}>
-      {#if !trayElevated && screenDimmer.enabled}
+      {#if !trayHelperReady && screenDimmer.enabled}
         <button
           type="button"
           class="tray-screen-dimmer-warn"
-          aria-label="Screen Dimmer needs administrator rights to run"
-          title="The Screen Dimmer needs administrator rights for power state detection. Relaunch OLED Helper elevated to run it."
-          onclick={relaunchScreenDimmerElevated}
+          aria-label="Set up Screen Dimmer media detection"
+          title="Screen Dimmer media detection (pause while video plays) needs a one-time elevated helper setup. Idle dimming works without it."
+          onclick={setupScreenDimmerHelper}
         >⚠</button>
       {/if}
       <button

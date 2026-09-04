@@ -19,7 +19,7 @@
   let restoreConfirmOpen = $state(false);
   let fontList = $state([]); // [{ family, path }], de-duplicated by family
   let selectedFontPath = $state('');
-  let fontStatus = $state({ elevated: false, applied: null });
+  let fontStatus = $state({ applied: null, needsRestart: false });
   let fontMessage = $state('');
   let fontError = $state('');
   let fontProgress = $state(''); // live phase text while download/apply runs
@@ -47,7 +47,6 @@
     try {
       const status = await invoke('font_get_status');
       fontStatus = {
-        elevated: status.elevated,
         applied: status.applied,
         needsRestart: status.needs_restart === true,
       };
@@ -142,17 +141,6 @@
     return cssFontFamily(`GF-${key}`);
   }
 
-  // Trigger a UAC relaunch when a font operation needs administrator rights.
-  async function requestFontElevation() {
-    if (fontStatus.elevated || fontBusy) return;
-    try {
-      await invoke('relaunch_elevated', { tab: 'windows-font' });
-    } catch (e) {
-      fontError = String(e);
-      console.warn('[font] elevation failed', e);
-    }
-  }
-
   // ── Font dropdowns ────────────────────────────────────────────────
   // Custom dropdowns keep each installed and downloadable family rendered in
   // its own typeface, while the shared keyboard helper preserves native select
@@ -232,11 +220,7 @@
       toggle: () => toggleFontMenu('installed'),
       close: closeFontMenus,
       select: (index) => selectFontOption('installed', index),
-      canSelect: () => {
-        if (fontStatus.elevated) return true;
-        requestFontElevation();
-        return false;
-      },
+      canSelect: () => true,
       getMenu: () => fontMenu.installed.el,
       getTrigger: () => fontMenu.installed.wrap?.querySelector('.font-select-trigger'),
     }),
@@ -252,11 +236,7 @@
       toggle: () => toggleFontMenu('download'),
       close: closeFontMenus,
       select: (index) => selectFontOption('download', index),
-      canSelect: () => {
-        if (fontStatus.elevated) return true;
-        requestFontElevation();
-        return false;
-      },
+      canSelect: () => true,
       getMenu: () => fontMenu.download.el,
       getTrigger: () => fontMenu.download.wrap?.querySelector('.font-select-trigger'),
     }),
@@ -274,10 +254,6 @@
 
   function toggleFontMenu(which) {
     if (fontBusy || !fontReady) return;
-    if (!fontStatus.elevated) {
-      requestFontElevation();
-      return;
-    }
     const menu = fontMenu[which];
     menu.open = !menu.open;
     if (menu.open) {
@@ -456,13 +432,9 @@
 
   async function restoreFont() {
     if (fontBusy) return;
-    // Restoring schedules a boot-time swap back to the originals, which needs
-    // admin like the apply, prompt for a UAC relaunch instead of hitting a
-    // disabled button.
-    if (!fontStatus.elevated) {
-      requestFontElevation();
-      return;
-    }
+    // Restoring schedules a boot-time swap back to the originals. The
+    // privileged steps run in the one-time elevated helper, so no app
+    // relaunch is needed.
     fontBusy = true;
     fontError = '';
     fontMessage = '';
@@ -596,13 +568,6 @@
   </div>
   <div class="separator"></div>
 
-  {#if !fontStatus.elevated}
-    <div class="font-admin-warning" role="alert">
-      <p class="font-warning">Administrator rights are required to apply or restore a font.</p>
-      <button type="button" class="font-admin-restart-btn" onclick={requestFontElevation}>Restart as administrator</button>
-    </div>
-  {/if}
-
   <div class="font-section">
     <div class="font-current-line">
       <span class="font-current-label">Currently Applied:</span>
@@ -733,12 +698,12 @@
       {#if fontJustApplied}
         <button class="font-btn font-btn-apply font-btn-applied" disabled>Applied ✓</button>
       {:else if !selectionIsApplied}
-        <button class="font-btn font-btn-apply" disabled={fontBusy || !fontStatus.elevated || (!selectedFontPath && !selectedDownloadKey)} onclick={applySelected}>
+        <button class="font-btn font-btn-apply" disabled={fontBusy || (!selectedFontPath && !selectedDownloadKey)} onclick={applySelected}>
           {fontBusy ? '…' : (selectedDownloadKey ? 'Download & apply' : 'Apply')}
         </button>
       {/if}
       {#if fontStatus.needsRestart}
-        <button class="font-btn font-btn-restart" bind:this={restartBtnEl} disabled={fontBusy || !fontStatus.elevated} onclick={openRestartConfirm}>
+        <button class="font-btn font-btn-restart" bind:this={restartBtnEl} disabled={fontBusy} onclick={openRestartConfirm}>
           Restart System
         </button>
       {/if}

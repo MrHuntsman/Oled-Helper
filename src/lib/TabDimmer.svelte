@@ -3,7 +3,6 @@
   import { invoke } from '@tauri-apps/api/core';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
-  import ShieldBadge from './ShieldBadge.svelte';
   import ScreenDimmerState from './ScreenDimmerState.svelte';
   import ConfirmModal from './ConfirmModal.svelte';
   import { app, taskbarDimmer, screenDimmer, saveConfig, setScreenDimmer, setScreenDimmerEnabled, setTaskbarDimmer, restoreTaskbarDimmerDefaults, SCREEN_DIMMER_DEFAULTS, activeMonitor, monitors, dimmerMonKey, syncScreenDimmerView } from './stores.svelte.js';
@@ -102,25 +101,6 @@
     } catch (e) {
       screenError = String(e);
       console.warn('[screen-dimmer] toggle failed', e);
-    }
-  }
-
-  // The dimmer only runs in an elevated session. If the user declined the
-  // startup prompt (or launched without admin), this relaunches the app
-  // elevated so the dimmer actually starts; a second decline keeps the
-  // enabled state and the warning banner.
-  async function restartScreenDimmerAsAdmin() {
-    try {
-      await invoke('relaunch_elevated', {
-        rtxHdrFlags: null,
-        rtxHdrEnabled: null,
-        hdrMode: null,
-        screenDimmerEnabled: true,
-        tab: 'screen-dimmer',
-      });
-    } catch (e) {
-      screenError = String(e);
-      console.warn('[screen-dimmer] restart as admin failed', e);
     }
   }
 
@@ -403,7 +383,6 @@
           <span class="subtitle">Dims the display after inactivity to reduce static OLED content.</span>
         </div>
         <div class="tab-heading-spacer"></div>
-        <ShieldBadge size={24} text="Admin required." />
         <span class={`pill${screenDimmer.enabled ? '' : ' off'}`} aria-hidden="true"></span>
       </div>
       <button class="restore-defaults-btn" onclick={() => screenRestoreConfirmOpen = true}>↻ Restore Tab Defaults</button>
@@ -414,17 +393,6 @@
 
     {#if screenError}
       <p class="power-error" role="alert">⚠ {screenError}</p>
-    {/if}
-
-    {#if app.isElevated === false && screenDimmer.enabled}
-      <div class="dimmer-admin-warning" role="alert">
-        <span class="dimmer-admin-warning-icon" aria-hidden="true">⚠</span>
-        <div class="dimmer-admin-warning-text">
-          <span class="dimmer-admin-warning-title">Administrator rights required</span>
-          <span class="dimmer-admin-warning-desc">The Screen Dimmer needs administrator rights for power state detection (pausing while video is playing, etc). Restart OLED Helper as administrator to enable it.</span>
-        </div>
-        <button type="button" class="dimmer-admin-restart-btn" onclick={restartScreenDimmerAsAdmin}>Restart as administrator</button>
-      </div>
     {/if}
 
     <div class="dimmer-control-group" class:disabled={!screenDimmer.enabled}>

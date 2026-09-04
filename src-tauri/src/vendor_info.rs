@@ -2287,8 +2287,31 @@ pub fn get_rtx_hdr_settings_state() -> Result<RtxHdrSettings, String> {
 }
 
 #[tauri::command]
-pub fn set_rtx_hdr_state(flags: u32) -> Result<(), String> {
-    set_rtx_hdr_flags(flags)
+pub async fn set_rtx_hdr_state(flags: u32) -> Result<(), String> {
+    match set_rtx_hdr_flags(flags) {
+        Ok(()) => Ok(()),
+        // Same routing as set_hdr_enhancement_mode: a standard-user DRS write
+        // is refused with the admin marker, so perform it in the elevated
+        // helper child instead of relaunching the whole app.
+        Err(error)
+            if error.contains("ADMIN_REQUIRED:") && !crate::process::process_is_elevated() =>
+        {
+            crate::helper::ensure_registered().map_err(|setup_error| {
+                format!("The RTX HDR change needs a one-time elevated helper setup. {setup_error}")
+            })?;
+            let run = tauri::async_runtime::spawn_blocking(move || {
+                crate::helper::run_request(
+                    "hdr-flags",
+                    |request| request.flags = Some(flags),
+                    std::time::Duration::from_secs(20),
+                )
+            })
+            .await
+            .map_err(|error| format!("the privileged helper task failed: {error}"))?;
+            crate::helper::result_into_std(run?)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,6 @@
   import { COMPARISON_NITS } from './calibration.js';
   import tabHdrIcon from './icons/tab_hdr.png?inline';
   import SdrHdrCompare from './SdrHdrCompare.svelte';
-  import ShieldBadge from './ShieldBadge.svelte';
   import VendorTag from './VendorTag.svelte';
   import { createDropdownPositionController } from './dropdown-position.js';
   import { createDropdownKeyboardHandlers } from './dropdown.js';
@@ -137,7 +136,6 @@
   let autoHdrError = $state('');
   let hdrModeBusy = $state(false);
   let hdrModeError = $state('');
-  let hdrModePending = $state(null);
   let autoHdrRefreshing = false;
   let pollTicks = 0;
   // Transient "Applied" confirmations shown after a successful mode/option
@@ -155,7 +153,6 @@
   let rtxHdrEnabled = $state(null);
   let rtxHdrFlags = $state(null);
   let rtxHdrError = $state('');
-  let rtxHdrPendingFlags = $state(null);
   let rtxHdrRefreshing = false;
   let rtxHdrFlagsBusy = $state(false);
   let rtxHdrMenuOpen = $state(false);
@@ -164,7 +161,6 @@
   let rtxHdrWrapEl = $state(null);
   let rtxHdrMenuEl = $state(null);
   let rtxHdrPositionController = null;
-  let rtxHdrRelaunching = $state(false);
   // Auto-resolution guard for the "both modes enabled" conflict: one attempt
   // per conflict with a cooldown after a failed attempt, so a persistent
   // conflict (e.g. an external tool re-enabling Auto HDR) is not hammered
@@ -199,10 +195,7 @@
       const settings = await invoke('get_rtx_hdr_settings_state');
       rtxHdrEnabled = !!settings?.enabled;
       rtxHdrFlags = Number(settings?.flags ?? 0);
-      // A read can succeed even when the preceding write was rejected for
-      // lack of administrator rights. Keep that actionable error visible so
-      // the restart button is not cleared by the follow-up refresh/poll.
-      if (!rtxHdrError.startsWith('ADMIN_REQUIRED:')) rtxHdrError = '';
+      rtxHdrError = '';
     } catch (e) {
       rtxHdrError = String(e);
     } finally {
@@ -267,8 +260,10 @@
     const previous = rtxHdrFlags;
     rtxHdrFlags = value;
     try {
+      // The write runs in-process when the session allows it and routes
+      // through the one-time elevated helper otherwise; the app never
+      // relaunches elevated for this.
       await invoke('set_rtx_hdr_state', { flags: value });
-      rtxHdrPendingFlags = null;
       await refreshRtxHdr();
       rtxHdrFlagsApplied = true;
       clearTimeout(rtxHdrFlagsAppliedTimer);
@@ -276,16 +271,6 @@
     } catch (e) {
       rtxHdrError = String(e);
       rtxHdrFlags = previous;
-      if (rtxHdrError.startsWith('ADMIN_REQUIRED:')) {
-        rtxHdrPendingFlags = value;
-        hdrModePending = 'rtx';
-        // Prompt UAC immediately instead of waiting for a separate button
-        // click, selecting the dropdown option is the deliberate action
-        // that should trigger elevation.
-        rtxHdrFlagsBusy = false;
-        await relaunchRtxHdrElevated();
-        return;
-      }
       await refreshRtxHdr();
     } finally {
       rtxHdrFlagsBusy = false;
@@ -316,11 +301,12 @@
     hdrModeBusy = true;
     hdrModeError = '';
     rtxHdrError = '';
-    hdrModePending = null;
     try {
       // Keep the transition in one backend command. It disables the old path
       // before enabling the new one, and rolls back RTX if the Auto HDR write
-      // fails, so both systems cannot remain enabled after a failed transition.
+      // fails, so both systems cannot remain enabled after a failed
+      // transition. DRS writes that need elevation route through the
+      // one-time helper instead of relaunching the app.
       await invoke('set_hdr_enhancement_mode', { mode });
       await refreshAutoHdr();
       await refreshRtxHdr();
@@ -329,41 +315,10 @@
       hdrModeAppliedTimer = setTimeout(() => { hdrModeApplied = false; }, 2000);
     } catch (e) {
       hdrModeError = String(e);
-      if (hdrModeError.startsWith('ADMIN_REQUIRED:')) {
-        hdrModePending = mode;
-        // Prompt UAC immediately instead of waiting for a separate button
-        // click, selecting the mode is the deliberate action that should
-        // trigger elevation.
-        hdrModeBusy = false;
-        await relaunchRtxHdrElevated();
-        return;
-      }
       await refreshAutoHdr();
       await refreshRtxHdr();
     } finally {
       hdrModeBusy = false;
-    }
-  }
-
-  // RTX HDR writes need an elevated process. The pending exclusive mode is
-  // forwarded so the elevated child performs the complete transition before
-  // the replacement UI is shown.
-  async function relaunchRtxHdrElevated() {
-    if (rtxHdrRelaunching) return;
-    rtxHdrRelaunching = true;
-    hdrModeError = '';
-    // The admin error is no longer needed once the elevated relaunch starts;
-    // the new process will apply the pending mode/flags.
-    rtxHdrError = '';
-    try {
-      await invoke('relaunch_elevated', {
-        rtxHdrFlags: rtxHdrPendingFlags,
-        hdrMode: hdrModePending,
-        tab: app.activeTab,
-      });
-    } catch (e) {
-      hdrModeError = String(e);
-      rtxHdrRelaunching = false;
     }
   }
 
@@ -623,7 +578,6 @@
             </button>
             {#if option.value === 'rtx' && hdrMode === 'rtx' && rtxHdrFlags !== null}
               <span class="rtx-hdr-inline-select" bind:this={rtxHdrWrapEl}>
-                <ShieldBadge text="Admin required." />
                 <span class="rtx-hdr-trigger-wrap">
                   {#if rtxHdrFlagsApplied && !rtxHdrFlagsBusy}
                     <span class="hdr-applied-msg rtx-hdr-applied-msg">Applied</span>
@@ -680,11 +634,11 @@
             : 'Both HDR enhancement modes are enabled. Auto-switching to NVIDIA RTX HDR failed. Choose an option to resolve the conflict.'}
         </p>
       {/if}
-      {#if hdrModeError && !hdrModeError.startsWith('ADMIN_REQUIRED:')}
+      {#if hdrModeError}
         <p class="gpu-error">{hdrModeError}</p>
       {:else if autoHdrError}
         <p class="gpu-error">{autoHdrError}</p>
-      {:else if rtxHdrError && !rtxHdrError.startsWith('ADMIN_REQUIRED:')}
+      {:else if rtxHdrError}
         <p class="gpu-error">{rtxHdrError}</p>
       {/if}
     </div>

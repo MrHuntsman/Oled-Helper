@@ -484,11 +484,10 @@ function currentScreenDimmerProfile() {
   return p;
 }
 
-// App-level settings (Settings tab). alwaysElevated relaunches the app
-// elevated at startup; the backend probes the on-disk config before any
-// window exists, so this just needs to persist the flag.
+// App-level settings (Settings tab). No feature needs an elevated app
+// session anymore (privileged steps run in the transient helper child), so
+// only the flags below are persisted.
 export const appSettings = $state({
-  alwaysElevated: false,
   skipFavoriteConfirmation: false,
 });
 
@@ -497,7 +496,9 @@ export const appSettings = $state({
 //   dimmerVerbose: taskbar dimmer tick/winevent/fade verbose logs
 //                     (set_taskbar_dimmer_verbose_logging)
 export const runtimeLogSettings = $state({ verbosePeriodic: false, dimmerVerbose: false });
-export const debugSettings = $state({ contextMenuEnabled: false });
+export const debugSettings = $state({
+  contextMenuEnabled: false,
+});
 
 // Global hotkey bindings: action name → combo string ("Ctrl+Alt+F9", or
 // "None" for unbound). Loaded from config on startup; changes go through
@@ -1242,9 +1243,6 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.screen_protector_fullscreen_detection === 'boolean') {
       screenDimmer.fullscreenDetection = cfg.screen_protector_fullscreen_detection;
     }
-    if (cfg && typeof cfg.always_elevated === 'boolean') {
-      appSettings.alwaysElevated = cfg.always_elevated;
-    }
     if (cfg && typeof cfg.skip_favorite_confirmation === 'boolean') {
       appSettings.skipFavoriteConfirmation = cfg.skip_favorite_confirmation;
     }
@@ -1433,7 +1431,6 @@ export function saveConfig() {
     screen_protector_fade_linked: screenDimmer.fadeLinked,
     screen_protector_fullscreen_detection: primaryScreenDimmerProfile?.fullscreenDetection ?? screenDimmer.fullscreenDetection,
     screen_dimmer_profiles: { ...screenDimmerProfiles },
-    always_elevated: appSettings.alwaysElevated,
     skip_favorite_confirmation: appSettings.skipFavoriteConfirmation,
     // The flat legacy fields stay in sync with the PRIMARY monitor's profile
     // (the tray menu, which has no monitor selector, reads these as its
@@ -1512,58 +1509,18 @@ export async function setScreenDimmerEnabled(enabled, tab = app.activeTab) {
     return;
   }
 
-  const elevated = await invoke('is_process_elevated');
+  // The dimmer runs in any session now: no UAC relaunch, the watcher starts
+  // immediately and dims on idle alone. Only its media-playback detection
+  // (pause while video plays) needs the elevated helper, so enabling also
+  // registers the one-time Task Scheduler helper task in the background.
+  // A declined or failed setup leaves the dimmer on (idle dimming works)
+  // and only disables the media suppression; the next enable retries.
   screenDimmer.enabled = true;
-  if (elevated) {
-    await setScreenDimmer(true, screenDimmer.seconds, screenDimmer.opacity, screenDimmer.fadeInDurationMs, screenDimmer.fadeOutDurationMs, screenDimmer.fullscreenDetection, true);
-    return;
-  }
-
-  // Record the enabled state in the backend too, so the tab's state poll
-  // keeps the toggle on even before the relaunch lands (the backend never
-  // starts the watcher in a non-elevated session, it only records the flag).
-  await setScreenDimmer(true, screenDimmer.seconds, screenDimmer.opacity, screenDimmer.fadeInDurationMs, screenDimmer.fadeOutDurationMs, screenDimmer.fullscreenDetection, false).catch(() => {});
-  // Save before the UAC relaunch so the elevated replacement has the same
-  // settings even if the old frontend closes before its normal save cycle.
-  await saveConfig();
+  await setScreenDimmer(true, screenDimmer.seconds, screenDimmer.opacity, screenDimmer.fadeInDurationMs, screenDimmer.fadeOutDurationMs, screenDimmer.fullscreenDetection, true);
   try {
-    await invoke('relaunch_elevated', {
-      rtxHdrFlags: null,
-      rtxHdrEnabled: null,
-      hdrMode: null,
-      screenDimmerEnabled: true,
-      tab,
-    });
+    await invoke('ensure_helper_task');
   } catch (error) {
-    // A declined prompt keeps the dimmer enabled: the user's intent stays
-    // saved, and the Screen Dimmer tab shows a restart-as-admin prompt
-    // instead of silently reverting the toggle.
-    console.warn('[screen-dimmer] elevation declined, dimmer stays enabled', error);
-  }
-}
-
-// Settings-tab "Always open as administrator": persist the flag, then
-// relaunch elevated immediately when turning it on from a non-elevated
-// session so it takes effect right away (same handoff the Screen Dimmer
-// toggle uses). A declined prompt reverts the flag.
-export async function setAlwaysElevated(enabled, tab = app.activeTab) {
-  appSettings.alwaysElevated = enabled;
-  await saveConfig();
-  if (!enabled) return;
-  const elevated = await invoke('is_process_elevated');
-  if (elevated) return;
-  try {
-    await invoke('relaunch_elevated', {
-      rtxHdrFlags: null,
-      rtxHdrEnabled: null,
-      hdrMode: null,
-      screenDimmerEnabled: null,
-      tab,
-    });
-  } catch (error) {
-    appSettings.alwaysElevated = false;
-    await saveConfig();
-    throw error;
+    console.warn('[screen-dimmer] privileged helper setup unavailable; media detection disabled', error);
   }
 }
 

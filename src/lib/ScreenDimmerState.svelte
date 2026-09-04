@@ -44,8 +44,6 @@
     <span class="diag-dim-status diag-dim-on">● Dimming</span>
   {:else if !state || !state.enabled}
     <span class="diag-dim-status diag-dim-off">● Off</span>
-  {:else if !state.elevated}
-    <span class="diag-dim-status diag-dim-blocked">● Blocked</span>
   {:else if state.timeoutSeconds === 0}
     <span class="diag-dim-status">● Initializing…</span>
   {:else if state.reasons.length > 0}

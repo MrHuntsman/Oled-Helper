@@ -1485,9 +1485,6 @@
       <button type="button" class="nav-switch" class:on={screenDimmer.enabled} aria-pressed={screenDimmer.enabled} onclick={toggleScreenDimmerFromNav} title="Toggle Screen Dimmer" aria-label="Toggle Screen Dimmer">
         <span class="nav-switch-thumb" aria-hidden="true"></span>
       </button>
-      {#if app.isElevated === false && screenDimmer.enabled}
-        <span class="nav-item-shield" title="Screen Dimmer needs administrator rights for power state detection." aria-label="Screen Dimmer needs administrator rights">⚠</span>
-      {/if}
     </div>
     <div class="sidebar-sep" role="separator"></div>
     <button class="nav-btn" class:active={app.activeTab === 'text'} aria-current={app.activeTab === 'text' ? 'page' : undefined} onclick={() => app.activeTab = 'text'}>

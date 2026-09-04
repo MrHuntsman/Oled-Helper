@@ -96,18 +96,19 @@ mod platform {
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-        GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetTopWindow, GetWindow,
-        GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible, PostMessageW,
-        PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes,
+        GetClassNameW, GetCursorInfo, GetCursorPos, GetForegroundWindow, GetMessageW, GetTopWindow,
+        GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible,
+        PostMessageW, PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes,
         SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
         UnhookWindowsHookEx,
-        GWLP_HWNDPARENT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT,
-        HWND_TOPMOST, IDC_ARROW, LoadCursorW, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS,
-        SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-        SW_SHOW, WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT,
-        WM_QUIT, WM_SETCURSOR, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
+        HCURSOR, CURSORINFO, CURSORINFO_FLAGS, CURSOR_SHOWING, GWLP_HWNDPARENT, GWL_EXSTYLE,
+        GWL_STYLE,
+        GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, LoadCursorW, LWA_ALPHA,
+        MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER,
+        SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL,
+        WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZE,
+        WS_POPUP, WS_THICKFRAME,
     };
 
     // One adaptive timer handles both cursor polling and animation. It runs
@@ -252,6 +253,26 @@ mod platform {
     static FLICKER_REVERSAL_COUNT: AtomicU64 = AtomicU64::new(0);
     static FLICKER_HIDE_COUNT: AtomicU64 = AtomicU64::new(0);
     static FLICKER_RESHOW_COUNT: AtomicU64 = AtomicU64::new(0);
+    // Diagnostic: how many times the overlay window proc actually handled a
+    // WM_SETCURSOR message. The overlay returns HTTRANSPARENT from
+    // WM_NCHITTEST, so on Windows the mouse is routed to the window beneath
+    // (the taskbar) and the WM_SETCURSOR arm below may never fire. A counter
+    // of zero while a cursor problem is live proves the overlay never owns
+    // cursor control and the fix must live somewhere else (e.g. the taskbar's
+    // cursor or a system-wide SetCursor).
+    static WM_SETCURSOR_COUNT: AtomicU64 = AtomicU64::new(0);
+    // Diagnostic: the last hCursor handle this process asked Windows to show
+    // (overlay WM_SETCURSOR arm, create-overlay class, or the cursor re-show
+    // in force_arrow_over_dimmed_taskbar). Lets the probe say whether the
+    // arrow was ever set, versus Windows showing whatever state a streaming
+    // session left the cursor in.
+    static LAST_SET_CURSOR_HANDLE: AtomicIsize = AtomicIsize::new(0);
+    // Diagnostic: how many times the arrow was forced back over the dimmed
+    // taskbar because Windows reported the cursor hidden (see
+    // force_arrow_over_dimmed_taskbar). A reproduction where this climbs
+    // while the probe still reports showing=false would prove SetCursor from
+    // this process cannot re-show the taskbar cursor, and the fix must move.
+    static CURSOR_RESHOW_COUNT: AtomicU64 = AtomicU64::new(0);
     // Per-detection toggle flags, settable from the Debug tab to isolate
     // which tick-time Win32 call is causing poll-gap stutter.
     static FULLSCREEN_DETECTION: AtomicBool = AtomicBool::new(true);
@@ -304,7 +325,6 @@ mod platform {
     static MOUSE_HOOK_LIFECYCLE: Mutex<()> = Mutex::new(());
     static MOUSE_HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
     static MOUSE_HOOK_TOGGLE: AtomicBool = AtomicBool::new(true);
-
 
     // True while a system popup menu (any app's context menu) is open. Driven by the WinEvent MENUPOPUPSTART/END hooks when
     // they are installed; the repair's FindWindowW("#32768") scan is the
@@ -361,6 +381,13 @@ mod platform {
     // DISPLAY_CHANGE_SETTLE_MS the taskbar cache refreshes on every tick so the
     // overlay follows the taskbar through the transition to its final geometry.
     static DISPLAY_CHANGE_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+    // Throttle for the stale-taskbar rekey (rekey_taskbar_for_overlay). When
+    // Explorer recreates Shell_TrayWnd with a new HWND after a display change,
+    // GetWindowRect on the dead handle fails on every tick, so without a gate
+    // the EnumWindows re-enumeration would run at tick cadence for as long as
+    // the taskbar is missing (e.g. during an Explorer restart).
+    static LAST_TASKBAR_REKEY: Mutex<Option<Instant>> = Mutex::new(None);
+    const TASKBAR_REKEY_INTERVAL_MS: u64 = 1000;
     // After a foreground/minimize transition (Show Desktop, task switch),
     // Explorer can reorder the topmost band, leaving the overlay behind the
     // taskbar. This counter forces the next few z-order repairs to run
@@ -928,8 +955,25 @@ mod platform {
             // taskbar. Setting the arrow here guarantees the pointer is
             // always visible over the taskbar while the dimmer is on.
             WM_SETCURSOR => {
+                // Count every delivery: a live cursor problem with a counter
+                // that never rises proves the overlay never receives this
+                // message (HTTRANSPARENT routes the mouse away), so the arrow
+                // being forced here is irrelevant and the culprit is the
+                // window that actually owns the pointer (the taskbar).
+                WM_SETCURSOR_COUNT.fetch_add(1, Ordering::Relaxed);
                 unsafe {
-                    let _ = SetCursor(Some(LoadCursorW(None, IDC_ARROW).unwrap_or_default()));
+                    let arrow = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+                    LAST_SET_CURSOR_HANDLE.store(arrow.0 as isize, Ordering::Relaxed);
+                    let _ = SetCursor(Some(arrow));
+                }
+                if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+                    emit_runtime(
+                        "info",
+                        format!(
+                            "[taskbar-dimmer] overlay received WM_SETCURSOR (count={})",
+                            WM_SETCURSOR_COUNT.load(Ordering::Relaxed),
+                        ),
+                    );
                 }
                 LRESULT(1)
             }
@@ -1195,6 +1239,55 @@ mod platform {
 
     fn rects_intersect(a: RECT, b: RECT) -> bool {
         a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+    }
+
+    // Re-point this overlay at the fresh taskbar HWND after Explorer
+    // recreated Shell_TrayWnd (new handle) following a display change. The
+    // stored HWND goes stale, GetWindowRect on it fails forever, and with
+    // cached_taskbar None both hover detection and z-order repair stop
+    // running, leaving the overlay stuck behind the recreated taskbar until
+    // the next apply(). Match by monitor: each monitor has exactly one
+    // taskbar, so the overlay's own HMONITOR identifies its replacement.
+    // Throttled via LAST_TASKBAR_REKEY so a taskbar that is genuinely
+    // missing (Explorer restart) doesn't spin EnumWindows at tick cadence.
+    fn rekey_taskbar_for_overlay(hwnd: HWND, hwnd_raw: isize, now: Instant) -> Option<(isize, RECT)> {
+        {
+            let mut last = LAST_TASKBAR_REKEY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = *last {
+                if (now.duration_since(prev).as_millis() as u64) < TASKBAR_REKEY_INTERVAL_MS {
+                    return None;
+                }
+            }
+            *last = Some(now);
+        }
+        let overlay_monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut replacement = None;
+        for (taskbar, rect) in taskbars() {
+            let taskbar_monitor = unsafe { MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST) };
+            if taskbar_monitor == overlay_monitor {
+                replacement = Some((taskbar.0 as isize, rect));
+                break;
+            }
+        }
+        let (new_raw, new_rect) = replacement?;
+        {
+            let mut overlays = overlays_map().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = overlays.get_mut(&hwnd_raw) {
+                info.taskbar = new_raw;
+                info.rect = new_rect;
+            }
+        }
+        if VERBOSE_LOGGING.load(Ordering::Relaxed) {
+            emit_runtime(
+                "info",
+                format!(
+                    "[taskbar-dimmer] taskbar rekeyed stale hwnd -> 0x{:x} rect={}",
+                    new_raw,
+                    rect_text(Some(new_rect)),
+                ),
+            );
+        }
+        Some((new_raw, new_rect))
     }
 
     // The "Keep display mode?" flyout (flyout_window.rs) is also an
@@ -1487,6 +1580,81 @@ mod platform {
             }
         }
         (hover_hit_test(rect, point, currently_hovered), point)
+    }
+
+    // True when Windows reports the cursor is not being drawn at all
+    // (GetCursorInfo without CURSOR_SHOWING). After a Sunshine stream ends
+    // the cursor can be left in exactly this state over the taskbar: the
+    // stream hid it, and nothing has re-shown it, because Explorer only
+    // restores its arrow over empty taskbar space on a click, not on hover.
+    fn cursor_is_hidden() -> bool {
+        unsafe {
+            let mut info = CURSORINFO {
+                cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+                flags: CURSORINFO_FLAGS(0),
+                hCursor: HCURSOR(std::ptr::null_mut()),
+                ptScreenPos: windows::Win32::Foundation::POINT::default(),
+            };
+            GetCursorInfo(&mut info).is_ok() && info.flags != CURSOR_SHOWING
+        }
+    }
+
+    // Force the arrow back over the dimmed taskbar. The overlay cannot do
+    // this from WM_SETCURSOR: it is click-through (HTTRANSPARENT plus
+    // WS_EX_TRANSPARENT), so that message is routed to the window beneath
+    // (the taskbar) and the overlay's WM_SETCURSOR arm never fires, which is
+    // exactly what WM_SETCURSOR_COUNT staying at zero proved during the bug.
+    // Instead, re-show the cursor from here whenever the pointer sits inside
+    // a dimmed taskbar and Windows reports the cursor hidden, mirroring what
+    // Chrome's hover and Explorer's own click handling do elsewhere: a
+    // SetCursor with a real handle draws the cursor again (the display count
+    // is not negative, otherwise those paths could not re-show it either).
+    // Only fires when the cursor is hidden, so a legitimately visible cursor
+    // (resize handles at the taskbar edge, a custom shell cursor) is never
+    // overridden. Returns true when the arrow was set. Callers run this on
+    // mouse events (mouse_hook_proc) and on the hover poll (update_fade),
+    // never while holding the FADES lock (this function takes it itself).
+    fn force_arrow_over_dimmed_taskbar(point: windows::Win32::Foundation::POINT) -> bool {
+        if !cursor_is_hidden() {
+            return false;
+        }
+        let mut hit_dimmed_taskbar = false;
+        {
+            let fades = fades_map().lock().unwrap_or_else(|e| e.into_inner());
+            for (raw, fade) in fades.iter() {
+                if !fade.enabled {
+                    continue;
+                }
+                let Some((_, rect)) = fade.cached_taskbar else {
+                    continue;
+                };
+                // Only overlays actually covering their taskbar: a hidden
+                // overlay (fullscreen or the app's own fullscreen strip)
+                // must not force anything.
+                if !unsafe { IsWindowVisible(HWND(*raw as *mut _)).as_bool() } {
+                    continue;
+                }
+                // Strict containment (no hysteresis): the pointer must be
+                // genuinely inside the taskbar rect.
+                if hover_hit_test(rect, point, false) {
+                    hit_dimmed_taskbar = true;
+                    break;
+                }
+            }
+        }
+        if !hit_dimmed_taskbar {
+            return false;
+        }
+        unsafe {
+            let arrow = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+            if arrow.0.is_null() {
+                return false;
+            }
+            LAST_SET_CURSOR_HANDLE.store(arrow.0 as isize, Ordering::Relaxed);
+            CURSOR_RESHOW_COUNT.fetch_add(1, Ordering::Relaxed);
+            let _ = SetCursor(Some(arrow));
+        }
+        true
     }
 
     fn rect_text(rect: Option<RECT>) -> String {
@@ -1854,7 +2022,7 @@ mod platform {
             let msg_type = wparam.0 as u32;
             if (WM_MOUSEFIRST..=WM_MOUSEHWHEEL).contains(&msg_type) {
                 let mut point = windows::Win32::Foundation::POINT::default();
-                if GetCursorPos(&mut point).is_ok() {}
+                let point_ok = GetCursorPos(&mut point).is_ok();
                 // Per-overlay hover: only event-mode overlays consume the
                 // hook; poll-mode overlays get their hover from the tick.
                 let changed = {
@@ -1877,6 +2045,13 @@ mod platform {
                 };
                 if changed {
                     post_dimmer_tick();
+                }
+                // A mouse event just landed over the dimmed taskbar. If the
+                // streaming session left the cursor hidden, force the arrow
+                // back immediately so hovering the taskbar reveals it without
+                // requiring a click. No-op while the cursor is visible.
+                if point_ok {
+                    force_arrow_over_dimmed_taskbar(point);
                 }
             }
         }
@@ -1988,15 +2163,32 @@ mod platform {
 
     fn update_fade(hwnd: HWND) {
         let hwnd_raw = hwnd.0 as isize;
-        // This overlay's own taskbar window (copied before the FADES lock so
-        // the cache refresh below can re-fetch its rect without nesting a
-        // second lock).
-        let overlay_taskbar = overlays_map()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&hwnd_raw)
-            .map(|info| info.taskbar);
-        let now = Instant::now();
+    // This overlay's own taskbar window (copied before the FADES lock so
+    // the cache refresh below can re-fetch its rect without nesting a
+    // second lock).
+    let mut overlay_taskbar = overlays_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&hwnd_raw)
+        .map(|info| info.taskbar);
+    let now = Instant::now();
+    // Self-heal a stale taskbar HWND: after a display change Explorer can
+    // recreate Shell_TrayWnd with a new handle, and GetWindowRect on the old
+    // handle fails forever. With cached_taskbar None, hover detection and
+    // z-order repair both stop (the overlay ends up stuck behind the
+    // recreated taskbar) until the next apply() happens to re-enumerate.
+    // Re-point this overlay at the fresh taskbar on its monitor before the
+    // cache refresh below runs. This runs with no lock held, so it can never
+    // invert the OVERLAYS -> FADES lock order.
+    if let Some(raw) = overlay_taskbar {
+        let mut r = RECT::default();
+        let resolvable = unsafe { GetWindowRect(HWND(raw as *mut c_void), &mut r) }.is_ok();
+        if !resolvable {
+            overlay_taskbar = rekey_taskbar_for_overlay(hwnd, hwnd_raw, now)
+                .map(|(raw, _)| raw)
+                .or(Some(raw));
+        }
+    }
 
         // Fullscreen suppression is decoupled from the animation tick: the
         // expensive detection chain result is cached, so the fade timer can
@@ -2128,6 +2320,7 @@ mod platform {
         let mut hovered = false;
         let mut cursor = windows::Win32::Foundation::POINT::default();
         let mut cursor_polled = false;
+        let mut force_cursor_arrow = false;
         let mut alpha_to_apply = None;
         let mut transition_done = false;
 
@@ -2285,6 +2478,11 @@ mod platform {
                     // Keep the overlay's hover cache in sync so an immediate
                     // hook poke after this tick never sees a stale value.
                     fade.hover = hovered;
+                    // Poll tick found the pointer over this overlay's dimmed
+                    // taskbar; the arrow re-show runs after the lock drops.
+                    if fade.enabled && hovered {
+                        force_cursor_arrow = true;
+                    }
                 } else if hook_active {
                     // Cursor polling off (low-CPU mode): the hook is the sole
                     // hover detector.
@@ -2432,6 +2630,12 @@ mod platform {
             if should_repair_zorder {
                 fade.last_zorder_repair = now;
             }
+        }
+        // The cursor poll found the pointer over this overlay's dimmed
+        // taskbar. Re-show the arrow if Windows reports it hidden, outside
+        // the FADES lock (force_arrow_over_dimmed_taskbar takes it itself).
+        if force_cursor_arrow {
+            force_arrow_over_dimmed_taskbar(cursor);
         }
         // Re-show the overlay outside the lock, matching the codebase pattern
         // of not holding FADE_STATE across window calls (ShowWindow can send

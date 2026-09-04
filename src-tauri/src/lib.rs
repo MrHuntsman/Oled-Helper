@@ -8,6 +8,7 @@ mod gamma;
 mod gamma_ramp;
 mod gamma_watch;
 mod hdr_toggle;
+mod helper;
 mod hotkeys;
 mod input_monitor;
 mod monitors;
@@ -67,6 +68,7 @@ mod display_change_events {
 
     const SUBCLASS_ID: usize = 0x4F4C_4449; // "OLDI"
     static APP: OnceLock<AppHandle> = OnceLock::new();
+    static MAIN_HWND: Mutex<Option<isize>> = Mutex::new(None);
     // True while the main window is minimized (between SIZE_MINIMIZED and the
     // next SIZE_RESTORED). SIZE_RESTORED also fires for ordinary resizes, so
     // this flag is what lets us tell a genuine restore-from-minimized apart
@@ -205,6 +207,9 @@ mod display_change_events {
     pub fn install(window_handle: isize, app: AppHandle) -> Result<(), String> {
         let _ = APP.set(app);
         let hwnd = HWND(window_handle as *mut std::ffi::c_void);
+        if let Ok(mut stored) = MAIN_HWND.lock() {
+            *stored = Some(window_handle);
+        }
         let installed = unsafe { SetWindowSubclass(hwnd, Some(window_proc), SUBCLASS_ID, 0) };
         if installed.as_bool() {
             Ok(())
@@ -212,8 +217,8 @@ mod display_change_events {
             Err("SetWindowSubclass failed".into())
         }
     }
-}
 
+}
 
 // ── Pre-WebView log history ────────────────────────────────────────────────
 // tauri-plugin-log's Webview target only forwards records while the frontend
@@ -575,7 +580,7 @@ static HDR_MODE_LOCK: Mutex<()> = Mutex::new(());
 // and the elevated-restart pending apply in run(): the transition and its
 // rollback must stay identical in both paths, or a failed transition could
 // leave RTX and Auto HDR enabled together.
-fn apply_hdr_mode(mode: &str) -> Result<(), String> {
+pub(crate) fn apply_hdr_mode(mode: &str) -> Result<(), String> {
     let _transaction_guard = HDR_MODE_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -627,8 +632,31 @@ fn apply_hdr_mode(mode: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_hdr_enhancement_mode(app: AppHandle, mode: String) -> Result<(), String> {
-    let result = apply_hdr_mode(&mode);
+async fn set_hdr_enhancement_mode(app: AppHandle, mode: String) -> Result<(), String> {
+    let result = match apply_hdr_mode(&mode) {
+        // A DRS write from a standard-user process returns the admin marker.
+        // The whole exclusive transition then runs in the elevated helper
+        // child (same apply_hdr_mode, so the rollback behavior is identical)
+        // instead of relaunching the app elevated. The app itself stays
+        // non-elevated, which is what avoids the elevated-GUI hotkey issue.
+        Err(error) if error.contains("ADMIN_REQUIRED:") => {
+            crate::helper::ensure_registered().map_err(|setup_error| {
+                format!("The HDR change needs a one-time elevated helper setup. {setup_error}")
+            })?;
+            let helper_mode = mode.clone();
+            let run = tauri::async_runtime::spawn_blocking(move || {
+                crate::helper::run_request(
+                    "hdr-mode",
+                    |request| request.mode = Some(helper_mode.clone()),
+                    std::time::Duration::from_secs(20),
+                )
+            })
+            .await
+            .map_err(|error| format!("the privileged helper task failed: {error}"))?;
+            crate::helper::result_into_std(run?)
+        }
+        other => other,
+    };
     if result.is_ok() {
         // The HDR enhancement mode has no settings-change broadcast of its
         // own, so notify listeners (the tray's mode selector) when it
@@ -658,6 +686,21 @@ pub fn run() {
     // process dies while a non-default ramp is applied.
     if std::env::args().any(|arg| arg == "--gamma-watchdog") {
         gamma_watch::run_watchdog();
+        return;
+    }
+    // One-shot elevated child that registers the privileged-helper Task
+    // Scheduler task (/RL HIGHEST) and exits. Spawned by the non-elevated
+    // app the first time a feature needs the helper; must dispatch before
+    // the --restart-parent wait below because the spawner keeps running.
+    if std::env::args().any(|arg| arg == helper::ARG_REGISTER_HELPER_TASK) {
+        helper::run_register_helper_task();
+        return;
+    }
+    // The scheduled task's entry: performs one privileged operation read
+    // from helper-request.json, writes helper-result.json, and exits. Runs
+    // before any Tauri/WebView2 init, same as the gamma watchdog.
+    if std::env::args().any(|arg| arg == helper::ARG_PRIVILEGED_HELPER) {
+        helper::run_privileged_helper();
         return;
     }
     display_info::launch_recovery_watchdog_if_needed();
@@ -697,38 +740,9 @@ pub fn run() {
         return;
     }
 
-    // An elevated relaunch (RTX HDR write) can carry the mode the user tried
-    // to apply before the restart. Apply it once, shortly after startup, on a
-    // background thread, this instance is elevated, so the DRS write that
-    // failed before now succeeds.
-    let pending_rtx_hdr_flags: Option<u32> = std::env::args().find_map(|arg| {
-        arg.strip_prefix(process::ARG_RTX_HDR_FLAGS_PREFIX)
-            .and_then(|value| value.parse().ok())
-    });
-    let pending_rtx_hdr_enabled: Option<bool> = std::env::args().find_map(|arg| {
-        arg.strip_prefix(process::ARG_RTX_HDR_ENABLED_PREFIX)
-            .and_then(|value| match value {
-                "1" | "true" => Some(true),
-                "0" | "false" => Some(false),
-                _ => None,
-            })
-    });
-    let pending_hdr_mode: Option<String> = std::env::args().find_map(|arg| {
-        arg.strip_prefix(process::ARG_HDR_MODE_PREFIX)
-            .filter(|mode| matches!(*mode, "off" | "auto" | "rtx"))
-            .map(str::to_string)
-    });
-    let pending_screen_dimmer_enabled: Option<bool> = std::env::args().find_map(|arg| {
-        arg.strip_prefix(process::ARG_SCREEN_DIMMER_ENABLED_PREFIX)
-            .and_then(|value| match value {
-                "1" | "true" => Some(true),
-                "0" | "false" => Some(false),
-                _ => None,
-            })
-    });
-    // An elevated relaunch can carry the tab the user was on
-    // (--open-tab=<tab>); take_startup_tab hands it to the frontend once so
-    // the UI opens on the same tab after the UAC restart.
+    // A tray restart can carry the tab the user was on (--open-tab=<tab>);
+    // take_startup_tab hands it to the frontend once so the UI opens on the
+    // same tab after the restart.
     let startup_tab: Option<String> =
         std::env::args().find_map(|arg| arg.strip_prefix(process::ARG_OPEN_TAB_PREFIX).map(str::to_string));
     if let Some(tab) = startup_tab {
@@ -736,77 +750,13 @@ pub fn run() {
             *guard = Some(tab);
         }
     }
-    if pending_rtx_hdr_flags.is_some()
-        || pending_rtx_hdr_enabled.is_some()
-        || pending_hdr_mode.is_some()
-    {
-        if let Err(error) = std::thread::Builder::new()
-            .name("rtx-hdr-pending-apply".into())
-            .spawn(move || {
-                // Let nvapi and the driver settle before touching the profile.
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                // Apply the exclusive mode first. This disables the currently
-                // active path before enabling the requested one, so an elevated
-                // restart cannot leave Auto HDR and RTX HDR enabled together.
-                if let Some(mode) = pending_hdr_mode.as_deref() {
-                    match apply_hdr_mode(mode) {
-                        Ok(()) => log::info!(
-                            "applied pending HDR enhancement mode '{mode}' after elevated restart"
-                        ),
-                        Err(error) => {
-                            log::warn!("pending HDR enhancement mode apply failed: {error}")
-                        }
-                    }
-                }
-                // Legacy individual RTX arguments remain supported for older
-                // relaunches. Apply them after the mode only when present.
-                if pending_hdr_mode.as_deref() == Some("rtx") {
-                    if let Some(flags) = pending_rtx_hdr_flags {
-                        match vendor_info::set_rtx_hdr_flags(flags) {
-                            Ok(()) => log::info!(
-                                "applied pending RTX HDR mode 0x{flags:02X} after elevated restart"
-                            ),
-                            Err(error) => log::warn!("pending RTX HDR mode apply failed: {error}"),
-                        }
-                    }
-                }
-                if pending_hdr_mode.is_none() {
-                    if let Some(enabled) = pending_rtx_hdr_enabled {
-                        match vendor_info::set_rtx_hdr_enabled(enabled) {
-                            Ok(()) => log::info!(
-                                "applied pending RTX HDR global enable={} after elevated restart",
-                                enabled
-                            ),
-                            Err(error) => {
-                                log::warn!("pending RTX HDR global enable apply failed: {error}")
-                            }
-                        }
-                    }
-                }
-            })
-        {
-            log::error!("could not start RTX HDR pending-apply thread: {error}");
-        }
-    }
 
-    // Startup elevation, consolidated. "Always open as administrator" and
-    // the Screen Dimmer both want admin rights; they are probed as ONE
-    // decision so a single UAC prompt covers the launch (the two separate
-    // probe + relaunch blocks this replaces could prompt twice and spawn
-    // duplicate replacements, feeding the restart storm that raced the shared
-    // WebView2 user-data folder). When a replacement is spawned, only this
-    // bare launcher (which has not created any WebView2 yet) exits immediately
-    // so the window never flashes before the prompt. A declined prompt
-    // continues non-elevated, but the UAC secure-desktop interaction leaves
-    // the fresh window wanting to take the foreground; the declined flag
-    // below grabs it once the window appears. An already-elevated process
-    // skips it entirely, so there is no relaunch loop.
-    let declined_startup_elevation = match process::startup_elevation_handoff() {
-        process::StartupElevationResult::Launched => std::process::exit(0),
-        process::StartupElevationResult::Declined => true,
-        process::StartupElevationResult::None => false,
-    };
-
+    // No feature forces an elevated app session anymore: the Screen Dimmer,
+    // RTX HDR writes, and font replacement all run their privileged steps in
+    // the transient scheduled-task helper child (helper.rs), so the GUI
+    // stays non-elevated by design. An already-elevated session (legacy
+    // install, manual "Run as administrator") still works; it just never
+    // starts that way on its own.
     let builder = tauri::Builder::default();
     let gamma_desired = Arc::new(AtomicI32::new(0));
     let gamma_per_monitor = Arc::new(Mutex::new(HashMap::new()));
@@ -840,8 +790,8 @@ pub fn run() {
             vendor_info::get_rtx_hdr_settings_state,
             set_hdr_enhancement_mode,
             vendor_info::set_rtx_hdr_state,
-            process::relaunch_elevated,
-            process::is_process_elevated,
+            helper::ensure_helper_task,
+            helper::helper_task_registered,
             process::open_url,
             updater::check_for_update,
             updater::download_update,
@@ -1038,15 +988,7 @@ pub fn run() {
             // Load the persisted config before the flyout/tray webviews are
             // pre-warmed: their first status reads (taskbar dimmer, etc.)
             // must see the saved values, not the state defaults.
-            let mut saved_config = config::load_config(app.handle().clone());
-            if let Some(enabled) = pending_screen_dimmer_enabled {
-                saved_config.screen_protector_enabled = enabled;
-                // Persist the pending state before the frontend loads its
-                // config, so the elevated replacement and its UI agree even
-                // if the original frontend was closed before its async save
-                // completed.
-                let _ = config::save_config(app.handle().clone(), saved_config.clone());
-            }
+            let saved_config = config::load_config(app.handle().clone());
 
             // Seed the backend's global gamma fallback before the screen-
             // protector worker starts. Per-monitor Black Crush profiles are
@@ -1294,14 +1236,10 @@ pub fn run() {
 
             // A restart child (tray restart, elevated UAC relaunch) can come
             // up without the foreground: an elevated child is spawned by
-            // consent.exe, so Windows refuses its window activation. The same
-            // holds for a launch where the startup UAC prompt was declined:
-            // the secure-desktop interaction tears the foreground away from
-            // the fresh process, so its window opens in the background. Grab
-            // the foreground shortly after startup for both cases, never for
-            // plain login/autostart launches where stealing focus would be
-            // wrong.
-            if is_restart_child || declined_startup_elevation {
+            // consent.exe, so Windows refuses its window activation. Grab the
+            // foreground shortly after a restart, never for plain
+            // login/autostart launches where stealing focus would be wrong.
+            if is_restart_child {
                 let restart_app = app.handle().clone();
                 std::thread::spawn(move || {
                     process::grab_foreground_after_restart(restart_app);
@@ -1383,6 +1321,7 @@ pub fn run() {
                 _ => {}
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, _event| {});
 }

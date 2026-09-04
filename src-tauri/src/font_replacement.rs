@@ -1284,7 +1284,44 @@ pub async fn font_download_apply(
         .ok_or_else(|| format!("unknown font family key {family_key:?}"))?
         .clone();
     let primary = download_family(&entry, Some(&app)).await?;
-    apply_replacement(&primary, Some(&app))
+    if crate::process::process_is_elevated() {
+        apply_replacement(&primary, Some(&app))
+    } else {
+        font_apply_via_helper(&primary).await
+    }
+}
+
+// Shared helper round trip for font apply: runs the full pipeline in the
+// transient elevated helper child (takeown/icacls, boot scheduling, cache
+// purge) and returns the persisted ReplaceState. Only reached from a
+// non-elevated session, where apply_replacement's ensure_elevated would
+// refuse.
+async fn font_apply_via_helper(primary: &Path) -> Result<ReplaceState, String> {
+    crate::helper::ensure_registered().map_err(|setup_error| {
+        format!("Font replacement needs a one-time elevated helper setup. {setup_error}")
+    })?;
+    let helper_path = primary.to_string_lossy().to_string();
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        crate::helper::run_request(
+            "font-apply",
+            |request| request.primary_path = Some(helper_path),
+            std::time::Duration::from_secs(120),
+        )
+    })
+    .await
+    .map_err(|error| format!("the privileged helper task failed: {error}"))?;
+    let result = run?;
+    if !result.ok {
+        return Err(result
+            .error
+            .unwrap_or_else(|| "the privileged helper reported a failure".to_string()));
+    }
+    let data = result
+        .data
+        .ok_or_else(|| "the privileged helper returned no apply state".to_string())?;
+    let state: ReplaceState = serde_json::from_value(data)
+        .map_err(|error| format!("could not parse the helper's apply result: {error}"))?;
+    Ok(state)
 }
 
 // ── Step 7: apply/restore orchestration + commands ──────────────────
@@ -1464,11 +1501,12 @@ pub fn restore_originals(app: Option<&tauri::AppHandle>) -> Result<(), String> {
     Ok(())
 }
 
-/// Live status for the UI: whether the app is elevated, the pending apply
-/// state (if any), and whether a restart is actually needed to finish it.
+/// Live status for the UI: the pending apply state (if any) and whether a
+/// restart is actually needed to finish it. Apply/restore no longer require
+/// an elevated app session (they run in the transient privileged helper), so
+/// there is no elevation field anymore.
 #[derive(Serialize)]
 pub struct FontStatus {
-    pub elevated: bool,
     pub applied: Option<ReplaceState>,
     pub needs_restart: bool,
 }
@@ -1487,13 +1525,36 @@ fn restart_pending() -> bool {
 }
 
 #[tauri::command]
-pub fn font_apply(app: tauri::AppHandle, primary_path: String) -> Result<ReplaceState, String> {
-    apply_replacement(Path::new(&primary_path), Some(&app))
+pub async fn font_apply(app: tauri::AppHandle, primary_path: String) -> Result<ReplaceState, String> {
+    // An elevated legacy session applies in-process (with live progress
+    // events). A normal session runs the whole apply in the transient
+    // privileged helper child, which is elevated for the takeown/icacls and
+    // boot-scheduling steps; the app itself stays non-elevated.
+    if crate::process::process_is_elevated() {
+        apply_replacement(Path::new(&primary_path), Some(&app))
+    } else {
+        font_apply_via_helper(Path::new(&primary_path)).await
+    }
 }
 
 #[tauri::command]
-pub fn font_restore(app: tauri::AppHandle) -> Result<(), String> {
-    restore_originals(Some(&app))
+pub async fn font_restore(app: tauri::AppHandle) -> Result<(), String> {
+    if crate::process::process_is_elevated() {
+        return restore_originals(Some(&app));
+    }
+    crate::helper::ensure_registered().map_err(|setup_error| {
+        format!("Font restore needs a one-time elevated helper setup. {setup_error}")
+    })?;
+    let run = tauri::async_runtime::spawn_blocking(|| {
+        crate::helper::run_request(
+            "font-restore",
+            |_| {},
+            std::time::Duration::from_secs(120),
+        )
+    })
+    .await
+    .map_err(|error| format!("the privileged helper task failed: {error}"))?;
+    crate::helper::result_into_std(run?)
 }
 
 /// Tauri command: live status for the UI. Also reconciles the persisted
@@ -1518,7 +1579,6 @@ pub fn font_get_status() -> FontStatus {
         }
     }
     FontStatus {
-        elevated: crate::process::process_is_elevated(),
         needs_restart: restart_pending(),
         applied,
     }

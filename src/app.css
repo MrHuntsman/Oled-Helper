@@ -444,24 +444,6 @@ select:focus-visible,
   transition: left 0.12s;
 }
 .nav-switch.on .nav-switch-thumb { left: 14px; }
-/* Admin-required warning badge beside the Screen Dimmer nav switch, between
-   the label and the switch. Shown only when the dimmer is enabled but the
-   session is not elevated; the triangle glyph matches the app's other amber
-   warning icons. Right edge tracks the
-   smaller nav switch (26px at right:10px ends at 36px), so 38px keeps the
-   2px gap. */
-.nav-item-shield {
-  position: absolute;
-  right: 38px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: #E0A93C;
-  font-size: 13px;
-  line-height: 1;
-  cursor: default;
-  user-select: none;
-}
-
 .sidebar-spacer { flex: 1; }
 /* Sidebar section divider: groups the Screen Dimmer off from the other tabs. */
 .sidebar-sep {
@@ -1211,70 +1193,6 @@ select:focus-visible,
   transform: rotate(45deg);
 }
 
-/* Screen Dimmer admin warning: shown when the dimmer is enabled but the
-   session is not elevated (declined startup prompt or manual launch). Uses
-   the gold accent of the admin shield so it reads as a privilege notice,
-   not an error. */
-.dimmer-admin-warning {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 10px 12px;
-  margin-bottom: 12px;
-  border: 1px solid color-mix(in srgb, #e0a84b 45%, var(--divider));
-  border-radius: 8px;
-  background: color-mix(in srgb, #e0a84b 6%, transparent);
-}
-.dimmer-admin-warning-icon {
-  flex-shrink: 0;
-  width: 18px;
-  height: 18px;
-  margin-top: 1px;
-  color: #E0A93C;
-  font-size: 15px;
-  line-height: 1;
-}
-.dimmer-admin-warning-text {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.dimmer-admin-warning-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text);
-}
-.dimmer-admin-warning-desc {
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--text-weak);
-}
-/* Filled amber button so the action stands out against the dark banner,
-   matching the previous restart as administrator treatment. */
-.font-admin-restart-btn,
-.dimmer-admin-restart-btn {
-  flex-shrink: 0;
-  padding: 5px 12px;
-  border: 1px solid #e0a84b;
-  border-radius: 6px;
-  background: transparent;
-  color: #e0a84b;
-  font-size: 11px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: background 0.08s, color 0.08s, border-color 0.08s;
-}
-.font-admin-restart-btn:hover,
-.font-admin-restart-btn:focus-visible,
-.dimmer-admin-restart-btn:hover,
-.dimmer-admin-restart-btn:focus-visible {
-  background: #e0a84b;
-  color: #0d0d0f;
-  border-color: #e0a84b;
-  outline: none;
-}
 .dimmer-check-toggle input:disabled {
   cursor: not-allowed;
   opacity: 0.5;
@@ -3684,9 +3602,6 @@ select:focus-visible,
   border-width: 0 1.6px 1.6px 0;
   transform: rotate(45deg);
 }
-/* Dim-before-off preview button (Debug tab header, right of the tray-notice
-   button): a compact text chip, narrower than the icon-only .copy-btn row it
-   sits in. */
 .diag-detection-bar {
   display: flex;
   align-items: center;

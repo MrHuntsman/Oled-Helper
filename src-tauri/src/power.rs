@@ -592,10 +592,118 @@ fn emit_screen_dimmer_state_changed(dimmed: bool) {
 }
 
 // Set by the diagnostics command whenever a screen-dimmer state readout is
-// open, asking the watcher to probe powercfg on its next tick so the culprit
-// list is fresh instead of waiting for the timer to near its end. Consumed
-// by the watcher, so at most one probe per command call.
+// open, asking the watcher to probe power requests on its next tick so the
+// culprit list is fresh instead of waiting for the timer to near its end.
+// Consumed by the watcher, so at most one request per command call.
 static DIM_DIAGNOSTICS_PROBE: AtomicBool = AtomicBool::new(false);
+
+// The DISPLAY power-request probe used to run inline in the dim watcher
+// (one powercfg subprocess per check). It now runs in the privileged helper
+// child (helper.rs) on a dedicated worker thread, because the scheduled-task
+// round trip can take a few hundred milliseconds, far too slow for the
+// 16 ms dim tick. The watcher only asks (fire-and-forget) and reads the
+// cached answer; the worker coalesces asks to at most one helper run per
+// second, preserving the old inline gate.
+
+// Cached probe answer: when it was produced and the parsed DISPLAY list.
+fn display_probe_cache() -> &'static Mutex<(std::time::Instant, Vec<DisplayRequestInfo>)> {
+    static CACHE: OnceLock<Mutex<(std::time::Instant, Vec<DisplayRequestInfo>)>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new((
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+            Vec::new(),
+        ))
+    })
+}
+
+fn request_display_probe() {
+    let _ = probe_worker_sender().try_send(());
+}
+
+fn probe_worker_sender() -> &'static std::sync::mpsc::SyncSender<()> {
+    static SENDER: OnceLock<std::sync::mpsc::SyncSender<()>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<()>(4);
+        let _ = std::thread::Builder::new()
+            .name("dim-power-probe".into())
+            .spawn(move || {
+                // Coalescing gate: at most one helper run per second, the
+                // cadence the inline probe used.
+                let mut last_run =
+                    std::time::Instant::now() - std::time::Duration::from_secs(60);
+                while receiver.recv().is_ok() {
+                    // Drain queued asks so a burst of readout polls collapses
+                    // into a single probe.
+                    while receiver.try_recv().is_ok() {}
+                    if last_run.elapsed()
+                        < std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS)
+                    {
+                        continue;
+                    }
+                    last_run = std::time::Instant::now();
+                    let requests = run_elevated_power_probe();
+                    if let Ok(mut cache) = display_probe_cache().lock() {
+                        cache.0 = std::time::Instant::now();
+                        cache.1 = requests;
+                    }
+                }
+            });
+        sender
+    })
+}
+
+fn latest_display_requests() -> (std::time::Instant, Vec<DisplayRequestInfo>) {
+    let Ok(cache) = display_probe_cache().lock() else {
+        return (std::time::Instant::now(), Vec::new());
+    };
+    (cache.0, cache.1.clone())
+}
+
+fn clear_display_probe_cache() {
+    if let Ok(mut cache) = display_probe_cache().lock() {
+        cache.0 = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        cache.1.clear();
+    }
+}
+
+// Runs one elevated power-request probe. From a legacy elevated session it
+// queries powercfg in-process (no task needed); from the normal non-elevated
+// session it round-trips through the scheduled-task helper child. An empty
+// list is returned when the helper is unavailable (for example the user
+// declined the one-time registration), so the dimmer degrades to idle-only
+// suppression instead of hanging the watcher.
+fn run_elevated_power_probe() -> Vec<DisplayRequestInfo> {
+    if crate::process::process_is_elevated() {
+        return display_power_requests();
+    }
+    match crate::helper::run_request("power-requests", |_| {}, std::time::Duration::from_secs(5)) {
+        Ok(result) if result.ok => result
+            .data
+            .and_then(|data| serde_json::from_value::<Vec<DisplayRequestInfo>>(data).ok())
+            .unwrap_or_default(),
+        Ok(result) => {
+            log::debug!("[power] helper power probe failed: {:?}", result.error);
+            Vec::new()
+        }
+        Err(error) => {
+            // The unregistered-task case repeats every second while the
+            // dimmer is near a timeout, so report it once instead of
+            // flooding the log until the user sets the helper up.
+            static UNREGISTERED_WARNED: OnceLock<()> = OnceLock::new();
+            if error.contains("not registered") {
+                let _ = UNREGISTERED_WARNED.get_or_init(|| {
+                    log::warn!(
+                        "[power] media detection is off: the privileged helper task is not \
+                         registered. Enable the Screen Dimmer from the app once to set it up."
+                    );
+                });
+            } else {
+                log::debug!("[power] helper power probe unavailable: {error}");
+            }
+            Vec::new()
+        }
+    }
+}
 
 // Per-monitor settings pushed by the frontend, shared by the Tauri commands
 // and the watcher thread.
@@ -681,8 +789,10 @@ fn idle_seconds() -> u32 {
 
 // One entry of the DISPLAY section emitted by powercfg /requests: the holder
 // kind ([PROCESS], [DRIVER], [SERVICE]), its path or name, and the reason
-// line that follows it ("Video Wake Lock", possibly localized).
-#[derive(Clone, Serialize)]
+// line that follows it ("Video Wake Lock", possibly localized). Round-trips
+// through the privileged-helper result file (Serialize in the helper child,
+// Deserialize in the app), so both sides derive both traits.
+#[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisplayRequestInfo {
     pub kind: String,
@@ -756,8 +866,9 @@ fn decode_powercfg_output(bytes: &[u8]) -> String {
 // creates or clears a power request. `powercfg /requests` is the supported
 // diagnostic surface, so use it as a conditional, low-rate fallback rather
 // than polling continuously. Capturing output and suppressing the console
-// window keeps this invisible to the user.
-fn display_power_requests() -> Vec<DisplayRequestInfo> {
+// window keeps this invisible to the user. pub(crate): the privileged helper
+// child (helper.rs) runs this in-process while elevated.
+pub(crate) fn display_power_requests() -> Vec<DisplayRequestInfo> {
     // /requests and the native request-list query both require elevation on
     // current Windows builds. The Screen Dimmer asks for elevation before it
     // can be enabled, so reaching this branch as a standard-user process is
@@ -1234,8 +1345,6 @@ fn dim_watcher_loop() {
         std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut last_fullscreen_check =
         std::time::Instant::now() - std::time::Duration::from_millis(FULLSCREEN_CHECK_INTERVAL_MS);
-    let mut last_display_request_check =
-        std::time::Instant::now() - std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS);
     let mut last_gamepad_check =
         std::time::Instant::now() - std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS);
     let mut last_idle_diag =
@@ -1353,15 +1462,21 @@ fn dim_watcher_loop() {
         // never spawns more than one subprocess per second.
         let readout_probe_requested = DIM_DIAGNOSTICS_PROBE.swap(false, Ordering::AcqRel);
         if !enabled {
+            // Nothing is dimming, so no probe is wanted. Clear the cached
+            // culprit list so a later enable starts from "no requests"
+            // instead of replaying a stale playback state.
             display_request_active = false;
             display_requests.clear();
-            last_display_request_check = now
-                - std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS);
-        } else if last_display_request_check.elapsed()
-            >= std::time::Duration::from_millis(DISPLAY_REQUEST_CHECK_INTERVAL_MS)
-            && (readout_probe_requested || request_check_needed)
-        {
-            let requests = display_power_requests();
+            clear_display_probe_cache();
+        } else if readout_probe_requested || request_check_needed {
+            // Ask the worker to refresh the cached DISPLAY request list and
+            // read whatever it last produced. The worker coalesces asks to
+            // one elevated helper run per second, so this stays cheap even
+            // though the watcher ticks every 16 ms. Near a timeout the first
+            // fresh answer lands within the helper round trip (a few hundred
+            // ms), well inside the 5 s minimum Screen Dimmer timeout.
+            request_display_probe();
+            let (_, requests) = latest_display_requests();
             let request_active = !requests.is_empty();
             if request_active != display_request_active {
                 log::info!(
@@ -1371,7 +1486,6 @@ fn dim_watcher_loop() {
             }
             display_request_active = request_active;
             display_requests = requests;
-            last_display_request_check = now;
         }
 
         let mut next_levels = HashMap::new();
@@ -1514,26 +1628,30 @@ pub fn init(
     }
     sync_primary_mirror();
     DIM_ENABLED.store(screen_protector_enabled, Ordering::Release);
-    start_watcher_if_elevated(screen_protector_enabled);
+    start_watcher(screen_protector_enabled);
 }
 
-// The dimmer needs admin for its media-playback detection (powercfg
-// /requests). Record the requested state so the UI and config stay truthful,
-// but never start the dimming machinery in a standard-user session: dimming
-// on while media detection is off is the half-state the startup prompt was
-// designed to prevent. The tab shows a restart-as-admin prompt instead.
-fn start_watcher_if_elevated(enabled: bool) {
-    if crate::process::process_is_elevated() {
-        if enabled {
-            crate::input_monitor::start();
-        } else {
-            crate::input_monitor::stop();
-        }
-        // The watcher is cheap (one idle poll per tick) and handles the
-        // disabled case by fading back up, so just make sure it is running.
-        ensure_watcher();
-    } else if enabled {
-        log::warn!("[power] screen dimmer enabled but process is not elevated; watcher not started");
+// The dimmer no longer requires an elevated session. Media-playback
+// detection (powercfg /requests) runs in the transient privileged helper
+// child (helper.rs), and gamma dimming never needed admin, so the watcher
+// starts in a normal user session. Keeping the app non-elevated is what
+// avoids the elevated-process interaction that broke external
+// low-level-hook hotkeys (Volume2) when the taskbar had focus. The helper
+// task is registered when the dimmer is enabled (helper::ensure_helper_task);
+// until then the dimmer suppresses on idle alone.
+fn start_watcher(enabled: bool) {
+    if enabled {
+        crate::input_monitor::start();
+    } else {
+        crate::input_monitor::stop();
+    }
+    // The watcher is cheap (one idle poll per tick) and handles the
+    // disabled case by fading back up, so just make sure it is running.
+    ensure_watcher();
+    if enabled && !crate::process::process_is_elevated() {
+        log::debug!(
+            "[power] dim watcher running non-elevated; media detection goes through the privileged helper"
+        );
     }
 }
 
@@ -1555,10 +1673,10 @@ pub fn set_screen_protector(
         fade_out_duration_ms,
         fullscreen_detection,
     );
-    // Same elevation rule as init: a non-elevated session records the new
-    // values but never starts the watcher, so toggling the dimmer on without
-    // admin just flips the flag for the next elevated launch.
-    start_watcher_if_elevated(enabled);
+    // The watcher starts in any session now (media detection is delegated
+    // to the privileged helper), so enabling from the tray, a hotkey, or the
+    // tab all dim immediately without a UAC relaunch.
+    start_watcher(enabled);
 }
 
 pub fn shutdown() {
@@ -1739,11 +1857,12 @@ pub fn power_get_screen_dimmer_diagnostics() -> ScreenDimmerDiagnosticsView {
     // The reasons a dimmed state is not visible on screen, mirroring the
     // watcher's own suppression conditions plus the gamma-path early-outs.
     // "Waiting for idle" is normal behavior, so it is not listed as a reason.
+    // The dimmer runs in any session now (no elevation gate): media playback
+    // is suppressed through the privileged helper, so a missing helper only
+    // shows up as an absent display-request blocker, never as a hard block.
     let mut reasons = Vec::new();
     if !enabled {
         reasons.push("Dimming is turned off".to_string());
-    } else if !elevated {
-        reasons.push("Requires administrator privileges (restart the app elevated)".to_string());
     } else {
         if snapshot.fullscreen_active {
             reasons.push("A fullscreen app is active".to_string());
