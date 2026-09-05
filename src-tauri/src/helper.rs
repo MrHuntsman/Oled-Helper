@@ -88,6 +88,9 @@ pub(crate) struct HelperRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub primary_path: Option<String>,
+    // Named pipe the resident key observer (op "key-observer") connects to.
+    #[serde(default)]
+    pub pipe_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -255,6 +258,65 @@ pub fn helper_task_registered() -> bool {
     task_registered_and_current()
 }
 
+// Launches the resident key observer: writes a "key-observer" request (the
+// child connects to the named pipe and serves key-state queries until the
+// pipe closes) and triggers the task, then returns without waiting for any
+// result. Fire and forget by design, the observer has no result. Fails fast
+// (no UAC) when the task is missing or the app session is already elevated
+// (where the observer is unneeded because local key reads already work).
+pub(crate) fn launch_key_observer(pipe_name: &str) -> Result<(), String> {
+    if crate::process::process_is_elevated() {
+        return Err("the app is elevated, the key observer is unneeded".to_string());
+    }
+    let Some(request_file) = request_path() else {
+        return Err("app data folder is unavailable".to_string());
+    };
+    let Some(result_file) = result_path() else {
+        return Err("app data folder is unavailable".to_string());
+    };
+    if let Some(dir) = request_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let request = HelperRequest {
+        op: "key-observer".to_string(),
+        request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        mode: None,
+        flags: None,
+        enabled: None,
+        primary_path: None,
+        pipe_name: Some(pipe_name.to_string()),
+    };
+    let request_json = match serde_json::to_vec(&request) {
+        Ok(json) => json,
+        Err(error) => return Err(format!("could not serialize helper request: {error}")),
+    };
+    if let Err(error) = std::fs::write(&request_file, request_json) {
+        return Err(format!("could not write helper request: {error}"));
+    }
+    // Clear a stale result so it can never be mistaken for this launch.
+    let _ = std::fs::remove_file(&result_file);
+    // No background probe may raise a UAC prompt, so a missing (or stale,
+    // after the portable exe moved) task is a fail-fast error; the caller
+    // retries later and the next user-initiated action re-registers via
+    // ensure_registered.
+    if !task_registered_and_current() {
+        let _ = std::fs::remove_file(&request_file);
+        return Err("the privileged helper task is not registered".to_string());
+    }
+    let trigger = run_hidden("schtasks", &["/Run", "/TN", HELPER_TASK_NAME])
+        .map_err(|error| format!("could not trigger the privileged helper: {error}"))?;
+    if !trigger.status.success() {
+        let _ = std::fs::remove_file(&request_file);
+        let stderr = String::from_utf8_lossy(&trigger.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "could not run the privileged helper task".to_string()
+        } else {
+            stderr
+        });
+    }
+    Ok(())
+}
+
 // Runs the registered task and waits for the result file carrying the
 // matching request id. Returns the full result envelope. `timeout` bounds
 // the wait so a stuck or missing helper cannot hang a caller forever.
@@ -284,6 +346,7 @@ pub(crate) fn run_request(
         flags: None,
         enabled: None,
         primary_path: None,
+        pipe_name: None,
     };
     build_payload(&mut request);
     let request_json = serde_json::to_vec(&request)
@@ -390,6 +453,16 @@ pub(crate) fn run_privileged_helper() {
     };
     if !crate::process::process_is_elevated() {
         result.error = Some("the privileged helper started without elevation".to_string());
+    } else if request.op.as_str() == "key-observer" {
+        // Resident observer mode: this child stays alive serving key-state
+        // queries until the app's pipe closes, so no result file is written
+        // and the loop never returns. The request file is consumed up front
+        // (the app respawns the observer by writing a fresh one).
+        let _ = std::fs::remove_file(&request_file);
+        if let Some(pipe) = request.pipe_name.as_deref() {
+            crate::key_observer::run_elevated_observer(pipe);
+        }
+        std::process::exit(0);
     } else {
         match request.op.as_str() {
             "power-requests" => {

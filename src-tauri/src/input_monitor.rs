@@ -6,6 +6,18 @@
 // receives genuine keyboard and mouse events, so the idle clock ignores
 // controller chatter. The hooks are only installed while the Screen Dimmer is
 // enabled; each event is a single atomic store, so the overhead is negligible.
+//
+// The hooks have one blind spot: Windows filters low-level hook events by
+// integrity level (UIPI), so once an elevated window (an admin app, a UAC
+// prompt, an elevated game) takes the foreground, a non-elevated process
+// stops receiving them entirely and this clock would freeze. While such a
+// window is focused the clock falls back to GetLastInputInfo, which the
+// system maintains itself and which is not subject to that filter, so the
+// dimmer neither fires mid-use nor sticks once dimmed. The fallback is gated
+// on an explicit foreground-elevation check rather than on GetLastInputInfo
+// being fresher than the hook clock, because HID chatter keeps it
+// permanently fresh on some systems (the reason the hooks exist); whenever
+// the hooks can see input they stay authoritative.
 
 #![allow(non_snake_case)]
 
@@ -30,6 +42,27 @@ unsafe extern "system" {
 static LAST_KB_MOUSE_INPUT: AtomicU32 = AtomicU32::new(0);
 // True once both hooks are installed and running.
 static HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// How long the hook clock must be silent before the foreground window is
+// examined for elevation. While the user is actively typing in a normal
+// window the hooks fire constantly and the check is never reached.
+const HOOK_SILENCE_FALLBACK_MS: u32 = 1000;
+// Throttle for the foreground-elevation token query (OpenProcess +
+// GetTokenInformation). The watcher reads the idle clock every 16 ms tick;
+// the check itself only reruns at this cadence.
+const ELEVATION_RECHECK_MS: u32 = 300;
+
+// Cached verdict that the current foreground window is elevated above this
+// process, the condition under which the hooks are filtered and the clock
+// falls back to GetLastInputInfo.
+static FOREGROUND_ELEVATED: AtomicBool = AtomicBool::new(false);
+// Tick count of the most recent foreground-elevation check.
+static LAST_ELEVATION_CHECK: AtomicU32 = AtomicU32::new(0);
+// Whether this process itself runs elevated. An elevated process's hooks are
+// not filtered by UIPI, so the GetLastInputInfo fallback is never needed
+// (and would reintroduce HID chatter on the systems affected by it). Cached:
+// elevation cannot change during a process's lifetime.
+static SELF_ELEVATED: OnceLock<bool> = OnceLock::new();
 
 static HOOK_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -129,12 +162,8 @@ pub fn stop() {
     HOOKS_ACTIVE.store(false, Ordering::Release);
 }
 
-/// Last genuine keyboard/mouse input tick, falling back to GetLastInputInfo
-/// when the hooks are not installed (dimmer disabled, or install failed).
-pub fn last_kb_mouse_input_ms() -> u32 {
-    if HOOKS_ACTIVE.load(Ordering::Acquire) {
-        return LAST_KB_MOUSE_INPUT.load(Ordering::Acquire);
-    }
+/// System-wide last-input tick from GetLastInputInfo, the fallback clock.
+fn system_last_input_tick() -> u32 {
     unsafe {
         let mut lii = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
@@ -146,4 +175,50 @@ pub fn last_kb_mouse_input_ms() -> u32 {
             0
         }
     }
+}
+
+// Whether this process runs with an elevated token (cached, see SELF_ELEVATED).
+fn self_elevated() -> bool {
+    *SELF_ELEVATED.get_or_init(crate::process::process_is_elevated)
+}
+
+// Throttled foreground-elevation read (the token query itself lives in
+// process.rs, shared with the other UIPI-aware input paths). While the
+// verdict flips back from elevated to normal, the hook clock is re-seeded
+// from GetLastInputInfo: the hooks slept through the whole elevated session,
+// so without the seed the stale clock would count it all as idle and could
+// fire the dim the moment the user returns to a normal window.
+fn elevated_foreground_now(now: u32) -> bool {
+    if now.wrapping_sub(LAST_ELEVATION_CHECK.load(Ordering::Acquire)) < ELEVATION_RECHECK_MS {
+        return FOREGROUND_ELEVATED.load(Ordering::Acquire);
+    }
+    LAST_ELEVATION_CHECK.store(now, Ordering::Release);
+    let elevated = crate::process::foreground_process_is_elevated();
+    let was_elevated = FOREGROUND_ELEVATED.swap(elevated, Ordering::AcqRel);
+    if was_elevated && !elevated {
+        LAST_KB_MOUSE_INPUT.store(system_last_input_tick(), Ordering::Release);
+    }
+    elevated
+}
+
+/// Last genuine keyboard/mouse input tick. Falls back to GetLastInputInfo
+/// when the hooks are not installed (dimmer disabled, or install failed), and
+/// while an elevated foreground window is filtering the hooks (see the
+/// module comment): after the hook clock has been silent for a second the
+/// foreground is examined (throttled) and the system clock is used only when
+/// it is elevated, so HID chatter that keeps GetLastInputInfo fresh can
+/// never stall the dim while the hooks can see input.
+pub fn last_kb_mouse_input_ms() -> u32 {
+    if !HOOKS_ACTIVE.load(Ordering::Acquire) {
+        return system_last_input_tick();
+    }
+    let hook_tick = LAST_KB_MOUSE_INPUT.load(Ordering::Acquire);
+    let now = unsafe { GetTickCount64() } as u32;
+    if now.wrapping_sub(hook_tick) >= HOOK_SILENCE_FALLBACK_MS
+        && !self_elevated()
+        && elevated_foreground_now(now)
+    {
+        return system_last_input_tick();
+    }
+    hook_tick
 }

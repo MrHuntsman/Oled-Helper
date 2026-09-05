@@ -48,6 +48,7 @@
     if (enabled) pollGamepad();
   }
 
+
   onDestroy(() => {
     if (gamepadPollTimer) clearTimeout(gamepadPollTimer);
   });

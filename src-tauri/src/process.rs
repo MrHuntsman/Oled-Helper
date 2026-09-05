@@ -166,6 +166,90 @@ pub(crate) fn process_is_elevated() -> bool {
     false
 }
 
+// Whether the current foreground window belongs to a process running at a
+// higher integrity level than this one (an elevated admin app or game). A
+// non-elevated process's low-level hooks are filtered by UIPI and its
+// GetAsyncKeyState calls fail once such a window takes the foreground, so
+// input paths that need to keep working over it (the Screen Dimmer's idle
+// clock, hold-to-compare, the raw-input probe) check this instead of
+// assuming the hooks see everything.
+#[cfg(target_os = "windows")]
+pub(crate) fn foreground_process_is_elevated() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID,
+    };
+    use windows::Win32::System::Threading::{
+        OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() {
+            return false;
+        }
+        let mut process_id = 0u32;
+        let _ = GetWindowThreadProcessId(foreground, Some(&mut process_id));
+        if process_id == 0 || process_id == std::process::id() {
+            return false;
+        }
+        let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) {
+            Ok(process) => process,
+            Err(_) => return false,
+        };
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        const TOKEN_QUERY: u32 = 0x0008;
+        if OpenProcessToken(
+            process,
+            windows::Win32::Security::TOKEN_ACCESS_MASK(TOKEN_QUERY),
+            &mut token,
+        )
+        .is_err()
+        {
+            let _ = CloseHandle(process);
+            return false;
+        }
+        // TokenIntegrityLevel (25) returns a TOKEN_MANDATORY_LABEL whose
+        // label SID's last sub-authority is the integrity RID. Any value at
+        // or above SECURITY_MANDATORY_HIGH_RID is elevated from this
+        // (medium-integrity) perspective. The buffer is parsed by hand the
+        // same way the taskbar dimmer's identical check does.
+        let mut buffer = [0u8; 256];
+        let mut return_length = 0u32;
+        let result = GetTokenInformation(
+            token,
+            windows::Win32::Security::TOKEN_INFORMATION_CLASS(25),
+            Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+            buffer.len() as u32,
+            &mut return_length,
+        );
+        let _ = CloseHandle(token);
+        let _ = CloseHandle(process);
+        if result.is_err() || !(8..=buffer.len() as u32).contains(&return_length) {
+            return false;
+        }
+        let sid_ptr = std::ptr::read::<*mut std::ffi::c_void>(buffer.as_ptr() as *const _);
+        if sid_ptr.is_null() {
+            return false;
+        }
+        let sub_auth = GetSidSubAuthorityCount(PSID(sid_ptr));
+        if sub_auth.is_null() || *sub_auth == 0 {
+            return false;
+        }
+        let value = *GetSidSubAuthority(PSID(sid_ptr), (*sub_auth as u32) - 1);
+        const SECURITY_MANDATORY_HIGH_RID: u32 = 0x0000_3000;
+        value >= SECURITY_MANDATORY_HIGH_RID
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn foreground_process_is_elevated() -> bool {
+    false
+}
+
 
 
 // Launches a copy of the current executable elevated (ShellExecuteW "runas",

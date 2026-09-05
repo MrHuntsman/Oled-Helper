@@ -309,6 +309,10 @@ pub fn init(app: AppHandle, hwnd: isize, config: &crate::config::AppConfig) {
     if let Err(errors) = register_all() {
         log::warn!("[hotkeys] some bindings failed to register: {errors}");
     }
+    // Resident elevated key observer for hold-to-compare over elevated
+    // (admin) windows. Starts silently: without the registered helper task
+    // it logs once and hold detection falls back to the local key read.
+    crate::key_observer::start();
 }
 
 pub fn current_bindings() -> HashMap<String, String> {
@@ -668,13 +672,36 @@ pub fn poll_hold_release() {
     }
     let vk = HOLD_ACTIVE_VK.load(Ordering::Acquire);
     let mods = HOLD_ACTIVE_MODS.load(Ordering::Acquire);
-    if vk == 0 || !key_is_down(vk) || !modifiers_are_down(mods) {
+    if vk == 0 {
+        restore_hold_gamma();
+        return;
+    }
+    // Prefer the elevated key observer when it is connected: it reads the
+    // physical key state even while an elevated window (admin app or game)
+    // holds the foreground, where this process's GetAsyncKeyState is
+    // filtered by UIPI. When no observer answers, fall back to the local
+    // read, which is exact over normal windows and degrades to a quick
+    // flash over elevated ones.
+    if let Some(held) = crate::key_observer::combo_held(vk, mods) {
+        if !held {
+            restore_hold_gamma();
+        }
+        return;
+    }
+    if !key_is_down(vk) || !modifiers_are_down(mods) {
         restore_hold_gamma();
     }
 }
 
 fn key_is_down(vk: u32) -> bool {
     unsafe { GetAsyncKeyState(vk as i32) < 0 }
+}
+
+// Physical state of one RegisterHotKey-style combo. Used by the elevated
+// key observer child, whose GetAsyncKeyState reads are not filtered by UIPI
+// (both it and an elevated game run at High integrity).
+pub(crate) fn combo_is_down(vk: u32, mods: u32) -> bool {
+    key_is_down(vk) && modifiers_are_down(mods)
 }
 
 fn modifiers_are_down(mods: u32) -> bool {
@@ -695,6 +722,7 @@ fn emit(event: &str, action: &str) {
 }
 
 pub fn shutdown() {
+    crate::key_observer::shutdown();
     if let Some(hwnd) = main_hwnd() {
         unsafe {
             for (_, id, _) in ACTIONS {

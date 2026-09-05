@@ -11,6 +11,7 @@ mod hdr_toggle;
 mod helper;
 mod hotkeys;
 mod input_monitor;
+mod key_observer;
 mod monitors;
 mod power;
 mod process;
