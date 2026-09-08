@@ -43,12 +43,7 @@
   let trayHdrModeError = $state('');
   let trayHdrIsNvidia = $state(false);
 
-  // Mirror the main app's accent switch: app.css flips --accent to the gold
-  // HDR tone via `:root[data-hdr="true"]`, so the tray sliders/toggles follow
-  // the accent color too (not just the switch in the header).
-  $effect(() => {
-    document.documentElement.setAttribute('data-hdr', trayHdrStatus === 'hdr' ? 'true' : 'false');
-  });
+
   let windowsHdrBusy = $state(false);
   let windowsHdrError = $state('');
   // Whether the privileged helper task is registered, used by the Screen
@@ -217,6 +212,12 @@
   }
 
   // The tray menu has no monitor selector: it operates on the primary
+  // Keep this separate WebView's root theme token synchronized with its own
+  // HDR probe. The main window has a different document root.
+  function updateRootHdrAttr() {
+    document.documentElement.setAttribute('data-hdr', trayHdrStatus === 'hdr' ? 'true' : 'false');
+  }
+
   // monitor's taskbar. Its profile key is the primary's EDID id (what
   // tray_menu_get_display_info reports), matching the main window's keying.
   function trayDimmerMonKey() {
@@ -481,9 +482,19 @@
     let status = 'unknown';
     try { status = window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'sdr'; } catch {}
     trayHdrStatus = status;
-    // SDR Content Brightness only exists while HDR is active; clear the row's
-    // value when the mode flips to SDR so it never shows a stale reading.
-    if (status !== 'hdr') traySdrBrightness = { available: false, nits: null };
+    return status;
+  }
+
+  // Resolve the tray's current HDR state from the live WebView probe.
+  // This is the authoritative in-session source for the tray popup, which is why
+  // the tray does not blindly trust the snapshot's hdr_status on reopen after a
+  // remote-display transition.
+  function resolveLiveTrayHdrStatus() {
+    // If the live probe can answer, use it. Otherwise leave trayHdrStatus as-is
+    // so the snapshot fallback remains available on the very first open.
+    const liveStatus = pollTrayHdrStatus();
+    if (liveStatus !== 'unknown') return liveStatus;
+    return trayHdrStatus;
   }
 
   // Same safe toggle path as the main app's status-bar switch: optimistically
@@ -492,17 +503,23 @@
     if (windowsHdrBusy || trayHdrStatus === 'unknown') return;
     const next = trayHdrStatus !== 'hdr';
     const previous = trayHdrStatus;
-    windowsHdrBusy = true;
-    trayHdrStatus = next ? 'hdr' : 'sdr';
+    windowsHdrBusy = true;      trayHdrStatus = next ? 'hdr' : 'sdr';
+    updateRootHdrAttr();
     windowsHdrError = '';
     try {
       await invoke('set_windows_hdr_enabled', { enabled: next });
+      // Notify the main window and any other WebView immediately. The actual
+      // matchMedia probe still confirms the result when Windows finishes the
+      // transition.
+      emit('hdr-status-changed', next ? 'hdr' : 'sdr').catch(() => {});
       // SDR Content Brightness only becomes readable while HDR is active, so
       // re-read it after the mode settles.
       loadSdrContentBrightness();
     } catch (e) {
       windowsHdrError = String(e);
       trayHdrStatus = previous;
+      updateRootHdrAttr();
+      emit('hdr-status-changed', previous).catch(() => {});
     } finally {
       windowsHdrBusy = false;
       // The SDR row mounts/unmounts with the mode, changing the base menu's
@@ -512,26 +529,19 @@
     }
   }
 
-  function drainSdrBrightnessApply() {
-    if (sdrApplyInFlight || pendingSdrNits === null) return;
-    const requestedNits = pendingSdrNits;
-    pendingSdrNits = null;
-    sdrApplyInFlight = true;
+  function applyTraySdrBrightness(requestedNits) {
     sdrLastApplyTime = Date.now();
     invoke('set_sdr_brightness_nits', { nits: requestedNits })
       .then((result) => {
         const applied = Number(result?.nits);
-        if (Number.isFinite(applied) && traySdrBrightness.nits === requestedNits) traySdrBrightness.nits = applied;
-        if (Number.isFinite(applied)) emit('sdr-content-brightness-changed', { nits: applied }).catch(() => {});
+        if (Number.isFinite(applied) && traySdrBrightness.nits === requestedNits) {
+          traySdrBrightness.nits = applied;
+        }
+        if (Number.isFinite(applied)) {
+          emit('sdr-content-brightness-changed', { nits: applied }).catch(() => {});
+        }
       })
-      .catch((e) => console.error('tray-menu: failed to apply SDR Content Brightness', e))
-      .finally(() => {
-        sdrApplyInFlight = false;
-        // A newer value queued while this write was in flight applies right
-        // away so the final value always lands (trailing guarantee), same as
-        // the main window's slider.
-        if (pendingSdrNits !== null) drainSdrBrightnessApply();
-      });
+      .catch((e) => console.error('tray-menu: failed to apply SDR Content Brightness', e));
   }
 
   function handleTraySdrBrightnessInput(event) {
@@ -539,7 +549,6 @@
     quickInteractionVersion++;
     const nits = Math.max(80, Math.min(480, Math.round(Number(event.currentTarget.value))));
     traySdrBrightness.nits = nits;
-    pendingSdrNits = nits;
     // Leading-edge throttle, matching the main app's slider: during a
     // continuous drag the screen updates live instead of waiting for a pause.
     // A pure trailing debounce never fires while inputs arrive faster than
@@ -550,7 +559,7 @@
     clearTimeout(sdrApplyTimer);
     sdrApplyTimer = setTimeout(() => {
       sdrApplyTimer = null;
-      drainSdrBrightnessApply();
+      applyTraySdrBrightness(nits);
     }, delay);
   }
 
@@ -591,6 +600,14 @@
   let resolutionGroupBy = $state('none');
   // Which submenu (if any) is currently open: null | 'resolution' | 'refresh' | 'favorites'.
   let openSubmenu = $state(null);
+  // Hidden tray windows remain mounted between opens. Keep the whole wrapper
+  // invisible for one layout tick while the show event clears stale submenu
+  // state, so the two panes never reveal in separate frames.
+  let trayVisible = $state(false);
+
+  // The tray state is refreshed by native display events. The click path uses
+  // the Rust-owned snapshot and never starts native queries.
+  let pendingTraySnapshot = null;
   // The main app confirms destructive removals. Keep the same safeguard in
   // the tray without using a blocking browser confirm dialog.
   let pendingFavoriteRemove = $state(null);
@@ -601,11 +618,17 @@
   let favoritesSaveQueue = Promise.resolve();
   let pendingExternalFavorites = null;
   let closeSubmenuTimer = null;
+  // Resize/DPI transitions can settle after the tray show event. Repeat the
+  // exact DOM measurement briefly so the native hit region follows the final
+  // WebView scale instead of retaining a clipped pre-Sunshine region.
+  let trayLayoutRecoveryTimers = [];
+  let trayLayoutResizeObserver = null;
+  let trayDebugHitRegionCount = 0;
+  let trayDebugSequence = 0;
   // Serialize native region updates so a quick enter/leave cannot apply an
   // older submenu shape after the current one. The OS region, not just CSS,
   // must match the visible cards because the rest of the WebView is
   // transparent but would otherwise still intercept clicks.
-  let hitRegionSync = Promise.resolve();
   // The submenu is shorter than the base menu and both panes bottom-align to
   // the fixed tray canvas. Lift the submenu by the measured height
   // difference so its top edge matches the base menu's top edge (see
@@ -616,10 +639,77 @@
     try {
       display = await invoke('tray_menu_get_display_info');
       applyTrayBlackProfileForCurrentDisplay();
-      resetSubmenuScroll();
+      // Refresh the native region after the display info changes the visible
+      // card heights, but do not start a submenu scroll during a snapshot
+      // apply. The show path already handles initial layout sync.
       syncHitRegion();
     } catch (e) {
       console.error('tray-menu: failed to load display info', e);
+    }
+  }
+
+  function trayDebug(message) {
+    const line = `${++trayDebugSequence} ${message}`;
+    console.info(`[tray-debug] ${line}`);
+    void invoke('tray_menu_debug', { message: line }).catch((error) => {
+      console.warn('[tray-debug] could not forward frontend diagnostic', error);
+    });
+  }
+
+  function applyTraySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      trayDebug(`apply snapshot skipped, payload=${String(snapshot)}`);
+      return;
+    }
+    const cfg = snapshot.config || {};
+    const nextDisplay = snapshot.display || null;
+    display = nextDisplay;
+    showResolutionTags = cfg.display_menu_show_tags !== false;
+    skipFavoriteConfirmation = cfg.skip_favorite_confirmation === true;
+    trayBlack.enabled = cfg.black_enabled !== false;
+    trayBlack.adjustment = Math.max(-150, Math.min(150, Math.round((Number(cfg.black_lift) || 0) * 10)));
+    trayBlackProfiles = cfg.black_lift_profiles && typeof cfg.black_lift_profiles === 'object'
+      ? Object.fromEntries(Object.entries(cfg.black_lift_profiles).filter(([key, value]) => !/^\d+$/.test(key) && typeof value === 'number' && Number.isFinite(value)))
+      : {};
+    trayLegacyBlackProfiles = cfg.black_lift_profiles && typeof cfg.black_lift_profiles === 'object'
+      ? Object.fromEntries(Object.entries(cfg.black_lift_profiles).filter(([key, value]) => /^\d+$/.test(key) && typeof value === 'number' && Number.isFinite(value)))
+      : {};
+    applyTrayBlackProfileForCurrentDisplay();
+    resolutionSort = cfg.display_menu_resolution_sort === 'asc' ? 'asc' : 'desc';
+    resolutionGroupBy = cfg.display_menu_resolution_group_by === 'aspectRatio' ? 'aspectRatio' : 'none';
+    favorites = Array.isArray(cfg.favorite_display_modes) ? normalizeFavorites(cfg.favorite_display_modes) : [];
+    applyTaskbarDimmerStatus(snapshot.taskbar_dimmer);
+    applyScreenDimmerStatus(snapshot.screen_dimmer);
+    trayHelperReady = snapshot.helper_ready === true;
+    trayHdrIsNvidia = snapshot.vendor_info?.vendor === 'nvidia';
+    // Apply the snapshot HDR mode as the initial baseline, then reconcile it
+    // against the live WebView probe before the tray becomes visible. This keeps
+    // the tray from starting in an outdated HDR/SDR state after a Sunshine return
+    // when the snapshot may have been prepared under a different topology.
+    const hdrCapability = snapshot.hdr_status;
+    trayHdrStatus = hdrCapability ? (hdrCapability.enabled ? 'hdr' : 'sdr') : 'unknown';
+    trayHdrMode = snapshot.auto_hdr_enabled
+      ? 'auto'
+      : snapshot.rtx_hdr_settings?.enabled
+        ? 'rtx'
+        : 'off';
+    trayHdrModeError = '';
+    const nits = Number(snapshot.sdr_brightness?.nits);
+    traySdrBrightness = trayHdrStatus === 'hdr' && Number.isFinite(nits) && nits >= 80 && nits <= 480
+      ? { available: true, nits }
+      : { available: false, nits: null };
+    hotkeyTargetLabel = typeof snapshot.hotkey_target_label === 'string' ? snapshot.hotkey_target_label : '';
+    updateRootHdrAttr();
+
+    const reconciledHdrStatus = resolveLiveTrayHdrStatus();
+    if (reconciledHdrStatus !== trayHdrStatus) {
+      trayDebug(`hdr reconciled from live probe, snapshot=${trayHdrStatus}, live=${reconciledHdrStatus}`);
+      trayHdrStatus = reconciledHdrStatus;
+      if (trayHdrStatus !== 'hdr') traySdrBrightness = { available: false, nits: null };
+      updateRootHdrAttr();
+      loadSdrContentBrightness();
+    } else {
+      trayDebug(`hdr unchanged after reconcile, status=${trayHdrStatus}`);
     }
   }
 
@@ -724,6 +814,20 @@
     }
   }
 
+  function scheduleTrayLayoutRecovery() {
+    for (const timer of trayLayoutRecoveryTimers) clearTimeout(timer);
+    trayLayoutRecoveryTimers = [0, 80, 220, 500].map((delay) => setTimeout(() => {
+      if (!trayVisible) return;
+      // Re-probe HDR as well as the layout. A remote display transition can
+      // leave this WebView's matchMedia result stale for a few frames, which
+      // otherwise leaves the accent token on the wrong side until reopening.
+      pollTrayHdrStatus();
+      updateRootHdrAttr();
+      loadSdrContentBrightness();
+      syncHitRegion();
+    }, delay));
+  }
+
   // The native window is built at a fixed full-size footprint (see
   // tray_menu_window.rs) that fits both the base menu and any submenu; only
   // the DOM here changes on hover, not the window itself.
@@ -735,8 +839,12 @@
   function openSubmenuFor(name) {
     cancelScheduledSubmenuClose();
     openSubmenu = name;
-    resetSubmenuScroll();
-    syncHitRegion();
+    // Defer the submenu scroll and hit region until the next frame, so the
+    // open animation has a chance to start before the layout is remeasured.
+    requestAnimationFrame(() => {
+      resetSubmenuScroll();
+      syncHitRegion();
+    });
   }
 
   // The main app's ascending order puts the largest value at the bottom of
@@ -888,91 +996,104 @@
       y: element.offsetTop,
       width: element.offsetWidth,
       height: element.offsetHeight,
+      viewport_width: document.documentElement.clientWidth || window.innerWidth || 1,
+      viewport_height: document.documentElement.clientHeight || window.innerHeight || 1,
     };
   }
 
   // Resize neither the native window nor the layout. Instead, tell Rust the
   // exact visible card rectangles and let Windows hit-test only those rounded
-  // regions. This keeps the fixed taskbar anchor stable and makes the
-  // transparent canvas outside the cards click through to the window below.
-  function syncHitRegion() {
-    // Install a conservative bridge before waiting for Svelte's DOM update.
-    // Without this first pass, the submenu is visible in the browser while
-    // Windows still has only the collapsed base-menu region; a fast pointer
-    // crossing can blur/hide the window before the exact measurement arrives.
-    const preBase = openSubmenu !== null
-      ? menuRect(document.querySelector('.tray-menu'))
-      : null;
-    const preinstall = preBase
-      ? {
-          // The submenu pane is auto-sized now (max-content, up to 334px
-          // outer), so this preinstalled bridge only needs a conservative
-          // left region, the exact DOM measurement replaces it a tick
-          // later. 244px covers the collapsed/minimum-width case; keep the
-          // base menu's height since the submenu is no taller.
-          x: Math.max(0, preBase.x - 244),
-          y: preBase.y,
-          width: 244,
-          height: preBase.height,
-        }
-      : null;
+  // regions. Coalesce callers because display refreshes and first paint can
+  // request several measurements at once. A serialized IPC queue made the
+  // submenu pane arrive much later than the base pane after a mode change.
+  let hitRegionSyncScheduled = false;
+  let hitRegionSyncRunning = false;
 
-    hitRegionSync = hitRegionSync.then(async () => {
-      if (preinstall && openSubmenu !== null) {
+  function syncHitRegion() {
+    hitRegionSyncScheduled = true;
+    if (hitRegionSyncRunning) return;
+    hitRegionSyncRunning = true;
+
+    // Before the first DOM measurement arrives, use a conservative base-menu
+    // region so the initial frame cannot be too small. This is only a fallback
+    // for the base menu: it does not add a submenu region and it does not
+    // inflate the clickable area to the full fixed canvas.
+    const initialBaseFallback = () => {
+      const baseEl = document.querySelector('.tray-menu');
+      if (!baseEl) return null;
+      const viewportWidth = document.documentElement.clientWidth || window.innerWidth || 1;
+      const viewportHeight = document.documentElement.clientHeight || window.innerHeight || 1;
+      return {
+        x: baseEl.offsetLeft,
+        y: baseEl.offsetTop,
+        width: baseEl.offsetWidth,
+        height: Math.max(baseEl.offsetHeight, 1),
+        viewport_width: viewportWidth,
+        viewport_height: viewportHeight,
+      };
+    };
+
+    const run = async () => {
+      while (hitRegionSyncScheduled) {
+        hitRegionSyncScheduled = false;
+        await tick();
+        const base = menuRect(document.querySelector('.tray-menu'));
+        if (!base) {
+          const fallback = initialBaseFallback();
+          if (!fallback) continue;
+          try {
+            await invoke('tray_menu_set_expanded', {
+              expanded: false,
+              base: fallback,
+              submenu: null,
+            });
+          } catch (e) {
+            trayDebug(`hit region sync failed: ${String(e)}`);
+            console.error('tray-menu: failed to update hit region', e);
+          }
+          continue;
+        }
+        const expanded = openSubmenu !== null;
+        const submenuEl = expanded ? document.querySelector('.tray-submenu') : null;
+        const preLift = submenuEl ? menuRect(submenuEl) : null;
+        let lift = preLift ? Math.max(0, base.height - preLift.height) : 0;
+        if (preLift && openSubmenu === 'favorites') {
+          const baseEl = document.querySelector('.tray-menu');
+          const anchorEl = document.querySelector('.tray-menu .tray-item.open');
+          if (baseEl && anchorEl) {
+            const anchorTop = anchorEl.getBoundingClientRect().top - baseEl.getBoundingClientRect().top;
+            lift = Math.max(0, base.height - preLift.height - Math.max(0, anchorTop));
+          }
+        }
+        submenuLift = lift;
+        await tick();
+        const submenu = submenuEl ? menuRect(submenuEl) : null;
         try {
-          await invoke('tray_menu_set_expanded', {
-            expanded: true,
-            base: preBase,
-            submenu: preinstall,
-          });
-        } catch (e) {
-          console.error('tray-menu: failed to preinstall hit region', e);
+        // SetWindowRgn is in physical pixels. Include the live WebView viewport
+        // with every rectangle because the native client size is the authority
+        // after a Sunshine or Windows DPI transition.
+        const viewportWidth = document.documentElement.clientWidth || window.innerWidth || 1;
+        const viewportHeight = document.documentElement.clientHeight || window.innerHeight || 1;
+        const scaledBase = { ...base, viewport_width: viewportWidth, viewport_height: viewportHeight };
+        const scaledSubmenu = submenu ? { ...submenu, viewport_width: viewportWidth, viewport_height: viewportHeight } : null;
+        if (trayDebugHitRegionCount < 8) {
+          trayDebugHitRegionCount++;
+          trayDebug(`hit region sync ${trayDebugHitRegionCount}, expanded=${expanded}, base=${Math.round(base.width)}x${Math.round(base.height)}, submenu=${submenu ? `${Math.round(submenu.width)}x${Math.round(submenu.height)}` : 'none'}`);
         }
-      }
-      await tick();
-      const base = menuRect(document.querySelector('.tray-menu'));
-      if (!base) return;
-      const expanded = openSubmenu !== null;
-      const submenuEl = expanded
-        ? document.querySelector('.tray-submenu')
-        : null;
-      // Bottom-aligned panes: push the shorter submenu up so both cards
-      // share a top edge while the base menu stays anchored to the taskbar.
-      // For the short Favorites submenu that top edge sits far above the
-      // Favorites row, out of the cursor's path, align its top to the
-      // anchor row instead so the pointer can cross straight from the row
-      // into the card. (Resolution/Refresh Rate rows sit near the top, so
-      // their existing top-edge alignment is kept.)
-      const preLift = submenuEl ? menuRect(submenuEl) : null;
-      let lift = preLift ? Math.max(0, base.height - preLift.height) : 0;
-      if (preLift && openSubmenu === 'favorites') {
-        const baseEl = document.querySelector('.tray-menu');
-        const anchorEl = document.querySelector('.tray-menu .tray-item.open');
-        if (baseEl && anchorEl) {
-          // Viewport-coordinate difference (same frame): both elements move
-          // with .tray-menu's entrance transform, so the offset cancels out
-          // and stays stable even mid-animation. offsetTop alone would mix
-          // the wrapper frame with .tray-menu's transform-created offset
-          // parent frame.
-          const anchorTop = anchorEl.getBoundingClientRect().top - baseEl.getBoundingClientRect().top;
-          lift = Math.max(0, base.height - preLift.height - Math.max(0, anchorTop));
-        }
-      }
-      submenuLift = lift;
-      // Re-measure after Svelte applies the margin so the native region sent
-      // to Rust matches the submenu's lifted position.
-      await tick();
-      const submenu = submenuEl ? menuRect(submenuEl) : null;
-      try {
         await invoke('tray_menu_set_expanded', {
           expanded,
-          base,
-          submenu,
+          base: scaledBase,
+          submenu: scaledSubmenu,
         });
-      } catch (e) {
-        console.error('tray-menu: failed to update hit region', e);
+        } catch (e) {
+          trayDebug(`hit region sync failed: ${String(e)}`);
+          console.error('tray-menu: failed to update hit region', e);
+        }
       }
-    });
+      hitRegionSyncRunning = false;
+    };
+
+    void run();
   }
 
   // Favorites are scoped to the monitor they were saved on (the main app's
@@ -1156,46 +1277,97 @@
     await invoke('tray_menu_quit');
   }
 
-  // The tray keeps its data fresh while hidden so the menu opens instantly
-  // with current values: every value the tray shows has a live event backing
-  // it (taskbar dimmer, black level, SDR brightness, favorites, menu prefs,
-  // display changes, HDR status, plus backend events for HDR mode and screen
-  // dimmer settings), so there is no polling. The show-time refresh is then
-  // mostly a no-op, so nothing visibly changes after the menu appears.
-  function refreshMenuData() {
-    loadDisplayInfo();
-    loadFavorites();
-    loadTaskbarDimmer();
-    loadScreenDimmer();
-    loadTrayHelperReady();
-    loadHdrEnhancementMode();
-    loadSdrContentBrightness();
-    pollTrayHdrStatus();
-  }
-
   onMount(() => {
+    trayDebug('onMount entered');
     syncHitRegion();
-    refreshMenuData();
-    loadHotkeyTarget();
     getVersion().then((v) => { if (typeof v === 'string' && v) appVersion = v; }).catch(() => {});
-    const unlisten = listen('tray-menu-show', () => {
-      openSubmenu = null;
-      pendingFavoriteRemove = null;
-      syncHitRegion();
-      refreshMenuData();
-      loadHotkeyTarget();
+    const unlistenHide = listen('tray-menu-hide', () => {
+      trayDebug(`hide event received, trayVisible=${trayVisible}`);
+      trayVisible = false;
     });
-    // Follow external HDR changes (Windows hotkey, Settings, main app switch)
+    const unlistenStateUpdated = listen('tray-menu-state-updated', (event) => {
+      trayDebug(`state update received, visible=${trayVisible}, hasPayload=${Boolean(event.payload)}`);
+      if (trayVisible) {
+        pendingTraySnapshot = event.payload;
+        return;
+      }
+      applyTraySnapshot(event.payload);
+      syncHitRegion();
+    });
+    // The overlay can be created after the initial tray snapshot during shell
+    // startup. Refresh only this small status when that event arrives, so the
+    // tray does not stay disabled until the next display change.
+    const unlistenTaskbarAvailable = listen('taskbar-dimmer-available', (event) => {
+      // The backend emits this only after the overlay HWND has been created.
+      // Treat that notification as authoritative, rather than immediately
+      // performing another status read that could still catch the shell during
+      // its transient startup state.
+      if (event.payload !== false) taskbarDimmer.available = true;
+    });
+    const unlisten = listen('tray-menu-show', async (event) => {
+      trayDebug(`show event received, payloadType=${typeof event.payload}, hasPayload=${Boolean(event.payload)}, visible=${trayVisible}`);
+      const payload = event.payload || pendingTraySnapshot;
+      pendingTraySnapshot = null;
+      const wasVisible = trayVisible;
+      if (!wasVisible) {
+        trayVisible = false;
+        openSubmenu = null;
+        pendingFavoriteRemove = null;
+        submenuLift = 0;
+      }
+      applyTraySnapshot(payload);
+      if (wasVisible) {
+        trayDebug('show event applied while already visible');
+        syncHitRegion();
+        return;
+      }
+      await tick();
+      // The snapshot was applied while hidden, so the first visible frame uses
+      // one coherent state instead of rows arriving from separate IPC calls.
+      trayVisible = true;
+      trayDebug(`wrapper made visible, display=${display ? `${display.width}x${display.height}` : 'none'}, favorites=${favorites.length}`);
+      // Final live HDR reconciliation right before first paint, so the accent
+      // token and HDR/SDR row reflect the current session and not a stale
+      // snapshot fetched earlier.
+      const liveHdrNow = resolveLiveTrayHdrStatus();
+      trayDebug(`tray hdr at first-visible-frame, resolved=${liveHdrNow}, attr=${trayHdrStatus === 'hdr' ? 'hdr' : 'sdr'}`);
+      if (liveHdrNow !== trayHdrStatus) {
+        trayHdrStatus = liveHdrNow;
+        if (trayHdrStatus !== 'hdr') traySdrBrightness = { available: false, nits: null };
+        updateRootHdrAttr();
+        loadSdrContentBrightness();
+      }
+      updateRootHdrAttr();
+      syncHitRegion();
+      scheduleTrayLayoutRecovery();
+    });
+
+      // Follow external HDR changes (Windows hotkey, Settings, main app switch)
     // so the tray switch and SDR row stay in sync while the popup is open.
     const hdrMq = window.matchMedia('(dynamic-range: high)');
+    function applyTrayHdrStatus(status) {
+      if (status !== 'hdr' && status !== 'sdr') return;
+      trayHdrStatus = status;
+      if (status !== 'hdr') traySdrBrightness = { available: false, nits: null };
+      updateRootHdrAttr();
+      loadSdrContentBrightness();
+      syncHitRegion();
+      scheduleTrayLayoutRecovery();
+    }
     function onTrayHdrChange() {
       pollTrayHdrStatus();
+      updateRootHdrAttr();
       loadSdrContentBrightness();
       // External HDR changes can also mount/unmount the SDR row; keep the
       // native hit region in sync with the resized base menu.
       syncHitRegion();
+      scheduleTrayLayoutRecovery();
     }
     try { hdrMq.addEventListener('change', onTrayHdrChange); } catch {}
+    const unlistenHdrStatus = listen('hdr-status-changed', (event) => {
+      const status = typeof event.payload === 'string' ? event.payload : event.payload?.status;
+      applyTrayHdrStatus(status);
+    });
     const unlistenTags = listen('display-menu-tags-changed', (event) => {
       showResolutionTags = event.payload !== false;
     });
@@ -1229,19 +1401,23 @@
       applySdrBrightnessEvent(event.payload);
     });
     // Display topology/mode changes (hotplug, resolution or refresh-rate
-    // changes, including ones made outside the app) refresh the tray's
-    // display info, black profile, and the SDR/HDR-mode rows: external SDR
-    // white-level edits arrive through the same settings-change broadcast.
+    // changes, including ones made outside the app) invalidate the cached
+    // display info, the SDR white level, and the HDR mode rows; mark the
+    // cache dirty so the next tray-menu-show reloads them.
+    // (The live listener itself still re-fetches the rows immediately so a
+    // currently-open tray stays correct; this flag is for the next open.)
     const unlistenDisplayChanged = listen('display-changed', () => {
-      loadDisplayInfo();
-      loadSdrContentBrightness();
-      loadHdrEnhancementMode();
+      // Rust refreshes the complete snapshot after the native display event.
+      // Keep the current visible layout stable while Windows settles the new
+      // monitor and DPI topology.
+      scheduleTrayLayoutRecovery();
     });
     // Backend notification after set_hdr_enhancement_mode (the main
     // window's HDR tab or the tray's own selector), so the mode row follows
     // without polling.
     const unlistenHdrModeChanged = listen('hdr-mode-changed', () => {
       loadHdrEnhancementMode();
+      updateRootHdrAttr();
     });
     // Backend notification after the screen dimmer settings change (the
     // main window's dimmer tab or the tray's own row).
@@ -1253,30 +1429,51 @@
     const unlistenScreenDimmerState = listen('screen-dimmer-state-changed', () => {
       loadScreenDimmer();
     });
-    return () => {
-      unlisten.then((stop) => stop());
-      unlistenTags.then((stop) => stop());
-      unlistenSort.then((stop) => stop());
-      unlistenGroupBy.then((stop) => stop());
-      unlistenFavorites.then((stop) => stop());
-      unlistenDimmer.then((stop) => stop());
-      unlistenBlack.then((stop) => stop());
-      unlistenBlackMain.then((stop) => stop());
-      unlistenSdr.then((stop) => stop());
-      unlistenSdrMain.then((stop) => stop());
-      unlistenDisplayChanged.then((stop) => stop());
-      unlistenHdrModeChanged.then((stop) => stop());
-      unlistenScreenDimmerChanged.then((stop) => stop());
-      unlistenScreenDimmerState.then((stop) => stop());
-      try { hdrMq.removeEventListener('change', onTrayHdrChange); } catch {}
-      clearTimeout(dimmerSaveTimer);
-      clearTimeout(sdrApplyTimer);
-    };
+
+    trayLayoutResizeObserver = new ResizeObserver(() => {
+      if (trayVisible) syncHitRegion();
+    });
+    const trayMenuElement = document.querySelector('.tray-menu-wrap');
+    if (trayMenuElement) trayLayoutResizeObserver.observe(trayMenuElement);
+
+    // Live state-driven accent token, kept in sync with the live listeners.
+    $effect(() => {
+      updateRootHdrAttr();
+    });
+      return () => {
+        unlistenHdrModeChanged.then((stop) => stop());
+        unlistenHdrStatus.then((stop) => stop());
+        unlistenScreenDimmerState.then((stop) => stop());
+        unlistenHide.then((stop) => stop());
+        unlistenStateUpdated.then((stop) => stop());
+        unlistenTaskbarAvailable.then((stop) => stop());
+        unlisten.then((stop) => stop());
+        unlistenTags.then((stop) => stop());
+        unlistenSort.then((stop) => stop());
+        unlistenGroupBy.then((stop) => stop());
+        unlistenFavorites.then((stop) => stop());
+        unlistenDimmer.then((stop) => stop());
+        unlistenBlack.then((stop) => stop());
+        unlistenBlackMain.then((stop) => stop());
+        unlistenSdr.then((stop) => stop());
+        unlistenSdrMain.then((stop) => stop());
+        unlistenDisplayChanged.then((stop) => stop());
+        unlistenHdrModeChanged.then((stop) => stop());
+        unlistenScreenDimmerChanged.then((stop) => stop());
+        unlistenScreenDimmerState.then((stop) => stop());
+        try { hdrMq.removeEventListener('change', onTrayHdrChange); } catch {}
+        trayLayoutResizeObserver?.disconnect();
+        for (const timer of trayLayoutRecoveryTimers) clearTimeout(timer);
+        trayLayoutRecoveryTimers = [];
+        clearTimeout(dimmerSaveTimer);
+        clearTimeout(sdrApplyTimer);
+      };
   });
 </script>
 
 <div
   class="tray-menu-wrap"
+  class:tray-visible={trayVisible}
   class:tray-submenu-open={openSubmenu !== null}
   role="menu"
   tabindex="-1"

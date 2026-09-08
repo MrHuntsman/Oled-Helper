@@ -45,6 +45,7 @@
   // WM_DISPLAYCHANGE/WM_DEVICECHANGE messages) into a single SDR-white base
   // re-capture, and gives the OS a beat to settle before the new value is read.
   let sdrWhiteBaseRecaptureTimer = null;
+  let hdrStatusRefreshTimer = null;
   let vendorDisplayRefreshTimer = null;
 
   // Keep the native tray flyout's accent in sync with the main UI: push the
@@ -54,6 +55,9 @@
     const status = app.hdrStatus;
     if (status === 'unknown') return;
     invoke('set_flyout_hdr', { hdr: status === 'hdr' }).catch(() => {});
+    // Keep the separate tray WebView synchronized even when its own
+    // matchMedia listener misses a remote-display transition.
+    emit('hdr-status-changed', status).catch(() => {});
   });
 
   // Custom click-only dropdown for resolution, replacing the native
@@ -1172,6 +1176,14 @@
       // the OS settle before the new value is read. A plain SDR-brightness
       // slider move does NOT emit this event, so the base stays frozen there
       // (exactly what keeps the strip stable).
+      // Reconfirm the HDR state after the remote display and WebView context
+      // have settled. This also publishes the result to the separate tray
+      // WebView, which may miss its own matchMedia transition event.
+      clearTimeout(hdrStatusRefreshTimer);
+      hdrStatusRefreshTimer = setTimeout(() => {
+        hdrStatusRefreshTimer = null;
+        pollHDRStatus();
+      }, 400);
       clearTimeout(sdrWhiteBaseRecaptureTimer);
       sdrWhiteBaseRecaptureTimer = setTimeout(() => {
         sdrWhiteBaseRecaptureTimer = null;
@@ -1306,6 +1318,8 @@
       unlisten?.();
       unlistenDisplayChanged?.();
       clearTimeout(vendorDisplayRefreshTimer);
+      clearTimeout(hdrStatusRefreshTimer);
+      clearTimeout(sdrWhiteBaseRecaptureTimer);
       unlistenHotkeyPressed?.();
       unlistenFavoriteRemove?.();
       unlistenFlyoutCompleted?.();

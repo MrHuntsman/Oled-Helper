@@ -79,11 +79,10 @@
       if (detectedNits != null) setSdrWhiteNits(detectedNits);
     } catch (e) { error = String(e); }
   }
-  async function apply() {
+  async function apply(requestedNits) {
     if (!hdrAvailable || currentNits == null) return;
     if (applying) { applyQueued = true; return; }
     applying = true; applyQueued = false; error = '';
-    const requestedNits = Number(currentNits);
     lastApplyTime = Date.now();
     try {
       // Every write commits the value so the screen updates live while
@@ -91,7 +90,6 @@
       // write triggers on some systems (recent_sdr_white_write), which is
       // what used to make dragging re-enumerate the display config each step.
       const result = await invoke('set_sdr_brightness_nits', { nits: requestedNits });
-      if (Number(currentNits) !== requestedNits) applyQueued = true;
       if (result?.nits && Number(currentNits) === requestedNits) currentNits = Number(result.nits);
       setSdrWhiteNits(currentNits);
       emit('sdr-content-brightness-main-changed', { nits: Number(currentNits) }).catch(() => {});
@@ -101,7 +99,7 @@
       if (applyQueued) { applyQueued = false; scheduleApply(); }
     }
   }
-  function scheduleApply() {
+  function scheduleApply(nits = Number(currentNits)) {
     clearTimeout(applyTimer);
     if (sliderDragging) {
       // Throttle while dragging: apply as soon as the throttle window since
@@ -109,10 +107,10 @@
       // drag updates the screen live instead of waiting for release.
       const since = Date.now() - lastApplyTime;
       const delay = since >= APPLY_THROTTLE_MS ? 0 : APPLY_THROTTLE_MS - since;
-      applyTimer = setTimeout(() => { applyTimer = null; void apply(); }, delay);
+      applyTimer = setTimeout(() => { applyTimer = null; void apply(nits); }, delay);
     } else {
       // Keyboard arrows / programmatic changes: keep the trailing debounce.
-      applyTimer = setTimeout(() => { applyTimer = null; void apply(); }, 60);
+      applyTimer = setTimeout(() => { applyTimer = null; void apply(nits); }, 60);
     }
   }
   // Snap to the reference white only while actually dragging with the
@@ -127,7 +125,7 @@
       sliderDragging && Math.abs(raw - DEFAULT_NITS) <= SNAP_RANGE_NITS ? DEFAULT_NITS : raw;
     if (raw !== normalized) event.currentTarget.value = normalized;
     currentNits = normalized;
-    scheduleApply();
+    scheduleApply(normalized);
   }
   // Auto HDR is a system-wide Windows setting stored by hdr_toggle.rs.
   // The selector below deliberately treats it and NVIDIA RTX HDR as one

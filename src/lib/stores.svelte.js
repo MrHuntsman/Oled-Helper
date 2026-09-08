@@ -1791,7 +1791,14 @@ export function setContextMenuEnabled(enabled) {
   debugSettings.contextMenuEnabled = enabled;
 }
 export function pollHDRStatus() {
-  try { app.hdrStatus = window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'sdr'; } catch { }
+  try {
+    const status = window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'sdr';
+    app.hdrStatus = status;
+    // The tray popup is a separate WebView and can miss or delay its own
+    // matchMedia change event during a remote-display transition. Broadcast the
+    // main window's resolved state so every window uses the same accent token.
+    emit('hdr-status-changed', status).catch(() => {});
+  } catch { }
 }
 export function pollHDRLuminance() {
   invoke('get_hdr_luminance').then((info) => { app.hdrLuminance = info ? { maxNits: info.max_nits ?? null } : null; }).catch(() => { app.hdrLuminance = null; });

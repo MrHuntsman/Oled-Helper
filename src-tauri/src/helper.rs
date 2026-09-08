@@ -26,6 +26,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -33,11 +34,13 @@ use std::os::windows::process::CommandExt;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const ARG_PRIVILEGED_HELPER: &str = "--privileged-helper";
+pub(crate) const ARG_PRIVILEGED_KEY_OBSERVER: &str = "--privileged-key-observer";
 pub(crate) const ARG_REGISTER_HELPER_TASK: &str = "--register-helper-task";
 pub(crate) const HELPER_TASK_NAME: &str = "OledHelperPrivilegedHelper";
 
 const REQUEST_FILE: &str = "helper-request.json";
 const RESULT_FILE: &str = "helper-result.json";
+const KEY_OBSERVER_REQUEST_FILE: &str = "key-observer-request.json";
 
 // CREATE_NO_WINDOW: keep the helper and schtasks invisible.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -62,6 +65,10 @@ fn request_path() -> Option<PathBuf> {
 
 fn result_path() -> Option<PathBuf> {
     app_data_dir().map(|dir| dir.join(RESULT_FILE))
+}
+
+fn key_observer_request_path() -> Option<PathBuf> {
+    app_data_dir().map(|dir| dir.join(KEY_OBSERVER_REQUEST_FILE))
 }
 
 fn run_hidden(command: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -113,7 +120,11 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 // skips the schtasks query on its hot near-timeout cadence after that.
 // Left unset on a failure so a later ensure_registered self-heal is
 // re-checked on the next run_request.
-static REGISTRATION_VERIFIED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static REGISTRATION_VERIFIED: OnceLock<()> = OnceLock::new();
+// The request/result files are a single-slot protocol. Serialize all
+// one-shot operations so a power probe cannot overwrite an HDR or font
+// request, and vice versa.
+static REQUEST_LOCK: Mutex<()> = Mutex::new(());
 
 // ── Task registration ──────────────────────────────────────────────────
 
@@ -130,7 +141,7 @@ fn task_exists() -> bool {
 // but every /Run starts a stale or missing binary. schtasks /V /FO LIST
 // prints the task's full "Task To Run" command verbatim, so a
 // case-insensitive substring match on the current exe path is the check.
-fn task_matches_current_exe() -> bool {
+fn task_matches_current_exe_named(task_name: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -139,7 +150,7 @@ fn task_matches_current_exe() -> bool {
     };
     let Ok(output) = run_hidden(
         "schtasks",
-        &["/Query", "/TN", HELPER_TASK_NAME, "/V", "/FO", "LIST"],
+        &["/Query", "/TN", task_name, "/V", "/FO", "LIST"],
     ) else {
         return false;
     };
@@ -152,16 +163,15 @@ fn task_matches_current_exe() -> bool {
 
 // A usable registration is both present and pointed at this exe.
 fn task_registered_and_current() -> bool {
-    task_exists() && task_matches_current_exe()
+    task_exists() && task_matches_current_exe_named(HELPER_TASK_NAME)
 }
 
 // Creates the helper task. The process creating it must be elevated:
 // /RL HIGHEST is refused from a standard-user token. The /TR command is
-// generic (no per-run args): the child reads helper-request.json, so one
-// registration serves every op. /SC ONCE is the lightest schedule the task
-// can carry purely so /Run exists; the midnight auto-run (no /SD, defaults
-// to today) starts the child with no request file, and it exits immediately
-// without doing anything.
+// generic for one-shot operations: the child reads helper-request.json, so
+// one registration serves every one-shot operation. The observer request is
+// handled first and launches a detached elevated observer child. /SC ONCE is
+// only the trigger used by schtasks /Run; it has no useful automatic schedule.
 fn create_task() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| format!("could not resolve app path: {error}"))?;
     let command = format!("\"{}\" {}", exe.display(), ARG_PRIVILEGED_HELPER);
@@ -194,6 +204,7 @@ fn create_task() -> Result<(), String> {
         })
     }
 }
+
 
 // Ensures the Task Scheduler task exists. Idempotent. When the app is
 // elevated (installer, legacy always-elevated session) it creates the task
@@ -265,13 +276,13 @@ pub fn helper_task_registered() -> bool {
 // (no UAC) when the task is missing or the app session is already elevated
 // (where the observer is unneeded because local key reads already work).
 pub(crate) fn launch_key_observer(pipe_name: &str) -> Result<(), String> {
+    let _request_guard = REQUEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if crate::process::process_is_elevated() {
         return Err("the app is elevated, the key observer is unneeded".to_string());
     }
-    let Some(request_file) = request_path() else {
-        return Err("app data folder is unavailable".to_string());
-    };
-    let Some(result_file) = result_path() else {
+    let Some(request_file) = key_observer_request_path() else {
         return Err("app data folder is unavailable".to_string());
     };
     if let Some(dir) = request_file.parent() {
@@ -293,23 +304,20 @@ pub(crate) fn launch_key_observer(pipe_name: &str) -> Result<(), String> {
     if let Err(error) = std::fs::write(&request_file, request_json) {
         return Err(format!("could not write helper request: {error}"));
     }
-    // Clear a stale result so it can never be mistaken for this launch.
-    let _ = std::fs::remove_file(&result_file);
-    // No background probe may raise a UAC prompt, so a missing (or stale,
-    // after the portable exe moved) task is a fail-fast error; the caller
-    // retries later and the next user-initiated action re-registers via
-    // ensure_registered.
+    // No background observer start may raise a UAC prompt, so a missing or
+    // stale task is a fail-fast error. The user initiated helper setup creates
+    // the task, and the observer retries on the next app start.
     if !task_registered_and_current() {
         let _ = std::fs::remove_file(&request_file);
         return Err("the privileged helper task is not registered".to_string());
     }
     let trigger = run_hidden("schtasks", &["/Run", "/TN", HELPER_TASK_NAME])
-        .map_err(|error| format!("could not trigger the privileged helper: {error}"))?;
+        .map_err(|error| format!("could not trigger the elevated key observer: {error}"))?;
     if !trigger.status.success() {
         let _ = std::fs::remove_file(&request_file);
         let stderr = String::from_utf8_lossy(&trigger.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            "could not run the privileged helper task".to_string()
+            "could not run the elevated key observer task".to_string()
         } else {
             stderr
         });
@@ -325,6 +333,9 @@ pub(crate) fn run_request(
     build_payload: impl FnOnce(&mut HelperRequest),
     timeout: std::time::Duration,
 ) -> Result<HelperResult, String> {
+    let _request_guard = REQUEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(request_file) = request_path() else {
         return Err("app data folder is unavailable".to_string());
     };
@@ -420,12 +431,59 @@ pub(crate) fn run_register_helper_task() {
     std::process::exit(0);
 }
 
-// --privileged-helper: the scheduled task's entry. Reads the request file,
-// performs the operation elevated, writes the result file, and exits. Runs
-// before the Tauri logger and WebView2 exist, so every outcome travels in
-// the result file, never a log line.
+// --privileged-key-observer: the detached elevated resident observer entry.
+// It receives only the app's named pipe on the command line. The one-shot
+// helper task exits before this child begins its blocking pipe loop, so power,
+// HDR, and font requests remain independent.
 #[cfg(target_os = "windows")]
+pub(crate) fn run_privileged_key_observer() {
+    let pipe = std::env::args()
+        .skip(1)
+        .find(|arg| arg != ARG_PRIVILEGED_KEY_OBSERVER);
+    if !crate::process::process_is_elevated() {
+        std::process::exit(1);
+    }
+    if let Some(pipe) = pipe {
+        crate::key_observer::run_elevated_observer(&pipe);
+    }
+    std::process::exit(0);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn run_privileged_key_observer() {
+    std::process::exit(0);
+}
+
 pub(crate) fn run_privileged_helper() {
+    // The observer uses a separate request file because the normal helper
+    // protocol is also used by the power probe. Handle it before the
+    // one-shot request so the two protocols cannot overwrite each other.
+    if let Some(observer_request_file) = key_observer_request_path() {
+        if let Ok(content) = std::fs::read_to_string(&observer_request_file) {
+            if let Ok(request) = serde_json::from_str::<HelperRequest>(&content) {
+                let _ = std::fs::remove_file(&observer_request_file);
+                if request.op == "key-observer"
+                    && crate::process::process_is_elevated()
+                {
+                    if let Some(pipe) = request.pipe_name.as_deref() {
+                        let Ok(exe) = std::env::current_exe() else {
+                            std::process::exit(1);
+                        };
+                        let spawned = std::process::Command::new(exe)
+                            .arg(ARG_PRIVILEGED_KEY_OBSERVER)
+                            .arg(pipe)
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .spawn();
+                        if spawned.is_err() {
+                            std::process::exit(1);
+                        }
+                    }
+                    std::process::exit(0);
+                }
+            }
+        }
+    }
+
     let Some(request_file) = request_path() else {
         std::process::exit(1);
     };
@@ -453,16 +511,6 @@ pub(crate) fn run_privileged_helper() {
     };
     if !crate::process::process_is_elevated() {
         result.error = Some("the privileged helper started without elevation".to_string());
-    } else if request.op.as_str() == "key-observer" {
-        // Resident observer mode: this child stays alive serving key-state
-        // queries until the app's pipe closes, so no result file is written
-        // and the loop never returns. The request file is consumed up front
-        // (the app respawns the observer by writing a fresh one).
-        let _ = std::fs::remove_file(&request_file);
-        if let Some(pipe) = request.pipe_name.as_deref() {
-            crate::key_observer::run_elevated_observer(pipe);
-        }
-        std::process::exit(0);
     } else {
         match request.op.as_str() {
             "power-requests" => {

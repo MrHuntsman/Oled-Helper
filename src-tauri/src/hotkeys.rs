@@ -688,6 +688,16 @@ pub fn poll_hold_release() {
         }
         return;
     }
+
+    // Never trust this process's filtered key state while an elevated window
+    // owns the foreground. If the observer is still starting or has dropped,
+    // keeping the neutral ramp is safer than restoring it 40 ms after the
+    // press. Once the user leaves the elevated window, the local read can
+    // finish the hold normally.
+    if crate::process::foreground_process_is_elevated() {
+        return;
+    }
+
     if !key_is_down(vk) || !modifiers_are_down(mods) {
         restore_hold_gamma();
     }

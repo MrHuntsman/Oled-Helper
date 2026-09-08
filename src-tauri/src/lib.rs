@@ -193,6 +193,9 @@ mod display_change_events {
             crate::power::rekey_profiles();
         }
         let _ = app.emit("display-changed", source);
+        if refresh_hook_table {
+            tray_menu_window::refresh_after_display_change(app);
+        }
         // The vendor caches (primary-GPU adapter info, NVAPI context and its
         // display ID, and the DRS session) are all derived from the display
         // topology. A change can reorder or replace the primary adapter or
@@ -700,6 +703,10 @@ pub fn run() {
     // The scheduled task's entry: performs one privileged operation read
     // from helper-request.json, writes helper-result.json, and exits. Runs
     // before any Tauri/WebView2 init, same as the gamma watchdog.
+    if std::env::args().any(|arg| arg == helper::ARG_PRIVILEGED_KEY_OBSERVER) {
+        helper::run_privileged_key_observer();
+        return;
+    }
     if std::env::args().any(|arg| arg == helper::ARG_PRIVILEGED_HELPER) {
         helper::run_privileged_helper();
         return;
@@ -871,12 +878,14 @@ pub fn run() {
             flyout_window::flyout_hidden,
             flyout_window::show_mode_confirmation,
             tray_menu_window::tray_menu_get_display_info,
+            tray_menu_window::tray_menu_get_state,
             tray_menu_window::tray_menu_set_resolution,
             tray_menu_window::tray_menu_set_refresh_rate,
             tray_menu_window::tray_menu_hide,
             tray_menu_window::tray_menu_open_main,
             tray_menu_window::tray_menu_restart,
             tray_menu_window::tray_menu_quit,
+            tray_menu_window::tray_menu_debug,
             tray_menu_window::tray_menu_set_expanded,
             quit_app,
             reset_tray_notice,
@@ -1126,11 +1135,8 @@ pub fn run() {
             log::info!("[tray] mode flyout window ready");
 
             // Custom CSS tray popup (test replacement for the native menu on
-            // right-click). Pre-warmed for the same reason as the flyout: its
-            // WebView2 controller should exist before the first click.
-            tray_menu_window::prewarm(app.handle());
-            log::info!("[tray] custom tray menu window ready");
-
+            // right-click). It is pre-warmed after the taskbar overlay is
+            // created, so its initial snapshot sees the real availability.
             let tray_image = window_icon::crisp_tray_image()
                 .or_else(|| app.default_window_icon().cloned())
                 .ok_or("missing default app icon")?;
@@ -1205,7 +1211,18 @@ pub fn run() {
                         "taskbar dimmer overlay could not be created after {MAX_ATTEMPTS} attempts; dimmer disabled for this session"
                     );
                 });
+            } else {
+                // Publish the successful initial creation too. The tray window
+                // is pre-warmed immediately afterward, but an already-mounted
+                // WebView may also need to clear a transient unavailable state.
+                let _ = app.emit("taskbar-dimmer-available", true);
             }
+
+            // Custom CSS tray popup (test replacement for the native menu on
+            // right-click). Pre-warm it after overlay creation so the initial
+            // snapshot contains the correct availability state.
+            tray_menu_window::prewarm(app.handle());
+            log::info!("[tray] custom tray menu window ready");
 
             // Tauri's runtime window icon (titlebar/taskbar while running) is blurry
             // on Windows, it sets HICON from raw RGBA instead of reading per-size

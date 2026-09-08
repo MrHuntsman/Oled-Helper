@@ -8,11 +8,11 @@
 // taskbar_position, rather than tauri-plugin-positioner's TrayCenter (which
 // only centers on the tray icon at a fixed offset, not flush to the edge).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
-};
+use std::sync::{Mutex, OnceLock};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 #[derive(Debug, Deserialize, Clone, Copy)]
 pub struct TrayMenuRect {
@@ -20,6 +20,17 @@ pub struct TrayMenuRect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    // CSS pixels are converted against the live DOM viewport and the native
+    // client size. This remains correct through a Sunshine or DPI transition,
+    // even if devicePixelRatio itself is briefly stale.
+    #[serde(default = "default_tray_viewport")]
+    pub viewport_width: f64,
+    #[serde(default = "default_tray_viewport")]
+    pub viewport_height: f64,
+}
+
+fn default_tray_viewport() -> f64 {
+    0.0
 }
 
 #[cfg(target_os = "windows")]
@@ -34,40 +45,48 @@ use windows::Win32::Graphics::Gdi::{
     HMONITOR, HRGN, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, RGN_ERROR, RGN_OR,
 };
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
 };
 
 const LABEL: &str = "tray-menu";
+
+#[derive(Serialize)]
+pub struct TrayMenuState {
+    pub display: Option<crate::display_info::DisplayInfo>,
+    pub config: crate::config::AppConfig,
+    pub taskbar_dimmer: crate::taskbar_dimmer::TaskbarDimmerStatus,
+    pub screen_dimmer: crate::power::ScreenDimmerStatus,
+    pub helper_ready: bool,
+    pub hdr_status: Option<crate::hdr_toggle::HdrCapability>,
+    pub vendor_info: crate::vendor_info::VendorDisplayInfo,
+    pub auto_hdr_enabled: bool,
+    pub rtx_hdr_settings: Option<crate::vendor_info::RtxHdrSettings>,
+    pub sdr_brightness: Option<crate::hdr_toggle::SdrWhiteLevel>,
+    pub hotkey_target_label: String,
+}
+
 static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
 static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
+static LAST_SHOW_AT_MS: AtomicU64 = AtomicU64::new(0);
+static STATE_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
+static STATE_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static STATE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static CACHED_TRAY_STATE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
 // The resolution submenu includes the same friendly/UW/native labels as the
 // main app, so reserve enough left-side space to keep those tags readable.
-// These are the rendered outer widths: the CSS declarations add 12px of
-// horizontal padding and 1px borders on both sides of each pane.
-// 284px base + up to 334px auto-sized resolution submenu. The submenu's
-// CSS max-width:320px caps the content box; its own 12px horizontal padding
-// and 2px borders make the widest rendered pane 334px (same reasoning as
-// the 230px→244px note below). The base menu stays flush against the
-// window's right edge, so the extra canvas is reserved on the left for
-// whichever submenu is open.
+// The fixed canvas is deliberately larger than the visible cards. The cards
+// stay bottom-aligned, while the frontend narrows the native hit region after
+// layout has settled.
+//
+// Keeping the canvas fixed avoids moving the HWND while the pointer is over
+// the menu. A generous height also leaves room for the dynamic SDR row and
+// inline favorites after a DPI or Sunshine transition.
 const FULL_WIDTH: f64 = 618.0;
-const FULL_HEIGHT: f64 = 460.0;
-// CSS width 270px + padding/borders.
-const BASE_WIDTH: f64 = 284.0;
-// Estimate for the collapsed base menu: Resolution / Refresh Rate /
-// Favorites / separator / Restart / Exit (6 rows + 1 separator). Only used
-// as the initial native hit-region before the first real Svelte layout
-// measurement replaces it via tray_menu_set_expanded (see below), so an
-// approximate value is fine; it only has to be roughly right for the very
-// first frame after the window is created.
-// Includes the title/monitor/current-mode header, the three compact quick
-// control rows, separators, plus the largest inline favorites layout (up to
-// three favorites) before exact DOM measurement. Kept in step with the
-// compact row padding in tray-menu.css.
-const BASE_HEIGHT_ESTIMATE: f64 = 400.0;
+const FULL_HEIGHT: f64 = 620.0;
+// The CSS tray card uses the global border-box rule, so its declared width is
+// also its rendered outer width.
+const BASE_WIDTH: f64 = 270.0;
 // The window is built once at this full footprint (base menu + resolution
 // submenu both visible) and never resized while shown; CSS/Svelte alone
 // show or hide the submenu pane inside that fixed canvas. An earlier
@@ -86,18 +105,43 @@ const BASE_HEIGHT_ESTIMATE: f64 = 400.0;
 #[cfg(target_os = "windows")]
 fn apply_hit_region(window: &tauri::WebviewWindow, rects: &[TrayMenuRect]) {
     let Ok(hwnd) = window.hwnd() else { return };
-    let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+    let native_size = window.inner_size().ok();
+    let first = rects.first();
+    let fallback_scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+    let scale_x = first
+        .and_then(|rect| {
+            (rect.viewport_width.is_finite()
+                && rect.viewport_width > 0.0
+                && native_size.is_some())
+                .then(|| native_size.unwrap().width as f64 / rect.viewport_width)
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(fallback_scale);
+    let scale_y = first
+        .and_then(|rect| {
+            (rect.viewport_height.is_finite()
+                && rect.viewport_height > 0.0
+                && native_size.is_some())
+                .then(|| native_size.unwrap().height as f64 / rect.viewport_height)
+        })
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(fallback_scale);
+    // Add a small CSS-pixel safety margin. The WebView and native window can
+    // round a fractional DPI boundary differently, and clipping one row is
+    // worse than allowing a few transparent pixels into the native region.
+    let padding_x = (2.0 * scale_x).ceil() as i32;
+    let padding_y = (2.0 * scale_y).ceil() as i32;
     let mut regions: Vec<HRGN> = rects
         .iter()
         .filter_map(|rect| {
-            let left = (rect.x * scale).round() as i32;
-            let top = (rect.y * scale).round() as i32;
-            let right = ((rect.x + rect.width) * scale).round() as i32;
-            let bottom = ((rect.y + rect.height) * scale).round() as i32;
+            let left = ((rect.x * scale_x).round() as i32 - padding_x).max(0);
+            let top = ((rect.y * scale_y).round() as i32 - padding_y).max(0);
+            let right = ((rect.x + rect.width) * scale_x).round() as i32 + padding_x;
+            let bottom = ((rect.y + rect.height) * scale_y).round() as i32 + padding_y;
             if right <= left || bottom <= top {
                 return None;
             }
-            let radius = (10.0 * scale).round().max(1.0) as i32;
+            let radius = (10.0 * scale_x.min(scale_y)).round().max(1.0) as i32;
             let region = unsafe { CreateRoundRectRgn(left, top, right, bottom, radius, radius) };
             (!region.0.is_null()).then_some(region)
         })
@@ -125,13 +169,19 @@ fn apply_hit_region(window: &tauri::WebviewWindow, rects: &[TrayMenuRect]) {
 
 #[cfg(target_os = "windows")]
 fn apply_default_hit_region(window: &tauri::WebviewWindow) {
+    let (width, height) = window
+        .outer_size()
+        .map(|size| (size.width.max(1) as f64, size.height.max(1) as f64))
+        .unwrap_or((FULL_WIDTH, FULL_HEIGHT));
     apply_hit_region(
         window,
         &[TrayMenuRect {
-            x: FULL_WIDTH - BASE_WIDTH,
-            y: FULL_HEIGHT - BASE_HEIGHT_ESTIMATE,
-            width: BASE_WIDTH,
-            height: BASE_HEIGHT_ESTIMATE,
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            viewport_width: 0.0,
+            viewport_height: 0.0,
         }],
     );
 }
@@ -177,38 +227,6 @@ fn primary_monitor_info() -> Option<(HMONITOR, MONITORINFO)> {
         }
         Some((monitor, info))
     }
-}
-
-// Reads the primary monitor's effective DPI as a scale factor. The tray
-// window's own scale factor (GetDpiForWindow / window.scale_factor()) can
-// retain the pre-change DPI context briefly after a display-mode switch,
-// which made the first menu open after a resolution change land at the wrong
-// y, the physical size derived from the stale scale no longer matches the
-// new work area. Querying the monitor directly (mirroring
-// flyout_window.rs's primary_monitor_scale) is independent of the hidden
-// window's previous scale, with a short retry budget for the DWM/monitor
-// init race on cold start.
-#[cfg(target_os = "windows")]
-fn primary_monitor_scale(fallback: f64) -> f64 {
-    for _ in 0..6 {
-        if let Some((monitor, _)) = primary_monitor_info() {
-            let mut dpi_x = 96u32;
-            let mut dpi_y = 96u32;
-            let result =
-                unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
-            if result.is_ok() {
-                let dpi = dpi_x.max(dpi_y);
-                if dpi > 0 {
-                    return dpi as f64 / 96.0;
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    log::warn!(
-        "[tray-menu] GetDpiForMonitor failed all 6 attempts; falling back to window scale {fallback}"
-    );
-    fallback.max(0.5)
 }
 
 // Positions the tray menu flush against the taskbar edge, near the tray icon
@@ -336,29 +354,17 @@ fn taskbar_position(
 // calls this with resize=false once more AFTER show(), when the transition
 // is complete and the position sticks.
 #[cfg(target_os = "windows")]
-fn anchor_to_taskbar(
-    window: &tauri::WebviewWindow,
-    anchor_x_px: Option<i32>,
-    resize: bool,
-    scale: f64,
-) {
+fn anchor_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
     let Ok(hwnd) = window.hwnd() else { return };
-    let (width_px, height_px) = if resize {
-        let width = (FULL_WIDTH * scale).round().max(1.0) as u32;
-        let height = (FULL_HEIGHT * scale).round().max(1.0) as u32;
-        // Keep Tauri's size bookkeeping in sync so the post-show pass's
-        // outer_size() read reflects the new physical size.
-        if let Err(e) = window.set_size(PhysicalSize::new(width, height)) {
-            log::warn!("[tray-menu] reposition resize failed: {e}");
-        }
-        (width, height)
-    } else {
-        match window.outer_size() {
-            Ok(size) => (size.width as u32, size.height as u32),
-            Err(_) => return,
-        }
+    let size = match window.outer_size() {
+        Ok(size) => size,
+        Err(_) => return,
     };
-    let card_width_px = (BASE_WIDTH * scale).round() as i32;
+    let width_px = size.width.max(1);
+    let height_px = size.height.max(1);
+    // The CSS card is border-box, so its rendered outer width is BASE_WIDTH.
+    // The wider fixed canvas reserves the submenu on the left.
+    let card_width_px = ((width_px as f64 * BASE_WIDTH / FULL_WIDTH).round() as i32).max(1);
     let Some((x, y)) = taskbar_position(
         width_px as i32,
         height_px as i32,
@@ -367,28 +373,33 @@ fn anchor_to_taskbar(
     ) else {
         return;
     };
-    let flags = if resize {
-        SWP_NOACTIVATE | SWP_NOZORDER
-    } else {
-        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE
-    };
-    let size_w = if resize { width_px as i32 } else { 0 };
-    let size_h = if resize { height_px as i32 } else { 0 };
     unsafe {
-        let _ = SetWindowPos(HWND(hwnd.0), None, x, y, size_w, size_h, flags);
+        let _ = SetWindowPos(
+            HWND(hwnd.0),
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE,
+        );
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn anchor_to_taskbar(
-    _window: &tauri::WebviewWindow,
-    _anchor_x_px: Option<i32>,
-    _resize: bool,
-    _scale: f64,
-) {}
+fn anchor_to_taskbar(_window: &tauri::WebviewWindow, _anchor_x_px: Option<i32>) {}
 
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    log::info!("[tray-debug] get_or_create_window begin");
     if let Some(window) = app.get_webview_window(LABEL) {
+        let visible = window.is_visible().unwrap_or(false);
+        log::info!("[tray-debug] existing window found, visible={visible}");
+        // Reassert the fixed logical canvas on every open. This repairs a
+        // native size retained across a remote-display session without ever
+        // resizing the window while it is visible.
+        if !window.is_visible().unwrap_or(false) {
+            let _ = window.set_size(LogicalSize::new(FULL_WIDTH, FULL_HEIGHT));
+        }
         return Ok(window);
     }
     log::info!("[tray-menu] creating tray menu window");
@@ -417,23 +428,31 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     // window so the per-window profile folders stay bounded (~64 MB instead
     // of growing to a few hundred MB of cache each).
     builder = builder.additional_browser_args("--disk-cache-size=67108864");
+    log::info!("[tray-debug] building tray window");
     let window = builder
         .build()
         .map_err(|e| format!("could not create tray menu window: {e}"))?;
+    log::info!("[tray-debug] tray window built");
     disable_dwm_corner_rounding(app);
     // Transparency-nudge resize, WebView2's transparent background is only
     // honored after a real post-creation resize (see flyout_window.rs).
     if let Err(e) = window.set_size(LogicalSize::new(FULL_WIDTH, FULL_HEIGHT)) {
         log::warn!("[tray-menu] initial resize failed: {e}");
     }
-    // Start with a small native region before the frontend has measured its
+    // Start with a safe initial region before the frontend has measured its
     // cards. The first Svelte layout replaces this estimate with exact DOM
     // rectangles through tray_menu_set_expanded.
+    //
+    // Use the full fixed canvas as the initial region only as a fallback shape
+    // for the base menu, not as a claim that the submenu is already open. Once
+    // Svelte reports the real base card, the exact smaller region replaces it,
+    // and the submenu region is added only when it is actually expanded.
     apply_default_hit_region(&window);
     // Hide on blur, like a normal context menu dismissing on outside click.
     let blur_window = window.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(false) = event {
+            log::info!("[tray-debug] native focus lost, generation={}", MENU_GENERATION.load(Ordering::Acquire));
             // The native region is updated asynchronously when a submenu
             // opens. Delay the blur dismissal long enough for the preinstalled
             // bridge/exact region to arrive; if the submenu is still open,
@@ -445,11 +464,16 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
             let generation = MENU_GENERATION.load(Ordering::Acquire);
             let delayed_window = blur_window.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                std::thread::sleep(std::time::Duration::from_millis(80));
                 if MENU_GENERATION.load(Ordering::Acquire) == generation
+                    && LAST_SHOW_AT_MS.load(Ordering::Acquire).saturating_add(250)
+                        <= now_ms()
                     && !SUBMENU_EXPANDED.load(Ordering::Acquire)
                 {
+                    log::info!("[tray-debug] delayed blur hiding generation={generation}");
                     let _ = delayed_window.hide();
+                } else {
+                    log::info!("[tray-debug] delayed blur ignored generation={generation}, current_generation={}, submenu_expanded={}, age_ms={}", MENU_GENERATION.load(Ordering::Acquire), SUBMENU_EXPANDED.load(Ordering::Acquire), now_ms().saturating_sub(LAST_SHOW_AT_MS.load(Ordering::Acquire)));
                 }
             });
         }
@@ -457,17 +481,30 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     Ok(window)
 }
 
-/// Called once from setup() so the webview exists before the first click.
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
 pub fn prewarm(app: &AppHandle) {
+    log::info!("[tray-debug] prewarm begin");
     if let Err(e) = get_or_create_window(app) {
         log::warn!("[tray-menu] prewarm failed: {e}");
+        return;
     }
-    // Warm up the DPI query (mirrors flyout_window.rs's prewarm): on a cold
-    // start it can still be racing DWM/monitor init, and losing that race on
-    // the very first open would anchor the menu at a stale y.
-    #[cfg(target_os = "windows")]
-    {
-        let _ = primary_monitor_scale(1.0);
+    // Build the first snapshot while the tray window is still hidden. Later
+    // refreshes are event-driven, so the click path never performs these reads.
+    let taskbar_state = app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
+    let snapshot = collect_tray_menu_state(app, taskbar_state);
+    log::info!("[tray-debug] prewarm snapshot collected");
+    let payload = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+    if let Ok(mut cached) = CACHED_TRAY_STATE.get_or_init(|| Mutex::new(None)).lock() {
+        *cached = Some(payload);
+        log::info!("[tray-debug] prewarm cache populated");
+    } else {
+        log::warn!("[tray-debug] prewarm cache lock failed");
     }
 }
 
@@ -475,7 +512,50 @@ pub fn prewarm(app: &AppHandle) {
 /// against the taskbar edge near the tray icon. anchor_x is the click's
 /// physical-pixel x-coordinate from the TrayIconEvent, used to center the
 /// popup on wherever the tray icon actually sits.
+fn schedule_post_show_event(
+    window: &tauri::WebviewWindow,
+    payload: Value,
+    generation: u64,
+) {
+    let delayed_window = window.clone();
+    std::thread::spawn(move || {
+        for delay_ms in [30_u64, 120, 300] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            if MENU_GENERATION.load(Ordering::Acquire) != generation
+                || !delayed_window.is_visible().unwrap_or(false)
+            {
+                return;
+            }
+            log::info!("[tray-debug] show retry generation={generation}, delay_ms={delay_ms}, visible={}", delayed_window.is_visible().unwrap_or(false));
+            match delayed_window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
+                Ok(()) => log::info!("[tray-debug] show retry emitted generation={generation}"),
+                Err(error) => log::warn!("[tray-debug] show retry emit failed generation={generation}: {error}"),
+            }
+        }
+    });
+}/// Re-anchor the already-visible window while Windows finishes applying a
+/// display or DPI transition.
+fn schedule_post_show_anchor(
+    window: &tauri::WebviewWindow,
+    anchor_x_px: Option<i32>,
+    generation: u64,
+) {
+    let delayed_window = window.clone();
+    std::thread::spawn(move || {
+        for delay_ms in [50_u64, 150, 350, 700] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            if MENU_GENERATION.load(Ordering::Acquire) != generation
+                || !delayed_window.is_visible().unwrap_or(false)
+            {
+                return;
+            }
+            anchor_to_taskbar(&delayed_window, anchor_x_px);
+        }
+    });
+}
+
 pub fn toggle(app: &AppHandle, anchor_x: f64) {
+    log::info!("[tray-debug] toggle begin anchor_x={anchor_x:.1}");
     let window = match get_or_create_window(app) {
         Ok(w) => w,
         Err(e) => {
@@ -484,47 +564,188 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
         }
     };
     MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
-    if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+    let visible = window.is_visible().unwrap_or(false);
+    log::info!("[tray-debug] toggle generation={}, visible_before={visible}", MENU_GENERATION.load(Ordering::Acquire));
+    if visible {
+        log::info!("[tray-debug] hiding already-visible tray window");
+        match window.emit_to(LABEL, "tray-menu-hide", ()) {
+            Ok(()) => log::info!("[tray-debug] hide event emitted"),
+            Err(error) => log::warn!("[tray-debug] hide event emit failed: {error}"),
+        }
+        match window.hide() {
+            Ok(()) => log::info!("[tray-debug] native hide succeeded"),
+            Err(error) => log::warn!("[tray-debug] native hide failed: {error}"),
+        }
         return;
     }
     SUBMENU_EXPANDED.store(false, Ordering::Release);
+    LAST_SHOW_AT_MS.store(now_ms(), Ordering::Release);
     // A click outside the region can hide the window before Svelte gets a
     // chance to close its submenu state. Reset the native region before the
     // next show so a stale expanded shape can never intercept the first frame.
     apply_default_hit_region(&window);
-    let _ = window.emit_to(LABEL, "tray-menu-show", ());
-    // Two-step anchoring (mirrors flyout_window.rs): step 1 moves and sizes
-    // the hidden window at the monitor's fresh DPI (the window's own DPI
-    // context can be stale after a mode switch). Windows defers a hidden
-    // window's DPI transition until it is shown and applies it by rescaling
-    // the window's pre-change geometry *during* show(), which used to put
-    // the first open after a resolution change at the wrong y (e.g. 711
-    // instead of 959). Step 2 runs right after show(), when the transition
-    // is complete and the window's scale matches the monitor, and re-applies
-    // the anchor; it sticks this time. Both steps run in the same
-    // synchronous main-thread block, so no intermediate frame is ever
-    // painted at the stale position.
+    SUBMENU_EXPANDED.store(false, Ordering::Release);
+    let payload = cached_tray_state();
+    log::info!("[tray-debug] cache lookup complete, has_payload={}", payload.is_some());
+    let payload = payload.unwrap_or(Value::Null);
+    match window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
+        Ok(()) => log::info!("[tray-debug] initial show event emitted"),
+        Err(error) => log::warn!("[tray-debug] initial show event emit failed: {error}"),
+    }
     let anchor = Some(anchor_x.round() as i32);
-    // Resolve the monitor's effective DPI ONCE per open and share it between
-    // both anchor passes. Each pass used to re-query GetDpiForMonitor up to
-    // twice (size pass + card width), and right after a resolution/DPI
-    // change that query can transiently fail, so the first open after a
-    // change blocked for up to ~1.2 s (6 attempts x 50 ms x 4 queries)
-    // before the menu even appeared. The single query keeps its retry
-    // budget, so the fresh-DPI anchoring after a mode switch still works.
-    let scale = primary_monitor_scale(window.scale_factor().unwrap_or(1.0));
-    anchor_to_taskbar(&window, anchor, true, scale);
-    let _ = window.show();
-    anchor_to_taskbar(&window, anchor, false, scale);
-    let _ = window.set_focus();
+    anchor_to_taskbar(&window, anchor);
+    match window.show() {
+        Ok(()) => log::info!("[tray-debug] native show succeeded, visible_after={}", window.is_visible().unwrap_or(false)),
+        Err(error) => log::warn!("[tray-debug] native show failed: {error}"),
+    }
+    anchor_to_taskbar(&window, anchor);
+    let generation = MENU_GENERATION.load(Ordering::Acquire);
+    schedule_post_show_event(&window, payload, generation);
+    schedule_post_show_anchor(&window, anchor, generation);
+    match window.set_focus() {
+        Ok(()) => log::info!("[tray-debug] focus request succeeded"),
+        Err(error) => log::warn!("[tray-debug] focus request failed: {error}"),
+    }
+    log::info!("[tray-debug] toggle complete generation={generation}, visible_after={}", window.is_visible().unwrap_or(false));
 }
 
 pub fn hide(app: &AppHandle) {
+    log::info!("[tray-debug] hide requested");
     if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.hide();
+        match window.emit_to(LABEL, "tray-menu-hide", ()) {
+            Ok(()) => log::info!("[tray-debug] hide event emitted"),
+            Err(error) => log::warn!("[tray-debug] hide event emit failed: {error}"),
+        }
+        match window.hide() {
+            Ok(()) => log::info!("[tray-debug] native hide succeeded"),
+            Err(error) => log::warn!("[tray-debug] native hide failed: {error}"),
+        }
+    } else {
+        log::warn!("[tray-debug] hide requested but window does not exist");
     }
 }
+
+fn tray_primary_key(display: Option<&crate::display_info::DisplayInfo>) -> Option<String> {
+    display
+        .and_then(|info| {
+            let key = if info.profile_id.is_empty() {
+                &info.monitor_id
+            } else {
+                &info.profile_id
+            };
+            (!key.is_empty()).then(|| key.to_string())
+        })
+}
+
+fn collect_tray_menu_state(
+    app: &AppHandle,
+    taskbar_state: State<'_, crate::taskbar_dimmer::TaskbarDimmerState>,
+) -> TrayMenuState {
+    let display = tray_menu_get_display_info().ok();
+    let monitor_key = tray_primary_key(display.as_ref());
+    let config = crate::config::load_config(app.clone());
+    let taskbar_dimmer = crate::taskbar_dimmer::get_taskbar_dimmer_status(
+        taskbar_state,
+        monitor_key.clone(),
+    );
+    let screen_dimmer = crate::power::power_get_screen_dimmer_status(monitor_key);
+    let hdr_status = crate::hdr_toggle::get_windows_hdr_status().ok().flatten();
+    let vendor_info = crate::vendor_info::query_vendor_display_info();
+    let auto_hdr_enabled = crate::hdr_toggle::get_auto_hdr_enabled().unwrap_or(false);
+    let rtx_hdr_settings = crate::vendor_info::get_rtx_hdr_settings_state().ok();
+    let sdr_brightness = crate::hdr_toggle::get_sdr_white_level().ok().flatten();
+    let hotkey_target_label = {
+        let monitors = crate::monitors::all_monitors();
+        let selected = monitors
+            .iter()
+            .find(|monitor| !config.active_monitor_sig.is_empty() && monitor.sig() == config.active_monitor_sig)
+            .or_else(|| monitors.iter().find(|monitor| monitor.primary));
+        selected
+            .map(|monitor| {
+                if monitor.friendly_name.is_empty() {
+                    "Primary monitor".to_string()
+                } else {
+                    monitor.friendly_name.clone()
+                }
+            })
+            .unwrap_or_default()
+    };
+    TrayMenuState {
+        display,
+        config,
+        taskbar_dimmer,
+        screen_dimmer,
+        helper_ready: crate::helper::helper_task_registered(),
+        hdr_status,
+        vendor_info,
+        auto_hdr_enabled,
+        rtx_hdr_settings,
+        sdr_brightness,
+        hotkey_target_label,
+    }
+}
+
+#[tauri::command]
+pub fn tray_menu_debug(message: String) {
+    log::info!("[tray-debug] frontend {message}");
+}
+
+#[tauri::command]
+pub fn tray_menu_get_state(
+    app: AppHandle,
+    state: State<'_, crate::taskbar_dimmer::TaskbarDimmerState>,
+) -> TrayMenuState {
+    collect_tray_menu_state(&app, state)
+}
+
+fn cached_tray_state() -> Option<Value> {
+    CACHED_TRAY_STATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|state| state.clone())
+}
+
+/// Refresh the complete tray snapshot in response to a native event. The
+/// expensive display and driver reads stay off the tray click path.
+pub fn refresh_cached_state(app: &AppHandle) {
+    if STATE_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        STATE_REFRESH_PENDING.store(true, Ordering::Release);
+        return;
+    }
+    let generation = STATE_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let refresh_app = app.clone();
+    std::thread::spawn(move || {
+        let taskbar_state = refresh_app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
+        let snapshot = collect_tray_menu_state(&refresh_app, taskbar_state);
+        let payload = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+        if STATE_REFRESH_GENERATION.load(Ordering::Acquire) == generation {
+            if let Ok(mut cached) = CACHED_TRAY_STATE
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+            {
+                *cached = Some(payload.clone());
+            }
+            let _ = refresh_app.emit("tray-menu-state-updated", payload);
+        }
+        STATE_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        if STATE_REFRESH_PENDING.swap(false, Ordering::AcqRel) {
+            refresh_cached_state(&refresh_app);
+        }
+    });
+}
+
+/// Refresh the event-driven snapshot after a display transition. A short
+/// delay lets Windows finish replacing the monitor and DPI topology before
+/// the native queries run, without introducing a periodic polling loop.
+pub fn refresh_after_display_change(app: &AppHandle) {
+    let delayed_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        refresh_cached_state(&delayed_app);
+    });
+}
+
 
 /// Frontend command: update the native hit-test region after Svelte changes
 /// the visible panes. This intentionally never changes window geometry, so
@@ -557,6 +778,8 @@ pub fn tray_menu_set_expanded(
                         y: top,
                         width: right - left,
                         height: bottom - top,
+                        viewport_width: base.viewport_width,
+                        viewport_height: base.viewport_height,
                     });
                 }
                 rects.push(submenu);

@@ -686,9 +686,12 @@ fn run_elevated_power_probe() -> Vec<DisplayRequestInfo> {
             Vec::new()
         }
         Err(error) => {
-            // The unregistered-task case repeats every second while the
-            // dimmer is near a timeout, so report it once instead of
-            // flooding the log until the user sets the helper up.
+            // A helper timeout is expected when Task Scheduler is busy or the
+            // helper is unavailable. This runs on a one second cadence near a
+            // dim timeout, so logging every failure creates the debug spam the
+            // diagnostics setting was intended to prevent. Keep the actionable
+            // missing-task warning, and only expose other failures when the
+            // user explicitly enabled detailed logging.
             static UNREGISTERED_WARNED: OnceLock<()> = OnceLock::new();
             if error.contains("not registered") {
                 let _ = UNREGISTERED_WARNED.get_or_init(|| {
@@ -698,8 +701,6 @@ fn run_elevated_power_probe() -> Vec<DisplayRequestInfo> {
                          the Screen Dimmer off and on once to re-register it."
                     );
                 });
-            } else {
-                log::debug!("[power] helper power probe unavailable: {error}");
             }
             Vec::new()
         }

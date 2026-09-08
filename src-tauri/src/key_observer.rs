@@ -173,9 +173,18 @@ fn server_thread_loop() {
         // Blocking accept. On any error (including the already-connected
         // case where the observer beat us to it) close and recreate; an
         // observer that connected in that window retries its own open.
-        if unsafe { ConnectNamedPipe(handle, None) }.is_err() {
-            let _ = unsafe { CloseHandle(handle) };
-            continue;
+        let connect_result = unsafe { ConnectNamedPipe(handle, None) };
+        if let Err(error) = connect_result {
+            // ERROR_PIPE_CONNECTED means the observer connected between
+            // CreateNamedPipeW and ConnectNamedPipe. That is a successful
+            // connection, not a failed one. Treating it as an error drops
+            // the only elevated observer and makes every admin-window hold
+            // fall back to the filtered local key state.
+            let already_connected = (error.code().0 as u32 & 0xFFFF) == 535;
+            if !already_connected {
+                let _ = unsafe { CloseHandle(handle) };
+                continue;
+            }
         }
 
         let (tx, rx) = mpsc::channel::<Query>();
@@ -252,14 +261,12 @@ fn request_respawn() {
                 Err(error) => {
                     if SPAWN_WARNED.get().is_none() {
                         let _ = SPAWN_WARNED.get_or_init(|| {
-                            log::warn!(
+                            log::debug!(
                                 "[key-observer] elevated observer unavailable: {error}. \
-                                 Hold-to-compare over elevated (admin) windows will not hold \
-                                 until the privileged helper task is registered."
+                                 Hold-to-compare over elevated (admin) windows will use the \
+                                 local fallback until the privileged helper task is registered."
                             );
                         });
-                    } else {
-                        log::debug!("[key-observer] observer spawn failed: {error}");
                     }
                 }
             }
@@ -298,10 +305,11 @@ pub(crate) fn combo_held(vk: u32, mods: u32) -> Option<bool> {
     }
 }
 
-// Start the pipe server once and spawn the initial observer. Called from
-// hotkeys::init (a hold_compare binding exists, so the observer will be
-// used). Never fails: without the helper task the spawn logs once and the
-// app falls back to local key reads.
+// Start the pipe server once and prepare the resident observer. Registration
+// is done on a worker because it can require the one-time UAC prompt and can
+// take several seconds while Task Scheduler refreshes. The normal app UI is
+// never blocked by this setup. Once the two helper tasks are ready, the worker
+// starts the elevated observer through its dedicated task.
 pub(crate) fn start() {
     static STARTED: OnceLock<()> = OnceLock::new();
     let _ = STARTED.get_or_init(|| {
@@ -309,6 +317,9 @@ pub(crate) fn start() {
             .name("key-observer-server".into())
             .spawn(server_thread_loop);
         if !self_elevated() {
+            // Do not trigger UAC from app startup. The observer task is
+            // created by the existing user initiated helper setup, or by the
+            // installer. Until then, try silently and keep the local fallback.
             request_respawn();
         }
     });

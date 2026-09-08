@@ -5,6 +5,7 @@
   --nav-bg: #121215;
   --accent-sdr: #688a9c;
   --accent-hdr: #cb9f1a;
+  --accent: var(--accent-sdr);
   --text: rgba(255, 255, 255, 0.71);
   --text-weak: #8A8A94;
   --divider: #2A2A30;

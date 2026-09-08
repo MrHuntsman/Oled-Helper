@@ -324,10 +324,9 @@ fn query_sdr_white_level() -> Result<Option<SdrWhiteLevel>, String> {
 // positive renumbering); the SET variant was never documented. Its value is
 // 0xFFFFFFEE (-18) in the preview-era negative numbering, matching the
 // ledoge/set_maxtml reference implementation, and Windows still honors it
-// alongside the positive GET value. set_sdr_white_level_ccd verifies every
-// write by reading back through the documented GET path, so a Windows change
-// to this internal type number is detected at runtime rather than silently
-// no-opping.
+// alongside the positive GET value. The write result is used directly during
+// live slider updates, while the normal refresh path verifies the current value
+// without blocking every drag step.
 const DISPLAYCONFIG_DEVICE_INFO_SET_SDR_WHITE_LEVEL_I: i32 = -18; // 0xFFFFFFEE
 
 // The SET form carries an extra `finalValue` byte beyond the GET struct
@@ -400,19 +399,10 @@ fn set_sdr_white_level_ccd(nits: f32) -> Result<SdrWhiteLevel, String> {
         }
     }
     LAST_SDR_WRITE_AT.store(now_ms(), Ordering::Relaxed);
-    // The SET device-info type above is undocumented, so confirm it took effect
-    // by reading back through the documented GET path. A mismatch is the first
-    // signal that a Windows update changed the internal type number or that the
-    // driver quantized the value. Only a mismatch is logged to keep slider
-    // drags quiet; the Windows HDR tab's 500ms poll shows the same readback.
-    if let Ok(Some(readback)) = query_sdr_white_level() {
-        if (readback.nits - nits).abs() > 1.0 {
-            log::warn!(
-                "[hdr] SDR white level set to {nits:.0} nits but read back {:.1} nits; the SET may not have applied",
-                readback.nits
-            );
-        }
-    }
+    // The write result is authoritative for the live slider path. Avoid an
+    // immediate DisplayConfig readback here because that read can block behind
+    // the compositor and make consecutive drag updates queue visibly. External
+    // changes are still picked up by the existing refresh path.
     Ok(SdrWhiteLevel { raw, nits })
 }
 

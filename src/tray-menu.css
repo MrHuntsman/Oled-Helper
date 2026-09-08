@@ -1,36 +1,25 @@
 /* tray-menu.css, custom CSS tray popup, styled with the same tokens as
    the rest of the app (see :root in app.css: --panel, --accent, --hover,
    --divider). Kept separate from app.css since this window has no other
-   shared chrome (no modal backdrop, no dropdown machinery). */
-
-.tray-menu-wrap {
+   shared chrome (no modal backdrop, no dropdown machinery). */.tray-menu-wrap {
   display: flex;
   position: relative;
   /* The native window is a fixed canvas. Give the flex wrapper that same
      height so the bottom alignment is relative to the window, not to the
-     currently visible pane. Without this, opening the submenu increases the
-     wrapper's content height and moves the base menu downward. */
+     currently visible pane. */
   width: 100%;
   height: 100%;
-  /* Bottom-align the panes so the base menu hugs the taskbar. The submenu
-     is shorter than the base menu, so TrayMenu.svelte lifts it with a
-     measured margin-bottom (submenuLift) to align its top edge with the
-     base menu's top edge. */
   align-items: flex-end;
-  /* Row order is reversed (submenu first in DOM, rendered on the right via
-     row-reverse) so the base menu pane is the one flush against the
-     window's right edge. The Rust side anchors the window's RIGHT edge to
-     the taskbar/tray corner and grows further left when the submenu opens
-     (see tray_menu_window.rs taskbar_position), with a normal left-to-
-     right row the base menu is the LEFT pane, so growing the window
-     leftward drags it along too. Right-aligning the base menu instead
-     means growing the window only extends the submenu into the new space
-     on the left, leaving the base menu visually static. */
   flex-direction: row-reverse;
-  /* Zero gap so the two panes are edge-to-edge: no dead space for the
-     cursor to fall out of while moving between the Resolution item and
-     its submenu. */
   gap: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: none;
+}
+
+.tray-menu-wrap.tray-visible {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .tray-menu {
@@ -46,13 +35,9 @@
   font: 13px/1.4 -apple-system, "Segoe UI", sans-serif;
   color: #e8e8ec;
   user-select: none;
-  opacity: 0;
-  transform: translateY(4px) scale(0.98);
-  animation: tray-menu-in 120ms ease-out forwards;
-}
-
-@keyframes tray-menu-in {
-  to { opacity: 1; transform: translateY(0) scale(1); }
+  opacity: 1;
+  transform: none;
+  animation: none;
 }
 
 .tray-menu-header {

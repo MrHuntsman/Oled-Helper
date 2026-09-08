@@ -412,7 +412,7 @@
 
     {#if screenDimmer.enabled && !screenDimmerHelper.ready && app.isElevated === false}
       <div class="dimmer-helper-warning" role="status">
-        <span class="dimmer-helper-warning-text">⚠ Video-pause detection is off: the one-time elevated helper isn't set up (or points at an old location after the app was moved). Idle dimming still works.</span>
+        <span class="dimmer-helper-warning-text">⚠ Video-pause detection unavailable. Idle dimming still works.</span>
         <button type="button" class="dimmer-helper-warning-btn" disabled={screenHelperBusy} onclick={setupScreenDimmerHelper}>
           {screenHelperBusy ? 'Setting up…' : 'Set up now'}
         </button>
