@@ -14,12 +14,29 @@
   gap: 0;
   opacity: 0;
   pointer-events: none;
-  transition: none;
+  /* Fade in on open and fade out on close (the backend keeps the native
+     window visible through the fade, see TRAY_FADE_OUT_MS in
+     tray_menu_window.rs). pointer-events snap instantly either way. */
+  transition: opacity 0.14s ease;
 }
 
 .tray-menu-wrap.tray-visible {
   opacity: 1;
   pointer-events: auto;
+}
+
+/* First-open settle: this WebView's HDR/theme state starts at its prewarm
+   defaults (switch thumb on the SDR side, SDR accent) and flips to the real
+   value right as the first reveal happens. Those flips animate over
+   0.1-0.22s and would visibly slide the switch thumb and shift the accent
+   colors during the fade-in on the very first open after app start; later
+   opens keep the settled state, so nothing animates then. Snap the children
+   through the first reveal instead (the wrapper's own opacity fade stays),
+   and drop the class ~300ms after the first reveal. */
+.tray-menu-wrap.tray-first-session *,
+.tray-menu-wrap.tray-first-session *::before,
+.tray-menu-wrap.tray-first-session *::after {
+  transition: none !important;
 }
 
 .tray-menu {

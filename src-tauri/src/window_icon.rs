@@ -10,6 +10,8 @@
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
@@ -27,6 +29,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.ico");
 
 static INSTALLED_ICONS: OnceLock<Mutex<(isize, isize)>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static TRAY_ICON_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static TRAY_ICON_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -223,6 +230,51 @@ pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
 pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
     tauri::image::Image::from_bytes(ICON_BYTES).ok()
 }
+
+pub fn refresh_tray_icon(app: &tauri::AppHandle) {
+    let Some(icon) = crisp_tray_image() else {
+        log::warn!("[tray-icon] could not rebuild crisp tray icon");
+        return;
+    };
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        log::debug!("[tray-icon] tray icon is not available during refresh");
+        return;
+    };
+    match tray.set_icon(Some(icon)) {
+        Ok(()) => log::info!("[tray-icon] refreshed after display change"),
+        Err(error) => log::warn!("[tray-icon] refresh failed: {error}"),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn refresh_tray_icon_after_display_change(app: &tauri::AppHandle) {
+    // A single resolution switch can broadcast several WM_DISPLAYCHANGE and
+    // WM_DEVICECHANGE events, and each one used to start its own refresh
+    // cycle, so one switch produced bursts of overlapping rebuilds. Coalesce
+    // like refresh_cached_state: one cycle runs at a time, and a change that
+    // arrives mid-cycle only marks the cycle to rerun once it finishes.
+    if TRAY_ICON_REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        TRAY_ICON_REFRESH_PENDING.store(true, Ordering::Release);
+        return;
+    }
+    let delayed_app = app.clone();
+    std::thread::spawn(move || {
+        // Windows may continue using the old system icon metrics briefly while
+        // Explorer rebuilds the notification area after a monitor or DPI
+        // transition. Rebuild at the settled points, not on a timer loop.
+        for delay_ms in [250_u64, 750, 1500] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            refresh_tray_icon(&delayed_app);
+        }
+        TRAY_ICON_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        if TRAY_ICON_REFRESH_PENDING.swap(false, Ordering::AcqRel) {
+            refresh_tray_icon_after_display_change(&delayed_app);
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn refresh_tray_icon_after_display_change(_app: &tauri::AppHandle) {}
 
 /// Applies crisp small (titlebar/taskbar) and large (alt-tab) icons to the given
 /// HWND, bypassing Tauri's blurry default runtime icon. Sizes are read from the

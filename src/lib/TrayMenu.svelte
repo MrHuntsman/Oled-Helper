@@ -43,7 +43,6 @@
   let trayHdrModeError = $state('');
   let trayHdrIsNvidia = $state(false);
 
-
   let windowsHdrBusy = $state(false);
   let windowsHdrError = $state('');
   // Whether the privileged helper task is registered, used by the Screen
@@ -211,13 +210,13 @@
     }
   }
 
-  // The tray menu has no monitor selector: it operates on the primary
   // Keep this separate WebView's root theme token synchronized with its own
   // HDR probe. The main window has a different document root.
   function updateRootHdrAttr() {
     document.documentElement.setAttribute('data-hdr', trayHdrStatus === 'hdr' ? 'true' : 'false');
   }
 
+  // The tray menu has no monitor selector: it operates on the primary
   // monitor's taskbar. Its profile key is the primary's EDID id (what
   // tray_menu_get_display_info reports), matching the main window's keying.
   function trayDimmerMonKey() {
@@ -475,24 +474,31 @@
     }
   }
 
+  // Pure read of the tray WebView's live HDR probe, no state mutation.
+  // matchMedia is the authoritative in-session source for the tray popup, which
+  // is why the tray reconciles against it instead of blindly trusting the
+  // snapshot's hdr_status after a remote-display transition.
+  function readLiveTrayHdrStatus() {
+    try {
+      return window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'sdr';
+    } catch {
+      return 'unknown';
+    }
+  }
+
   // Windows HDR status via the same matchMedia probe the main window uses.
   // The tray is a separate WebView, so it keeps its own copy instead of
   // importing the main window's in-memory store.
   function pollTrayHdrStatus() {
-    let status = 'unknown';
-    try { status = window.matchMedia('(dynamic-range: high)').matches ? 'hdr' : 'sdr'; } catch {}
-    trayHdrStatus = status;
-    return status;
+    trayHdrStatus = readLiveTrayHdrStatus();
+    return trayHdrStatus;
   }
 
-  // Resolve the tray's current HDR state from the live WebView probe.
-  // This is the authoritative in-session source for the tray popup, which is why
-  // the tray does not blindly trust the snapshot's hdr_status on reopen after a
-  // remote-display transition.
+  // Resolve the tray's current HDR state from the live WebView probe without
+  // mutating state. Falls back to the current value when the probe cannot
+  // answer, so the snapshot fallback remains available on the very first open.
   function resolveLiveTrayHdrStatus() {
-    // If the live probe can answer, use it. Otherwise leave trayHdrStatus as-is
-    // so the snapshot fallback remains available on the very first open.
-    const liveStatus = pollTrayHdrStatus();
+    const liveStatus = readLiveTrayHdrStatus();
     if (liveStatus !== 'unknown') return liveStatus;
     return trayHdrStatus;
   }
@@ -503,7 +509,8 @@
     if (windowsHdrBusy || trayHdrStatus === 'unknown') return;
     const next = trayHdrStatus !== 'hdr';
     const previous = trayHdrStatus;
-    windowsHdrBusy = true;      trayHdrStatus = next ? 'hdr' : 'sdr';
+    windowsHdrBusy = true;
+    trayHdrStatus = next ? 'hdr' : 'sdr';
     updateRootHdrAttr();
     windowsHdrError = '';
     try {
@@ -608,6 +615,18 @@
   // The tray state is refreshed by native display events. The click path uses
   // the Rust-owned snapshot and never starts native queries.
   let pendingTraySnapshot = null;
+  // Whether the tray WebView has completed one visible session. Until the
+  // first hide, its own matchMedia is not trusted (the window was hidden since
+  // creation), so the first open uses the main window's hdr-status-changed
+  // broadcast instead of probing this WebView.
+  let firstShowDone = false;
+  // The first open after app start flips the initial HDR/theme defaults to
+  // the real values right before reveal. Keep child transitions snapped
+  // through that first reveal (see .tray-first-session in tray-menu.css) so
+  // the switch thumb and accent colors don't visibly animate during the
+  // fade-in, then re-enable them once the reveal has settled.
+  let trayFirstSession = $state(true);
+  let trayFirstSessionTimer;
   // The main app confirms destructive removals. Keep the same safeguard in
   // the tray without using a blocking browser confirm dialog.
   let pendingFavoriteRemove = $state(null);
@@ -686,14 +705,35 @@
     // against the live WebView probe before the tray becomes visible. This keeps
     // the tray from starting in an outdated HDR/SDR state after a Sunshine return
     // when the snapshot may have been prepared under a different topology.
+    //
+    // Exception: the first open after app start. This WebView stays hidden until
+    // then, so its own matchMedia can report the wrong dynamic range until it has
+    // painted once. The native snapshot query (a direct Windows Advanced Color
+    // read) is authoritative for that open; the broadcast is only a fallback, so
+    // the first open already shows the final state and nothing can flip it.
+    const broadcastHdrStatus = trayHdrStatus;
     const hdrCapability = snapshot.hdr_status;
-    trayHdrStatus = hdrCapability ? (hdrCapability.enabled ? 'hdr' : 'sdr') : 'unknown';
+    const snapshotHdrStatus = hdrCapability ? (hdrCapability.enabled ? 'hdr' : 'sdr') : 'unknown';
+    if (firstShowDone) {
+      trayHdrStatus = snapshotHdrStatus;
+    } else {
+      trayHdrStatus = snapshotHdrStatus !== 'unknown' ? snapshotHdrStatus : broadcastHdrStatus;
+      trayDebug(`hdr first-open source: snapshot=${snapshotHdrStatus}, broadcast=${broadcastHdrStatus} -> ${trayHdrStatus}`);
+    }
     trayHdrMode = snapshot.auto_hdr_enabled
       ? 'auto'
       : snapshot.rtx_hdr_settings?.enabled
         ? 'rtx'
         : 'off';
     trayHdrModeError = '';
+    if (!firstShowDone) {
+      // Ungated: the first-open HDR decision must be visible in the log even
+      // with Detailed logging off, since it is the one path we cannot infer
+      // from the runtime log otherwise.
+      void invoke('tray_menu_hdr_report', {
+        message: `applyTraySnapshot first-open: snapshot=${snapshotHdrStatus}, broadcast=${broadcastHdrStatus}, resolved=${trayHdrStatus}`,
+      }).catch(() => {});
+    }
     const nits = Number(snapshot.sdr_brightness?.nits);
     traySdrBrightness = trayHdrStatus === 'hdr' && Number.isFinite(nits) && nits >= 80 && nits <= 480
       ? { available: true, nits }
@@ -701,15 +741,18 @@
     hotkeyTargetLabel = typeof snapshot.hotkey_target_label === 'string' ? snapshot.hotkey_target_label : '';
     updateRootHdrAttr();
 
-    const reconciledHdrStatus = resolveLiveTrayHdrStatus();
-    if (reconciledHdrStatus !== trayHdrStatus) {
-      trayDebug(`hdr reconciled from live probe, snapshot=${trayHdrStatus}, live=${reconciledHdrStatus}`);
-      trayHdrStatus = reconciledHdrStatus;
-      if (trayHdrStatus !== 'hdr') traySdrBrightness = { available: false, nits: null };
-      updateRootHdrAttr();
-      loadSdrContentBrightness();
-    } else {
-      trayDebug(`hdr unchanged after reconcile, status=${trayHdrStatus}`);
+    if (firstShowDone) {
+      const preReconcileStatus = trayHdrStatus;
+      const reconciledHdrStatus = resolveLiveTrayHdrStatus();
+      if (reconciledHdrStatus !== 'unknown' && reconciledHdrStatus !== preReconcileStatus) {
+        trayDebug(`hdr reconciled from live probe, snapshot=${preReconcileStatus}, live=${reconciledHdrStatus}`);
+        trayHdrStatus = reconciledHdrStatus;
+        if (trayHdrStatus !== 'hdr') traySdrBrightness = { available: false, nits: null };
+        updateRootHdrAttr();
+        loadSdrContentBrightness();
+      } else {
+        trayDebug(`hdr unchanged after reconcile, status=${trayHdrStatus}`);
+      }
     }
   }
 
@@ -764,8 +807,9 @@
             fav_id: typeof f.fav_id === 'string' ? f.fav_id : '',
             monitor_id: typeof f.monitor_id === 'string' ? f.monitor_id : '',
             monitor_sig: typeof f.monitor_sig === 'string' ? f.monitor_sig : '',
-            monitor_device: typeof f.monitor_device === 'string' ? f.monitor_device : '',              monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
-              confirmed_monitor_id: typeof f.confirmed_monitor_id === 'string' ? f.confirmed_monitor_id : '',
+            monitor_device: typeof f.monitor_device === 'string' ? f.monitor_device : '',
+            monitor_name: typeof f.monitor_name === 'string' ? f.monitor_name : '',
+            confirmed_monitor_id: typeof f.confirmed_monitor_id === 'string' ? f.confirmed_monitor_id : '',
             }))
       : [];
   }
@@ -821,9 +865,13 @@
       // Re-probe HDR as well as the layout. A remote display transition can
       // leave this WebView's matchMedia result stale for a few frames, which
       // otherwise leaves the accent token on the wrong side until reopening.
-      pollTrayHdrStatus();
+      // Skipped during the first open after app start, when this WebView's own
+      // matchMedia is not settled yet and a poll would flip the visible state.
+      if (firstShowDone) {
+        pollTrayHdrStatus();
+        loadSdrContentBrightness();
+      }
       updateRootHdrAttr();
-      loadSdrContentBrightness();
       syncHitRegion();
     }, delay));
   }
@@ -1010,6 +1058,13 @@
   let hitRegionSyncRunning = false;
 
   function syncHitRegion() {
+    // Do not measure or replace the native region while the window is hidden.
+    // Hidden WebView layout is transient during display and DPI transitions,
+    // and SetWindowRgn clips the HWND itself, not only its hit testing. A
+    // partial hidden measurement can therefore clip the first visible frame.
+    // Rust restores the full canvas before every show; the visible recovery
+    // pass below installs the exact card region once layout has settled.
+    if (!trayVisible) return;
     hitRegionSyncScheduled = true;
     if (hitRegionSyncRunning) return;
     hitRegionSyncRunning = true;
@@ -1173,8 +1228,9 @@
       fav_id: newTrayFavoriteId(),
       monitor_id: trayMonitorIdentity(),
       monitor_sig: '',
-      monitor_device: String(display?.device_name || ''),              monitor_name: String(display?.monitor_name || ''),
-              confirmed_monitor_id: '',
+      monitor_device: String(display?.device_name || ''),
+      monitor_name: String(display?.monitor_name || ''),
+      confirmed_monitor_id: '',
     }]);
   }
 
@@ -1284,6 +1340,9 @@
     const unlistenHide = listen('tray-menu-hide', () => {
       trayDebug(`hide event received, trayVisible=${trayVisible}`);
       trayVisible = false;
+      // The first visible session is over: the WebView has painted, so its
+      // own matchMedia is trusted from the next open onward.
+      firstShowDone = true;
     });
     const unlistenStateUpdated = listen('tray-menu-state-updated', (event) => {
       trayDebug(`state update received, visible=${trayVisible}, hasPayload=${Boolean(event.payload)}`);
@@ -1321,23 +1380,85 @@
         syncHitRegion();
         return;
       }
+      // The first open after app start must not trust this WebView's own
+      // matchMedia (unsettled until it has painted once) or the main window's
+      // broadcast (which can also settle seconds after startup). Query the OS
+      // directly: the same Advanced Color read the snapshot uses, but fresh at
+      // open time, so a pre-open HDR toggle is reflected even if the cached
+      // snapshot is stale. Fire it now so it overlaps the frame settling below.
+      const firstOpenHdrQuery = !firstShowDone
+        ? invoke('get_windows_hdr_status').catch(() => null)
+        : Promise.resolve(null);
       await tick();
-      // The snapshot was applied while hidden, so the first visible frame uses
-      // one coherent state instead of rows arriving from separate IPC calls.
-      trayVisible = true;
-      trayDebug(`wrapper made visible, display=${display ? `${display.width}x${display.height}` : 'none'}, favorites=${favorites.length}`);
-      // Final live HDR reconciliation right before first paint, so the accent
-      // token and HDR/SDR row reflect the current session and not a stale
-      // snapshot fetched earlier.
-      const liveHdrNow = resolveLiveTrayHdrStatus();
-      trayDebug(`tray hdr at first-visible-frame, resolved=${liveHdrNow}, attr=${trayHdrStatus === 'hdr' ? 'hdr' : 'sdr'}`);
-      if (liveHdrNow !== trayHdrStatus) {
+      // Let the browser commit the snapshot, then allow two paint frames for
+      // conditional rows, fonts, and the post-display WebView scale to settle.
+      // The native window starts with its full transparent canvas region, so
+      // this delay cannot clip the first paint. We install the exact visible
+      // card region only after the settled measurement is available.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      // First-open override from the fresh native query, committed while the
+      // wrapper is still invisible so the reveal already shows the final state.
+      if (!firstShowDone) {
+        const capability = await firstOpenHdrQuery;
+        const nativeStatus = capability && typeof capability.enabled === 'boolean'
+          ? (capability.enabled ? 'hdr' : 'sdr')
+          : null;
+        if (nativeStatus) {
+          // Ungated decision-chain report for the first open (see
+          // tray_menu_hdr_report in tray_menu_window.rs).
+          void invoke('tray_menu_hdr_report', {
+            message: `show first-open: native=${nativeStatus}, snapshotResolved=${trayHdrStatus}, final=${nativeStatus === trayHdrStatus ? 'unchanged' : 'corrected'}`,
+          }).catch(() => {});
+        }
+        if (nativeStatus && nativeStatus !== trayHdrStatus) {
+          trayDebug(`hdr first-open native query corrected: ${trayHdrStatus} -> ${nativeStatus}`);
+          trayHdrStatus = nativeStatus;
+          if (trayHdrStatus !== 'hdr') traySdrBrightness = { available: false, nits: null };
+          updateRootHdrAttr();
+          loadSdrContentBrightness();
+          await tick();
+        }
+      }
+      // Later opens probe until two consecutive reads agree before revealing.
+      // The first open skips the probe entirely: its state was decided by the
+      // fresh native query above (falling back to the snapshot/broadcast).
+      let liveHdrNow = trayHdrStatus;
+      if (firstShowDone || trayHdrStatus === 'unknown') {
+        liveHdrNow = readLiveTrayHdrStatus();
+        let hdrStable = false;
+        for (let i = 0; i < 4 && !hdrStable; i++) {
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+          const next = readLiveTrayHdrStatus();
+          hdrStable = next === liveHdrNow && next !== 'unknown';
+          liveHdrNow = next;
+        }
+      }
+      if (liveHdrNow !== 'unknown' && liveHdrNow !== trayHdrStatus) {
         trayHdrStatus = liveHdrNow;
         if (trayHdrStatus !== 'hdr') traySdrBrightness = { available: false, nits: null };
         updateRootHdrAttr();
         loadSdrContentBrightness();
+        // Commit the corrected state (SDR row mount, switch thumb slide) while
+        // the wrapper is still invisible, so the reveal already shows the final
+        // state and nothing visibly moves on screen.
+        await tick();
+        await new Promise((resolve) => setTimeout(resolve, 240));
       }
       updateRootHdrAttr();
+      trayVisible = true;
+      if (!firstShowDone) {
+        void invoke('tray_menu_hdr_report', {
+          message: `reveal first-open: shown=${trayHdrStatus}, liveProbe=${liveHdrNow}`,
+        }).catch(() => {});
+        // The initial state flips snapped while the wrapper was invisible;
+        // re-enable child transitions once the first fade-in has finished.
+        clearTimeout(trayFirstSessionTimer);
+        trayFirstSessionTimer = setTimeout(() => {
+          trayFirstSession = false;
+        }, 300);
+      }
+      trayDebug(`wrapper made visible, display=${display ? `${display.width}x${display.height}` : 'none'}, favorites=${favorites.length}`);
+      trayDebug(`tray hdr at first-visible-frame, resolved=${liveHdrNow}, attr=${trayHdrStatus === 'hdr' ? 'hdr' : 'sdr'}`);
       syncHitRegion();
       scheduleTrayLayoutRecovery();
     });
@@ -1347,6 +1468,14 @@
     const hdrMq = window.matchMedia('(dynamic-range: high)');
     function applyTrayHdrStatus(status) {
       if (status !== 'hdr' && status !== 'sdr') return;
+      // Ungated watchdog: a broadcast landing after the first reveal would
+      // visibly move the switch/SDR row. Log it unconditionally if it happens
+      // so the next repro shows the flip instead of leaving us guessing.
+      if (!firstShowDone && trayVisible) {
+        void invoke('tray_menu_hdr_report', {
+          message: `post-reveal broadcast during first session: ${trayHdrStatus} -> ${status}`,
+        }).catch(() => {});
+      }
       trayHdrStatus = status;
       if (status !== 'hdr') traySdrBrightness = { available: false, nits: null };
       updateRootHdrAttr();
@@ -1355,6 +1484,17 @@
       scheduleTrayLayoutRecovery();
     }
     function onTrayHdrChange() {
+      // This WebView's own matchMedia is not settled during the first open
+      // after app start; the broadcast drives that open instead.
+      if (!firstShowDone) {
+        // Ungated: if the tray WebView's own matchMedia fires a change during
+        // the first session (the "wrong until first paint" case), report it so
+        // the repro log shows the flip source instead of leaving us guessing.
+        void invoke('tray_menu_hdr_report', {
+          message: `first-session matchMedia change ignored, status=${trayHdrStatus}, visible=${trayVisible}`,
+        }).catch(() => {});
+        return;
+      }
       pollTrayHdrStatus();
       updateRootHdrAttr();
       loadSdrContentBrightness();
@@ -1366,6 +1506,22 @@
     try { hdrMq.addEventListener('change', onTrayHdrChange); } catch {}
     const unlistenHdrStatus = listen('hdr-status-changed', (event) => {
       const status = typeof event.payload === 'string' ? event.payload : event.payload?.status;
+      if (status !== 'hdr' && status !== 'sdr') return;
+      // The first session's HDR state is decided once at reveal from the native
+      // snapshot. The main window's broadcast can settle seconds after startup
+      // and arrive mid-open (even in the pre-reveal window), and applying it
+      // would flip the switch and mount/unmount the SDR row. Ignore broadcasts
+      // entirely until the first session completes; later opens use the normal
+      // snapshot + live-probe reconcile, and the snapshot's native query stays
+      // the source of truth for the very first open.
+      if (!firstShowDone) {
+        // Ungated: a broadcast arriving during the first session is the prime
+        // suspect for the visible flip, so always log when one is dropped.
+        void invoke('tray_menu_hdr_report', {
+          message: `first-session broadcast ignored: status=${trayHdrStatus} -> ${status}, visible=${trayVisible}`,
+        }).catch(() => {});
+        return;
+      }
       applyTrayHdrStatus(status);
     });
     const unlistenTags = listen('display-menu-tags-changed', (event) => {
@@ -1467,6 +1623,7 @@
         trayLayoutRecoveryTimers = [];
         clearTimeout(dimmerSaveTimer);
         clearTimeout(sdrApplyTimer);
+        clearTimeout(trayFirstSessionTimer);
       };
   });
 </script>
@@ -1475,6 +1632,7 @@
   class="tray-menu-wrap"
   class:tray-visible={trayVisible}
   class:tray-submenu-open={openSubmenu !== null}
+  class:tray-first-session={trayFirstSession}
   role="menu"
   tabindex="-1"
   onmouseenter={cancelScheduledSubmenuClose}
@@ -1640,7 +1798,8 @@
       >
         <img src={tabCrushIcon} alt="" aria-hidden="true" />
       </button>
-      <div class="tray-quick-slider-wrap">          <input
+      <div class="tray-quick-slider-wrap">
+        <input
             class="tray-quick-slider"
             type="range"
             min="-150"

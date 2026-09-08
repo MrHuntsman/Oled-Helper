@@ -1,5 +1,5 @@
 // tray_menu_window.rs, custom CSS-styled tray popup (replaces the native
-// muda menu from tray_menu.rs for the right-click path, as a test).
+// muda menu from tray_menu.rs for the right-click path).
 //
 // Built the same way as flyout_window.rs: a small undecorated/transparent
 // Tauri WebviewWindow rendering real Svelte/CSS instead of a Win32
@@ -46,10 +46,25 @@ use windows::Win32::Graphics::Gdi::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, GWL_STYLE, IsWindowVisible, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 const LABEL: &str = "tray-menu";
+
+// Verbose tray lifecycle diagnostics for the open/hide/positioning paths.
+// These log many lines per interaction, so they are emitted only when the
+// Debug tab's "Detailed logging" toggle is on, same as the vendor/EDID
+// diagnostics. Warnings (log::warn!) stay visible regardless.
+macro_rules! tray_debug {
+    ($($arg:tt)*) => {
+        if crate::detailed_logging_enabled() {
+            log::debug!($($arg)*);
+        }
+    };
+}
 
 #[derive(Serialize)]
 pub struct TrayMenuState {
@@ -69,6 +84,14 @@ pub struct TrayMenuState {
 static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
 static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LAST_SHOW_AT_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_DISPLAY_CHANGE_MS: AtomicU64 = AtomicU64::new(0);
+// Opens whose last show predates a real display change use the deferred
+// reveal path (see schedule_deferred_reveal): Windows defers a hidden
+// window's DPI transition until its next show, so the first show after a
+// resolution switch lands at stale geometry and can briefly re-create the
+// non-client frame. The deferred path keeps the window off-screen until the
+// geometry settles, so neither the stale position nor a transient title bar
+// can ever be painted on-screen.
 static STATE_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static STATE_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static STATE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
@@ -84,6 +107,10 @@ static CACHED_TRAY_STATE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
 // inline favorites after a DPI or Sunshine transition.
 const FULL_WIDTH: f64 = 618.0;
 const FULL_HEIGHT: f64 = 620.0;
+// How long the frontend's CSS fade takes (.tray-menu-wrap opacity
+// transition). Every hide path keeps the native window visible for this long
+// so the fade-out is actually visible before the HWND disappears.
+const TRAY_FADE_OUT_MS: u64 = 170;
 // The CSS tray card uses the global border-box rule, so its declared width is
 // also its rendered outer width.
 const BASE_WIDTH: f64 = 270.0;
@@ -188,6 +215,134 @@ fn apply_default_hit_region(window: &tauri::WebviewWindow) {
 
 #[cfg(not(target_os = "windows"))]
 fn apply_default_hit_region(_window: &tauri::WebviewWindow) {}
+
+#[cfg(target_os = "windows")]
+fn log_native_window_state(window: &tauri::WebviewWindow, phase: &str) {
+    // Pure diagnostics: skip the Win32 reads entirely unless detailed
+    // logging is enabled, since this runs on every open and recovery pass.
+    if !crate::detailed_logging_enabled() {
+        return;
+    }
+    let Ok(hwnd) = window.hwnd() else { return };
+    unsafe {
+        let style = GetWindowLongPtrW(HWND(hwnd.0), GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(HWND(hwnd.0), GWL_EXSTYLE) as u32;
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let has_rect = GetWindowRect(HWND(hwnd.0), &mut rect).is_ok();
+        let outer = window.outer_size().ok();
+        let inner = window.inner_size().ok();
+        log::info!(
+            "[tray-debug] native state phase={phase}, hwnd={:?}, visible={}, style=0x{style:08X}, ex_style=0x{ex_style:08X}, rect={}x{}+{},{} outer={}x{} inner={}x{}",
+            hwnd.0,
+            window.is_visible().unwrap_or(false),
+            if has_rect { rect.right - rect.left } else { 0 },
+            if has_rect { rect.bottom - rect.top } else { 0 },
+            if has_rect { rect.left } else { 0 },
+            if has_rect { rect.top } else { 0 },
+            outer.map(|s| s.width).unwrap_or(0),
+            outer.map(|s| s.height).unwrap_or(0),
+            inner.map(|s| s.width).unwrap_or(0),
+            inner.map(|s| s.height).unwrap_or(0),
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn log_native_window_state(_window: &tauri::WebviewWindow, _phase: &str) {}
+
+fn native_window_visible(window: &tauri::WebviewWindow) -> bool {
+    let Ok(hwnd) = window.hwnd() else { return false };
+    unsafe { IsWindowVisible(HWND(hwnd.0)).as_bool() }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_window_visible(window: &tauri::WebviewWindow) -> bool {
+    window.is_visible().unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn native_window_hide(window: &tauri::WebviewWindow) {
+    let Ok(hwnd) = window.hwnd() else { return };
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd.0), SW_HIDE);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_window_hide(window: &tauri::WebviewWindow) {
+    let _ = window.hide();
+}
+
+// Hide the menu with its CSS fade-out: notify the frontend so it can play
+// the opacity transition, bump the menu generation so every pending
+// show-retry/anchor/deferred-reveal thread for the current open stops (they
+// only check native visibility, which stays true during the fade and would
+// otherwise re-emit tray-menu-show mid-fade), then hide the native window
+// once the fade has completed.
+fn request_tray_hide(window: &tauri::WebviewWindow) {
+    // This hide owns the generation it bumps to. The delayed native hide
+    // below stands down if a newer session (a re-open) bumped the generation
+    // in the meantime: without this guard, a blur dismissal's pending hide
+    // fires ~170ms later and hides a menu the user just reopened, which reads
+    // as "opens then closes itself" (and as "doesn't open" when the click
+    // lands while the fade-out is still running).
+    let generation = MENU_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    match window.emit_to(LABEL, "tray-menu-hide", ()) {
+        Ok(()) => tray_debug!("[tray-debug] hide event emitted"),
+        Err(error) => log::warn!("[tray-debug] hide event emit failed: {error}"),
+    }
+    let delayed_window = window.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(TRAY_FADE_OUT_MS));
+        if MENU_GENERATION.load(Ordering::Acquire) != generation {
+            tray_debug!(
+                "[tray-debug] stale native hide skipped generation={generation}, current_generation={}",
+                MENU_GENERATION.load(Ordering::Acquire)
+            );
+            return;
+        }
+        native_window_hide(&delayed_window);
+        tray_debug!(
+            "[tray-debug] native hide requested, visible_after={}",
+            native_window_visible(&delayed_window)
+        );
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn force_borderless_window(window: &tauri::WebviewWindow) {
+    let Ok(hwnd) = window.hwnd() else { return };
+    unsafe {
+        let old_style = GetWindowLongPtrW(HWND(hwnd.0), windows::Win32::UI::WindowsAndMessaging::GWL_STYLE);
+        log_native_window_state(window, "before-borderless");
+        let frame_bits = (WS_CAPTION.0
+            | WS_THICKFRAME.0
+            | WS_SYSMENU.0
+            | WS_MINIMIZEBOX.0
+            | WS_MAXIMIZEBOX.0) as isize;
+        let new_style = (old_style & !frame_bits) | WS_POPUP.0 as isize;
+        if new_style != old_style {
+            SetWindowLongPtrW(
+                HWND(hwnd.0),
+                windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                new_style,
+            );
+            let _ = SetWindowPos(
+                HWND(hwnd.0),
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+        log_native_window_state(window, "after-borderless");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn force_borderless_window(_window: &tauri::WebviewWindow) {}
 
 #[cfg(target_os = "windows")]
 fn disable_dwm_corner_rounding(app: &AppHandle) {
@@ -386,18 +541,38 @@ fn anchor_to_taskbar(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn move_window_offscreen(window: &tauri::WebviewWindow) {
+    let Ok(hwnd) = window.hwnd() else { return };
+    // The hidden HWND can retain its previous monitor position across a DPI or
+    // resolution change. Show it outside every normal desktop coordinate, then
+    // anchor it after Windows has applied the new display context. This avoids
+    // exposing the old position for even one painted frame.
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(hwnd.0),
+            None,
+            -100_000,
+            -100_000,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+        );
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
-fn anchor_to_taskbar(_window: &tauri::WebviewWindow, _anchor_x_px: Option<i32>) {}
+fn move_window_offscreen(_window: &tauri::WebviewWindow) {}
 
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
-    log::info!("[tray-debug] get_or_create_window begin");
+    tray_debug!("[tray-debug] get_or_create_window begin");
     if let Some(window) = app.get_webview_window(LABEL) {
-        let visible = window.is_visible().unwrap_or(false);
-        log::info!("[tray-debug] existing window found, visible={visible}");
+        let visible = native_window_visible(&window);
+        tray_debug!("[tray-debug] existing window found, visible={visible}");
         // Reassert the fixed logical canvas on every open. This repairs a
         // native size retained across a remote-display session without ever
         // resizing the window while it is visible.
-        if !window.is_visible().unwrap_or(false) {
+        if !visible {
             let _ = window.set_size(LogicalSize::new(FULL_WIDTH, FULL_HEIGHT));
         }
         return Ok(window);
@@ -428,11 +603,16 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     // window so the per-window profile folders stay bounded (~64 MB instead
     // of growing to a few hundred MB of cache each).
     builder = builder.additional_browser_args("--disk-cache-size=67108864");
-    log::info!("[tray-debug] building tray window");
+    tray_debug!("[tray-debug] building tray window");
     let window = builder
         .build()
         .map_err(|e| format!("could not create tray menu window: {e}"))?;
-    log::info!("[tray-debug] tray window built");
+    tray_debug!("[tray-debug] tray window built");
+    // Tauri's decoration flag is normally sufficient, but Windows can briefly
+    // recreate the non-client frame during the first show after a DPI change.
+    // Remove caption and frame styles directly while the window is still
+    // hidden, so the title bar can never be painted for one frame.
+    force_borderless_window(&window);
     disable_dwm_corner_rounding(app);
     // Transparency-nudge resize, WebView2's transparent background is only
     // honored after a real post-creation resize (see flyout_window.rs).
@@ -452,7 +632,7 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     let blur_window = window.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(false) = event {
-            log::info!("[tray-debug] native focus lost, generation={}", MENU_GENERATION.load(Ordering::Acquire));
+            tray_debug!("[tray-debug] native focus lost, generation={}", MENU_GENERATION.load(Ordering::Acquire));
             // The native region is updated asynchronously when a submenu
             // opens. Delay the blur dismissal long enough for the preinstalled
             // bridge/exact region to arrive; if the submenu is still open,
@@ -470,10 +650,10 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
                         <= now_ms()
                     && !SUBMENU_EXPANDED.load(Ordering::Acquire)
                 {
-                    log::info!("[tray-debug] delayed blur hiding generation={generation}");
-                    let _ = delayed_window.hide();
+                    tray_debug!("[tray-debug] delayed blur hiding generation={generation}");
+                    request_tray_hide(&delayed_window);
                 } else {
-                    log::info!("[tray-debug] delayed blur ignored generation={generation}, current_generation={}, submenu_expanded={}, age_ms={}", MENU_GENERATION.load(Ordering::Acquire), SUBMENU_EXPANDED.load(Ordering::Acquire), now_ms().saturating_sub(LAST_SHOW_AT_MS.load(Ordering::Acquire)));
+                    tray_debug!("[tray-debug] delayed blur ignored generation={generation}, current_generation={}, submenu_expanded={}, age_ms={}", MENU_GENERATION.load(Ordering::Acquire), SUBMENU_EXPANDED.load(Ordering::Acquire), now_ms().saturating_sub(LAST_SHOW_AT_MS.load(Ordering::Acquire)));
                 }
             });
         }
@@ -489,7 +669,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 pub fn prewarm(app: &AppHandle) {
-    log::info!("[tray-debug] prewarm begin");
+    tray_debug!("[tray-debug] prewarm begin");
     if let Err(e) = get_or_create_window(app) {
         log::warn!("[tray-menu] prewarm failed: {e}");
         return;
@@ -498,11 +678,11 @@ pub fn prewarm(app: &AppHandle) {
     // refreshes are event-driven, so the click path never performs these reads.
     let taskbar_state = app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
     let snapshot = collect_tray_menu_state(app, taskbar_state);
-    log::info!("[tray-debug] prewarm snapshot collected");
+    tray_debug!("[tray-debug] prewarm snapshot collected");
     let payload = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
     if let Ok(mut cached) = CACHED_TRAY_STATE.get_or_init(|| Mutex::new(None)).lock() {
         *cached = Some(payload);
-        log::info!("[tray-debug] prewarm cache populated");
+        tray_debug!("[tray-debug] prewarm cache populated");
     } else {
         log::warn!("[tray-debug] prewarm cache lock failed");
     }
@@ -522,18 +702,33 @@ fn schedule_post_show_event(
         for delay_ms in [30_u64, 120, 300] {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             if MENU_GENERATION.load(Ordering::Acquire) != generation
-                || !delayed_window.is_visible().unwrap_or(false)
+                || !native_window_visible(&delayed_window)
             {
                 return;
             }
-            log::info!("[tray-debug] show retry generation={generation}, delay_ms={delay_ms}, visible={}", delayed_window.is_visible().unwrap_or(false));
+            tray_debug!("[tray-debug] show retry generation={generation}, delay_ms={delay_ms}, visible={}", native_window_visible(&delayed_window));
             match delayed_window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
-                Ok(()) => log::info!("[tray-debug] show retry emitted generation={generation}"),
+                Ok(()) => tray_debug!("[tray-debug] show retry emitted generation={generation}"),
                 Err(error) => log::warn!("[tray-debug] show retry emit failed generation={generation}: {error}"),
             }
         }
     });
-}/// Re-anchor the already-visible window while Windows finishes applying a
+}
+
+fn stabilize_canvas(window: &tauri::WebviewWindow, generation: u64, phase: &str) {
+    // Reassert the fixed logical canvas after Windows applies a new DPI
+    // context. This keeps the native transparent surface aligned with the
+    // WebView coordinate system before the measured region is installed.
+    match window.set_size(LogicalSize::new(FULL_WIDTH, FULL_HEIGHT)) {
+        Ok(()) => tray_debug!("[tray-debug] canvas stabilized generation={generation}, phase={phase}"),
+        Err(error) => log::warn!("[tray-debug] canvas stabilization failed generation={generation}, phase={phase}: {error}"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stabilize_canvas(_window: &tauri::WebviewWindow, _generation: u64, _phase: &str) {}
+
+/// Re-anchor the already-visible window while Windows finishes applying a
 /// display or DPI transition.
 fn schedule_post_show_anchor(
     window: &tauri::WebviewWindow,
@@ -545,17 +740,123 @@ fn schedule_post_show_anchor(
         for delay_ms in [50_u64, 150, 350, 700] {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             if MENU_GENERATION.load(Ordering::Acquire) != generation
-                || !delayed_window.is_visible().unwrap_or(false)
+                || !native_window_visible(&delayed_window)
             {
                 return;
             }
+            stabilize_canvas(&delayed_window, generation, "post-show-recovery");
+            force_borderless_window(&delayed_window);
             anchor_to_taskbar(&delayed_window, anchor_x_px);
         }
     });
 }
 
+#[cfg(target_os = "windows")]
+fn native_window_rect(window: &tauri::WebviewWindow) -> Option<(i32, i32, i32, i32)> {
+    let Ok(hwnd) = window.hwnd() else { return None };
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe {
+        GetWindowRect(HWND(hwnd.0), &mut rect).ok()?;
+    }
+    Some((rect.left, rect.top, rect.right, rect.bottom))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn native_window_rect(_window: &tauri::WebviewWindow) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// First-open-after-display-change path: keep the menu hidden (the frontend
+/// wrapper only becomes visible on the tray-menu-show event) while the
+/// sizing passes below re-derive the window's geometry under the new DPI
+/// context. The native window itself stays off-screen during these passes:
+/// anchoring it on-screen before the geometry settles would flash the stale
+/// position and any transient frame Windows re-created during the DPI
+/// transition. The reveal is emitted exactly once, once two consecutive
+/// passes agree on the native rect after the rect provably changed from the
+/// stale post-show baseline; the reveal pass then anchors the window at its
+/// final position. If the geometry never changes (it was already correct),
+/// the 280ms cumulative escape hatch reveals, and the final pass always
+/// reveals as a fallback. The passes are cumulative (~40+60+80+100+120ms),
+/// so a typical transition reveals around 100ms instead of waiting seconds.
+fn schedule_deferred_reveal(
+    window: &tauri::WebviewWindow,
+    payload: Value,
+    anchor_x_px: Option<i32>,
+    generation: u64,
+    initial_rect: Option<(i32, i32, i32, i32)>,
+) {
+    let delayed_window = window.clone();
+    std::thread::spawn(move || {
+        let mut previous_rect: Option<(i32, i32, i32, i32)> = None;
+        let mut elapsed_ms: u64 = 0;
+        let mut revealed = false;
+        for step_ms in [40_u64, 60, 80, 100, 120] {
+            std::thread::sleep(std::time::Duration::from_millis(step_ms));
+            elapsed_ms += step_ms;
+            if MENU_GENERATION.load(Ordering::Acquire) != generation
+                || !native_window_visible(&delayed_window)
+            {
+                return;
+            }
+            stabilize_canvas(&delayed_window, generation, "post-show-recovery");
+            force_borderless_window(&delayed_window);
+            // The window stays off-screen while its geometry is settling:
+            // anchoring it on-screen here would flash the stale position (and
+            // any transient frame) before the reveal decides where it belongs.
+            // Once revealed, every pass re-anchors normally.
+            if revealed {
+                anchor_to_taskbar(&delayed_window, anchor_x_px);
+            }
+            let rect = native_window_rect(&delayed_window);
+            tray_debug!(
+                "[tray-debug] deferred anchor pass generation={generation}, elapsed_ms={elapsed_ms}, rect={}x{}+{},{} initial={}x{}+{},{}",
+                rect.map(|r| r.2 - r.0).unwrap_or(0),
+                rect.map(|r| r.3 - r.1).unwrap_or(0),
+                rect.map(|r| r.0).unwrap_or(0),
+                rect.map(|r| r.1).unwrap_or(0),
+                initial_rect.map(|r| r.2 - r.0).unwrap_or(0),
+                initial_rect.map(|r| r.3 - r.1).unwrap_or(0),
+                initial_rect.map(|r| r.0).unwrap_or(0),
+                initial_rect.map(|r| r.1).unwrap_or(0),
+            );
+            let changed_from_initial = rect.is_some() && initial_rect != rect;
+            let stable = rect.is_some() && previous_rect == rect;
+            previous_rect = rect;
+            // Reveal once the geometry provably changed off the stale
+            // baseline and then held still for two passes, or as an escape
+            // hatch when it never changed (it was already correct).
+            let should_reveal = (stable && changed_from_initial) || elapsed_ms >= 280;
+            if !revealed && should_reveal {
+                revealed = true;
+                // First on-screen appearance: the geometry has settled, so
+                // anchor at the final position, re-strip any frame the DPI
+                // transition may have re-created, and only then reveal.
+                anchor_to_taskbar(&delayed_window, anchor_x_px);
+                force_borderless_window(&delayed_window);
+                match delayed_window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
+                    Ok(()) => tray_debug!(
+                        "[tray-debug] deferred reveal emitted generation={generation}, elapsed_ms={elapsed_ms}, stable={stable}, changed_from_initial={changed_from_initial}"
+                    ),
+                    Err(error) => log::warn!(
+                        "[tray-debug] deferred reveal emit failed generation={generation}: {error}"
+                    ),
+                }
+            }
+        }
+        if !revealed {
+            anchor_to_taskbar(&delayed_window, anchor_x_px);
+            force_borderless_window(&delayed_window);
+            match delayed_window.emit_to(LABEL, "tray-menu-show", payload) {
+                Ok(()) => tray_debug!("[tray-debug] deferred reveal emitted generation={generation}, elapsed_ms=final"),
+                Err(error) => log::warn!("[tray-debug] deferred reveal emit failed generation={generation}: {error}"),
+            }
+        }
+    });
+}
+
 pub fn toggle(app: &AppHandle, anchor_x: f64) {
-    log::info!("[tray-debug] toggle begin anchor_x={anchor_x:.1}");
+    tray_debug!("[tray-debug] toggle begin anchor_x={anchor_x:.1}");
     let window = match get_or_create_window(app) {
         Ok(w) => w,
         Err(e) => {
@@ -564,62 +865,95 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
         }
     };
     MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
-    let visible = window.is_visible().unwrap_or(false);
-    log::info!("[tray-debug] toggle generation={}, visible_before={visible}", MENU_GENERATION.load(Ordering::Acquire));
+    let visible = native_window_visible(&window);
+    tray_debug!("[tray-debug] toggle generation={}, visible_before={visible}", MENU_GENERATION.load(Ordering::Acquire));
     if visible {
-        log::info!("[tray-debug] hiding already-visible tray window");
-        match window.emit_to(LABEL, "tray-menu-hide", ()) {
-            Ok(()) => log::info!("[tray-debug] hide event emitted"),
-            Err(error) => log::warn!("[tray-debug] hide event emit failed: {error}"),
-        }
-        match window.hide() {
-            Ok(()) => log::info!("[tray-debug] native hide succeeded"),
-            Err(error) => log::warn!("[tray-debug] native hide failed: {error}"),
-        }
+        tray_debug!("[tray-debug] hiding already-visible tray window");
+        request_tray_hide(&window);
         return;
     }
     SUBMENU_EXPANDED.store(false, Ordering::Release);
+    // A display change since the window was last shown means its DPI context
+    // is stale: Windows applies a hidden window's DPI transition at the next
+    // show, which lands at stale geometry and can briefly re-create the
+    // non-client frame. Use the deferred reveal in that case; it keeps the
+    // window off-screen until the geometry settles. Read the previous show
+    // time before storing the new one.
+    let last_show_at = LAST_SHOW_AT_MS.load(Ordering::Acquire);
     LAST_SHOW_AT_MS.store(now_ms(), Ordering::Release);
     // A click outside the region can hide the window before Svelte gets a
     // chance to close its submenu state. Reset the native region before the
     // next show so a stale expanded shape can never intercept the first frame.
     apply_default_hit_region(&window);
-    SUBMENU_EXPANDED.store(false, Ordering::Release);
     let payload = cached_tray_state();
-    log::info!("[tray-debug] cache lookup complete, has_payload={}", payload.is_some());
+    tray_debug!("[tray-debug] cache lookup complete, has_payload={}", payload.is_some());
     let payload = payload.unwrap_or(Value::Null);
-    match window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
-        Ok(()) => log::info!("[tray-debug] initial show event emitted"),
-        Err(error) => log::warn!("[tray-debug] initial show event emit failed: {error}"),
+    let deferred_reveal =
+        LAST_DISPLAY_CHANGE_MS.load(Ordering::Acquire) > last_show_at;
+    if !deferred_reveal {
+        match window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
+            Ok(()) => tray_debug!("[tray-debug] initial show event emitted"),
+            Err(error) => log::warn!("[tray-debug] initial show event emit failed: {error}"),
+        }
+    } else {
+        tray_debug!("[tray-debug] initial show event deferred after display change");
     }
     let anchor = Some(anchor_x.round() as i32);
-    anchor_to_taskbar(&window, anchor);
-    match window.show() {
-        Ok(()) => log::info!("[tray-debug] native show succeeded, visible_after={}", window.is_visible().unwrap_or(false)),
-        Err(error) => log::warn!("[tray-debug] native show failed: {error}"),
+    move_window_offscreen(&window);
+    log_native_window_state(&window, "before-show");
+    // Tauri's show() path can temporarily restore the configured decorated
+    // style before painting. Use ShowWindow directly after the borderless
+    // style has been installed, so the first visible frame is borderless too.
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let hwnd = HWND(hwnd.0);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(hwnd);
+        }
     }
-    anchor_to_taskbar(&window, anchor);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.show();
+    }
+    tray_debug!("[tray-debug] native show succeeded, visible_after={}", native_window_visible(&window));
+    log_native_window_state(&window, "after-show");
+    // Tauri or Windows can reapply the configured decorated style as part of
+    // show(). Remove it again immediately, before the WebView presents the
+    // first painted frame with a title bar.
+    force_borderless_window(&window);
+    // On the deferred path the window stays off-screen until the settle
+    // passes decide where it belongs: anchoring now would expose the stale
+    // geometry (and any transient frame Windows re-created during the DPI
+    // transition) on-screen for the 40-280ms before the first recovery pass.
+    if !deferred_reveal {
+        anchor_to_taskbar(&window, anchor);
+    }
+    log_native_window_state(&window, "after-borderless-show");
+    // The geometry right after show() can be stale (the window's DPI context
+    // is still transitioning), so remember it as the baseline: the deferred
+    // reveal waits until it provably changed from this stale baseline and
+    // then held still.
+    let initial_rect = native_window_rect(&window);
     let generation = MENU_GENERATION.load(Ordering::Acquire);
-    schedule_post_show_event(&window, payload, generation);
-    schedule_post_show_anchor(&window, anchor, generation);
+    stabilize_canvas(&window, generation, "after-show");
+    if deferred_reveal {
+        schedule_deferred_reveal(&window, payload, anchor, generation, initial_rect);
+    } else {
+        schedule_post_show_event(&window, payload, generation);
+        schedule_post_show_anchor(&window, anchor, generation);
+    }
     match window.set_focus() {
-        Ok(()) => log::info!("[tray-debug] focus request succeeded"),
+        Ok(()) => tray_debug!("[tray-debug] focus request succeeded"),
         Err(error) => log::warn!("[tray-debug] focus request failed: {error}"),
     }
-    log::info!("[tray-debug] toggle complete generation={generation}, visible_after={}", window.is_visible().unwrap_or(false));
+    tray_debug!("[tray-debug] toggle complete generation={generation}, visible_after={}", native_window_visible(&window));
 }
 
 pub fn hide(app: &AppHandle) {
-    log::info!("[tray-debug] hide requested");
+    tray_debug!("[tray-debug] hide requested");
     if let Some(window) = app.get_webview_window(LABEL) {
-        match window.emit_to(LABEL, "tray-menu-hide", ()) {
-            Ok(()) => log::info!("[tray-debug] hide event emitted"),
-            Err(error) => log::warn!("[tray-debug] hide event emit failed: {error}"),
-        }
-        match window.hide() {
-            Ok(()) => log::info!("[tray-debug] native hide succeeded"),
-            Err(error) => log::warn!("[tray-debug] native hide failed: {error}"),
-        }
+        request_tray_hide(&window);
     } else {
         log::warn!("[tray-debug] hide requested but window does not exist");
     }
@@ -687,7 +1021,17 @@ fn collect_tray_menu_state(
 
 #[tauri::command]
 pub fn tray_menu_debug(message: String) {
-    log::info!("[tray-debug] frontend {message}");
+    tray_debug!("[tray-debug] frontend {message}");
+}
+
+/// Ungated first-open HDR report. The tray's per-event diagnostics are gated
+/// behind Detailed logging (tray_menu_debug), which made the first-open HDR
+/// state invisible in normal runs and hard to diagnose. This fires once per
+/// first open and logs unconditionally so a repro produces the decision chain
+/// (snapshot vs native query vs broadcast) without enabling the toggle.
+#[tauri::command]
+pub fn tray_menu_hdr_report(message: String) {
+    log::info!("[tray-hdr] {message}");
 }
 
 #[tauri::command]
@@ -739,13 +1083,13 @@ pub fn refresh_cached_state(app: &AppHandle) {
 /// delay lets Windows finish replacing the monitor and DPI topology before
 /// the native queries run, without introducing a periodic polling loop.
 pub fn refresh_after_display_change(app: &AppHandle) {
+    LAST_DISPLAY_CHANGE_MS.store(now_ms(), Ordering::Release);
     let delayed_app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(180));
         refresh_cached_state(&delayed_app);
     });
 }
-
 
 /// Frontend command: update the native hit-test region after Svelte changes
 /// the visible panes. This intentionally never changes window geometry, so

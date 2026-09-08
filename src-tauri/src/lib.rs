@@ -195,6 +195,7 @@ mod display_change_events {
         let _ = app.emit("display-changed", source);
         if refresh_hook_table {
             tray_menu_window::refresh_after_display_change(app);
+            window_icon::refresh_tray_icon_after_display_change(app);
         }
         // The vendor caches (primary-GPU adapter info, NVAPI context and its
         // display ID, and the DRS session) are all derived from the display
@@ -886,6 +887,7 @@ pub fn run() {
             tray_menu_window::tray_menu_restart,
             tray_menu_window::tray_menu_quit,
             tray_menu_window::tray_menu_debug,
+            tray_menu_window::tray_menu_hdr_report,
             tray_menu_window::tray_menu_set_expanded,
             quit_app,
             reset_tray_notice,
