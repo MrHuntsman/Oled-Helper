@@ -21,6 +21,7 @@ dependencies = [
  "tauri-plugin-positioner",
  "tauri-plugin-window-state",
  "text-raster",
+ "time",
  "ttf-parser",
  "windows 0.62.2",
  "write-fonts",

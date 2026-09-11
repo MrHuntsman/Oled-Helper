@@ -48,11 +48,14 @@
     <span class="diag-dim-status">● Initializing…</span>
   {:else if state.reasons.length > 0}
     <!-- A blocker (fullscreen app, display power request, reference mode, ...)
-         means the dim will not happen even when the timer reaches its end, so
-         the countdown is pointless while it is active. The timer keeps running
-         underneath; when the blocker clears, the countdown resumes. -->
+         holds the countdown just below the timeout instead of letting it run
+         on, so when the blocker clears (a video buffering, a fullscreen app
+         exiting) the dim waits the full timeout again instead of firing
+         instantly off the idle time that piled up while blocked. -->
     <span class="diag-dim-status diag-dim-blocked">● Blocked</span>
   {:else if state.idleSeconds >= state.timeoutSeconds}
+    <!-- Defensive: the backend pins the countdown below the timeout, so this
+         branch should not be reachable while enabled with no blockers. -->
     <span class="diag-dim-status diag-dim-blocked">● Blocked</span>
   {:else}
     <span class="diag-dim-status">● Waiting: idle {state.idleSeconds}s of {state.timeoutSeconds}s</span>

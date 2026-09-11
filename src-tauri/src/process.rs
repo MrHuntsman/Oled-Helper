@@ -83,6 +83,12 @@ pub(crate) fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
         log::error!("failed to spawn replacement instance: {error}");
         return;
     }
+    // Milestone for the early logger: with pre-Tauri logging in place the
+    // replacement's parent wait and lock race are captured, and this line
+    // timestamps the exact moment the old instance began its own teardown.
+    log::info!(
+        "restart handoff: replacement spawned; this instance is exiting"
+    );
 
     crate::taskbar_dimmer::shutdown();
     crate::shutdown_gamma_worker(app);

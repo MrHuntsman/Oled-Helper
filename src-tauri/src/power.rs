@@ -489,6 +489,12 @@ const FULLSCREEN_CHECK_INTERVAL_MS: u64 = 100;
 // command sets DIM_DIAGNOSTICS_PROBE on every poll). With no readout open
 // and the dimmer far from a timeout, no process is spawned at all.
 const DISPLAY_REQUEST_CHECK_INTERVAL_MS: u64 = 1000;
+// How many seconds before the countdown reaches the timeout the powercfg
+// probe starts running. While a blocker holds, the countdown is pinned just
+// below the timeout, so this lead also keeps the probe alive the whole time a
+// video holds its wake lock; the fresh answers are what let the dimmer tell a
+// real blocker from a stale one.
+const DISPLAY_PROBE_LEAD_SECONDS: u32 = 5;
 // Gamepad polling cadence while the dimmer is enabled. Controllers are polled
 // at a low rate (not every 16 ms tick) so the DirectInput enumeration stays
 // cheap; 100 ms keeps the idle timer accurate without a busy loop.
@@ -787,6 +793,23 @@ fn idle_breakdown() -> (u32, u32) {
 fn idle_seconds() -> u32 {
     let (kb_mouse_idle, gamepad_idle) = idle_breakdown();
     kb_mouse_idle.min(gamepad_idle)
+}
+
+// Effective idle countdown the dim gate compares against a monitor's timeout.
+// While a blocker (fullscreen app or display power request) holds, the
+// countdown is pinned just below the timeout: the blocker clearing then
+// restarts the wait from zero rather than dimming instantly off a stale idle
+// value (a video that buffered while the user was away used to dim the moment
+// its wake lock dropped). The pin also keeps a blocked monitor from ever
+// satisfying the gate, so the loop body no longer tests the blockers directly.
+// With no blocker the raw idle applies, clamped by the time since the last
+// blocker cleared, so real input resets still win through the min().
+fn dim_countdown_seconds(idle: u32, timeout: u32, blocked: bool, since_clear: u32) -> u32 {
+    if blocked {
+        idle.min(timeout.saturating_sub(1))
+    } else {
+        idle.min(since_clear)
+    }
 }
 
 // One entry of the DISPLAY section emitted by powercfg /requests: the holder
@@ -1352,6 +1375,13 @@ fn dim_watcher_loop() {
     let mut last_idle_diag =
         std::time::Instant::now() - std::time::Duration::from_secs(5);
     let mut gamepad_active = false;
+    // Per-monitor re-baselined countdowns from the previous tick, consumed by
+    // the request-probe gate below and the diagnostics snapshot.
+    let mut dim_idle_baseline: HashMap<String, u64> = HashMap::new();
+    // When each monitor's blocker last held. Updated on every blocked tick, so
+    // the countdown restarts from the last blocked tick when the blocker
+    // clears; absent for a monitor that was never blocked.
+    let mut blocker_last_seen: HashMap<String, std::time::Instant> = HashMap::new();
 
     while !DIM_SHUTDOWN.load(Ordering::Acquire) {
         let enabled = DIM_ENABLED.load(Ordering::Acquire);
@@ -1416,11 +1446,15 @@ fn dim_watcher_loop() {
             last_fullscreen_check = now;
         }
 
+        // The per-monitor countdowns are computed later in this loop (the
+        // monitor pass); this tick's probe gate and readout consume the
+        // previous tick's map, which is at most 16 ms stale.
         let idle = idle_seconds();
         let currently_dimmed = levels.values().any(|level| *level < 1000);
         // The powercfg request probe is system-wide, so it only needs to
         // know whether ANY monitor is close to its own dim timeout. Use the
-        // shortest effective timeout across connected monitors.
+        // shortest effective timeout across connected monitors, with the same
+        // floor the dim gate applies so the two thresholds agree.
         let min_timeout = monitors
             .iter()
             .filter(|m| !m.device_name.is_empty())
@@ -1429,6 +1463,7 @@ fn dim_watcher_loop() {
                     .get(&monitor_profile_key(m))
                     .map(|p| p.seconds)
                     .unwrap_or(DEFAULT_SCREEN_PROTECTOR_SECONDS)
+                    .max(MIN_SCREEN_PROTECTOR_SECONDS)
             })
             .min()
             .unwrap_or(DEFAULT_SCREEN_PROTECTOR_SECONDS);
@@ -1454,8 +1489,17 @@ fn dim_watcher_loop() {
             );
             last_idle_diag = now;
         }
+        // Gate on the re-baselined countdowns: a blocker pins them just
+        // below the timeout, so the probe keeps running while a video holds
+        // the wake lock and the user stays away, instead of arming only one
+        // second before an unblocked crossing (which let a stale empty probe
+        // answer dim the screen during the helper round trip). The lead gives
+        // a slow helper round trip time to land before the countdown crosses.
         let request_check_needed = enabled
-            && (idle.saturating_add(1) >= min_timeout || currently_dimmed);
+            && (dim_idle_baseline.values().any(|countdown| {
+                countdown.saturating_add(u64::from(DISPLAY_PROBE_LEAD_SECONDS))
+                    >= u64::from(min_timeout)
+            }) || currently_dimmed);
         // A readout is open: the diagnostics command sets this on every poll,
         // so the culprit appears the moment it exists instead of waiting for
         // the timer to near its end. With no readout open the flag stays
@@ -1511,11 +1555,27 @@ fn dim_watcher_loop() {
                 .unwrap_or_default();
             let current = levels.get(&key).copied().unwrap_or(1000);
             let fullscreen = fullscreen_by_monitor.get(&key).copied().unwrap_or(false);
-            let target = if enabled
-                && !fullscreen
-                && !display_request_active
-                && idle >= profile.seconds
-            {
+            // Re-baselined countdown for this monitor (dim_countdown_seconds):
+            // a blocked monitor is pinned below its timeout, so it cannot dim
+            // while the blocker holds, and the wait restarts at zero when the
+            // blocker clears instead of dimming instantly.
+            let blocked = fullscreen || display_request_active;
+            if blocked {
+                blocker_last_seen.insert(key.clone(), now);
+            }
+            // Same floor write_screen_protector_profile enforces, so a
+            // hand-edited config cannot drop the timeout to zero, where the
+            // blocked pin (timeout - 1) would reach zero and satisfy the gate
+            // while the blocker still holds.
+            let timeout = profile.seconds.max(MIN_SCREEN_PROTECTOR_SECONDS);
+            let since_clear = blocker_last_seen
+                .get(&key)
+                .map(|t| t.elapsed().as_secs().min(u32::MAX as u64) as u32)
+                .unwrap_or(u32::MAX);
+            let countdown =
+                dim_countdown_seconds(idle, timeout, blocked, since_clear);
+            dim_idle_baseline.insert(key.clone(), countdown as u64);
+            let target = if enabled && countdown >= timeout {
                 dim_level_for_opacity(profile.opacity)
             } else {
                 1000
@@ -1548,6 +1608,8 @@ fn dim_watcher_loop() {
         }
 
         transitions.retain(|key, _| seen.contains(key));
+        blocker_last_seen.retain(|key, _| seen.contains(key));
+        dim_idle_baseline.retain(|key, _| seen.contains(key));
         if next_levels != levels {
             levels = next_levels;
             // `true` restores all monitors whose fullscreen suppression just
@@ -1567,7 +1629,15 @@ fn dim_watcher_loop() {
                     .unwrap_or_else(|e| e.into_inner());
                 diag.enabled = enabled;
                 diag.dimmed = dimmed;
-                diag.idle_seconds = idle as u64;
+                // Report the re-baselined countdown closest to dimming (the
+                // blocked ones are pinned below their timeout), so the
+                // readout's "idle Xs of Ys" reflects what the dim gate
+                // actually compares instead of a blocker-skipped raw idle.
+                diag.idle_seconds = dim_idle_baseline
+                    .values()
+                    .copied()
+                    .min()
+                    .unwrap_or(idle as u64);
                 diag.timeout_seconds = min_timeout as u64;
                 diag.fullscreen_active = fullscreen_by_monitor.values().any(|f| *f);
                 diag.display_request_active = display_request_active;
@@ -1980,5 +2050,61 @@ mod tests {
     fn ignores_other_sections_culprits() {
         let output = "DISPLAY:\nNone\n\nSYSTEM:\n[PROCESS]\\foo.exe\nAudio\n";
         assert!(super::display_requests_from_powercfg_output(output).is_empty());
+    }
+
+    // The dim gate compares the re-baselined countdown against the timeout.
+    // While a blocker holds, the pin (timeout - 1) must never satisfy it, and
+    // after the blocker clears the countdown must restart near zero instead
+    // of dimming instantly off the idle time that piled up while blocked.
+    #[test]
+    fn blocked_countdown_never_reaches_timeout() {
+        // Idle far past the timeout with the blocker still holding (a video
+        // wake lock while the user is away).
+        let countdown = super::dim_countdown_seconds(600, 40, true, 0);
+        assert!(countdown < 40);
+        assert_eq!(countdown, 39);
+    }
+
+    #[test]
+    fn blocked_countdown_tracks_idle_below_the_pin() {
+        // Fresh idle time still shows through while blocked (small idle, so
+        // the pin at timeout - 1 is not what limits the countdown).
+        assert_eq!(super::dim_countdown_seconds(10, 40, true, 0), 10);
+    }
+
+    #[test]
+    fn blocker_clear_restarts_the_countdown() {
+        // The exact bug: idle piled up to 600 while a video held the display
+        // awake, the video buffered and dropped the wake lock, and the dim
+        // fired instantly. With the re-baseline, three seconds after the
+        // clear the countdown is still 3, far from the 40s timeout.
+        let countdown = super::dim_countdown_seconds(600, 40, false, 3);
+        assert_eq!(countdown, 3);
+        assert!(countdown < 40);
+    }
+
+    #[test]
+    fn dim_fires_again_after_the_full_timeout_from_the_clear() {
+        // Once the time since the blocker cleared reaches the timeout (and
+        // the user genuinely never touched anything), the dim applies again.
+        let countdown = super::dim_countdown_seconds(600, 40, false, 41);
+        assert!(countdown >= 40);
+    }
+
+    #[test]
+    fn unblocked_idle_without_a_prior_blocker_is_unchanged() {
+        // No blocker ever seen: the sentinel since_clear leaves raw idle
+        // intact, so the classic countdown behavior is preserved.
+        assert_eq!(
+            super::dim_countdown_seconds(35, 40, false, u32::MAX),
+            35
+        );
+    }
+
+    #[test]
+    fn real_input_reset_wins_over_the_blocker_clear() {
+        // Input during or after the block resets idle to 2; the countdown
+        // must take the smaller of idle and the since-clear clock.
+        assert_eq!(super::dim_countdown_seconds(2, 40, false, 100), 2);
     }
 }

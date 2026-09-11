@@ -27,6 +27,9 @@ write-fonts = { version = "0.41", features = ["read"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
+# Timestamp formatting for early_log's file logger (same crate+version the
+# log plugin uses internally, so early lines match the plugin's format).
+time = { version = "0.3", features = ["formatting", "macros"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-log = "2"
 tauri-plugin-autostart = "2"

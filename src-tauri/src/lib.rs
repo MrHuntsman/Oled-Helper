@@ -1,5 +1,6 @@
 mod config;
 mod display_info;
+mod early_log;
 mod explorer_hook;
 mod flyout_window;
 mod font_replacement;
@@ -676,6 +677,14 @@ async fn set_hdr_enhancement_mode(app: AppHandle, mode: String) -> Result<(), St
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Earliest possible file logging. The restart handoff (the replacement's
+    // parent wait and the single-instance lock race), the updater's apply
+    // child, and the watchdog children all run before the log plugin exists,
+    // and their records used to be lost, which is exactly what made the
+    // silent tray-restart failure of 2026-09-10 undiagnosable. The early
+    // logger appends to the same log file in the same format; setup() hands
+    // its global slot to the plugin via early_log::attach_plugin_logger.
+    early_log::init();
     // Portable-update handoff: a staged copy of the new exe was spawned with
     // --apply-update and is responsible for swapping the files and relaunching
     // once this process exits. Must run before any Tauri/WebView2 init.
@@ -959,37 +968,45 @@ pub fn run() {
             // persistent log the only evidence is whatever DevTools happened
             // to be open and scrolled to at the time. See log_frontend above
             // and the console bridge in main.js for how JS-side output gets in.
-            app.handle().plugin(
-                tauri_plugin_log::Builder::default()
-                    // The app's own modules keep full Trace (the Debug tab
-                    // and file log stay detailed), but everything else -
-                    // reqwest, hyper, tao's event-loop diagnostics, and the
-                    // rest of the dependency tree, is capped at Info so
-                    // library internals can't flood the log with per-request
-                    // noise. That flood was filling files to the rotation cap
-                    // in minutes during dev ("just a few lines" repeated
-                    // thousands of times).
-                    .level(log::LevelFilter::Info)
-                    .level_for("app_lib", log::LevelFilter::Trace)
-                    .max_file_size(5_000_000)
-                    // Keep the newest 5 rotated archives; the plugin prunes
-                    // older ones on startup and rotation, so the logs folder
-                    // stays bounded instead of accumulating every 5 MB file
-                    // forever (KeepAll left ~160 MB of backlog).
-                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
-                    // The same logger record is fanned out to terminal, file,
-                    // and the frontend event consumed by main.js. Keeping one
-                    // logger target set prevents the three views from drifting.
-                    .target(tauri_plugin_log::Target::new(
-                        tauri_plugin_log::TargetKind::Webview,
-                    ))
-                    // Captures records emitted before the WebView attaches its
-                    // listener, for the startup replay in main.js.
-                    .target(tauri_plugin_log::Target::new(
-                        tauri_plugin_log::TargetKind::Dispatch(log_history::fern_dispatch()),
-                    ))
-                    .build(),
-            )?;
+            // split() assembles the plugin's full logger (every target and
+            // filter below) WITHOUT installing it into the global log slot,
+            // which early_log has owned since the top of run().
+            // attach_plugin_logger fills the early logger's delegate with the
+            // assembled one, so pre-Tauri records and plugin records share
+            // one slot with no gap and no duplicated lines. The plugin must
+            // not be built with .build() here, that would try to install a
+            // second global logger and fail.
+            let (log_plugin, log_max_level, log_logger) = tauri_plugin_log::Builder::default()
+                // The app's own modules keep full Trace (the Debug tab
+                // and file log stay detailed), but everything else -
+                // reqwest, hyper, tao's event-loop diagnostics, and the
+                // rest of the dependency tree, is capped at Info so
+                // library internals can't flood the log with per-request
+                // noise. That flood was filling files to the rotation cap
+                // in minutes during dev ("just a few lines" repeated
+                // thousands of times).
+                .level(log::LevelFilter::Info)
+                .level_for("app_lib", log::LevelFilter::Trace)
+                .max_file_size(5_000_000)
+                // Keep the newest 5 rotated archives; the plugin prunes
+                // older ones on startup and rotation, so the logs folder
+                // stays bounded instead of accumulating every 5 MB file
+                // forever (KeepAll left ~160 MB of backlog).
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                // The same logger record is fanned out to terminal, file,
+                // and the frontend event consumed by main.js. Keeping one
+                // logger target set prevents the three views from drifting.
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Webview,
+                ))
+                // Captures records emitted before the WebView attaches its
+                // listener, for the startup replay in main.js.
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Dispatch(log_history::fern_dispatch()),
+                ))
+                .split(app.handle())?;
+            early_log::attach_plugin_logger(log_max_level, log_logger);
+            app.handle().plugin(log_plugin)?;
 
             // The hidden-tray confirmation is a second small Tauri WebviewWindow
             // ("flyout", see tauri.conf.json + flyout_window.rs) rendering the
