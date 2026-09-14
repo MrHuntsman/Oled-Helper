@@ -251,6 +251,14 @@ try {
   }).catch((e) => console.error('[startup] preload failed', e)).finally(() => {
     mount(App, { target });
     document.addEventListener('contextmenu', e => { if (!debugSettings.contextMenuEnabled) e.preventDefault(); });
+    // The main webview is torn down while the app sits in the tray so WebView2
+    // can release its memory, and global hotkeys are performed in Rust for as
+    // long as it is gone (see src-tauri/src/main_window.rs). Mounting attaches
+    // the listeners those hotkeys answer to, so this is the point to hand them
+    // back: anything emitted before this call would arrive with nothing
+    // listening. A failure is not fatal - Rust keeps handling the hotkeys until
+    // a later reload reports in.
+    invoke('main_frontend_ready').catch(() => {});
   });
 } catch (e) {
   console.error('OLED Helper mount failed:', e);

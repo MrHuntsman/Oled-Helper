@@ -10,9 +10,11 @@ mod gamma_ramp;
 mod gamma_watch;
 mod hdr_toggle;
 mod helper;
+mod hotkey_actions;
 mod hotkeys;
 mod input_monitor;
 mod key_observer;
+mod main_window;
 mod monitors;
 mod power;
 mod process;
@@ -22,6 +24,7 @@ mod tray_balloon;
 mod tray_menu_window;
 mod updater;
 mod vendor_info;
+mod webview_env;
 mod window_icon;
 
 use std::collections::HashMap;
@@ -429,15 +432,25 @@ fn get_display_target() -> Option<display_info::DisplayTargetInfo> {
 // on window focus.
 #[tauri::command]
 fn is_main_window_visible(app: AppHandle) -> bool {
-    app.get_webview_window("main")
+    main_window::window(&app)
         .map(|window| {
             window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
         })
         .unwrap_or(false)
 }
 
+// The rebuilt main frontend reports in here once its event listeners are
+// attached, which is what hands the global hotkeys back to it. Until then
+// hotkeys::handle_hotkey performs them in Rust (hotkey_actions): an event
+// emitted into a webview that is still loading would just be lost, and the
+// renderer suspension that hid the window may still be in effect.
+#[tauri::command]
+fn main_frontend_ready() {
+    hotkeys::set_frontend_alive(true);
+}
+
 pub(crate) fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = main_window::window(app) {
         let is_minimized = window.is_minimized().unwrap_or(false);
         let is_visible = window.is_visible().unwrap_or(false);
 
@@ -446,6 +459,7 @@ pub(crate) fn show_main_window(app: &AppHandle) {
         // runs. Visibility and minimized state are the reliable toggle inputs.
         if is_visible && !is_minimized {
             if window.minimize().is_ok() {
+                webview_env::set_inactive(app, "main");
                 let _ = app.emit(
                     "window-visibility",
                     serde_json::json!({ "visible": false, "animated": false }),
@@ -454,21 +468,11 @@ pub(crate) fn show_main_window(app: &AppHandle) {
             return;
         }
 
-        if is_minimized {
-            let _ = window.unminimize();
-        }
-        if window.show().is_ok() {
-            let _ = window.set_focus();
-            // animated = the window was minimized, so restoring replays the
-            // Windows restore animation; a merely-hidden window (close-to-tray)
-            // appears instantly. The frontend uses this to decide whether the
-            // Text tab's native preview must wait out the animation before
-            // showing.
-            let _ = app.emit(
-                "window-visibility",
-                serde_json::json!({ "visible": true, "animated": is_minimized }),
-            );
-        }
+        // Hidden (or minimized): show it again. main_window::reveal also
+        // rebuilds the webview when the tray teardown took it away, and does
+        // the rebuild off this thread because add_child waits on main-thread
+        // work of its own.
+        main_window::reveal(app);
     }
 }
 
@@ -752,9 +756,11 @@ pub fn run() {
     // normal launch may immediately hand off to an elevated child for the
     // Screen Dimmer or the always-elevated setting, so checking this later
     // would let every launch create another replacement process. Restart
-    // children reach this point only after their old parent has exited, so
-    // they can safely acquire the lock instead of skipping it.
-    if !process::acquire_single_instance(process::APP_IDENTIFIER) {
+    // children reach this point only after their old parent has exited, and
+    // they retry the lock while that old instance finishes releasing its
+    // handles, so a deliberate handoff is never mistaken for a duplicate
+    // launch.
+    if !process::acquire_single_instance(process::APP_IDENTIFIER, is_restart_child) {
         return;
     }
 
@@ -896,10 +902,12 @@ pub fn run() {
             tray_menu_window::tray_menu_restart,
             tray_menu_window::tray_menu_quit,
             tray_menu_window::tray_menu_debug,
+            tray_menu_window::tray_menu_set_keep_warm,
             tray_menu_window::tray_menu_hdr_report,
             tray_menu_window::tray_menu_set_expanded,
             quit_app,
             reset_tray_notice,
+            main_frontend_ready,
         ])
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -930,6 +938,15 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            // The main window is built here rather than declared in
+            // tauri.conf.json: it has to be a plain window with a webview we
+            // can add and drop on demand (see main_window), and Tauri would
+            // create a config-declared window as an inseparable
+            // WebviewWindow. Its size/position still come back across launches
+            // through the window-state plugin, which is registered at the
+            // builder level above so it sees this window too.
+            main_window::create(app.handle())?;
+
             // Watch for a second launch: when another instance starts (the
             // single-instance mutex already existed) it signals the named
             // event and exits; this thread brings the main window forward
@@ -1018,6 +1035,7 @@ pub fn run() {
             // pre-warmed: their first status reads (taskbar dimmer, etc.)
             // must see the saved values, not the state defaults.
             let saved_config = config::load_config(app.handle().clone());
+            tray_menu_window::set_keep_tray_menu_warm(saved_config.keep_tray_menu_warm);
 
             // Seed the backend's global gamma fallback before the screen-
             // protector worker starts. Per-monitor Black Crush profiles are
@@ -1238,16 +1256,27 @@ pub fn run() {
             }
 
             // Custom CSS tray popup (test replacement for the native menu on
-            // right-click). Pre-warm it after overlay creation so the initial
-            // snapshot contains the correct availability state.
-            tray_menu_window::prewarm(app.handle());
-            log::info!("[tray] custom tray menu window ready");
+            // right-click). Only pre-warm it when the user opted into the
+            // fast-first-open tradeoff. Otherwise it is created lazily on the
+            // first tray-menu click and then released after the idle timeout.
+            if saved_config.keep_tray_menu_warm {
+                tray_menu_window::prewarm(app.handle());
+            } else {
+                log::info!("[tray] custom tray menu will be created on first use");
+            }
+            tray_menu_window::start_idle_destroyer(app.handle());
+            log::info!("[tray] custom tray menu ready");
+
+            // Keeps every window's WebView2 memory policy in step with its
+            // visibility (Low target level, and a suspended renderer, while
+            // hidden), see webview_env.
+            webview_env::start_policy(app.handle().clone());
 
             // Tauri's runtime window icon (titlebar/taskbar while running) is blurry
             // on Windows, it sets HICON from raw RGBA instead of reading per-size
             // frames from icon.ico like Explorer does. Fix it manually.
             #[cfg(target_os = "windows")]
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = main_window::window(app.handle()) {
                 if let Ok(hwnd) = window.hwnd() {
                     let hwnd_raw = hwnd.0 as isize;
                     if let Err(error) =
@@ -1323,6 +1352,8 @@ pub fn run() {
                         }
                     }
                     if hidden {
+                        // Hidden in the tray: hand the webview's memory back.
+                        webview_env::set_inactive(window.app_handle(), "main");
                         // First close-to-tray ever: tell the user the app is
                         // still running in the tray.
                         show_tray_notice(window.app_handle());
@@ -1332,10 +1363,32 @@ pub fn run() {
                         // shutdown so NVAPI can initialize lazily again
                         // when the window is shown.
                         vendor_info::release_for_tray();
+                        // Tell the frontend it is hidden while it is still
+                        // listening (it unmounts the tab content and drops the
+                        // Text preview); the teardown below closes its webview
+                        // for good, so this is the last event it receives.
                         let _ = window.app_handle().emit(
                             "window-visibility",
                             serde_json::json!({ "visible": false, "animated": false }),
                         );
+                        // Hidden in the tray is the app's idle state, so this is
+                        // where the webviews are torn down (see main_window):
+                        // dropping them is the only way WebView2's browser and
+                        // GPU processes, and the hundreds of MB they hold, are
+                        // released. The window itself stays, so hotkeys, the
+                        // subclass, the icon and the geometry all survive; a
+                        // click on the tray icon rebuilds the webview and the
+                        // frontend boots from the persisted config.
+                        //
+                        // On its own thread: this runs inside the close
+                        // handler, and destroying the other windows plus
+                        // closing the webview is not something to do re-entrant
+                        // with this one's message. Hotkeys were already handed
+                        // over to hotkey_actions (main_window::tear_down sets
+                        // that first), so nothing depends on the frontend until
+                        // it is rebuilt and reports back in.
+                        let teardown_app = window.app_handle().clone();
+                        std::thread::spawn(move || main_window::tear_down(&teardown_app));
                     } else {
                         // Leave the window fully visible with its content
                         // intact: far better than a blank window. The user
@@ -1345,11 +1398,17 @@ pub fn run() {
                         );
                     }
                 }
-                tauri::WindowEvent::Destroyed => {
+                tauri::WindowEvent::Destroyed if window.label() == main_window::LABEL => {
                     // Closing the main window hides it to the tray rather than
                     // destroying it. When it is actually destroyed (real exit),
                     // request a synchronous worker shutdown so the display
                     // ramp is reset before the process exits.
+                    //
+                    // The label guard matters: the tray and flyout popups ARE
+                    // destroyed for real when the app goes idle in the tray
+                    // (see main_window::tear_down), and tearing the app's
+                    // workers down with them would kill hotkeys, the dimmer and
+                    // the gamma safety thread on the way into the tray.
                     taskbar_dimmer::shutdown();
                     hotkeys::shutdown();
                     power::shutdown();

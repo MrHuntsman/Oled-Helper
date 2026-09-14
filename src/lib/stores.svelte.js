@@ -512,7 +512,26 @@ function currentScreenDimmerProfile() {
 // only the flags below are persisted.
 export const appSettings = $state({
   skipFavoriteConfirmation: false,
+  // Keep the custom tray menu WebView2 alive for instant first open. Off by
+  // default because the warm menu retains browser/GPU memory while hidden.
+  keepTrayMenuWarm: false,
 });
+
+export async function setKeepTrayMenuWarm(enabled) {
+  const previous = appSettings.keepTrayMenuWarm;
+  appSettings.keepTrayMenuWarm = Boolean(enabled);
+  try {
+    await invoke('tray_menu_set_keep_warm', { enabled: appSettings.keepTrayMenuWarm });
+    await saveConfig();
+  } catch (e) {
+    appSettings.keepTrayMenuWarm = previous;
+    console.warn('[settings] tray menu warm setting failed', e);
+  }
+}
+
+export async function toggleKeepTrayMenuWarm() {
+  await setKeepTrayMenuWarm(!appSettings.keepTrayMenuWarm);
+}
 
 // Debug-tab logging switches, independent of each other:
 //   verbosePeriodic: vendor/EDID detailed diagnostics (set_detailed_logging)
@@ -1266,6 +1285,9 @@ export async function loadConfig(prefetchedCfg = null) {
     if (cfg && typeof cfg.screen_protector_fullscreen_detection === 'boolean') {
       screenDimmer.fullscreenDetection = cfg.screen_protector_fullscreen_detection;
     }
+    if (cfg && typeof cfg.keep_tray_menu_warm === 'boolean') {
+      appSettings.keepTrayMenuWarm = cfg.keep_tray_menu_warm;
+    }
     if (cfg && typeof cfg.skip_favorite_confirmation === 'boolean') {
       appSettings.skipFavoriteConfirmation = cfg.skip_favorite_confirmation;
     }
@@ -1455,6 +1477,7 @@ export function saveConfig() {
     screen_protector_fullscreen_detection: primaryScreenDimmerProfile?.fullscreenDetection ?? screenDimmer.fullscreenDetection,
     screen_dimmer_profiles: { ...screenDimmerProfiles },
     skip_favorite_confirmation: appSettings.skipFavoriteConfirmation,
+    keep_tray_menu_warm: appSettings.keepTrayMenuWarm,
     // The flat legacy fields stay in sync with the PRIMARY monitor's profile
     // (the tray menu, which has no monitor selector, reads these as its
     // fallback and the backend seeds the primary from them at startup). The
@@ -1739,6 +1762,10 @@ function scheduleDimmerAvailabilityRecheck(attemptsLeft, epoch) {
 export async function restoreAllDefaults() {
   const defaults = await invoke('reset_config');
   await loadConfig(defaults);
+  // Keep the native tray lifecycle in sync with the reset config. This also
+  // releases an already hidden warm menu immediately instead of waiting for
+  // its idle timer.
+  await setKeepTrayMenuWarm(false);
   crush.squareCounts = { black: 12, highNits: 8 };
   crush.highNitsMin = HIGH_NITS_DEFAULT_MIN;
   crush.highNitsMax = HIGH_NITS_DEFAULT_MAX;

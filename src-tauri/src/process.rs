@@ -90,6 +90,14 @@ pub(crate) fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
         "restart handoff: replacement spawned; this instance is exiting"
     );
 
+    // Release the single-instance lock now that the replacement is running.
+    // The named mutex lives until this process's kernel handles are closed,
+    // which lags the exit code the replacement polls, so a restart child
+    // probing the lock in that window saw "already running" and exited,
+    // leaving no app behind. Handing the lock over explicitly removes the
+    // race; the retry in acquire_single_instance is the safety net.
+    release_single_instance();
+
     crate::taskbar_dimmer::shutdown();
     crate::shutdown_gamma_worker(app);
     // Spawn the replacement before leaving the event loop so the next process
@@ -341,7 +349,6 @@ pub(crate) fn spawn_elevated(extra_args: &[String]) -> Result<(), String> {
 // login/autostart launches where stealing focus would be wrong.
 #[cfg(target_os = "windows")]
 pub(crate) fn grab_foreground_after_restart(app: AppHandle) {
-    use tauri::Manager;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
@@ -352,7 +359,7 @@ pub(crate) fn grab_foreground_after_restart(app: AppHandle) {
         SWP_SHOWWINDOW, SW_RESTORE,
     };
 
-    let Some(window) = app.get_webview_window("main") else {
+    let Some(window) = crate::main_window::window(&app) else {
         log::warn!("foreground grab skipped: main window is missing");
         return;
     };
@@ -458,10 +465,26 @@ pub(crate) fn grab_foreground_after_restart(_app: AppHandle) {}
 // tauri.conf.json's "identifier".
 pub(crate) const APP_IDENTIFIER: &str = "OledHelper";
 
+// Raw handle values, 0 when unset. Atomics rather than OnceLock because a
+// restarting instance hands the mutex over explicitly: the handle has to be
+// closable, and forgettable, before the process ends.
 #[cfg(target_os = "windows")]
-static SINGLE_INSTANCE_MUTEX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SINGLE_INSTANCE_MUTEX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(target_os = "windows")]
-static SINGLE_INSTANCE_EVENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SINGLE_INSTANCE_EVENT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// How long a restart child keeps retrying the single-instance lock while the
+// old instance finishes releasing its kernel handles. Bounded so a genuinely
+// running instance (a second launch racing the restart) still wins.
+#[cfg(target_os = "windows")]
+const RESTART_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(target_os = "windows")]
+const RESTART_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(target_os = "windows")]
+use std::sync::atomic::Ordering;
 
 // SeSecurityPrivilege is required to attach a SACL (the Medium integrity
 // label below) to a newly created kernel object. It sits disabled in an
@@ -625,19 +648,112 @@ fn permissive_security(with_sacl: bool) -> Option<Box<PermissiveSecurity>> {
     }
 }
 
+// One CreateMutexW attempt with the permissive descriptor, falling back to a
+// descriptor without the SACL. Returns the handle plus whether the mutex
+// already existed, or None when the lock cannot be created at all (the caller
+// then fails open).
+//
+// GetLastError() is captured immediately after each CreateMutexW call, with
+// nothing in between: CreateMutexW returns a valid, non-null handle whether it
+// created a NEW mutex or opened an EXISTING one, and ERROR_ALREADY_EXISTS is
+// the only signal that distinguishes the two. Reading it after the match (as
+// this used to) left room for other calls, including ones the windows crate's
+// own Result handling can make, to overwrite the thread's last-error value
+// first, which silently turned "already running" into "primary instance" and
+// let duplicate windows open.
+#[cfg(target_os = "windows")]
+unsafe fn create_instance_mutex(
+    name: windows::core::PCWSTR,
+    with_sacl: Option<&PermissiveSecurity>,
+) -> Option<(windows::Win32::Foundation::HANDLE, bool)> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    let create_result = CreateMutexW(
+        with_sacl.map(|security| &security.attributes as *const _),
+        false,
+        name,
+    );
+    if let Ok(mutex) = create_result {
+        return Some((mutex, GetLastError() == ERROR_ALREADY_EXISTS));
+    }
+    let without_sacl = permissive_security(false);
+    match CreateMutexW(
+        without_sacl
+            .as_ref()
+            .map(|security| &security.attributes as *const _),
+        false,
+        name,
+    ) {
+        Ok(mutex) => Some((mutex, GetLastError() == ERROR_ALREADY_EXISTS)),
+        Err(error) => {
+            // Fail open: an unusable lock must not block startup.
+            log::warn!(
+                "single-instance mutex creation failed ({error}); continuing without a single-instance lock"
+            );
+            None
+        }
+    }
+}
+
+// Creates the named event the single-instance watcher thread waits on. Shared
+// by the normal primary path and by a restart child that takes the lock over
+// after a retry, so both set up exactly the same signal.
+#[cfg(target_os = "windows")]
+unsafe fn create_watcher_event(name: windows::core::PCWSTR, with_sacl: Option<&PermissiveSecurity>) {
+    use windows::Win32::System::Threading::CreateEventW;
+
+    match CreateEventW(
+        with_sacl.map(|security| &security.attributes as *const _),
+        true,
+        false,
+        name,
+    ) {
+        Ok(event) => {
+            SINGLE_INSTANCE_EVENT.store(event.0 as usize, Ordering::Release);
+        }
+        Err(error) => {
+            log::warn!(
+                "single-instance event creation failed ({error}); running instances can still be detected but not woken"
+            );
+        }
+    }
+}
+
+// Wakes the primary instance through the named event so it shows its window.
+// Used when this process turns out to be a duplicate launch.
+#[cfg(target_os = "windows")]
+unsafe fn wake_running_instance(name: windows::core::PCWSTR) {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+
+    match CreateEventW(None, true, false, name) {
+        Ok(event) => {
+            let _ = SetEvent(event);
+            let _ = CloseHandle(event);
+        }
+        Err(_) => log::warn!("could not open single-instance event to wake the running instance"),
+    }
+}
+
 // Returns true when this process is the primary instance and startup should
 // continue; false when another instance already holds the lock (the caller
 // must exit, the running instance has already been told to show itself).
 // Runs before any Tauri/WebView2 initialization so a duplicate launch exits
-// without flashing a window. Skipped entirely by restart children: the old
-// instance is still alive mid-shutdown and still holds the lock, so a
-// restart child taking it would see "already running" and exit instead of
-// taking over (the same reason the plugin was skipped for them).
+// without flashing a window.
+//
+// Restart children (tray Restart, elevated UAC relaunch) pass restart_child
+// true. Their old instance releases the lock explicitly, but the named mutex
+// can still be alive for a moment after the exit code the child waited on
+// became readable, because a process's kernel handles are closed after its
+// exit code is set. Treating that window as "another instance is already
+// running" is what closed the app with no replacement, so those children
+// retry the lock instead of exiting, and only fall back to the duplicate
+// launch path when something is still holding it after the timeout.
 #[cfg(target_os = "windows")]
-pub(crate) fn acquire_single_instance(identifier: &str) -> bool {
+pub(crate) fn acquire_single_instance(identifier: &str, restart_child: bool) -> bool {
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_ALREADY_EXISTS};
-    use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, SetEvent};
+    use windows::Win32::Foundation::CloseHandle;
 
     let mutex_w: Vec<u16> = format!("{identifier}-sim")
         .encode_utf16()
@@ -656,82 +772,74 @@ pub(crate) fn acquire_single_instance(identifier: &str) -> bool {
         // creator's objects default to the Medium label anyway.
         enable_security_privilege();
         let with_sacl = permissive_security(true);
-        // GetLastError() must be captured immediately after each CreateMutexW
-        // call, with nothing in between: CreateMutexW returns a valid,
-        // non-null handle whether it created a NEW mutex or opened an
-        // EXISTING one, and ERROR_ALREADY_EXISTS is the only signal that
-        // distinguishes the two. Reading it after the match (as this used
-        // to) left room for other calls - including ones the windows
-        // crate's own Result handling can make - to overwrite the thread's
-        // last-error value first, which silently turned "already running"
-        // into "primary instance" and let duplicate windows open.
-        let create_result = CreateMutexW(
-            with_sacl.as_ref().map(|s| &s.attributes as *const _),
-            false,
-            name(&mutex_w),
-        );
-        let mut already_existed = GetLastError() == ERROR_ALREADY_EXISTS;
-        let mutex = match create_result {
-            Ok(mutex) => mutex,
-            Err(_) => {
-                let without_sacl = permissive_security(false);
-                let create_result = CreateMutexW(
-                    without_sacl.as_ref().map(|s| &s.attributes as *const _),
-                    false,
-                    name(&mutex_w),
-                );
-                already_existed = GetLastError() == ERROR_ALREADY_EXISTS;
-                match create_result {
-                    Ok(mutex) => mutex,
-                    Err(error) => {
-                        // Fail open: an unusable lock must not block startup.
-                        log::warn!(
-                            "single-instance mutex creation failed ({error}); continuing without a single-instance lock"
-                        );
-                        return true;
-                    }
-                }
+        let deadline = std::time::Instant::now() + RESTART_LOCK_MAX_WAIT;
+        let mut waiting_logged = false;
+        loop {
+            let Some((mutex, already_existed)) =
+                create_instance_mutex(name(&mutex_w), with_sacl.as_deref())
+            else {
+                // Fail open: an unusable lock must not block startup.
+                return true;
+            };
+            if !already_existed {
+                // Primary instance: keep the mutex for the process lifetime
+                // (the handle closes automatically when the process exits,
+                // releasing the lock) and create the event the watcher thread
+                // will wait on.
+                SINGLE_INSTANCE_MUTEX.store(mutex.0 as usize, Ordering::Release);
+                create_watcher_event(name(&event_w), with_sacl.as_deref());
+                log::info!("single-instance lock acquired");
+                return true;
             }
-        };
-        if already_existed {
-            // Second instance: wake the primary through the named event,
-            // then exit without creating any window.
-            if let Ok(event) = CreateEventW(None, true, false, name(&event_w)) {
-                let _ = SetEvent(event);
-                let _ = CloseHandle(event);
-            } else {
-                log::warn!("could not open single-instance event to wake the running instance");
-            }
+            // The mutex already exists: either a real second launch, or a
+            // restart whose old instance has not finished releasing its
+            // handles. The handle opened above belongs to this process now,
+            // so close it before retrying.
             let _ = CloseHandle(mutex);
-            log::info!("another instance is already running; exiting");
-            return false;
-        }
-        // Primary instance: keep the mutex for the process lifetime (the
-        // handle closes automatically when the process exits, releasing the
-        // lock) and create the event the watcher thread will wait on.
-        let _ = SINGLE_INSTANCE_MUTEX.set(mutex.0 as usize);
-        let event = match CreateEventW(
-            with_sacl.as_ref().map(|s| &s.attributes as *const _),
-            true,
-            false,
-            name(&event_w),
-        ) {
-            Ok(event) => event,
-            Err(error) => {
-                log::warn!(
-                    "single-instance event creation failed ({error}); running instances can still be detected but not woken"
-                );
-                HANDLE::default()
+            if !restart_child || std::time::Instant::now() >= deadline {
+                if restart_child {
+                    log::error!(
+                        "restart child could not take the single-instance lock within {:?}; treating this as a duplicate launch",
+                        RESTART_LOCK_MAX_WAIT
+                    );
+                }
+                let _ = wake_running_instance(name(&event_w));
+                log::info!("another instance is already running; exiting");
+                return false;
             }
-        };
-        let _ = SINGLE_INSTANCE_EVENT.set(event.0 as usize);
+            if !waiting_logged {
+                log::info!(
+                    "restart child waiting for the old instance to release the single-instance lock"
+                );
+                waiting_logged = true;
+            }
+            std::thread::sleep(RESTART_LOCK_RETRY_INTERVAL);
+        }
     }
-    log::info!("single-instance lock acquired");
-    true
+}
+
+// Hands the single-instance lock over to a replacement process during a
+// restart. The named mutex stays alive until every handle to it is closed, and
+// that teardown lags the exit code the replacement waits on, so a replacement
+// probing the lock in that window used to see ERROR_ALREADY_EXISTS and exit as
+// a duplicate launch, leaving no app running. This instance no longer needs
+// the lock once its replacement is spawned, so close it here and let the
+// replacement take over instead of racing this process's own teardown.
+#[cfg(target_os = "windows")]
+pub(crate) fn release_single_instance() {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+
+    let handle = SINGLE_INSTANCE_MUTEX.swap(0, Ordering::AcqRel);
+    if handle != 0 {
+        let _ = unsafe { CloseHandle(HANDLE(handle as *mut std::ffi::c_void)) };
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn acquire_single_instance(_identifier: &str) -> bool {
+pub(crate) fn release_single_instance() {}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn acquire_single_instance(_identifier: &str, _restart_child: bool) -> bool {
     true
 }
 
@@ -745,10 +853,10 @@ pub(crate) fn start_single_instance_watcher(app: AppHandle) {
     use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{ResetEvent, WaitForSingleObject, INFINITE};
 
-    let Some(event) = SINGLE_INSTANCE_EVENT.get().copied() else {
-        return; // not the primary instance (restart child) or event failed
-    };
-    if HANDLE(event as *mut std::ffi::c_void).is_invalid() {
+    let event = SINGLE_INSTANCE_EVENT.load(Ordering::Acquire);
+    if event == 0 {
+        // Not the primary instance (a restart child before it takes the lock
+        // over) or the event could not be created.
         return;
     }
     let result = std::thread::Builder::new()
@@ -838,6 +946,11 @@ pub(crate) fn wait_for_restart_parent(parent_pid: u32) -> bool {
             }
             if exit_code != STILL_ACTIVE.0 as u32 {
                 let _ = CloseHandle(handle);
+                // Milestone for diagnosing restarts: the wait is over. Its
+                // kernel handles can still be closing for a moment after the
+                // exit code appears, which is why the replacement retries the
+                // single-instance lock instead of trusting this point alone.
+                log::info!("restart parent {parent_pid} has exited; replacement proceeding");
                 return true;
             }
             if std::time::Instant::now() >= deadline {

@@ -232,6 +232,10 @@ pub struct AppConfig {
     // write this field.
     #[serde(default)]
     pub favorite_hotkey_slots: HashMap<String, String>,
+    // Whether the custom tray menu stays alive after it is hidden. Keeping it
+    // warm makes the first open fast, at the cost of its WebView2 memory.
+    #[serde(default)]
+    pub keep_tray_menu_warm: bool,
     // When enabled, only favorites that were explicitly confirmed on the
     // same monitor may skip the visible confirmation dialog. The crash-safe
     // recovery watchdog remains active regardless.
@@ -353,6 +357,7 @@ impl Default for AppConfig {
             hotkeys: HashMap::new(),
             favorite_display_modes: Vec::new(),
             favorite_hotkey_slots: HashMap::new(),
+            keep_tray_menu_warm: false,
             skip_favorite_confirmation: false,
         }
     }
@@ -671,6 +676,23 @@ mod tests {
         migrate_legacy_ease_duration("not json", &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
     }
+    #[test]
+    fn tray_menu_warm_setting_round_trip() {
+        let config = AppConfig {
+            keep_tray_menu_warm: true,
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.keep_tray_menu_warm);
+    }
+
+    #[test]
+    fn tray_menu_warm_setting_defaults_off_when_missing() {
+        let parsed: AppConfig = serde_json::from_str(r#"{"black_lift": 0.5}"#).unwrap();
+        assert!(!parsed.keep_tray_menu_warm);
+    }
+
     #[test]
     fn display_menu_prefs_round_trip() {
         let config = AppConfig {

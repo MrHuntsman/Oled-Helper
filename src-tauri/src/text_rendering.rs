@@ -434,7 +434,7 @@ fn log_smoothing_state(context: &str) {
 #[cfg(target_os = "windows")]
 mod native_preview {
     use std::sync::{Mutex, OnceLock};
-    use tauri::{AppHandle, Manager};
+    use tauri::AppHandle;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
@@ -725,8 +725,7 @@ mod native_preview {
     // to the same thread and waiting for it would deadlock until the timeout,
     // leaving the preview window uncreated or unpositioned.
     pub fn show(app: &AppHandle, mode: String, gamma: u32, contrast: u32) -> Result<(), String> {
-        let main = app
-            .get_webview_window("main")
+        let main = crate::main_window::window(app)
             .ok_or_else(|| "main window is unavailable".to_string())?;
         let parent = main
             .hwnd()
@@ -791,8 +790,7 @@ mod native_preview {
             .ok()
             .and_then(|current| current.as_ref().map(|value| HWND(value.hwnd as *mut std::ffi::c_void)));
         if let Some(hwnd) = hwnd {
-            let main = app
-                .get_webview_window("main")
+            let main = crate::main_window::window(app)
                 .ok_or_else(|| "main window is unavailable".to_string())?;
             let parent = main
                 .hwnd()

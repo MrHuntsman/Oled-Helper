@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_SHOWWINDOW,
 };
 
-const FLYOUT_LABEL: &str = "flyout";
+pub(crate) const FLYOUT_LABEL: &str = "flyout";
 // Matches Flyout.svelte's fixed .modal width (380px). Height is sized to the
 // modal's actual rendered content (title + up to 3-line description + error
 // row + buttons, 18px padding) rather than padded for slack: the window no
@@ -254,25 +254,15 @@ pub fn set_flyout_hdr(app: AppHandle, hdr: bool) {
 
 // Builds the flyout window if it doesn't already exist. Called eagerly from
 // setup() (see prewarm below) so the webview exists well before it's first
-// shown. Uses its own `data_directory` (a "flyout" subfolder next to the
-// main window's default WebView2 profile) so it gets its own WebView2
-// *environment* instead of sharing the main window's: the main window sets
-// `additionalBrowserArgs` (tauri.conf.json) and the flyout does not, and
-// creating a second webview with different browser args against the same
-// shared environment is a known Tauri/WebView2 issue that fails with
-// HRESULT 0x8007139F ("the group or resource is not in the correct state") ,
-// see tauri-apps/tauri#11144. A separate data_directory gives each webview
-// its own environment, avoiding the conflict entirely.
+// shown. Shares the main window's WebView2 environment (Tauri's default user
+// data directory plus the same browser arguments, see webview_env), which is
+// what keeps this window from costing a second browser process with its own
+// GPU/utility children and its own profile folder on disk.
 fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
         return Ok(window);
     }
     log::info!("[flyout] creating flyout window");
-    let data_dir = app
-        .path()
-        .app_local_data_dir()
-        .map(|dir| dir.join("webview-flyout"))
-        .ok();
     // Built 1px smaller than the real target size on purpose (see below).
     let mut builder =
         WebviewWindowBuilder::new(app, FLYOUT_LABEL, WebviewUrl::App("flyout.html".into()))
@@ -287,16 +277,12 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
             .visible(false)
             .focused(false)
             .center();
-    if let Some(dir) = data_dir {
-        builder = builder.data_directory(dir);
-    } else {
-        log::warn!("[flyout] could not resolve app_local_data_dir; flyout will share the main window's WebView2 environment");
+    // Must match the main window's arguments exactly: WebView2 only shares one
+    // environment (and so one browser process) between webviews whose browser
+    // arguments are identical, and refuses to share one when they differ.
+    if let Some(args) = crate::webview_env::shared_browser_args(app) {
+        builder = builder.additional_browser_args(&args);
     }
-    // This window has its own WebView2 environment (own data_directory), so
-    // it can take its own browser args. Cap the HTTP cache like the main
-    // window so the per-window profile folders stay bounded (~64 MB instead
-    // of growing to a few hundred MB of cache each).
-    builder = builder.additional_browser_args("--disk-cache-size=67108864");
     let window = builder
         .build()
         .map_err(|error| format!("could not create flyout window: {error}"))?;
@@ -391,6 +377,22 @@ fn reset_layout_ready() {
     }
 }
 
+/// Forgets both handshake signals when the flyout window is destroyed for the
+/// tray teardown (see main_window). They are sticky for the lifetime of the
+/// webview they describe, and a rebuilt flyout reports in again from scratch:
+/// a stale "ready" would let the first show skip the handshake and paint
+/// before the new page has rendered, which is the first-use bug this handshake
+/// exists to prevent.
+pub(crate) fn reset_session_state() {
+    let signals = flyout_signals();
+    if let Ok(mut ready) = signals.frontend_ready.lock() {
+        *ready = false;
+    }
+    if let Ok(mut ready) = signals.layout_ready.lock() {
+        *ready = false;
+    }
+}
+
 fn wait_for_signal(lock: &Mutex<bool>, changed: &Condvar, timeout: std::time::Duration) -> bool {
     let guard = match lock.lock() {
         Ok(guard) => guard,
@@ -441,6 +443,10 @@ fn prepare(app: &AppHandle, mode: &AppliedMode) -> Result<(), String> {
         let _ = window.destroy();
         window = get_or_create_window(app)?;
     }
+    // Resume the webview before the flyout-show event below: a suspended
+    // renderer cannot act on that event until it is resumed, and the layout
+    // handshake this show waits for depends on the frontend running.
+    crate::webview_env::set_active(app, FLYOUT_LABEL);
     reset_layout_ready();
     let (width_px, height_px, _) = size_and_position(app, &window);
     #[cfg(target_os = "windows")]
@@ -564,6 +570,11 @@ pub fn hide(app: &AppHandle) {
             }
         }
         let _ = window.hide();
+        // Only once the window is off screen: the policy mirrors this onto the
+        // webview's own visibility and suspends its renderer, and the next show
+        // resumes it. Doing it before the hide would suspend a window that is
+        // still visible for the remainder of this call.
+        crate::webview_env::set_inactive(app, FLYOUT_LABEL);
     }
     crate::taskbar_dimmer::set_flyout_hwnd(0);
     log::debug!("[flyout] hidden");
@@ -581,9 +592,22 @@ pub fn hide(app: &AppHandle) {
 #[tauri::command]
 pub fn flyout_hidden(app: AppHandle) {
     crate::taskbar_dimmer::set_flyout_hwnd(0);
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.emit("flyout-completed", ());
+    // This is the normal hide path (the frontend hides its own window and then
+    // reports it here), so give the hidden webview's memory back right away
+    // rather than waiting for the policy poll. Checked, not assumed: the
+    // frontend races win.hide() against an 800ms timeout, so an unusually slow
+    // hide can report this while the window is still on screen, and suspending
+    // a visible renderer would leave the flyout frozen. If it is still visible
+    // here, the poll or the backend hide() applies the policy later.
+    if let Some(window) = app.get_webview_window(FLYOUT_LABEL) {
+        if !window.is_visible().unwrap_or(false) {
+            crate::webview_env::set_inactive(&app, FLYOUT_LABEL);
+        }
     }
+    // Target the main window's webview by label; it is not a WebviewWindow any
+    // more (the window and its webview have separate lifetimes, see
+    // main_window), and it may not exist at all while the app is in the tray.
+    let _ = app.emit_to(crate::main_window::LABEL, "flyout-completed", ());
 }
 
 // Shows the flyout confirmation dialog centered on screen. Called from the

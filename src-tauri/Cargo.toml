@@ -30,7 +30,11 @@ log = "0.4"
 # Timestamp formatting for early_log's file logger (same crate+version the
 # log plugin uses internally, so early lines match the plugin's format).
 time = { version = "0.3", features = ["formatting", "macros"] }
-tauri = { version = "2", features = ["tray-icon"] }
+# "unstable" is required for the main window's detachable webview: the app
+# keeps one long-lived window and adds/removes the webview inside it to release
+# WebView2's memory while idle in the tray (see src/main_window.rs). Without it,
+# Manager::get_window / get_webview / Window::add_child are not compiled in.
+tauri = { version = "2", features = ["tray-icon", "unstable"] }
 tauri-plugin-log = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
@@ -46,3 +50,13 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 sha2 = "0.10"
 tauri-plugin-window-state = "2.4.1"
+
+# WebView2 memory policy (see src/webview_env.rs). Both crates are already in
+# the graph through wry/tauri-runtime-wry; depending on them directly pins the
+# COM types Tauri hands back from `PlatformWebview::controller()`, so no second
+# copy of webview2-com is pulled in. windows-core has to stay on the 0.61 line
+# the webview2-com crates use, not the 0.62 line the `windows` dependency
+# above uses, otherwise the COM interfaces and their traits do not unify.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows-core = "0.61"

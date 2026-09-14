@@ -4,7 +4,7 @@
   import tabDebugIcon from './icons/tab_debug.png?inline';
   import { isEnabled, enable, disable } from '@tauri-apps/plugin-autostart';
   import { onMount } from 'svelte';
-  import { app, appSettings, restoreAllDefaults, taskbarDimmer, setHoverDetection, setPollIntervalMs, TASKBAR_DIMMER_DEFAULTS } from './stores.svelte.js';
+  import { app, appSettings, restoreAllDefaults, taskbarDimmer, setHoverDetection, setPollIntervalMs, toggleKeepTrayMenuWarm, TASKBAR_DIMMER_DEFAULTS } from './stores.svelte.js';
   import ConfirmModal from './ConfirmModal.svelte';
 
   let startOnBoot = $state(false);
@@ -52,6 +52,10 @@
     }
   }
 
+  async function toggleTrayMenuWarm() {
+    await toggleKeepTrayMenuWarm();
+  }
+
   async function restoreDefaults() {
     if (startOnBoot) {
       try {
@@ -66,6 +70,7 @@
     // (debounced), so the reset survives a restart.
     setHoverDetection(TASKBAR_DIMMER_DEFAULTS.hoverDetection);
     setPollIntervalMs(TASKBAR_DIMMER_DEFAULTS.pollIntervalMs);
+    await import('./stores.svelte.js').then(({ setKeepTrayMenuWarm }) => setKeepTrayMenuWarm(false));
   }
 
   function openResetAllConfirm() {
@@ -148,7 +153,7 @@
     <img class="tab-icon" src={tabSystemIcon} alt="" />
     <h2>Settings</h2>
     <div class="tab-heading-spacer"></div>
-    <button class="restore-defaults-btn" onclick={() => restoreConfirmOpen = true} title="Resets the Start on Boot, Always open as administrator, trusted favorites and Detection Method options">↻ Restore Tab Defaults</button>
+    <button class="restore-defaults-btn" onclick={() => restoreConfirmOpen = true} title="Resets the Start on Boot, Always open as administrator, trusted favorites, tray menu behavior and Detection Method options">↻ Restore Tab Defaults</button>
   </div>
   <div class="separator"></div>
 
@@ -161,6 +166,16 @@
       {#if ready}
         <span class={`pill${startOnBoot ? '' : ' off'}`} aria-hidden="true"></span>
       {/if}
+    </div>
+  </button>
+
+  <button class="settings-row" onclick={toggleTrayMenuWarm}>
+    <div class="settings-row-text">
+      <span class="settings-row-label">Keep tray menu warm</span>
+      <span class="settings-row-desc">Keep the tray menu ready for a faster first open, at the cost of extra WebView2 GPU memory.</span>
+    </div>
+    <div class="pill-wrap">
+      <span class={`pill${appSettings.keepTrayMenuWarm ? '' : ' off'}`} aria-hidden="true"></span>
     </div>
   </button>
 
@@ -236,7 +251,7 @@
   {#if restoreConfirmOpen}
     <ConfirmModal
       title="Restore Settings defaults?"
-      desc="This resets the Start on Boot, trusted favorites and Detection Method options to their defaults."
+      desc="This resets the Start on Boot, trusted favorites, tray menu behavior and Detection Method options to their defaults."
       confirmLabel="Restore"
       onConfirm={restoreDefaults}
       onClose={() => restoreConfirmOpen = false} />

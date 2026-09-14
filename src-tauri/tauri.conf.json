@@ -10,20 +10,7 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "OLED Helper",
-        "width": 940,
-        "height": 700,
-        "minWidth": 600,
-        "minHeight": 400,
-        "resizable": true,
-        "fullscreen": false,
-        "shadow": false,
-        "additionalBrowserArgs": "--enable-hdr --enable-unsafe-webgpu --disk-cache-size=67108864"
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost; font-src 'self' data: https://fonts.gstatic.com; object-src 'none'; base-uri 'self'; form-action 'none'"
     }

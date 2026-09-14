@@ -3,8 +3,10 @@
 // Bindings are stored as strings in the config ("Ctrl+Alt+F9", or "None" for
 // unbound) and registered with RegisterHotKey on the main window. WM_HOTKEY
 // arrives through the window subclass installed in lib.rs and is dispatched
-// here as a "hotkey-pressed" event that the frontend turns into the actual
-// action (toggle black crush, step the level, flip the dimmer, toggle HDR, ...).
+// here either as a "hotkey-pressed" event that the frontend turns into the
+// actual action (toggle black crush, step the level, flip the dimmer, toggle
+// HDR, ...), or - while the main webview has been torn down to hand its
+// graphics memory back - as a direct call into hotkey_actions.
 //
 // Increase/decrease bindings are registered WITHOUT MOD_NOREPEAT so holding
 // the key auto-repeats WM_HOTKEY, giving hold-to-repeat for free.
@@ -12,7 +14,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tauri::{AppHandle, Emitter};
@@ -109,6 +111,29 @@ const HOLD_RESTORING: u32 = 2;
 // Private timer id; WM_TIMER wParam carries this value.
 const HOLD_TIMER_ID: usize = 0x4F48;
 const HOLD_TIMER_INTERVAL_MS: u32 = 40;
+
+// Whether the main window's frontend is alive to perform a hotkey action
+// itself. The actions are split between the frontend (the visible-window path,
+// where all the live per-monitor UI state lives) and hotkey_actions (the tray
+// path, once the main webview has been torn down to release its graphics
+// memory). Never set this to false without a working Rust implementation of
+// every binding in ACTIONS, or those hotkeys go silent in the tray.
+static FRONTEND_ALIVE: AtomicBool = AtomicBool::new(true);
+
+/// Set by the main webview's lifecycle (main_window): false once it has been
+/// torn down for the tray, true again once the rebuilt frontend is up. Logged
+/// on every change: which side performs the actions is invisible from the UI,
+/// so this is the line to check when a hotkey seems to do nothing or the UI
+/// looks out of step with the config.
+pub fn set_frontend_alive(alive: bool) {
+    if FRONTEND_ALIVE.swap(alive, Ordering::AcqRel) != alive {
+        if alive {
+            log::info!("[hotkeys] frontend is up: global hotkeys handed back to it");
+        } else {
+            log::info!("[hotkeys] frontend is gone: global hotkeys now run in Rust");
+        }
+    }
+}
 
 pub fn set_current_lift(lift: Arc<AtomicI32>) {
     let _ = CURRENT_LIFT.set(lift);
@@ -474,24 +499,38 @@ pub fn reset_hotkeys() -> Result<(), String> {
 // ── WM_HOTKEY dispatch (called from the window subclass on the main thread) ─
 
 pub fn handle_hotkey(id: i32) {
-    let Some((action, _, _)) = ACTIONS.iter().find(|(_, hk, _)| *hk == id) else {
-        // Favorite-slot actions beyond the static pool live in the dynamic id
-        // map; reverse-look up the action name and dispatch normally.
-        let action = DYNAMIC_IDS
-            .get()
-            .and_then(|map| map.lock().ok())
-            .and_then(|guard| guard.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()));
-        let Some(action) = action else {
-            return;
-        };
-        emit("hotkey-pressed", &action);
+    let Some(action) = action_for_id(id) else {
         return;
     };
     if id == HK_HOLD_COMPARE {
+        // Hold-to-compare is gamma state owned by this module, so it never
+        // needs the frontend and behaves identically either way.
         apply_hold_gamma();
-    } else {
-        emit("hotkey-pressed", action);
+        return;
     }
+    if FRONTEND_ALIVE.load(Ordering::Acquire) {
+        emit("hotkey-pressed", &action);
+        return;
+    }
+    // The main webview is gone (hidden in the tray with its memory handed
+    // back), so no listener would act on the event: perform it here.
+    if let Some(app) = APP.get() {
+        if !crate::hotkey_actions::dispatch(app, &action) {
+            log::warn!("[hotkey] no handler for '{action}' while the window is torn down");
+        }
+    }
+}
+
+fn action_for_id(id: i32) -> Option<String> {
+    if let Some((action, _, _)) = ACTIONS.iter().find(|(_, hk, _)| *hk == id) {
+        return Some((*action).to_string());
+    }
+    // Favorite-slot actions beyond the static pool live in the dynamic id
+    // map; reverse-look up the action name and dispatch normally.
+    DYNAMIC_IDS
+        .get()
+        .and_then(|map| map.lock().ok())
+        .and_then(|guard| guard.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()))
 }
 
 pub fn handle_timer(timer_id: usize) {

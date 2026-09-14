@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, LogicalSize, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -46,13 +46,14 @@ use windows::Win32::Graphics::Gdi::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, GWL_STYLE, IsWindowVisible, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-    WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    GetAncestor, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
+    GA_ROOT, GWL_EXSTYLE, GWL_STYLE, IsWindowVisible, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow,
+    SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
+    WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
-const LABEL: &str = "tray-menu";
+pub(crate) const LABEL: &str = "tray-menu";
 
 // Verbose tray lifecycle diagnostics for the open/hide/positioning paths.
 // These log many lines per interaction, so they are emitted only when the
@@ -85,6 +86,249 @@ static SUBMENU_EXPANDED: AtomicBool = AtomicBool::new(false);
 static MENU_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LAST_SHOW_AT_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_DISPLAY_CHANGE_MS: AtomicU64 = AtomicU64::new(0);
+
+// How long a hidden tray menu may keep its webview (renderer + its share of
+// Chromium's process set) after the last interaction. Hidden-but-alive costs
+// roughly the renderer's commit even with the memory policy suspending it,
+// and the suspension cannot touch the browser/GPU processes it pins; the only
+// real release is destruction. One slower first open after each destroy is
+// the price, same trade the tray teardown already makes for the main window.
+const IDLE_DESTROY_MS: u64 = 60_000;
+// Last time the menu was created, opened or asked to hide. The destroyer
+// measures against this so a click that lands while it is deciding wins.
+static LAST_USE_MS: AtomicU64 = AtomicU64::new(0);
+static KEEP_TRAY_MENU_WARM: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_keep_tray_menu_warm(enabled: bool) {
+    KEEP_TRAY_MENU_WARM.store(enabled, Ordering::Release);
+}
+
+pub(crate) fn keep_tray_menu_warm() -> bool {
+    KEEP_TRAY_MENU_WARM.load(Ordering::Acquire)
+}
+
+#[tauri::command]
+pub fn tray_menu_set_keep_warm(app: AppHandle, enabled: bool) {
+    set_keep_tray_menu_warm(enabled);
+    if enabled {
+        prewarm(&app);
+    } else if let Some(window) = app.get_webview_window(LABEL) {
+        if !native_window_visible(&window) && tray_phase() == TrayMenuPhase::Hidden {
+            if let Err(error) = window.destroy() {
+                log::warn!("[tray-menu] could not release the hidden tray menu: {error}");
+            } else {
+                log::info!("[tray-menu] warm tray menu disabled; hidden webview released");
+                reset_session_state();
+            }
+        }
+    }
+}
+
+fn touch_usage() {
+    LAST_USE_MS.store(now_ms(), Ordering::Release);
+}
+
+/// Starts the thread that destroys a tray-menu webview which has been hidden
+/// and untouched for IDLE_DESTROY_MS, so its memory is actually returned.
+/// Called once from setup(). The window is rebuilt on the next open; phase
+/// state is reset with it.
+pub(crate) fn start_idle_destroyer(app: &AppHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("tray-menu-idle-destroy".into())
+        .spawn({
+            let app = app.clone();
+            move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let Some(window) = app.get_webview_window(LABEL) else {
+                    continue; // nothing to release; rebuilt on the next open
+                };
+                if native_window_visible(&window) || tray_phase() != TrayMenuPhase::Hidden {
+                    // Open, mid-fade or mid-reveal: not idle in any way that
+                    // matters.
+                    continue;
+                }
+                if KEEP_TRAY_MENU_WARM.load(Ordering::Acquire) {
+                    continue;
+                }
+                let elapsed = now_ms().saturating_sub(LAST_USE_MS.load(Ordering::Acquire));
+                if elapsed < IDLE_DESTROY_MS {
+                    continue;
+                }
+                // A click may have landed between the checks above and here.
+                // The 3s grace window is far wider than any toggle path needs
+                // to reach the show, so a fresh interaction is never destroyed
+                // under the cursor.
+                if now_ms().saturating_sub(LAST_USE_MS.load(Ordering::Acquire)) < 3_000 {
+                    continue;
+                }
+                log::info!(
+                    "[tray-menu] hidden for {}s; releasing the tray menu webview (rebuilt on next open)",
+                    elapsed / 1000
+                );
+                if let Err(error) = window.destroy() {
+                    log::warn!("[tray-menu] idle destroy failed: {error}");
+                }
+                reset_session_state();
+            }
+        });
+    if let Err(error) = spawned {
+        log::warn!("[tray-menu] could not start the idle destroyer: {error}");
+    }
+}
+
+// Explicit lifecycle phase for the tray popup, tracked independently of
+// Win32's IsWindowVisible. The native HWND is "visible" (per Windows) both
+// while it is fading out after a hide request and while a deferred reveal
+// is settling off-screen after a display/resolution change, so a raw
+// visibility check cannot tell "really on screen" from "about to
+// appear/disappear". toggle() used to treat any visible HWND as open and
+// hide it, which meant a click landing during either transition was
+// silently swallowed by the wrong branch and needed a follow-up click to
+// reach the state the user actually wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayMenuPhase {
+    Hidden = 0,
+    // Native window shown (possibly off-screen) but not yet the final
+    // on-screen state the user asked for.
+    Revealing = 1,
+    Shown = 2,
+    // Hide requested; native window still on screen until the CSS fade
+    // completes and the delayed thread actually hides it.
+    Hiding = 3,
+}
+
+impl TrayMenuPhase {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => TrayMenuPhase::Revealing,
+            2 => TrayMenuPhase::Shown,
+            3 => TrayMenuPhase::Hiding,
+            _ => TrayMenuPhase::Hidden,
+        }
+    }
+}
+
+static TRAY_PHASE: AtomicU8 = AtomicU8::new(TrayMenuPhase::Hidden as u8);
+
+fn tray_phase() -> TrayMenuPhase {
+    TrayMenuPhase::from_u8(TRAY_PHASE.load(Ordering::Acquire))
+}
+
+fn set_tray_phase(phase: TrayMenuPhase) {
+    TRAY_PHASE.store(phase as u8, Ordering::Release);
+}/// Forgets the phase recorded for the current window when that window is
+/// destroyed for the tray teardown (see main_window). The next open builds a
+/// fresh window and has to start from Hidden: a stale Shown/Hiding would make
+/// the first click on the rebuilt menu hide it instead of showing it.
+pub(crate) fn reset_session_state() {
+    set_tray_phase(TrayMenuPhase::Hidden);
+    MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+// ── Focus acquisition and outside-click dismissal ─────────────────────────
+//
+// The menu is shown with raw ShowWindow(SW_SHOWNOACTIVATE) +
+// SetForegroundWindow rather than window.show(), because Tauri's show path can
+// briefly restore the decorated style before painting. That leaves two gaps
+// the old WebviewWindow-built window did not have:
+//
+// 1. tao's set_focus() consults its *internal* VISIBLE window flag, which is
+//    only set by window.show() (tao window_state.rs), never by a raw
+//    ShowWindow, so window.set_focus() after a raw show is a silent no-op.
+//    The WebView child therefore never holds keyboard focus, the HWND never
+//    receives WM_KILLFOCUS when the user clicks elsewhere, and the
+//    WindowEvent::Focused(false) dismissal never fires - the menu stayed on
+//    screen until the user clicked the tray icon again.
+// 2. SetForegroundWindow from a background thread does not move focus when
+//    the calling thread owns no foreground window (Windows grants foreground
+//    rights only to the thread that owns the current foreground window, or
+//    one recently started by it). Standard fix: AttachThreadInput to the
+//    current foreground thread, force SetFocus, then detach.
+//
+// The foreground watcher below closes the loop for good: while the menu is
+// shown it polls which window has focus, and the moment focus lands on any
+// window other than the menu (a click elsewhere, another app, the taskbar)
+// it plays the regular hide. This is the dismissal users expect from every
+// Windows context menu; the blur event remains as the first line and the
+// watcher as the guarantee.
+
+/// Gives the tray menu's HWND real keyboard focus, attaching to the current
+/// foreground thread first so Windows permits the focus change (see above).
+#[cfg(target_os = "windows")]
+fn force_focus(hwnd: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    unsafe {
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let this_thread = GetCurrentThreadId();
+        let attached = foreground_thread != 0
+            && foreground_thread != this_thread
+            && AttachThreadInput(this_thread, foreground_thread, true).as_bool();
+        let _ = SetFocus(Some(hwnd));
+        if attached {
+            let _ = AttachThreadInput(this_thread, foreground_thread, false);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn force_focus(_: ()) {}
+
+/// Polls foreground focus while the tray menu is shown and hides it the
+/// moment the foreground window is anything but the menu. One thread per
+/// open, same lifecycle as the blur handler's poll: created when the menu
+/// reaches Shown, gone as soon as the menu hides (or the generation moves,
+/// i.e. a fast-forward reopened it).
+///
+/// GetFocus is deliberately not used here: it reports the *calling thread's*
+/// focused window, which is always NULL from this worker thread. The
+/// foreground window is the process-wide truth, and its root ancestor is
+/// compared against the menu's HWND so the WebView child (or any descendant)
+/// holding the foreground still counts as "the menu".
+#[cfg(target_os = "windows")]
+fn start_foreground_watcher(window: &tauri::WebviewWindow, generation: u64) {
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let menu_hwnd = hwnd.0 as isize;
+    let delayed_window = window.clone();
+    std::thread::Builder::new()
+        .name("tray-menu-focus-watch".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                if MENU_GENERATION.load(Ordering::Acquire) != generation {
+                    return; // re-opened or reset: the new session owns the menu
+                }
+                if tray_phase() != TrayMenuPhase::Shown {
+                    return; // already hiding/hid
+                }
+                // No foreground window at all is a transient state (menu
+                // closing on its own, lock screen): not a dismissal.
+                let foreground = unsafe { GetForegroundWindow() };
+                if foreground.0.is_null() {
+                    continue;
+                }
+                let foreground_root = unsafe { GetAncestor(foreground, GA_ROOT) };
+                if foreground_root.0 as isize == menu_hwnd {
+                    continue;
+                }
+                tray_debug!("[tray-debug] focus watcher: foreground left the menu, hiding");
+                request_tray_hide(&delayed_window);
+                return;
+            }
+        })
+        .ok();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_foreground_watcher(_window: &tauri::WebviewWindow, _generation: u64) {}
+
 // Opens whose last show predates a real display change use the deferred
 // reveal path (see schedule_deferred_reveal): Windows defers a hidden
 // window's DPI transition until its next show, so the first show after a
@@ -266,11 +510,15 @@ fn native_window_hide(window: &tauri::WebviewWindow) {
     unsafe {
         let _ = ShowWindow(HWND(hwnd.0), SW_HIDE);
     }
+    // Release the hidden webview's memory only once the fade-out has finished:
+    // suspending the renderer earlier would freeze the CSS transition.
+    crate::webview_env::set_inactive(window.app_handle(), LABEL);
 }
 
 #[cfg(not(target_os = "windows"))]
 fn native_window_hide(window: &tauri::WebviewWindow) {
     let _ = window.hide();
+    crate::webview_env::set_inactive(window.app_handle(), LABEL);
 }
 
 // Hide the menu with its CSS fade-out: notify the frontend so it can play
@@ -287,6 +535,10 @@ fn request_tray_hide(window: &tauri::WebviewWindow) {
     // as "opens then closes itself" (and as "doesn't open" when the click
     // lands while the fade-out is still running).
     let generation = MENU_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    // The hide itself is a use: the destroyer must not decide the menu has
+    // been idle since before the user last touched it.
+    touch_usage();
+    set_tray_phase(TrayMenuPhase::Hiding);
     match window.emit_to(LABEL, "tray-menu-hide", ()) {
         Ok(()) => tray_debug!("[tray-debug] hide event emitted"),
         Err(error) => log::warn!("[tray-debug] hide event emit failed: {error}"),
@@ -302,6 +554,7 @@ fn request_tray_hide(window: &tauri::WebviewWindow) {
             return;
         }
         native_window_hide(&delayed_window);
+        set_tray_phase(TrayMenuPhase::Hidden);
         tray_debug!(
             "[tray-debug] native hide requested, visible_after={}",
             native_window_visible(&delayed_window)
@@ -578,11 +831,6 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
         return Ok(window);
     }
     log::info!("[tray-menu] creating tray menu window");
-    let data_dir = app
-        .path()
-        .app_local_data_dir()
-        .map(|dir| dir.join("webview-tray-menu"))
-        .ok();
     let mut builder =
         WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("tray-menu.html".into()))
             .title("OLED Helper")
@@ -595,14 +843,12 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
             .skip_taskbar(true)
             .visible(false)
             .focused(false);
-    if let Some(dir) = data_dir {
-        builder = builder.data_directory(dir);
+    // Must match the main window's arguments exactly: WebView2 only shares one
+    // environment (and so one browser process) between webviews whose browser
+    // arguments are identical, and refuses to share one when they differ.
+    if let Some(args) = crate::webview_env::shared_browser_args(app) {
+        builder = builder.additional_browser_args(&args);
     }
-    // This window has its own WebView2 environment (own data_directory), so
-    // it can take its own browser args. Cap the HTTP cache like the main
-    // window so the per-window profile folders stay bounded (~64 MB instead
-    // of growing to a few hundred MB of cache each).
-    builder = builder.additional_browser_args("--disk-cache-size=67108864");
     tray_debug!("[tray-debug] building tray window");
     let window = builder
         .build()
@@ -633,27 +879,44 @@ fn get_or_create_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String>
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Focused(false) = event {
             tray_debug!("[tray-debug] native focus lost, generation={}", MENU_GENERATION.load(Ordering::Acquire));
-            // The native region is updated asynchronously when a submenu
-            // opens. Delay the blur dismissal long enough for the preinstalled
-            // bridge/exact region to arrive; if the submenu is still open,
-            // the pointer crossed internally and the popup must remain visible.
             // Capture the menu generation so an old blur callback can never
-            // hide a newly reopened tray menu. Kept short (60ms) since there
-            // is no exit animation to wait for; the window hides instantly
-            // once this guard clears, so a long delay only reads as sluggish.
+            // hide a newly reopened tray menu.
+            //
+            // The frontend closes an open submenu asynchronously: mouseleave
+            // schedules a ~100ms bridge (scheduleSubmenuClose) before it even
+            // calls closeSubmenu(), which then round-trips an IPC call
+            // (syncHitRegion -> tray_menu_set_expanded) to clear
+            // SUBMENU_EXPANDED on this side. A single fixed-delay check here
+            // used to run before that finished often enough that an outside
+            // click left the menu stuck open. Poll instead, but only for
+            // this one blur event of this one open tray menu (this thread
+            // only exists because the window just had focus, i.e. was open),
+            // so there is no background polling while the menu is closed.
             let generation = MENU_GENERATION.load(Ordering::Acquire);
             let delayed_window = blur_window.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                if MENU_GENERATION.load(Ordering::Acquire) == generation
-                    && LAST_SHOW_AT_MS.load(Ordering::Acquire).saturating_add(250)
-                        <= now_ms()
-                    && !SUBMENU_EXPANDED.load(Ordering::Acquire)
-                {
-                    tray_debug!("[tray-debug] delayed blur hiding generation={generation}");
-                    request_tray_hide(&delayed_window);
-                } else {
-                    tray_debug!("[tray-debug] delayed blur ignored generation={generation}, current_generation={}, submenu_expanded={}, age_ms={}", MENU_GENERATION.load(Ordering::Acquire), SUBMENU_EXPANDED.load(Ordering::Acquire), now_ms().saturating_sub(LAST_SHOW_AT_MS.load(Ordering::Acquire)));
+                const POLL_INTERVAL_MS: u64 = 50;
+                const MAX_WAIT_MS: u64 = 300;
+                let mut waited_ms: u64 = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
+                    waited_ms += POLL_INTERVAL_MS;
+                    if MENU_GENERATION.load(Ordering::Acquire) != generation {
+                        tray_debug!("[tray-debug] blur poll stopped, generation changed, waited_ms={waited_ms}");
+                        return;
+                    }
+                    let submenu_expanded = SUBMENU_EXPANDED.load(Ordering::Acquire);
+                    let too_soon = LAST_SHOW_AT_MS.load(Ordering::Acquire).saturating_add(250) > now_ms();
+                    if !submenu_expanded && !too_soon {
+                        tray_debug!("[tray-debug] delayed blur hiding generation={generation}, waited_ms={waited_ms}");
+                        request_tray_hide(&delayed_window);
+                        return;
+                    }
+                    if waited_ms >= MAX_WAIT_MS {
+                        tray_debug!("[tray-debug] blur poll timed out, hiding anyway generation={generation}, submenu_expanded={submenu_expanded}, too_soon={too_soon}");
+                        request_tray_hide(&delayed_window);
+                        return;
+                    }
                 }
             });
         }
@@ -670,6 +933,7 @@ fn now_ms() -> u64 {
 }
 pub fn prewarm(app: &AppHandle) {
     tray_debug!("[tray-debug] prewarm begin");
+    touch_usage();
     if let Err(e) = get_or_create_window(app) {
         log::warn!("[tray-menu] prewarm failed: {e}");
         return;
@@ -834,6 +1098,8 @@ fn schedule_deferred_reveal(
                 // transition may have re-created, and only then reveal.
                 anchor_to_taskbar(&delayed_window, anchor_x_px);
                 force_borderless_window(&delayed_window);
+                set_tray_phase(TrayMenuPhase::Shown);
+                start_foreground_watcher(&delayed_window, generation);
                 match delayed_window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
                     Ok(()) => tray_debug!(
                         "[tray-debug] deferred reveal emitted generation={generation}, elapsed_ms={elapsed_ms}, stable={stable}, changed_from_initial={changed_from_initial}"
@@ -847,6 +1113,8 @@ fn schedule_deferred_reveal(
         if !revealed {
             anchor_to_taskbar(&delayed_window, anchor_x_px);
             force_borderless_window(&delayed_window);
+            set_tray_phase(TrayMenuPhase::Shown);
+            start_foreground_watcher(&delayed_window, generation);
             match delayed_window.emit_to(LABEL, "tray-menu-show", payload) {
                 Ok(()) => tray_debug!("[tray-debug] deferred reveal emitted generation={generation}, elapsed_ms=final"),
                 Err(error) => log::warn!("[tray-debug] deferred reveal emit failed generation={generation}: {error}"),
@@ -855,8 +1123,61 @@ fn schedule_deferred_reveal(
     });
 }
 
+/// Fast-forward a tray window that is mid-transition (still fading out from
+/// a hide, or still settling off-screen after a deferred reveal) straight to
+/// fully shown. Called when toggle() is invoked again while in that state:
+/// without this, the click would be misread as "close" (IsWindowVisible
+/// reads true in both Hiding and Revealing), cancelling the transition
+/// already in flight and leaving nothing on screen, which is what made the
+/// popup need a follow-up click (or two) to actually appear.
+fn reveal_now(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
+    // Bump the generation to invalidate whatever hide/reveal thread is
+    // currently in flight for this window; this call takes over from here.
+    let generation = MENU_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    LAST_SHOW_AT_MS.store(now_ms(), Ordering::Release);
+    let payload = cached_tray_state().unwrap_or(Value::Null);
+    // Mid-transition fast-forward: resume before the emit below so the
+    // renderer can act on it.
+    crate::webview_env::set_active(window.app_handle(), LABEL);
+    stabilize_canvas(window, generation, "reveal-now");
+    force_borderless_window(window);
+    anchor_to_taskbar(window, anchor_x_px);
+    #[cfg(target_os = "windows")]
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let hwnd = HWND(hwnd.0);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        // Raw ShowWindow never sets tao's internal VISIBLE flag, so
+        // window.set_focus() below is a silent no-op (tao's set_focus checks
+        // that flag). Force real keyboard focus the Win32 way instead.
+        force_focus(HWND(hwnd.0));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window.show();
+    }
+    match window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
+        Ok(()) => tray_debug!("[tray-debug] reveal-now show emitted generation={generation}"),
+        Err(error) => log::warn!("[tray-debug] reveal-now show emit failed generation={generation}: {error}"),
+    }
+    match window.set_focus() {
+        Ok(()) => tray_debug!("[tray-debug] reveal-now focus request succeeded"),
+        Err(error) => log::warn!("[tray-debug] reveal-now focus request failed: {error}"),
+    }
+    set_tray_phase(TrayMenuPhase::Shown);
+    schedule_post_show_event(window, payload, generation);
+    schedule_post_show_anchor(window, anchor_x_px, generation);
+    start_foreground_watcher(window, generation);
+}
+
 pub fn toggle(app: &AppHandle, anchor_x: f64) {
     tray_debug!("[tray-debug] toggle begin anchor_x={anchor_x:.1}");
+    // Any interaction counts as use, including the click that opens the menu
+    // after an idle destroy: the 3s grace window in the destroyer is measured
+    // from here, so it can never tear down a window this call is about to use.
+    touch_usage();
     let window = match get_or_create_window(app) {
         Ok(w) => w,
         Err(e) => {
@@ -864,14 +1185,29 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
             return;
         }
     };
-    MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
-    let visible = native_window_visible(&window);
-    tray_debug!("[tray-debug] toggle generation={}, visible_before={visible}", MENU_GENERATION.load(Ordering::Acquire));
-    if visible {
-        tray_debug!("[tray-debug] hiding already-visible tray window");
-        request_tray_hide(&window);
-        return;
+    let phase = tray_phase();
+    tray_debug!("[tray-debug] toggle phase={phase:?}");
+    match phase {
+        TrayMenuPhase::Shown => {
+            tray_debug!("[tray-debug] hiding shown tray window");
+            request_tray_hide(&window);
+            return;
+        }
+        TrayMenuPhase::Hiding | TrayMenuPhase::Revealing => {
+            // IsWindowVisible would also read true here, which is exactly
+            // the ambiguity phase tracking exists to resolve: the window is
+            // on screen (or about to be), so this click means "show it
+            // now", not "hide the thing I can already see".
+            tray_debug!("[tray-debug] fast-forwarding {phase:?} tray window to shown");
+            let anchor = Some(anchor_x.round() as i32);
+            reveal_now(&window, anchor);
+            return;
+        }
+        TrayMenuPhase::Hidden => {}
     }
+    MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
+    set_tray_phase(TrayMenuPhase::Revealing);
+    tray_debug!("[tray-debug] toggle generation={}", MENU_GENERATION.load(Ordering::Acquire));
     SUBMENU_EXPANDED.store(false, Ordering::Release);
     // A display change since the window was last shown means its DPI context
     // is stale: Windows applies a hidden window's DPI transition at the next
@@ -885,6 +1221,9 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     // chance to close its submenu state. Reset the native region before the
     // next show so a stale expanded shape can never intercept the first frame.
     apply_default_hit_region(&window);
+    // Resume the webview before the show event below: a suspended renderer
+    // cannot process it until it is resumed.
+    crate::webview_env::set_active(app, LABEL);
     let payload = cached_tray_state();
     tray_debug!("[tray-debug] cache lookup complete, has_payload={}", payload.is_some());
     let payload = payload.unwrap_or(Value::Null);
@@ -911,6 +1250,13 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = SetForegroundWindow(hwnd);
         }
+        // Raw ShowWindow never sets tao's internal VISIBLE flag, so the
+        // window.set_focus() at the end of this function is a silent no-op
+        // (tao's set_focus checks that flag, which only window.show() sets).
+        // Without real keyboard focus the HWND never sees WM_KILLFOCUS, the
+        // Focused(false) dismissal never fires and the menu only ever closed
+        // via the tray icon. Force it the Win32 way.
+        force_focus(HWND(hwnd.0));
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -928,6 +1274,10 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     // transition) on-screen for the 40-280ms before the first recovery pass.
     if !deferred_reveal {
         anchor_to_taskbar(&window, anchor);
+        // The immediate path puts the window on screen at its final
+        // position right here; the deferred path only reaches Shown once
+        // schedule_deferred_reveal actually reveals it (see below).
+        set_tray_phase(TrayMenuPhase::Shown);
     }
     log_native_window_state(&window, "after-borderless-show");
     // The geometry right after show() can be stale (the window's DPI context
@@ -947,11 +1297,20 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
         Ok(()) => tray_debug!("[tray-debug] focus request succeeded"),
         Err(error) => log::warn!("[tray-debug] focus request failed: {error}"),
     }
+    // Both dismissal mechanisms (the Focused(false) handler and this watcher)
+    // depend on the menu actually holding foreground focus; the watcher is
+    // also the catch-all if focus acquisition failed anyway. Deferred-reveal
+    // opens start it from their reveal step instead: the phase is not Shown
+    // yet here, and the watcher would exit on its first poll.
+    if !deferred_reveal {
+        start_foreground_watcher(&window, generation);
+    }
     tray_debug!("[tray-debug] toggle complete generation={generation}, visible_after={}", native_window_visible(&window));
 }
 
 pub fn hide(app: &AppHandle) {
     tray_debug!("[tray-debug] hide requested");
+    touch_usage();
     if let Some(window) = app.get_webview_window(LABEL) {
         request_tray_hide(&window);
     } else {
@@ -1281,23 +1640,13 @@ pub fn tray_menu_restart(app: AppHandle) {
 /// Open (not toggle) the main app window from the tray menu header. Mirrors
 /// the single-instance handler: unminimize + show + focus, then emit the
 /// same window-visibility event so the frontend reconciles its tab state.
+/// main_window::reveal also rebuilds the main webview when the tray teardown
+/// took it (opening the tray menu builds webviews again, but the main window's
+/// only comes back here or from the tray icon).
 #[tauri::command]
 pub fn tray_menu_open_main(app: AppHandle) {
     hide(&app);
-    if let Some(window) = app.get_webview_window("main") {
-        let was_minimized = window.is_minimized().unwrap_or(false);
-        if was_minimized {
-            let _ = window.unminimize();
-        }
-        let _ = window.show();
-        let _ = window.set_focus();
-        // animated = the window was minimized, so the restore replays the
-        // Windows restore animation (see show_main_window).
-        let _ = app.emit(
-            "window-visibility",
-            serde_json::json!({ "visible": true, "animated": was_minimized }),
-        );
-    }
+    crate::main_window::reveal(&app);
 }
 
 #[tauri::command]
