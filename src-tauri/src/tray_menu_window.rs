@@ -1518,6 +1518,9 @@ pub fn tray_menu_get_display_info() -> Result<crate::display_info::DisplayInfo, 
 /// of the monitor a favorite was saved on: the change targets that monitor
 /// (like the main app's favorites path) instead of always the primary. The
 /// plain Resolution submenu sends none, so it stays primary-scoped.
+/// favorite_id is the favorite's stable id when the row came from the
+/// Favorites submenu, and arms the trusted-favorite credit a Keep will record
+/// (see favorite_credit). The plain Resolution submenu sends none.
 #[tauri::command]
 pub fn tray_menu_set_resolution(
     app: AppHandle,
@@ -1527,6 +1530,7 @@ pub fn tray_menu_set_resolution(
     monitor_id: Option<String>,
     monitor_device: Option<String>,
     skip_confirmation: Option<bool>,
+    favorite_id: Option<String>,
 ) {
     std::thread::spawn(move || {
         // Resolve the favorite's saved monitor to its GDI device name. A
@@ -1597,6 +1601,13 @@ pub fn tray_menu_set_resolution(
                         log::warn!("[tray-menu] trusted favorite confirmation failed: {error}");
                     }
                     return;
+                }
+                // A Keep credits this favorite as trusted on its monitor. The
+                // tray is exactly the case the in-app frontend could not
+                // cover: the app usually has no main window while this menu is
+                // in use, so the backend records the credit itself.
+                if let Some(favorite_id) = favorite_id.as_deref() {
+                    crate::favorite_credit::arm(favorite_id);
                 }
                 crate::flyout_window::show_after_ready(&app, mode).ok();
             }

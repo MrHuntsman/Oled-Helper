@@ -1262,6 +1262,10 @@
       hz: fav.hz,
       monitorId: fav.monitor_id || null,
       monitorDevice: fav.monitor_device || null,
+      // Lets the backend credit this favorite when a Keep succeeds, so a
+      // favorite applied from the tray becomes trusted too (the tray has no
+      // main window to record it).
+      favoriteId: fav.fav_id || null,
       skipConfirmation: skipFavoriteConfirmation
         && Boolean(fav.confirmed_monitor_id)
         && Boolean(fav.monitor_id)

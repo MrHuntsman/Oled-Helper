@@ -46,8 +46,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW,
+    SetWindowPos, HWND_TOPMOST, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW,
 };
 
 pub(crate) const FLYOUT_LABEL: &str = "flyout";
@@ -169,15 +169,25 @@ fn show_at_final_position(app: &AppHandle) -> Result<(i32, i32), String> {
     // visible main window, so it briefly takes the foreground; that is
     // exactly what a modal confirmation is supposed to do, and focus returns
     // to the main window once it hides.
+    //
+    // HWND_TOPMOST, instead of the SWP_NOZORDER that used to leave the z-order
+    // untouched, inserts the flyout at the very front of the topmost band. always_on_top alone only makes the
+    // window WS_EX_TOPMOST, which still lets another topmost window sit in
+    // front of it: the taskbar dimmer overlay claims the front of that band on
+    // every repair tick while it does not see a visible flyout (see
+    // taskbar_dimmer.rs), which is how a correctly rendered dialog can end up
+    // invisible behind the fully opaque overlay. finish_show publishes this
+    // HWND right after, so the dimmer's next tick tucks itself behind the
+    // flyout instead.
     unsafe {
         SetWindowPos(
             HWND(hwnd.0),
-            None,
+            Some(HWND_TOPMOST),
             x,
             y,
             0,
             0,
-            SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOZORDER,
+            SWP_SHOWWINDOW | SWP_NOSIZE,
         )
         .map_err(|error| format!("could not show flyout: {error}"))?;
     }
@@ -337,6 +347,13 @@ struct FlyoutSignals {
     frontend_ready_changed: Condvar,
     layout_ready: Mutex<bool>,
     layout_ready_changed: Condvar,
+    // The mode payload of the confirmation currently being shown. Rust keeps a
+    // copy here alongside the `flyout-show` emit so a webview that registers
+    // its listener after the emit (a flyout built on the show path, where
+    // WebView2 startup can outlast any handshake budget) can pull the payload
+    // from its flyout_frontend_ready call instead of coming up blank and
+    // letting the mode silently revert.
+    pending_mode: Mutex<Option<AppliedMode>>,
 }
 
 static FLYOUT_SIGNALS: OnceLock<FlyoutSignals> = OnceLock::new();
@@ -347,17 +364,29 @@ fn flyout_signals() -> &'static FlyoutSignals {
         frontend_ready_changed: Condvar::new(),
         layout_ready: Mutex::new(false),
         layout_ready_changed: Condvar::new(),
+        pending_mode: Mutex::new(None),
     })
 }
 
 #[tauri::command]
-pub fn flyout_frontend_ready() {
+pub fn flyout_frontend_ready() -> Option<AppliedMode> {
     let signals = flyout_signals();
+    // Hand back a payload that was emitted before this page registered its
+    // `flyout-show` listener. The listener resolves first and the command runs
+    // right after it, so a payload kept from an earlier emit is the one the
+    // event would have delivered; None means the page is up before the next
+    // show and no recovery is needed.
+    let pending = signals
+        .pending_mode
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
     if let Ok(mut ready) = signals.frontend_ready.lock() {
         *ready = true;
         signals.frontend_ready_changed.notify_all();
     }
     log::info!("[flyout] frontend handshake ready");
+    pending
 }
 
 #[tauri::command]
@@ -390,6 +419,11 @@ pub(crate) fn reset_session_state() {
     }
     if let Ok(mut ready) = signals.layout_ready.lock() {
         *ready = false;
+    }
+    // A pending payload describes a dialog the destroyed webview was showing;
+    // the rebuilt page must not pull a stale confirmation into its first show.
+    if let Ok(mut pending) = signals.pending_mode.lock() {
+        *pending = None;
     }
 }
 
@@ -448,6 +482,12 @@ fn prepare(app: &AppHandle, mode: &AppliedMode) -> Result<(), String> {
     // handshake this show waits for depends on the frontend running.
     crate::webview_env::set_active(app, FLYOUT_LABEL);
     reset_layout_ready();
+    // Publish the payload before emitting it. If the page is not listening yet
+    // (the emitted event would be dropped) it picks this copy up from its
+    // flyout_frontend_ready call, so the dialog can never come up empty.
+    if let Ok(mut pending) = flyout_signals().pending_mode.lock() {
+        *pending = Some(mode.clone());
+    }
     let (width_px, height_px, _) = size_and_position(app, &window);
     #[cfg(target_os = "windows")]
     place_hidden_at_final_position(app, width_px as i32, height_px as i32)?;
@@ -494,6 +534,34 @@ fn finish_show(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Makes sure the flyout webview exists before the show handshake waits on it.
+//
+// The window is destroyed by the tray teardown (see main_window::tear_down) and
+// is otherwise only rebuilt lazily here, so a tray-initiated change used to
+// wait out the whole frontend-ready budget for a signal that could not arrive
+// (no webview existed yet), then build the window and emit the payload in the
+// same call that created it. That emit raced the page's own
+// `listen('flyout-show')` registration, so the payload was dropped and the
+// always-on-top dialog came up empty while the mode reverted at its deadline.
+// Building (or reusing) the window first makes the frontend-ready wait
+// meaningful and lets prepare() emit into a page that is already listening.
+//
+// Runs get_or_create_window on the Tauri main thread, like prepare and
+// finish_show, because show_after_ready itself runs on the tray worker.
+fn ensure_window(app: &AppHandle) -> Result<(), String> {
+    let worker_app = app.clone();
+    let (done, result) = mpsc::channel();
+    app.run_on_main_thread(move || {
+        let result = get_or_create_window(&worker_app).map(|_| ());
+        let _ = done.send(result);
+    })
+    .map_err(|error| format!("could not schedule flyout window creation: {error}"))?;
+    match result.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(result) => result,
+        Err(error) => Err(format!("flyout window creation timed out: {error}")),
+    }
+}
+
 // Full hidden-WebView handshake. This is called from the tray worker, not the
 // Tauri/UI thread, so waiting for JavaScript never freezes event processing.
 pub fn show_after_ready(app: &AppHandle, mode: AppliedMode) -> Result<(), String> {
@@ -504,6 +572,15 @@ pub fn show_after_ready(app: &AppHandle, mode: AppliedMode) -> Result<(), String
         mode.refresh_hz,
         std::thread::current().id()
     );
+    // The webview has to exist before its handshake can be waited on. Without
+    // this every first change after the app went to the tray took the
+    // "handshake timed out" path and showed a blank dialog (see ensure_window).
+    // Not fatal if it fails: prepare() below still attempts (and reports) the
+    // creation, and the payload pull covers a page that comes up late, so a
+    // slow main thread can never turn into a confirmation that never appears.
+    if let Err(error) = ensure_window(app) {
+        log::warn!("[flyout] could not pre-create the flyout window: {error}");
+    }
     if !wait_for_frontend_ready() {
         log::warn!("[flyout] frontend handshake timed out; attempting legacy hidden show");
     }
@@ -587,8 +664,10 @@ pub fn hide(app: &AppHandle) {
 // yielding z-order to a flyout HWND that is no longer showing, which is
 // harmless (active_flyout_window checks IsWindowVisible) but leaves a stale
 // pointer around until the next show. Clearing it here keeps the state tidy.
-// Also emits a flyout-completed event to the main window so the in-app UI
-// can clear its busy state and re-poll display info.
+// Completion is NOT reported from here. This runs before the confirm or
+// rollback command, so it cannot know the outcome, and the main window now
+// credits a favorite as trusted only on a real Keep. emit_completed below is
+// called once the transaction has actually resolved.
 #[tauri::command]
 pub fn flyout_hidden(app: AppHandle) {
     crate::taskbar_dimmer::set_flyout_hwnd(0);
@@ -604,10 +683,21 @@ pub fn flyout_hidden(app: AppHandle) {
             crate::webview_env::set_inactive(&app, FLYOUT_LABEL);
         }
     }
-    // Target the main window's webview by label; it is not a WebviewWindow any
-    // more (the window and its webview have separate lifetimes, see
-    // main_window), and it may not exist at all while the app is in the tray.
-    let _ = app.emit_to(crate::main_window::LABEL, "flyout-completed", ());
+}
+
+/// Announces that a mode confirmation is over, carrying whether the mode was
+/// actually kept. The main window reads this to credit a favorite as trusted
+/// (skip_favorite_confirmation), so the outcome has to come from the
+/// transaction itself: the dialog also ends on Revert and on the automatic
+/// timeout rollback, and neither of those proves the mode works on the target
+/// monitor. The main window's webview may not exist (the app is in the tray),
+/// in which case the emit has no target and is simply dropped.
+pub(crate) fn emit_completed(app: &AppHandle, confirmed: bool) {
+    let _ = app.emit_to(
+        crate::main_window::LABEL,
+        "flyout-completed",
+        serde_json::json!({ "confirmed": confirmed }),
+    );
 }
 
 // Shows the flyout confirmation dialog centered on screen. Called from the

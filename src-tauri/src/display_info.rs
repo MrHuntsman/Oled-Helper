@@ -28,7 +28,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, ReleaseMutex, WaitForSingleObject, INFINITE,
 };
 
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use windows::core::{GUID, PCWSTR};
 
 // Every record goes through the standard `log` facade. The tauri-plugin-log
@@ -134,6 +134,42 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// Pushes the pending transaction's rollback deadline out so the user gets the
+// full confirmation window from the moment the dialog is actually visible.
+//
+// The deadline is computed at apply time, but on a cold start the flyout's
+// WebView2 can take several seconds to come up (log evidence: a tray change
+// showed its dialog 6s into a 15s window, so the user got 9s and the mode
+// reverted while they were still reading). The frontend reports when the
+// dialog became visible; if that was late, the deadline moves by the same
+// amount. The countdown the dialog displays is anchored to the same deadline
+// value, so it jumps to the full remaining window on the next tick. Guarded
+// by the pending token so a late report from an older transaction can never
+// stretch the current one, and by a once-flag per transaction so a repeated
+// event cannot extend it twice.
+pub fn extend_mode_confirmation(deadline_ms: u64) {
+    let Some(entry) = pending_mode().lock().ok().and_then(|guard| guard.clone()) else {
+        return;
+    };
+    let token = entry.token;
+    let already_extended = extended_tokens()
+        .lock()
+        .map(|mut guard| !guard.insert(token))
+        .unwrap_or(true);
+    if already_extended {
+        return;
+    }
+    let current = ROLLBACK_DEADLINE_MS.load(Ordering::Acquire);
+    if deadline_ms <= current {
+        return;
+    }
+    ROLLBACK_DEADLINE_MS.store(deadline_ms, Ordering::Release);
+    log::info!(
+        "[display-info] flyout was shown {} ms late; extended the confirmation deadline to match",
+        deadline_ms - current
+    );
+}
+
 fn write_recovery_record_until(
     target: &DisplayTarget,
     previous: &DEVMODEW,
@@ -166,8 +202,11 @@ fn write_recovery_record(
     token: u64,
 ) -> Result<(), String> {
     // Covers the maximum three-second mode stabilization window plus the
-    // fifteen-second user confirmation window and a small crash margin.
-    write_recovery_record_until(target, previous, now_ms() + 22_000, token)
+    // fifteen-second user confirmation window, and stays past a late-dialog
+    // deadline extension (extend_mode_confirmation) plus a small crash margin,
+    // so the external watchdog never restores the mode while the flyout is
+    // still legitimately counting down.
+    write_recovery_record_until(target, previous, now_ms() + 40_000, token)
 }
 
 struct RecoveryMutex {
@@ -1566,6 +1605,21 @@ struct PendingMode {
 static PENDING_MODE: OnceLock<Mutex<Option<PendingMode>>> = OnceLock::new();
 static MODE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+// The rollback deadline of the transaction currently awaiting confirmation.
+// The rollback thread re-reads it in short increments instead of sleeping once
+// up to the value computed at apply time, so a deadline extension (a late
+// flyout show granting the user the full window, see extend_mode_confirmation)
+// is honored rather than rolling back while the dialog is still counting down.
+static ROLLBACK_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+// Transactions whose deadline has already been extended once. Tokens are
+// monotonically increasing, so the set only ever grows by one small entry per
+// late-shown dialog and is cleared whenever a new transaction begins.
+static EXTENDED_TOKENS: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+
+fn extended_tokens() -> &'static Mutex<std::collections::HashSet<u64>> {
+    EXTENDED_TOKENS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
 fn pending_mode() -> &'static Mutex<Option<PendingMode>> {
     PENDING_MODE.get_or_init(|| Mutex::new(None))
 }
@@ -1898,12 +1952,29 @@ fn begin_mode_change(
     // Absolute deadline for both the rollback thread and the flyout
     // countdown, so the confirmation reaches zero at the same moment the
     // automatic rollback fires even when the show handshake delays the
-    // flyout's first paint.
+    // flyout's first paint. Published in the atomic too: the rollback thread
+    // re-reads it, and extend_mode_confirmation moves it out when the dialog
+    // becomes visible late.
     let confirmation_deadline_ms = now_ms() + (MODE_CONFIRMATION_SECONDS as u64) * 1000;
+    ROLLBACK_DEADLINE_MS.store(confirmation_deadline_ms, Ordering::Release);
+    // A token can only be extended once (see extend_mode_confirmation); drop
+    // the previous transaction's entry so the set cannot grow unbounded.
+    if let Ok(mut guard) = extended_tokens().lock() {
+        guard.retain(|existing| *existing >= token);
+        guard.insert(token);
+    }
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(
-            confirmation_deadline_ms.saturating_sub(now_ms()),
-        ));
+        // Sleep until the active deadline, re-reading it in short increments.
+        // A single sleep to the apply-time value would roll back mid-countdown
+        // whenever the show handshake pushed the deadline out.
+        loop {
+            let now = now_ms();
+            let deadline = ROLLBACK_DEADLINE_MS.load(Ordering::Acquire);
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis((deadline - now).min(200)));
+        }
         // Roll back inside a closure so the forced flyout hide below always
         // runs when THIS transaction is still pending.
         //
@@ -2011,14 +2082,19 @@ fn begin_mode_change(
             if let Some(app) = APP_HANDLE.get() {
                 crate::flyout_window::hide(app);
                 // The main window only learns the confirmation is over
-                // through the frontend's flyout_hidden -> flyout-completed
-                // path, which never runs when the flyout was shown blank or
-                // its webview wedged. Emit the completion here too so the
-                // main window's busy flags always clear and display info is
-                // re-polled, even if the JS countdown never fired. A
-                // duplicate emit alongside the frontend's own is harmless
-                // (the handler just clears flags and re-polls).
-                let _ = app.emit("flyout-completed", ());
+                // through the confirm/rollback commands or this path, and
+                // neither runs when the flyout was shown blank or its webview
+                // wedged. Emit the completion here too so the main window's
+                // busy flags always clear and display info is re-polled, even
+                // if the JS countdown never fired. A duplicate emit alongside
+                // a command's own is harmless (the handler just clears flags
+                // and re-polls). Always confirmed=false: reaching here means
+                // the deadline expired and the mode was reverted, never kept.
+                // The favorite credit armed for this transaction is dropped
+                // with it, so an expired dialog can never make a favorite
+                // trusted (see favorite_credit).
+                crate::favorite_credit::disarm();
+                crate::flyout_window::emit_completed(app, false);
             }
         }
     });
@@ -2076,6 +2152,8 @@ fn same_mode(a: &DEVMODEW, b: &DEVMODEW) -> bool {
 }
 
 pub fn confirm_mode_change() -> Result<(), String> {
+    // A Keep also ends any pending deadline extension cleanly; nothing below
+    // needs the extension state, but the once-flag set is kept small.
     let _operation_guard = mode_operation_lock()
         .lock()
         .map_err(|_| "display mode operation state was poisoned".to_string())?;

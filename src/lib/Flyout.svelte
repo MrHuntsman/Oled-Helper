@@ -237,6 +237,45 @@
     await closeFlyout('rollback_display_mode_change');
   }
 
+  // Renders a mode payload and starts its countdown. Shared by the
+  // flyout-show event and the flyout_frontend_ready response: Rust keeps a copy
+  // of the payload and hands it back to a page whose listener was registered
+  // after the event had already been emitted, which is the only way a flyout
+  // built on the show path avoids coming up blank and letting the mode revert.
+  // Reports a late dialog show to the backend. The rollback deadline is fixed
+  // at apply time, but a cold webview start can eat several seconds of it
+  // before the dialog is even on screen; the backend then extends the deadline
+  // so the user gets the full window, and the countdown below re-anchors to
+  // the extended deadline on its next tick. Sent at most once per dialog: the
+  // backend rejects repeated extensions by token anyway.
+  let extensionReported = false;
+  function reportLateShow(deadlineMs) {
+    if (extensionReported || !deadlineMs) return;
+    extensionReported = true;
+    invoke('extend_mode_confirmation', { deadlineMs }).catch(() => {});
+  }
+
+  function applyPayload(payload) {
+    if (!payload) return;
+    busy = false;
+    visible = false;
+    mode = payload;
+    extensionReported = false;
+    startCountdown(
+      Number(payload?.confirmation_seconds) || 15,
+      Number(payload?.confirmation_deadline_ms) || 0,
+    );
+    notifyLayoutReady();
+    // Safety net: if flyout-shown is ever dropped (IPC hiccup, listener
+    // timing), force visibility after a generous timeout so the dialog can
+    // never remain blank.
+    clearShownFallback();
+    shownFallbackTimer = setTimeout(() => {
+      visible = true;
+      shownFallbackTimer = null;
+    }, FLYOUT_VISIBLE_FALLBACK_MS);
+  }
+
   onMount(() => {
     let unlistenShow;
     let unlistenShown;
@@ -246,29 +285,24 @@
     // entry point but as a normal Tauri event.
     listen('flyout-show', (event) => {
       diag('[flyout] flyout-show event received');
-      const payload = event.payload;
-      busy = false;
-      visible = false;
-      mode = payload;
-      startCountdown(
-        Number(payload?.confirmation_seconds) || 15,
-        Number(payload?.confirmation_deadline_ms) || 0,
-      );
-      notifyLayoutReady();
-      // Safety net: if flyout-shown is ever dropped (IPC hiccup, listener
-      // timing), force visibility after a generous timeout so the dialog can
-      // never remain blank.
-      clearShownFallback();
-      shownFallbackTimer = setTimeout(() => {
-        visible = true;
-        shownFallbackTimer = null;
-      }, FLYOUT_VISIBLE_FALLBACK_MS);
+      applyPayload(event.payload);
     }).then((stop) => {
       unlistenShow = stop;
       diag('[flyout] listening for flyout-show');
       // Signal only after listen() has completed. Rust can now safely emit the
-      // first payload while the window remains hidden.
-      invoke('flyout_frontend_ready').catch(() => {});
+      // first payload while the window remains hidden. If it had already
+      // emitted one before this listener existed, that payload comes back here
+      // so the confirmation still renders instead of reverting silently. The
+      // !mode guard drops it when the event did arrive after all: the event
+      // handler runs synchronously, this callback only ever sees the miss case.
+      invoke('flyout_frontend_ready')
+        .then((pending) => {
+          if (pending && !mode) {
+            diag('[flyout] recovered mode payload from the ready handshake');
+            applyPayload(pending);
+          }
+        })
+        .catch(() => {});
     }).catch((e) => diag(`[flyout] listen(flyout-show) failed: ${e}`));
     // Fired by Rust right after the native SetWindowPos(...SWP_SHOWWINDOW)
     // call, i.e. the instant the window is actually visible on screen. Only
@@ -278,6 +312,10 @@
     // final state pop in with no visible motion.
     listen('flyout-shown', () => {
       diag('[flyout] flyout-shown event received');
+      // The window is on screen now. If most of the confirmation window was
+      // eaten by the show handshake, ask the backend to push the rollback
+      // deadline out so the countdown the user sees is the window they get.
+      reportLateShow(Number(mode?.confirmation_deadline_ms) || 0);
       // Dwell briefly after the window becomes visible, then play the
       // entrance animation so the user actually sees it.
       showWithEntranceDelay();

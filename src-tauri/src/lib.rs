@@ -2,6 +2,7 @@ mod config;
 mod display_info;
 mod early_log;
 mod explorer_hook;
+mod favorite_credit;
 mod flyout_window;
 mod font_replacement;
 mod gamepad;
@@ -387,10 +388,17 @@ async fn set_resolution(
     preferred_hz: u32,
     device_name: Option<String>,
     skip_confirmation: Option<bool>,
+    favorite_id: Option<String>,
 ) -> Result<display_info::AppliedMode, String> {
     let result = display_info::set_resolution(width, height, preferred_hz, device_name, skip_confirmation.unwrap_or(false))?;
     if result.skip_confirmation {
         display_info::confirm_mode_change()?;
+    } else if let Some(favorite_id) = favorite_id.as_deref() {
+        // This confirmation dialog belongs to a favorite: a Keep credits it as
+        // trusted on its monitor (see favorite_credit). Armed here, before the
+        // frontend asks the flyout to show, so the credit is in place the
+        // moment the user can click Keep.
+        favorite_credit::arm(favorite_id);
     }
     Ok(result)
 }
@@ -409,6 +417,18 @@ async fn confirm_display_mode_change(app: AppHandle) -> Result<(), String> {
     // blocking clicks on the main window. Force-hide it here regardless of
     // the transaction result; hiding an already-hidden window is a no-op.
     let _ = crate::flyout_window::hide(&app);
+    // The Keep is what earns a favorite its skip-the-dialog credit. Commit it
+    // from the transaction's own result so every apply path (in-app menu,
+    // in-app hotkey, tray menu, tray hotkey) is credited the same way. A
+    // failed confirm leaves the mode pending, so the credit is dropped and the
+    // watchdog's rollback disarms it too.
+    if result.is_ok() {
+        favorite_credit::commit(&app);
+    } else {
+        favorite_credit::disarm();
+    }
+    // Report the transaction's real outcome to the main window.
+    crate::flyout_window::emit_completed(&app, result.is_ok());
     result
 }
 
@@ -416,7 +436,20 @@ async fn confirm_display_mode_change(app: AppHandle) -> Result<(), String> {
 async fn rollback_display_mode_change(app: AppHandle) -> Result<(), String> {
     let result = display_info::rollback_mode_change();
     let _ = crate::flyout_window::hide(&app);
+    // A Revert never marks a favorite as trusted, the mode was rejected.
+    favorite_credit::disarm();
+    crate::flyout_window::emit_completed(&app, false);
     result
+}
+
+// The flyout reports when it actually became visible. If the show handshake
+// ate part of the confirmation window (a cold WebView2 start after the app sat
+// in the tray can take seconds), the rollback deadline is pushed out so the
+// user still gets the full window from the moment the dialog is on screen.
+// See display_info::extend_mode_confirmation.
+#[tauri::command]
+fn extend_mode_confirmation(deadline_ms: u64) {
+    display_info::extend_mode_confirmation(deadline_ms);
 }
 
 #[tauri::command]
@@ -824,6 +857,7 @@ pub fn run() {
             set_refresh_rate,
             set_resolution,
             confirm_display_mode_change,
+            extend_mode_confirmation,
             rollback_display_mode_change,
             get_display_target,
             is_main_window_visible,

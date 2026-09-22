@@ -529,6 +529,11 @@ fn apply_favorite(app: &AppHandle, fav_id: &str) -> Result<(), String> {
         // frontend's skipConfirmation path.
         crate::display_info::confirm_mode_change()?;
     } else {
+        // Arm the trusted-favorite credit before the dialog is shown: a Keep
+        // is what makes later presses skip the dialog (see favorite_credit).
+        // This runs with no main window present, so the backend has to record
+        // the credit itself.
+        crate::favorite_credit::arm(&favorite.fav_id);
         // The "Keep display mode?" dialog is its own window, so it works with
         // the main webview gone; this is the same path the tray menu's
         // resolution rows take. The display module's watchdog reverts the

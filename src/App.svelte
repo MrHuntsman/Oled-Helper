@@ -478,7 +478,7 @@
   // current rate, matching the resolution dropdown's behavior. deviceName is
   // null for the primary monitor (the dropdown path); per-monitor favorites
   // pass the GDI device name of the monitor they were saved on.
-  async function applyModeCombo(width, height, preferredHz, deviceName = null, skipConfirmation = false) {
+  async function applyModeCombo(width, height, preferredHz, deviceName = null, skipConfirmation = false, favoriteId = null) {
     const primaryTarget = !deviceName;
     const currentWidth = app.displayInfo.width;
     const currentHeight = app.displayInfo.height;
@@ -509,6 +509,10 @@
         preferredHz,
         deviceName,
         skipConfirmation,
+        // Favorite id only, when this apply came from a favorite. The backend
+        // arms the trusted-favorite credit with it and records it on a Keep
+        // (see favorite_credit.rs).
+        favoriteId: favoriteId || null,
       });
       // The backend only returns after the temporary mode has stabilized, so
       // load the profile for the newly active display/mode immediately.
@@ -731,10 +735,9 @@
         // The backend validates the mode anyway; never block on this check.
       }
     }
-    if (!skipConfirmation) {
-      window.__pendingFavoriteConfirmation = { favorite: fav, monitorId: fav.monitorId };
-    }
-    await applyModeCombo(fav.width, fav.height, fav.hz, deviceName, skipConfirmation);
+    // The backend credits this favorite as trusted when the resulting Keep
+    // succeeds, from any UI, so pass its stable id down (see favorite_credit.rs).
+    await applyModeCombo(fav.width, fav.height, fav.hz, deviceName, skipConfirmation, fav.favId || null);
   }
   function applyFavorite(fav) {
     closeFavoritesMenu();
@@ -1301,19 +1304,28 @@
         favoritePendingRemove = fav;
       }
     }).then((stop) => { unlistenFavoriteRemove = stop; }).catch(() => {});
-    // When the flyout confirmation dialog completes (confirm/rollback),
-    // clear busy flags and re-poll display info.
+    // When the flyout confirmation dialog completes, clear busy flags and
+    // re-poll display info. The trusted-favorite credit is decided and written
+    // by the backend from the transaction's own result (see favorite_credit),
+    // so nothing here has to judge whether the mode was kept.
     let unlistenFlyoutCompleted;
     listen('flyout-completed', () => {
-      if (window.__pendingFavoriteConfirmation) {
-        const { favorite, monitorId } = window.__pendingFavoriteConfirmation;
-        markFavoriteConfirmed(favorite, monitorId);
-        window.__pendingFavoriteConfirmation = null;
-      }
       app.displayModeBusy = false;
       app.refreshRateBusy = false;
       pollDisplayInfo();
     }).then((stop) => { unlistenFlyoutCompleted = stop; }).catch(() => {});
+    // A Keep just recorded this favorite as trusted on its monitor. Mirror it
+    // into the in-memory favorites: they are what later config saves serialize,
+    // so a stale confirmed_monitor_id here would write the credit back out as
+    // empty the next time any setting is saved.
+    let unlistenFavoriteConfirmed;
+    listen('favorite-confirmed', (event) => {
+      const favId = event.payload?.fav_id;
+      const monitorId = event.payload?.confirmed_monitor_id;
+      if (!favId || !monitorId) return;
+      const fav = displayFavorites.find((entry) => entry.favId === favId);
+      if (fav) markFavoriteConfirmed(fav, monitorId);
+    }).then((stop) => { unlistenFavoriteConfirmed = stop; }).catch(() => {});
     return () => {
       unlisten?.();
       unlistenDisplayChanged?.();
@@ -1323,6 +1335,7 @@
       unlistenHotkeyPressed?.();
       unlistenFavoriteRemove?.();
       unlistenFlyoutCompleted?.();
+      unlistenFavoriteConfirmed?.();
       window.removeEventListener('focus', reconcileWindowVisible);
       window.removeEventListener('blur', closeAllMenus);
       if (visibilityReconcileTimer) {
