@@ -5,20 +5,17 @@ import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, H
 
 export const app = $state({
   activeTab: 'crush',
-  // Timestamp (Date.now) of the last time the main window became visible
-  // again (tray show or taskbar restore). The Text tab's native preview
-  // reads it on mount so it can hold itself hidden until the window's
-  // restore animation finishes, instead of appearing over the transition.
-  // 0 = never restored (fresh launch), which means no hold.
+  // Timestamp (Date.now) of the last transition from tray hidden to shown.
+  // The Text tab's native preview reads it on mount so it can hold itself
+  // hidden until the window's restore animation finishes, instead of appearing
+  // over the transition. 0 = never restored from the tray, which means no hold.
   windowRestoredAt: 0,
   // Whether that last restore was from MINIMIZED (the Windows restore
   // animation plays) rather than from hidden (instant, e.g. close-to-tray).
   // The Text tab only waits out the animation in the animated case.
   windowRestoreAnimated: false,
-  // Timestamp of the last backend-driven show (window-visibility event). The
-  // Text tab uses it to tell a backend show (the animated flag decides)
-  // from a taskbar restore (no event fires; a taskbar restore is always a
-  // minimized restore, so it always animates).
+  // Timestamp of the last backend-driven tray show. Taskbar restores keep
+  // the frontend mounted, so they do not change the availability timestamp.
   windowShownAt: 0,
   // Whether this session runs with administrator rights. null until the
   // startup probe answers; an elevated session runs the Screen Dimmer's
@@ -546,6 +543,206 @@ export const debugSettings = $state({
 // "None" for unbound). Loaded from config on startup; changes go through
 // setHotkey, which registers the combo in Rust (RegisterHotKey) and persists.
 export const hotkeys = $state({});
+
+export const tvController = $state({
+  state: 'disconnected',
+  deviceId: '',
+  name: '',
+  host: '',
+  endpoint: '',
+  paired: false,
+  credentialSaved: false,
+  pending: false,
+  volume: null,
+  muted: null,
+  inputId: '',
+  inputLabel: '',
+  pictureMode: null,
+  pictureModes: [],
+  pictureError: '',
+  pictureWriteError: '',
+  error: '',
+});
+
+export const tvDiscovery = $state({
+  state: 'idle',
+  candidates: [],
+  error: '',
+});
+
+function samePictureModes(left, right) {
+  if (left.length !== right.length) return false;
+  return left.every((option, index) => (
+    option.id === right[index]?.id && option.label === right[index]?.label
+  ));
+}
+
+function applyTvSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  const previousState = tvController.state;
+  const previousPending = tvController.pending;
+  const previousInputId = tvController.inputId;
+  const previousPictureMode = tvController.pictureMode;
+  const previousPictureError = tvController.pictureError;
+  const previousPictureWriteError = tvController.pictureWriteError;
+  tvController.state = typeof snapshot.state === 'string' ? snapshot.state : 'disconnected';
+  tvController.deviceId = typeof snapshot.deviceId === 'string' ? snapshot.deviceId : '';
+  tvController.name = typeof snapshot.name === 'string' ? snapshot.name : '';
+  tvController.host = typeof snapshot.host === 'string' ? snapshot.host : '';
+  tvController.endpoint = typeof snapshot.endpoint === 'string' ? snapshot.endpoint : '';
+  tvController.paired = snapshot.paired === true;
+  tvController.credentialSaved = snapshot.credentialSaved === true;
+  tvController.pending = snapshot.pending === true;
+  tvController.volume = snapshot.volume == null || !Number.isFinite(Number(snapshot.volume))
+    ? null
+    : Number(snapshot.volume);
+  tvController.muted = typeof snapshot.muted === 'boolean' ? snapshot.muted : null;
+  tvController.inputId = typeof snapshot.inputId === 'string' ? snapshot.inputId : '';
+  tvController.inputLabel = typeof snapshot.inputLabel === 'string' ? snapshot.inputLabel : '';
+  tvController.pictureMode = typeof snapshot.pictureMode === 'string' ? snapshot.pictureMode : null;
+  const nextPictureModes = Array.isArray(snapshot.pictureModes)
+    ? snapshot.pictureModes
+      .filter((option) => option && typeof option === 'object')
+      .map((option) => ({
+        id: typeof option.id === 'string' ? option.id : '',
+        label: typeof option.label === 'string' ? option.label : '',
+      }))
+      .filter((option) => option.id && option.label)
+    : [];
+  if (!samePictureModes(tvController.pictureModes, nextPictureModes)) {
+    tvController.pictureModes = nextPictureModes;
+  }
+  tvController.pictureError = typeof snapshot.pictureError === 'string' ? snapshot.pictureError : '';
+  tvController.pictureWriteError = typeof snapshot.pictureWriteError === 'string' ? snapshot.pictureWriteError : '';
+  tvController.error = typeof snapshot.error === 'string' ? snapshot.error : '';
+  const inputChanged = previousInputId !== tvController.inputId;
+  const pictureModeChanged = previousPictureMode !== tvController.pictureMode;
+  const pictureErrorChanged = previousPictureError !== tvController.pictureError;
+  const pictureWriteErrorChanged = previousPictureWriteError !== tvController.pictureWriteError;
+  if (
+    previousState !== tvController.state
+    || previousPending !== tvController.pending
+    || inputChanged
+    || pictureModeChanged
+    || pictureErrorChanged
+    || pictureWriteErrorChanged
+  ) {
+    console.debug('[tv] state snapshot applied', {
+      state: tvController.state,
+      pending: tvController.pending,
+      inputChanged,
+      pictureModeChanged,
+      pictureErrorChanged,
+      pictureWriteErrorChanged,
+      inputId: tvController.inputId,
+      pictureMode: tvController.pictureMode,
+      pictureErrorPresent: Boolean(tvController.pictureError),
+      pictureWriteErrorPresent: Boolean(tvController.pictureWriteError),
+    });
+  }
+}
+
+export async function loadTvState() {
+  try {
+    applyTvSnapshot(await invoke('tv_get_state'));
+  } catch (error) {
+    tvController.error = String(error);
+  }
+}
+
+export function syncTvState(snapshot) {
+  applyTvSnapshot(snapshot);
+}
+
+function applyTvDiscovery(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  tvDiscovery.state = typeof snapshot.state === 'string' ? snapshot.state : 'idle';
+  tvDiscovery.error = typeof snapshot.error === 'string' ? snapshot.error : '';
+  tvDiscovery.candidates = Array.isArray(snapshot.candidates)
+    ? snapshot.candidates
+      .filter((candidate) => candidate && typeof candidate === 'object')
+      .map((candidate) => ({
+        deviceId: typeof candidate.deviceId === 'string' ? candidate.deviceId : '',
+        name: typeof candidate.name === 'string' ? candidate.name : 'LG webOS TV',
+        host: typeof candidate.host === 'string' ? candidate.host : '',
+        model: typeof candidate.model === 'string' ? candidate.model : '',
+        modelNumber: typeof candidate.modelNumber === 'string' ? candidate.modelNumber : '',
+        softwareVersion: typeof candidate.softwareVersion === 'string' ? candidate.softwareVersion : '',
+        screenType: typeof candidate.screenType === 'string' ? candidate.screenType : '',
+        resolution: typeof candidate.resolution === 'string' ? candidate.resolution : '',
+        widthPx: Number.isFinite(Number(candidate.widthPx)) ? Number(candidate.widthPx) : 0,
+        heightPx: Number.isFinite(Number(candidate.heightPx)) ? Number(candidate.heightPx) : 0,
+      }))
+      .filter((candidate) => candidate.deviceId && candidate.host)
+    : [];
+}
+
+export async function loadTvDiscovery() {
+  try {
+    applyTvDiscovery(await invoke('tv_get_discovery'));
+  } catch (error) {
+    tvDiscovery.error = String(error);
+  }
+}
+
+export function syncTvDiscovery(snapshot) {
+  applyTvDiscovery(snapshot);
+}
+
+export async function discoverTvs() {
+  const snapshot = await invoke('tv_discover');
+  applyTvDiscovery(snapshot);
+  return snapshot;
+}
+
+export async function pairTv(host, name = 'OLED Helper') {
+  const snapshot = await invoke('tv_pair', { host, name });
+  applyTvSnapshot(snapshot);
+  return snapshot;
+}
+
+export async function disconnectTv() {
+  await invoke('tv_disconnect');
+}
+
+export async function connectTv(host, name = 'OLED Helper') {
+  const snapshot = await invoke('tv_connect', { host, name });
+  applyTvSnapshot(snapshot);
+  return snapshot;
+}
+
+export async function forgetTv() {
+  await invoke('tv_forget');
+}
+
+export async function adjustTvVolume(delta) {
+  return invoke('tv_adjust_volume', { delta });
+}
+
+export async function toggleTvMute() {
+  return invoke('tv_toggle_mute');
+}
+
+export async function refreshTvPictureContext() {
+  // Polling is intentionally a read only component operation. The worker
+  // updates its backend cache, while the TV tab merges the returned fields
+  // into its local state. Keeping this out of the shared store prevents a
+  // five second status read from invalidating the app shell or its menus.
+  return invoke('tv_refresh_picture_context');
+}
+
+export async function restartTv() {
+  return invoke('tv_restart');
+}
+
+export async function setTvPictureMode(mode) {
+  return invoke('tv_set_picture_mode', { mode });
+}
+
+export async function setTvPictureSetting(settingId, value) {
+  return invoke('tv_set_picture_setting', { settingId, value });
+}
+
 // Save is deferred briefly after a bind change: the capture flow can fire
 // several updates in quick succession (bind, then clear) and each save
 // rewrites the whole config file.

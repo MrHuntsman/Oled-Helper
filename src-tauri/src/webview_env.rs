@@ -111,6 +111,17 @@ pub(crate) fn set_inactive(app: &AppHandle, label: &str) {
     apply(app, label, false);
 }
 
+// The main window is different from the overlays. A taskbar minimize keeps
+// its native window visible and its webview mounted, so it must not enter the
+// inactive policy. Only a real tray hide makes the main webview inactive.
+fn policy_active(label: &str, visible: bool, minimized: bool) -> bool {
+    if label == MAIN_LABEL {
+        visible
+    } else {
+        visible && !minimized
+    }
+}
+
 fn apply(app: &AppHandle, label: &str, active: bool) {
     let Some(tracked) = TRACKED.iter().find(|tracked| tracked.label == label) else {
         return; // a window the policy does not track
@@ -154,10 +165,12 @@ pub(crate) fn start_policy(app: AppHandle) {
                 let Some(window) = app.get_window(label) else {
                     continue;
                 };
-                // A minimized window is off screen too, and Windows keeps
-                // compositing it otherwise.
-                let active = window.is_visible().unwrap_or(true)
-                    && !window.is_minimized().unwrap_or(false);
+                // Keep the main webview active through a taskbar minimize. The
+                // overlays still go inactive when minimized because they have
+                // no state that must survive a taskbar restore.
+                let visible = window.is_visible().unwrap_or(true);
+                let minimized = window.is_minimized().unwrap_or(false);
+                let active = policy_active(label, visible, minimized);
                 if active {
                     set_active(&app, label);
                 } else {
@@ -286,6 +299,27 @@ mod platform {
         if let Err(error) = unsafe { core3.TrySuspend(&handler) } {
             log::warn!("[webview] {log_label}: TrySuspend call failed ({error})");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{policy_active, FLYOUT_LABEL, MAIN_LABEL, TRAY_MENU_LABEL};
+
+    #[test]
+    fn main_taskbar_minimize_stays_active() {
+        assert!(policy_active(MAIN_LABEL, true, true));
+    }
+
+    #[test]
+    fn main_tray_hide_becomes_inactive() {
+        assert!(!policy_active(MAIN_LABEL, false, false));
+    }
+
+    #[test]
+    fn overlay_minimize_becomes_inactive() {
+        assert!(!policy_active(FLYOUT_LABEL, true, true));
+        assert!(!policy_active(TRAY_MENU_LABEL, true, true));
     }
 }
 

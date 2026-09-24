@@ -1,6 +1,7 @@
 // Simple JSON config file persisted in the app's config dir (same appdata
-// root as the log files, e.g. %APPDATA%/OledHelper on Windows). Currently
-// stores Black Crush and Taskbar Dimmer settings so they survive restarts.
+// root as the log files, e.g. %APPDATA%/OledHelper on Windows). It stores
+// application settings and nonsecret TV device metadata. The TV client key
+// is kept in Windows Credential Manager instead.
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -60,6 +61,44 @@ pub struct MonitorKnobs {
     pub boldness: u32,
     #[serde(default)]
     pub damping: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct TvDeviceConfig {
+    #[serde(default)]
+    pub device_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub firmware: String,
+    #[serde(default)]
+    pub paired: bool,
+    #[serde(default = "default_tv_auto_reconnect")]
+    pub auto_reconnect: bool,
+    #[serde(default)]
+    pub certificate_fingerprint: String,
+}
+
+impl Default for TvDeviceConfig {
+    fn default() -> Self {
+        Self {
+            device_id: String::new(),
+            name: String::new(),
+            host: String::new(),
+            endpoint: String::new(),
+            model: String::new(),
+            firmware: String::new(),
+            paired: false,
+            auto_reconnect: true,
+            certificate_fingerprint: String::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -241,6 +280,8 @@ pub struct AppConfig {
     // recovery watchdog remains active regardless.
     #[serde(default)]
     pub skip_favorite_confirmation: bool,
+    #[serde(default)]
+    pub tv_device: Option<TvDeviceConfig>,
 }
 
 /// Deserialize `per_monitor_custom`: accepts the current 2D shape
@@ -273,6 +314,9 @@ where
 }
 
 fn default_true() -> bool {
+    true
+}
+fn default_tv_auto_reconnect() -> bool {
     true
 }
 fn default_dimmer_opacity() -> f64 {
@@ -359,6 +403,7 @@ impl Default for AppConfig {
             favorite_hotkey_slots: HashMap::new(),
             keep_tray_menu_warm: false,
             skip_favorite_confirmation: false,
+            tv_device: None,
         }
     }
 }
@@ -426,7 +471,9 @@ pub fn load_config(app: AppHandle) -> AppConfig {
         Ok(p) => p,
         Err(e) => {
             log::warn!("load_config: {e}");
-            return AppConfig::default();
+            let config = AppConfig::default();
+            remember_tv_device(None);
+            return config;
         }
     };
     match fs::read_to_string(&path) {
@@ -438,9 +485,14 @@ pub fn load_config(app: AppHandle) -> AppConfig {
             migrate_legacy_ease_duration(&text, &mut config);
             migrate_legacy_screen_protector(&text, &mut config);
             migrate_screen_protector_enabled(&text, &mut config);
+            remember_tv_device(config.tv_device.clone());
             config
         }
-        Err(_) => AppConfig::default(),
+        Err(_) => {
+            let config = AppConfig::default();
+            remember_tv_device(None);
+            config
+        }
     }
 }
 
@@ -502,6 +554,32 @@ static CONFIG_WRITE_QUEUE: OnceLock<(Mutex<Option<PendingConfigWrite>>, Condvar)
 static CONFIG_WRITE_WORKER: OnceLock<Result<Mutex<Option<std::thread::JoinHandle<()>>>, String>> =
     OnceLock::new();
 static CONFIG_APP: OnceLock<AppHandle> = OnceLock::new();
+static TV_DEVICE_CONFIG: OnceLock<Mutex<Option<TvDeviceConfig>>> = OnceLock::new();
+
+fn tv_device_slot() -> &'static Mutex<Option<TvDeviceConfig>> {
+    TV_DEVICE_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+fn remember_tv_device(device: Option<TvDeviceConfig>) {
+    if let Ok(mut current) = tv_device_slot().lock() {
+        *current = device;
+    }
+}
+
+pub fn saved_tv_device() -> Option<TvDeviceConfig> {
+    tv_device_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+pub fn update_tv_device(app: &AppHandle, device: Option<TvDeviceConfig>) -> Result<(), String> {
+    remember_tv_device(device.clone());
+    let mut config = load_config(app.clone());
+    config.tv_device = device.clone();
+    remember_tv_device(device);
+    enqueue_config_write(app, &config)
+}
 
 fn emit_config_write_failed(message: &str) {
     if let Some(app) = CONFIG_APP.get() {
@@ -616,11 +694,24 @@ fn enqueue_config_write(app: &AppHandle, config: &AppConfig) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
+pub fn save_config(app: AppHandle, mut config: AppConfig) -> Result<(), String> {
+    // The frontend mirrors the ordinary settings, but it must not clear TV
+    // metadata that was loaded or updated by the Rust credential workflow.
+    if config.tv_device.is_none() {
+        config.tv_device = saved_tv_device();
+    }
     enqueue_config_write(&app, &config)
 }
 #[tauri::command]
 pub fn reset_config(app: AppHandle) -> Result<AppConfig, String> {
+    let saved_device = saved_tv_device();
+    if let Some(device) = saved_device.as_ref() {
+        crate::tv::delete_credential(&device.device_id)?;
+    }
+    if saved_device.is_some() {
+        crate::tv::queue_reset(&app)?;
+    }
+    remember_tv_device(None);
     let defaults = AppConfig::default();
     enqueue_config_write(&app, &defaults)?;
     Ok(defaults)
@@ -676,6 +767,25 @@ mod tests {
         migrate_legacy_ease_duration("not json", &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
     }
+    #[test]
+    fn tv_device_metadata_round_trip_without_a_client_key() {
+        let config = AppConfig {
+            tv_device: Some(TvDeviceConfig {
+                device_id: "lg-192.168.1.50".into(),
+                name: "Living Room TV".into(),
+                host: "192.168.1.50".into(),
+                endpoint: "wss://192.168.1.50:3001".into(),
+                paired: true,
+                ..TvDeviceConfig::default()
+            }),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("client-key"));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tv_device, config.tv_device);
+    }
+
     #[test]
     fn tray_menu_warm_setting_round_trip() {
         let config = AppConfig {

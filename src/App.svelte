@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, appSettings, crush, taskbarDimmer, screenDimmer, screenDimmerHelper, refreshScreenDimmerHelperReady, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId } from './lib/stores.svelte.js';
+  import { app, appSettings, crush, taskbarDimmer, screenDimmer, screenDimmerHelper, refreshScreenDimmerHelperReady, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId, loadTvState, syncTvState, loadTvDiscovery, syncTvDiscovery } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -18,6 +18,7 @@
   import TabTextIcon from './lib/TabTextIcon.svelte';
   import TabWindowsFont from './lib/TabWindowsFont.svelte';
   import TabWindowsFontIcon from './lib/TabWindowsFontIcon.svelte';
+  import TabTvController from './lib/TabTvController.svelte';
 
   // Icons are inlined as data URIs (?inline) instead of /icons/*.png URLs so
   // they never depend on the dev server or asset protocol at runtime, a tray
@@ -614,12 +615,18 @@
   // hides to the tray or loses focus (minimize, backgrounded): a dropdown
   // left open would otherwise still be open, stale and floating over the
   // restored window, when the user comes back.
-  function closeAllMenus() {
+  function closeAllMenus(reason = 'unknown') {
+    const hadOpenMenu = resMenuOpen
+      || hzMenuOpen
+      || favoritesMenuOpen
+      || resCtxMenu.open
+      || hzCtxMenu.open;
     resMenuOpen = false;
     hzMenuOpen = false;
     favoritesMenuOpen = false;
     if (resCtxMenu.open) closeResContextMenu();
     if (hzCtxMenu.open) closeHzContextMenu();
+    if (hadOpenMenu) console.debug('[window] menus closed', { reason });
   }
   // Hover-open for the favorites menu: a short delay so a quick pass over the
   // star in the status bar does not flash the menu, and a grace period on
@@ -1138,6 +1145,8 @@
     let unlisten;
     let unlistenDisplayChanged;
     let unlistenHotkeyPressed;
+    let unlistenTvState;
+    let unlistenTvDiscovery;
     // The Rust window subclass forwards WM_DISPLAYCHANGE and WM_DEVICECHANGE.
     // Full display-info queries remain event-driven. Vendor control panels can
     // silently change range/VRR, so a separate low-frequency vendor-only
@@ -1198,28 +1207,103 @@
       hdrLayerRetryCount = 0;
       hdrLayerInitStarted = false;
     }).then((stop) => { unlistenDisplayChanged = stop; }).catch(() => {});
-    // Central handler for the window's shown/hidden state. Rust's
-    // window-visibility event is the fast path for tray show/hide, but a
-    // restore that happens outside that path (taskbar click after minimize,
-    // or a dropped event) never emits it, so `windowVisible`, the flag that
-    // gates the active tab's markup, can go stale and leave the tab area
-    // blank. Routing the state change through here (and re-checking the real
-    // state on window focus below) makes the flag self-heal.
-    function applyWindowVisible(visible, animated = false) {
+    // Central handler for the main webview's availability. A taskbar
+    // minimize deliberately does not change `windowVisible`: the native
+    // window remains visible and the frontend stays mounted. Only a verified
+    // close to tray sends the false transition that unmounts the active tab.
+    // The focus reconciliation below covers a show or hide that did not
+    // produce a backend event.
+    let visibilityRequestSerial = 0;
+    function applyWindowVisible(
+      visible,
+      animated = false,
+      source = 'unknown',
+      nativeConfirmed = false,
+    ) {
+      const requestedVisible = !!visible;
       const wasVisible = windowVisible;
-      windowVisible = visible;
-      if (!visible) {
-        // Window hid to the tray (or a self-heal read found it hidden):
-        // close any open dropdown so it never greets the user on restore.
-        closeAllMenus();
+      const requestSerial = ++visibilityRequestSerial;
+      const documentVisible = document.visibilityState === 'visible';
+      console.debug('[window] visibility request received', {
+        source,
+        requestSerial,
+        requestedVisible,
+        wasVisible,
+        documentVisibility: document.visibilityState,
+        nativeConfirmed,
+      });
+      // A backend event can briefly report hidden while the native window is
+      // still on screen. Confirm that transition before unmounting the active
+      // tab, otherwise a harmless reconciliation race looks like a full page
+      // refresh. The confirmed flag prevents an asynchronous check from
+      // recursively checking itself.
+      if (!requestedVisible && wasVisible && documentVisible && !nativeConfirmed) {
+        const checkStarted = performance.now();
+        invoke('is_main_window_visible')
+          .then((nativeVisible) => {
+            console.debug('[window] native visibility confirmation completed', {
+              source,
+              requestSerial,
+              nativeVisible: !!nativeVisible,
+              elapsedMs: Math.round(performance.now() - checkStarted),
+            });
+            if (requestSerial !== visibilityRequestSerial) {
+              console.debug('[window] stale native visibility confirmation ignored', {
+                source,
+                requestSerial,
+                currentSerial: visibilityRequestSerial,
+              });
+              return;
+            }
+            applyWindowVisible(
+              !!nativeVisible,
+              false,
+              `${source}:native-confirmation`,
+              true,
+            );
+          })
+          .catch((error) => {
+            console.warn('[window] native visibility confirmation failed', {
+              source,
+              requestSerial,
+              error: String(error),
+            });
+          });
+        return;
+      }
+      windowVisible = requestedVisible;
+      if (!requestedVisible) {
+        console.debug('[window] visibility transition applied', {
+          source,
+          requestSerial,
+          visible: false,
+        });
+        // The main window was hidden to the tray. Close any open dropdown so
+        // it never greets the user when the rebuilt frontend is shown again.
+        closeAllMenus('native-hidden');
         scheduleVisibilityReconcile();
         return;
       }
-      if (wasVisible) return;
+      // A taskbar restore emits a true event while the webview stayed
+      // available. Keep the mounted tab and its session state intact.
+      if (wasVisible) {
+        console.debug('[window] visibility transition unchanged', {
+          source,
+          requestSerial,
+          visible: true,
+        });
+        return;
+      }
       if (visibilityReconcileTimer) {
         clearTimeout(visibilityReconcileTimer);
         visibilityReconcileTimer = null;
       }
+      console.debug('[window] visibility transition applied', {
+        source,
+        requestSerial,
+        visible: true,
+        animated: !!animated,
+      });
       // Stamp the restore moment. The Text tab's native preview reads this
       // on mount and holds itself hidden until the window's restore
       // animation has had time to finish, so the text sample never appears
@@ -1251,17 +1335,29 @@
       applyWindowVisible(
         object ? payload.visible !== false : payload !== false,
         object ? payload.animated === true : false,
+        'backend-event',
       );
     }).then((stop) => { unlisten = stop; }).catch(() => {});
-    // Self-heal: a restore that doesn't go through show_main_window (e.g.
-    // clicking the taskbar button after minimizing) fires window focus but no
-    // window-visibility event, which would leave windowVisible false and the
-    // active tab blank. Re-read the real visibility from Rust on focus so the
-    // flag always converges to the actual state.
-    function reconcileWindowVisible() {
+    // Self-heal: a taskbar restore or a missed backend event fires window
+    // focus. Re-read the native state from Rust so availability converges,
+    // while the minimized state remains available to the frontend.
+    function reconcileWindowVisible(source = 'focus') {
+      const reason = typeof source === 'string' ? source : source?.type || 'focus';
+      console.debug('[window] visibility reconcile started', { source: reason });
       invoke('is_main_window_visible')
-        .then((visible) => { applyWindowVisible(!!visible); })
-        .catch(() => {});
+        .then((visible) => {
+          console.debug('[window] visibility reconcile completed', {
+            source: reason,
+            visible: !!visible,
+          });
+          applyWindowVisible(!!visible, false, `reconcile:${reason}`);
+        })
+        .catch((error) => {
+          console.warn('[window] visibility reconcile failed', {
+            source: reason,
+            error: String(error),
+          });
+        });
     }
     window.addEventListener('focus', reconcileWindowVisible);
     // The focus-based reconcile above cannot fire when the window stays
@@ -1278,22 +1374,32 @@
       visibilityReconcileTimer = setTimeout(() => {
         visibilityReconcileTimer = null;
         if (windowVisible || document.visibilityState !== 'visible') return;
-        reconcileWindowVisible();
+        reconcileWindowVisible('visibility-timer');
         scheduleVisibilityReconcile();
       }, 500);
     }
     // A dropdown left open when the window is minimized or backgrounded
-    // (another app focused) would still be open, and stale, when the user
-    // comes back. The window-visibility event covers the close-to-tray path
-    // (applyWindowVisible above); blur and visibilitychange cover minimize
-    // and backgrounding, where no Rust event is emitted.
-    window.addEventListener('blur', closeAllMenus);
+    // would still be open, and stale, when the user comes back. The
+    // window-visibility event covers the close-to-tray path; blur and
+    // visibilitychange cover taskbar minimize and backgrounding.
+    function onWindowBlur() {
+      closeAllMenus('window-blur');
+    }
+    window.addEventListener('blur', onWindowBlur);
     function onDocumentVisibilityChange() {
-      if (document.visibilityState === 'hidden') closeAllMenus();
+      console.debug('[window] document visibility changed', {
+        visibility: document.visibilityState,
+        windowVisible,
+      });
+      if (document.visibilityState === 'hidden') closeAllMenus('document-hidden');
     }
     document.addEventListener('visibilitychange', onDocumentVisibilityChange);
     // Global hotkey dispatch (see hotkeys.rs). Payload is the action name.
     listen('hotkey-pressed', (event) => handleHotkeyAction(event.payload)).then((stop) => { unlistenHotkeyPressed = stop; }).catch(() => {});
+    listen('tv-state-changed', (event) => syncTvState(event.payload)).then((stop) => { unlistenTvState = stop; }).catch(() => {});
+    listen('tv-discovery-changed', (event) => syncTvDiscovery(event.payload)).then((stop) => { unlistenTvDiscovery = stop; }).catch(() => {});
+    loadTvState();
+    loadTvDiscovery();
     // A favorite removal requested from the Hotkeys tab (its slot rows have a
     // remove button). Opens the same confirmation dialog as the status-bar
     // star, so removal is always confirmed before it happens.
@@ -1333,11 +1439,13 @@
       clearTimeout(hdrStatusRefreshTimer);
       clearTimeout(sdrWhiteBaseRecaptureTimer);
       unlistenHotkeyPressed?.();
+      unlistenTvState?.();
+      unlistenTvDiscovery?.();
       unlistenFavoriteRemove?.();
       unlistenFlyoutCompleted?.();
       unlistenFavoriteConfirmed?.();
       window.removeEventListener('focus', reconcileWindowVisible);
-      window.removeEventListener('blur', closeAllMenus);
+      window.removeEventListener('blur', onWindowBlur);
       if (visibilityReconcileTimer) {
         clearTimeout(visibilityReconcileTimer);
         visibilityReconcileTimer = null;
@@ -1547,6 +1655,9 @@
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} aria-current={app.activeTab === 'windows-hdr' ? 'page' : undefined} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR <span class="nav-global-tag">Global</span>
     </button>
+    <button class="nav-btn" class:active={app.activeTab === 'tv-controller'} aria-current={app.activeTab === 'tv-controller' ? 'page' : undefined} onclick={() => app.activeTab = 'tv-controller'}>
+      <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> TV Controller
+    </button>
     <button class="nav-btn" class:active={app.activeTab === 'power'} aria-current={app.activeTab === 'power' ? 'page' : undefined} onclick={() => app.activeTab = 'power'}>
       <TabPowerIcon class="nav-icon" /> Power Saving <span class="nav-global-tag">Global</span>
     </button>
@@ -1572,6 +1683,8 @@
         <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} menuOpen={resMenuOpen || hzMenuOpen || favoritesMenuOpen || resCtxMenu.open || hzCtxMenu.open} />
       {:else if app.activeTab === 'windows-font'}
         <TabWindowsFont />
+      {:else if app.activeTab === 'tv-controller'}
+        <TabTvController />
       {:else if app.activeTab === 'power'}
         <TabPower />
       {:else if app.activeTab === 'windows-hdr'}

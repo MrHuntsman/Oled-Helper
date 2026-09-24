@@ -40,6 +40,348 @@
   }
 }
 
+/* ── LG TV Controller ─────────────────────────────────────────────── */
+.tv-device-panel,
+.tv-audio-panel,
+.tv-context-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.tv-pairing-strip {
+  gap: 8px;
+}
+.tv-pairing-strip .dimmer-control-heading {
+  gap: 10px;
+}
+.tv-pairing-strip-title {
+  overflow: hidden;
+  flex: 1 1 auto;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The TV tab's action buttons. They previously reused the dimmer tab's
+   button classes which have no CSS rules, so they rendered as bare text.
+   Solid variants: primary is accent filled, danger is red filled, and the
+   ghost variant is a bordered neutral button for inline strip actions. */
+.tv-btn {
+  padding: 5px 10px;
+  border: 1px solid var(--control-border);
+  border-radius: 5px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--hover) 60%, transparent);
+  font: 11px var(--font);
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s, filter 0.12s;
+}
+.tv-btn:hover:not(:disabled) {
+  border-color: var(--control-border-strong);
+  background: var(--hover);
+}
+.tv-btn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.tv-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.tv-btn-primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: #141414;
+  background: var(--accent);
+}
+.tv-btn-primary:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent);
+  filter: brightness(1.1);
+}
+.tv-btn-danger {
+  border-color: color-mix(in srgb, #E05555 45%, var(--control-border));
+  color: #E05555;
+  background: transparent;
+}
+.tv-btn-danger:hover:not(:disabled) {
+  border-color: #E05555;
+  background: color-mix(in srgb, #E05555 12%, transparent);
+}
+.tv-btn-ghost {
+  padding: 3px 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-weak);
+}
+.tv-btn-ghost:hover:not(:disabled) {
+  border-color: var(--control-border);
+  color: var(--text);
+  background: var(--hover);
+}
+.tv-pairing-strip-btn {
+  flex: 0 0 auto;
+}
+.tv-video-panel {
+  width: 100%;
+  max-width: 760px;
+  gap: 10px;
+}
+.tv-context-refresh-btn {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+}
+.tv-state-chip {
+  padding: 3px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 600;
+}
+.tv-state-connected {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--divider));
+}
+.tv-state-pending {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--divider));
+}
+.tv-connect-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 10px;
+}
+.tv-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 600;
+}
+.tv-field input,
+.tv-field select {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--bg);
+  font: 13px var(--font);
+}
+.tv-field input:disabled,
+.tv-field select:disabled {
+  opacity: 0.55;
+}
+.tv-action-row,
+.tv-audio-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.tv-endpoint,
+.tv-pairing-note {
+  color: var(--text-weak);
+  font-size: 12px;
+}
+.tv-endpoint {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.tv-context-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.tv-context-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.tv-context-label {
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 600;
+}
+.tv-context-value {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tv-picture-mode-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.tv-picture-mode-row .tv-field {
+  flex: 1 1 auto;
+}
+.tv-picture-mode-row > button {
+  flex: 0 0 auto;
+}
+.tv-context-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.tv-settings-panel {
+  width: 100%;
+  max-width: 760px;
+  gap: 10px;
+}
+.tv-settings-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+.tv-setting-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.tv-setting-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.tv-setting-select {
+  flex: 0 0 auto;
+  width: 130px;
+  padding: 6px 8px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--bg);
+  font: 12px var(--font);
+}
+.tv-setting-select:disabled {
+  opacity: 0.55;
+}
+.tv-setting-stepper {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tv-setting-step-btn {
+  width: 28px;
+  padding: 6px 0;
+  text-align: center;
+}
+.tv-setting-input {
+  width: 56px;
+  padding: 6px 4px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--bg);
+  font: 13px var(--font);
+  font-weight: 600;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.tv-setting-input:disabled {
+  opacity: 0.55;
+}
+.tv-setting-input::-webkit-inner-spin-button,
+.tv-setting-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.tv-setting-pending {
+  flex: 0 0 auto;
+  color: var(--text-weak);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tv-setting-error {
+  margin: -2px 0 0;
+  font-size: 11px;
+}
+.tv-discovery-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tv-discovery-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  color: var(--text);
+  background: transparent;
+  font: 12px var(--font);
+  text-align: left;
+  cursor: pointer;
+}
+.tv-discovery-item:hover:not(:disabled),
+.tv-discovery-item.selected {
+  border-color: var(--control-border-strong);
+  background: var(--hover);
+}
+.tv-discovery-item:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.tv-discovery-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.tv-discovery-item-name,
+.tv-discovery-item-model,
+.tv-discovery-item-host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tv-discovery-item-name {
+  font-weight: 600;
+}
+.tv-discovery-item-model,
+.tv-discovery-item-host {
+  color: var(--text-weak);
+  font-size: 11px;
+}
+.tv-discovery-item-meta {
+  overflow: hidden;
+  color: var(--text-weak);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+.tv-discovery-item-host {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 @font-face {
   font-family: 'Inter';
   src: url('/fonts/inter/Inter_18pt-Regular.ttf') format('truetype');
@@ -4010,6 +4352,13 @@ select:focus-visible,
 }
 
 @media (max-width: 620px) {
+  .tv-video-panel,
+  .tv-settings-panel {
+    max-width: none;
+  }
+  .tv-settings-list {
+    grid-template-columns: 1fr;
+  }
   .hdr-mode-switch { grid-template-columns: 1fr; }
   .hdr-mode-switch:not(:has(.hdr-mode-option-wrap:nth-child(3))) { grid-template-columns: 1fr; }
 }

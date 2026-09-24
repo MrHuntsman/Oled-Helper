@@ -23,6 +23,7 @@ mod taskbar_dimmer;
 mod text_rendering;
 mod tray_balloon;
 mod tray_menu_window;
+mod tv;
 mod updater;
 mod vendor_info;
 mod webview_env;
@@ -457,19 +458,18 @@ fn get_display_target() -> Option<display_info::DisplayTargetInfo> {
     display_info::display_target_info()
 }
 
-// Frontend self-heal for window visibility. The `window-visibility` event
-// mirrors show/hide driven from the tray, but a restore that happens outside
-// that path (e.g. clicking the taskbar button after minimize, or a missed
-// event) never emits it, so the frontend's mirror flag can go stale and leave
-// the active tab blank. Expose the real state so the frontend can reconcile
-// on window focus.
+// Frontend self-heal for main webview availability. The `window-visibility`
+// event mirrors the real tray hide, but a taskbar minimize is not a tray hide:
+// the native window stays visible and its webview must remain mounted. Expose
+// that state so a focus reconciliation cannot mistake a taskbar minimize for
+// the close-to-tray teardown path.
 #[tauri::command]
 fn is_main_window_visible(app: AppHandle) -> bool {
-    main_window::window(&app)
-        .map(|window| {
-            window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
-        })
-        .unwrap_or(false)
+    let visible = main_window::window(&app)
+        .map(|window| window.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+    log::debug!("[window] native visibility queried visible={visible}");
+    visible
 }
 
 // The rebuilt main frontend reports in here once its event listeners are
@@ -491,13 +491,10 @@ pub(crate) fn show_main_window(app: &AppHandle) {
         // clicked, so is_focused() is already false by the time this callback
         // runs. Visibility and minimized state are the reliable toggle inputs.
         if is_visible && !is_minimized {
-            if window.minimize().is_ok() {
-                webview_env::set_inactive(app, "main");
-                let _ = app.emit(
-                    "window-visibility",
-                    serde_json::json!({ "visible": false, "animated": false }),
-                );
-            }
+            // This is a taskbar minimize, not a close to the tray. Keep the
+            // main webview active and keep the frontend mounted so restoring
+            // from the taskbar is immediate and preserves its state.
+            let _ = window.minimize();
             return;
         }
 
@@ -551,6 +548,7 @@ fn request_shutdown_and_exit(app: &AppHandle) {
     taskbar_dimmer::shutdown();
     hotkeys::shutdown();
     power::shutdown();
+    tv::shutdown(app);
     shutdown_gamma_worker(app);
     explorer_hook::shutdown();
     app.exit(0);
@@ -834,6 +832,7 @@ pub fn run() {
             safety_thread: Mutex::new(None),
         })
         .manage(taskbar_dimmer::TaskbarDimmerState::default())
+        .manage(tv::TvControllerState::default())
         .invoke_handler(tauri::generate_handler![
             gamma::apply_gamma_ramp,
             gamma::apply_gamma_ramp_for,
@@ -877,6 +876,19 @@ pub fn run() {
             taskbar_dimmer::set_taskbar_dimmer_hover_mode,
             taskbar_dimmer::set_taskbar_dimmer_poll_interval,
             taskbar_dimmer::get_taskbar_dimmer_status,
+            tv::tv_get_state,
+            tv::tv_get_discovery,
+            tv::tv_discover,
+            tv::tv_connect,
+            tv::tv_pair,
+            tv::tv_disconnect,
+            tv::tv_forget,
+            tv::tv_adjust_volume,
+            tv::tv_toggle_mute,
+            tv::tv_restart,
+            tv::tv_refresh_picture_context,
+            tv::tv_set_picture_mode,
+            tv::tv_set_picture_setting,
             hdr_toggle::get_windows_hdr_status,
             hdr_toggle::set_windows_hdr_enabled,
             hdr_toggle::get_hdr_luminance,
@@ -1069,6 +1081,9 @@ pub fn run() {
             // pre-warmed: their first status reads (taskbar dimmer, etc.)
             // must see the saved values, not the state defaults.
             let saved_config = config::load_config(app.handle().clone());
+            if let Err(error) = tv::restore_saved(app.handle(), saved_config.tv_device.clone()) {
+                log::warn!("[tv] startup restore could not start: {error}");
+            }
             tray_menu_window::set_keep_tray_menu_warm(saved_config.keep_tray_menu_warm);
 
             // Seed the backend's global gamma fallback before the screen-
@@ -1446,6 +1461,7 @@ pub fn run() {
                     taskbar_dimmer::shutdown();
                     hotkeys::shutdown();
                     power::shutdown();
+                    tv::shutdown(window.app_handle());
                     shutdown_gamma_worker(window.app_handle());
                 }
                 _ => {}
