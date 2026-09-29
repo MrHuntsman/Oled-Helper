@@ -18,6 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
@@ -50,31 +51,18 @@ const PICTURE_SETTINGS_CONTEXT: &str = "picture";
 const TV_RESTART_QUICK_START_KEY: &str = "quickStartMode";
 const TV_RESTART_WOL_KEY: &str = "wolwowlOnOff";
 
-// Phase 4 direct picture settings. Every entry is written through the same
-// notification alert compatibility path as the picture mode, because this
-// firmware refuses the direct setter for paired third-party clients. The
-// backlight key maps to the user facing OLED Pixel Brightness control.
+// Picture settings use the same direct and notification alert fallback chain
+// as picture mode because this firmware refuses the direct setter for paired
+// third-party clients. The backlight key maps to the user facing OLED Pixel
+// Brightness control. LG labels the picture category's numeric color setting
+// as Color Depth, while webOS stores it under the key color. The frontend
+// renders this array across two columns, so each left column control is
+// followed by its matching right column control.
 const PICTURE_SETTING_SPECS: &[TvPictureSettingSpec] = &[
     TvPictureSettingSpec {
         id: "backlight",
         label: "OLED Pixel Brightness",
         key: "backlight",
-        kind: TvPictureSettingKind::Number,
-        min: 0,
-        max: 100,
-    },
-    TvPictureSettingSpec {
-        id: "contrast",
-        label: "Contrast",
-        key: "contrast",
-        kind: TvPictureSettingKind::Number,
-        min: 0,
-        max: 100,
-    },
-    TvPictureSettingSpec {
-        id: "brightness",
-        label: "Black Level",
-        key: "brightness",
         kind: TvPictureSettingKind::Number,
         min: 0,
         max: 100,
@@ -90,10 +78,34 @@ const PICTURE_SETTING_SPECS: &[TvPictureSettingSpec] = &[
         max: 50,
     },
     TvPictureSettingSpec {
-        id: "colorTemperatureCode",
-        label: "Color Temperature Preset",
-        key: "colorTemperatureCode",
-        kind: TvPictureSettingKind::ColorTemperaturePreset,
+        id: "contrast",
+        label: "Contrast",
+        key: "contrast",
+        kind: TvPictureSettingKind::Number,
+        min: 0,
+        max: 100,
+    },
+    TvPictureSettingSpec {
+        id: "color",
+        label: "Color Depth",
+        key: "color",
+        kind: TvPictureSettingKind::Number,
+        min: 0,
+        max: 100,
+    },
+    TvPictureSettingSpec {
+        id: "brightness",
+        label: "Black Level",
+        key: "brightness",
+        kind: TvPictureSettingKind::Number,
+        min: 0,
+        max: 100,
+    },
+    TvPictureSettingSpec {
+        id: "colorGamut",
+        label: "Color Gamut",
+        key: "colorGamut",
+        kind: TvPictureSettingKind::ColorGamut,
         min: 0,
         max: 0,
     },
@@ -108,8 +120,9 @@ const PICTURE_SETTING_SPECS: &[TvPictureSettingSpec] = &[
 ];
 
 const DTM_SETTING_VALUES: &[&str] = &["off", "on", "HGIG"];
-const COLOR_TEMPERATURE_PRESET_VALUES: &[&str] = &["warm2", "warm1", "normal", "cool1", "cool2"];
+const COLOR_GAMUT_SETTING_VALUES: &[&str] = &["auto", "native", "dynamic", "adobeRGB"];
 const PICTURE_MODE_SETTLE_DELAY: Duration = Duration::from_millis(750);
+const TV_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const PICTURE_MODE_READBACK_ATTEMPTS: usize = 5;
 const PICTURE_MODE_READBACK_DELAY: Duration = Duration::from_millis(300);
 const PICTURE_ALERT_ENTER_DELAY: Duration = Duration::from_millis(150);
@@ -120,6 +133,17 @@ const TV_RESTART_WOL_PACKET_COUNT: usize = 3;
 const TV_RESTART_WOL_PACKET_GAP: Duration = Duration::from_millis(100);
 const TV_LOG_VALUE_LIMIT: usize = 160;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0x4f4c4400);
+
+fn reconnect_delay(attempt_index: usize) -> Duration {
+    RECONNECT_DELAYS
+        .get(attempt_index)
+        .copied()
+        .unwrap_or_else(|| {
+            *RECONNECT_DELAYS
+                .last()
+                .expect("reconnect delays are configured")
+        })
+}
 
 #[cfg(target_os = "windows")]
 fn credential_target(device_id: &str) -> String {
@@ -380,8 +404,12 @@ enum WorkerCommand {
     },
     ReconnectSaved {
         device: TvDeviceConfig,
+        client_key: Option<String>,
+        credential_saved: bool,
     },
-    Forget,
+    Forget {
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+    },
     Reset,
     Disconnect,
     AdjustVolume(i32),
@@ -394,12 +422,14 @@ enum WorkerCommand {
     },
     SetPictureMode {
         mode: String,
-        reply: oneshot::Sender<Result<TvStateSnapshot, String>>,
+        reply: Option<oneshot::Sender<Result<TvStateSnapshot, String>>>,
     },
     SetPictureSetting {
         setting_id: String,
         value: String,
-        reply: oneshot::Sender<Result<TvStateSnapshot, String>>,
+        // Optional, like SetPictureMode: a hotkey binding queues the write
+        // with nobody waiting on a reply.
+        reply: Option<oneshot::Sender<Result<TvStateSnapshot, String>>>,
     },
     Shutdown,
 }
@@ -415,7 +445,7 @@ pub struct TvPictureModeOption {
 pub enum TvPictureSettingKind {
     Number,
     Dtm,
-    ColorTemperaturePreset,
+    ColorGamut,
 }
 
 impl TvPictureSettingKind {
@@ -423,7 +453,7 @@ impl TvPictureSettingKind {
         match self {
             TvPictureSettingKind::Number => "number",
             TvPictureSettingKind::Dtm => "dtm",
-            TvPictureSettingKind::ColorTemperaturePreset => "colorTemperaturePreset",
+            TvPictureSettingKind::ColorGamut => "colorGamut",
         }
     }
 }
@@ -482,7 +512,7 @@ const DOLBY_HDR_PICTURE_MODE_IDS: &[&str] = &[
     "dolbyHdrGame",
 ];
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PictureContext {
     input_id: String,
     input_label: String,
@@ -503,6 +533,13 @@ struct ConnectedTv {
     name: String,
     device_id: String,
     endpoint: String,
+    // SHA-256 of the TV's TLS leaf certificate, learned during the explicit
+    // first pairing and persisted with the pairing. Every later connection
+    // (reconnect, recovery, restart, and the remote input socket) must present
+    // the same certificate, so a device that replaces the TV at that address
+    // is rejected instead of receiving the pairing key and the user's control
+    // requests.
+    certificate_fingerprint: String,
     picture_context: PictureContext,
 }
 
@@ -521,26 +558,36 @@ pub fn restore_saved(app: &AppHandle, device: Option<TvDeviceConfig>) -> Result<
     let Some(device) = device else {
         return Ok(());
     };
-    if !device.paired {
-        publish(app, saved_device_snapshot(&device, "pairing_required"));
-        return Ok(());
-    }
-    if !device.auto_reconnect {
-        publish(app, saved_device_snapshot(&device, "disconnected"));
+    if !device.paired || !device.auto_reconnect {
+        publish(
+            app,
+            saved_device_snapshot(
+                &device,
+                if device.paired { "disconnected" } else { "pairing_required" },
+            ),
+        );
         return Ok(());
     }
     publish(app, saved_device_snapshot(&device, "connecting"));
     let sender = ensure_worker(app)?;
     sender
-        .try_send(WorkerCommand::ReconnectSaved { device })
+        .try_send(WorkerCommand::ReconnectSaved {
+            device,
+            client_key: None,
+            credential_saved: true,
+        })
         .map_err(|_| "TV controller is shutting down".to_string())
 }
 
-pub fn queue_forget(app: &AppHandle) -> Result<(), String> {
+pub async fn forget_and_wait(app: &AppHandle) -> Result<(), String> {
     let sender = ensure_worker(app)?;
+    let (reply, receiver) = oneshot::channel();
     sender
-        .try_send(WorkerCommand::Forget)
-        .map_err(|_| "TV controller is shutting down".to_string())
+        .try_send(WorkerCommand::Forget { reply: Some(reply) })
+        .map_err(|_| "TV controller is shutting down".to_string())?;
+    receiver
+        .await
+        .map_err(|_| "TV controller stopped before forgetting the TV".to_string())?
 }
 
 pub fn queue_reset(app: &AppHandle) -> Result<(), String> {
@@ -560,6 +607,30 @@ pub fn queue_action(app: &AppHandle, action: &str) -> Result<(), String> {
     let sender = ensure_worker(app)?;
     sender
         .try_send(command)
+        .map_err(|_| "TV controller is shutting down".to_string())
+}
+
+pub fn queue_picture_mode(app: &AppHandle, mode: &str) -> Result<(), String> {
+    let mode = validate_picture_mode(mode.trim())?;
+    let sender = ensure_worker(app)?;
+    sender
+        .try_send(WorkerCommand::SetPictureMode { mode, reply: None })
+        .map_err(|_| "TV controller is shutting down".to_string())
+}
+
+/// Queues a picture setting write with no caller waiting on the result, the
+/// tray side of a picture setting hotkey. The setting id and value are
+/// validated here, so a stale binding cannot reach the TV with garbage.
+pub fn queue_picture_setting(app: &AppHandle, setting_id: &str, value: &str) -> Result<(), String> {
+    let spec = picture_setting_spec(setting_id.trim())?;
+    let value = validate_picture_setting_value(spec, value)?;
+    let sender = ensure_worker(app)?;
+    sender
+        .try_send(WorkerCommand::SetPictureSetting {
+            setting_id: spec.id.to_string(),
+            value,
+            reply: None,
+        })
         .map_err(|_| "TV controller is shutting down".to_string())
 }
 
@@ -598,13 +669,70 @@ fn ensure_worker(app: &AppHandle) -> Result<mpsc::Sender<WorkerCommand>, String>
 async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>) {
     let mut connection: Option<ConnectedTv> = None;
     let mut pending_command: Option<WorkerCommand> = None;
+    let mut resume_reconnect: Option<ReconnectRequest> = None;
     let mut restore_quick_start_after_reconnect = false;
-    loop {
+    'worker_loop: loop {
         let command = match pending_command.take() {
             Some(command) => command,
+            None if resume_reconnect.is_some() => {
+                let reconnect = resume_reconnect
+                    .take()
+                    .expect("resume request was checked");
+                WorkerCommand::ReconnectSaved {
+                    device: reconnect.device,
+                    client_key: Some(reconnect.client_key),
+                    credential_saved: reconnect.credential_saved,
+                }
+            }
+            None if connection.is_some() => {
+                tokio::select! {
+                    command = receiver.recv() => match command {
+                        Some(command) => command,
+                        None => break 'worker_loop,
+                    },
+                    _ = tokio::time::sleep(TV_KEEPALIVE_INTERVAL) => {
+                        let Some(mut current) = connection.take() else {
+                            continue 'worker_loop;
+                        };
+                        match read_volume(&mut current.socket).await {
+                            Ok(_) => {
+                                connection = Some(current);
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "[tv] idle keepalive failed detail={}",
+                                    sanitized_error_detail(&error)
+                                );
+                                if current.client_key.is_some() {
+                                    let (recovered, interrupted, stop) =
+                                        recover_lost_connection(&app, current, &mut receiver).await;
+                                    if stop {
+                                        break 'worker_loop;
+                                    }
+                                    if let Some((next, resume)) = interrupted {
+                                        pending_command = Some(next);
+                                        resume_reconnect = resume;
+                                    }
+                                    connection = recovered;
+                                } else {
+                                    publish(
+                                        &app,
+                                        TvStateSnapshot {
+                                            state: "offline".to_string(),
+                                            error: stable_error(&error),
+                                            ..TvStateSnapshot::default()
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        continue 'worker_loop;
+                    }
+                }
+            }
             None => match receiver.recv().await {
                 Some(command) => command,
-                None => break,
+                None => break 'worker_loop,
             },
         };
         match command {
@@ -651,8 +779,12 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
             }
             WorkerCommand::Pair { host, name } => {
                 connection = None;
+                // An explicit Pair is the trust decision. The certificate the
+                // TV presents during this handshake is the one that gets
+                // pinned, so a first pairing cannot be hijacked afterwards and
+                // re-pairing is the way to adopt a new certificate.
                 let result = tokio::select! {
-                    result = connect_and_register(&app, host, name, None, "connecting") => Some(result),
+                    result = connect_and_register(&app, host, name, None, false, "connecting", "") => Some(result),
                     next = receiver.recv() => {
                         pending_command = Some(next.unwrap_or(WorkerCommand::Shutdown));
                         None
@@ -706,37 +838,47 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                     }
                 }
             }
-            WorkerCommand::ReconnectSaved { device } => {
+            WorkerCommand::ReconnectSaved {
+                device,
+                client_key: in_memory_key,
+                credential_saved: in_memory_credential_saved,
+            } => {
                 connection = None;
-                if !device.paired {
-                    publish(&app, saved_device_snapshot(&device, "pairing_required"));
-                    continue;
-                }
-                if !device.auto_reconnect {
-                    publish(&app, saved_device_snapshot(&device, "disconnected"));
-                    continue;
-                }
-                let client_key = match load_client_key(&device.device_id) {
-                    Ok(Some(key)) => key,
-                    Ok(None) => {
-                        let mut device = device;
-                        device.paired = false;
-                        device.auto_reconnect = false;
-                        let _ = crate::config::update_tv_device(&app, Some(device.clone()));
-                        publish(&app, saved_device_snapshot(&device, "pairing_required"));
+                let (client_key, credential_saved) = if let Some(key) = in_memory_key {
+                    (key, in_memory_credential_saved)
+                } else {
+                    if !device.paired || !device.auto_reconnect {
+                        publish(
+                            &app,
+                            saved_device_snapshot(
+                                &device,
+                                if device.paired { "disconnected" } else { "pairing_required" },
+                            ),
+                        );
                         continue;
                     }
-                    Err(error) => {
-                        log::warn!("[tv] could not load the saved TV pairing: {error}");
-                        let mut device = device;
-                        device.paired = false;
-                        device.auto_reconnect = false;
-                        let _ = crate::config::update_tv_device(&app, Some(device.clone()));
-                        publish(&app, saved_device_snapshot(&device, "pairing_required"));
-                        continue;
+                    match load_client_key(&device.device_id) {
+                        Ok(Some(key)) => (key, true),
+                        Ok(None) => {
+                            let mut device = device;
+                            device.paired = false;
+                            device.auto_reconnect = false;
+                            let _ = crate::config::update_tv_device(&app, Some(device.clone()));
+                            publish(&app, saved_device_snapshot(&device, "pairing_required"));
+                            continue;
+                        }
+                        Err(error) => {
+                            log::warn!("[tv] could not load the saved TV pairing: {error}");
+                            let mut device = device;
+                            device.paired = false;
+                            device.auto_reconnect = false;
+                            let _ = crate::config::update_tv_device(&app, Some(device.clone()));
+                            publish(&app, saved_device_snapshot(&device, "pairing_required"));
+                            continue;
+                        }
                     }
                 };
-                match reconnect_saved(&app, device, client_key, &mut receiver).await {
+                match reconnect_saved(&app, device, client_key, credential_saved, &mut receiver).await {
                     Ok(mut connected) => {
                         let restore_error = if restore_quick_start_after_reconnect {
                             match restore_tv_quick_start(&mut connected).await {
@@ -766,11 +908,12 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                         publish(&app, snapshot);
                         connection = Some(connected);
                     }
-                    Err(ReconnectStop::Command(next)) => {
+                    Err(ReconnectStop::Command { next, resume }) => {
                         // Reprocess the interrupting command through the normal
-                        // worker path. This keeps disconnect, forget, pairing,
-                        // and shutdown responsive while a retry is waiting.
+                        // worker path. Ordinary actions do not abandon retries,
+                        // while commands that replace or disable the pairing do.
                         pending_command = Some(next);
+                        resume_reconnect = resume;
                     }
                     Err(ReconnectStop::PairingRequired) => {
                         if let Some(mut device) = crate::config::saved_tv_device() {
@@ -781,14 +924,16 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                         }
                     }
                     Err(ReconnectStop::Shutdown) => break,
-                    Err(ReconnectStop::Offline) => {
-                        // The bounded retry window ended. The saved device and
-                        // credential remain available for an explicit retry.
-                    }
                 }
             }
-            WorkerCommand::Forget => {
-                let _ = forget_from_worker(&app);
+            WorkerCommand::Forget { reply } => {
+                connection = None;
+                let result = forget_from_worker(&app);
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                } else if let Err(error) = result {
+                    log::warn!("[tv] forget failed: {error}");
+                }
             }
             WorkerCommand::Reset => {
                 connection = None;
@@ -840,14 +985,15 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 } else {
                     read_mute(&mut current.socket).await.ok()
                 };
-                if request_failed && current.credential_saved && current.client_key.is_some() {
+                if request_failed && current.client_key.is_some() {
                     let (recovered, interrupted, stop) =
                         recover_lost_connection(&app, current, &mut receiver).await;
                     if stop {
                         break;
                     }
-                    if let Some(next) = interrupted {
+                    if let Some((next, resume)) = interrupted {
                         pending_command = Some(next);
+                        resume_reconnect = resume;
                         continue;
                     }
                     connection = recovered;
@@ -902,14 +1048,15 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 } else {
                     read_volume(&mut current.socket).await.ok()
                 };
-                if request_failed && current.credential_saved && current.client_key.is_some() {
+                if request_failed && current.client_key.is_some() {
                     let (recovered, interrupted, stop) =
                         recover_lost_connection(&app, current, &mut receiver).await;
                     if stop {
                         break;
                     }
-                    if let Some(next) = interrupted {
+                    if let Some((next, resume)) = interrupted {
                         pending_command = Some(next);
+                        resume_reconnect = resume;
                         continue;
                     }
                     connection = recovered;
@@ -940,8 +1087,9 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                     connection = Some(current);
                     continue;
                 };
+                let credential_saved = current.credential_saved;
                 let mut device = device_from_connection(&current);
-                device.paired = true;
+                device.paired = credential_saved;
                 device.auto_reconnect = true;
                 let quick_start = match read_tv_system_setting(
                     &mut current.socket,
@@ -1061,7 +1209,7 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 }
                 log::info!("[tv] restart wake packet sent");
                 let _ = reply.send(Ok(()));
-                match reconnect_saved(&app, device, client_key, &mut receiver).await {
+                match reconnect_saved(&app, device, client_key, credential_saved, &mut receiver).await {
                     Ok(mut reconnected) => {
                         let restore_error = if restore_quick_start_after_reconnect {
                             match restore_tv_quick_start(&mut reconnected).await {
@@ -1092,8 +1240,9 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                         publish(&app, reconnected.snapshot(volume, muted, restore_error));
                         connection = Some(reconnected);
                     }
-                    Err(ReconnectStop::Command(next)) => {
+                    Err(ReconnectStop::Command { next, resume }) => {
                         pending_command = Some(next);
+                        resume_reconnect = resume;
                     }
                     Err(ReconnectStop::PairingRequired) => {
                         if let Some(mut saved) = crate::config::saved_tv_device() {
@@ -1103,7 +1252,6 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                             publish(&app, saved_device_snapshot(&saved, "pairing_required"));
                         }
                     }
-                    Err(ReconnectStop::Offline) => {}
                     Err(ReconnectStop::Shutdown) => break,
                 }
             }
@@ -1122,8 +1270,59 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 current
                     .refresh_picture_context("automatic_picture_context_refresh")
                     .await;
-                let volume = read_volume(&mut current.socket).await.ok();
-                let muted = read_mute(&mut current.socket).await.ok();
+                // The refresh swallows per key failures into the context
+                // errors, so a socket the TV dropped is only visible there.
+                // One cheap read tells a slow TV from a dead one: alive it
+                // answers in milliseconds, dead it fails and triggers the
+                // reconnect below.
+                if is_picture_transport_failure(&current.picture_context.error)
+                    && current.client_key.is_some()
+                {
+                    log::warn!(
+                        "[tv] status refresh found the connection dead detail={}",
+                        sanitized_error_detail(&current.picture_context.error)
+                    );
+                    let (recovered, interrupted, stop) =
+                        recover_lost_connection(&app, current, &mut receiver).await;
+                    if stop {
+                        break;
+                    }
+                    if let Some((next, resume)) = interrupted {
+                        pending_command = Some(next);
+                        resume_reconnect = resume;
+                        let _ = reply.send(Err(
+                            "The TV connection was lost while refreshing the status".to_string(),
+                        ));
+                        continue;
+                    }
+                    match recovered {
+                            Some(current) => {
+                                // Recovery already refreshed the picture
+                                // context, so reuse it for this poll response.
+                                let (volume, muted) = cached_volume_mute(&app);
+                                let cached_write_error = app
+                                    .state::<TvControllerState>()
+                                    .snapshot
+                                    .lock()
+                                    .ok()
+                                    .map(|snapshot| snapshot.picture_write_error.clone())
+                                    .unwrap_or_default();
+                                let mut snapshot = current.snapshot(volume, muted, None);
+                                snapshot.picture_write_error = cached_write_error;
+                                save_snapshot(&app, &snapshot);
+                                let _ = reply.send(Ok(snapshot));
+                                connection = Some(current);
+                            }
+                            None => {
+                                let _ = reply.send(Err(
+                                    "The TV connection was lost and could not be restored yet"
+                                        .to_string(),
+                                ));
+                            }
+                    }
+                    continue;
+                }
+                let (volume, muted) = cached_volume_mute(&app);
                 let cached_write_error = app
                     .state::<TvControllerState>()
                     .snapshot
@@ -1152,7 +1351,9 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                             ..TvStateSnapshot::default()
                         },
                     );
-                    let _ = reply.send(Err(error));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(error));
+                    }
                     continue;
                 };
                 let mut pending = current.snapshot(None, None, None);
@@ -1181,7 +1382,14 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                     current.picture_context.picture_mode.as_deref(),
                 ) {
                     let endpoint = current.endpoint.clone();
-                    set_picture_mode(&mut current.socket, &mode, &endpoint).await
+                    let certificate_fingerprint = current.certificate_fingerprint.clone();
+                    set_picture_mode(
+                        &mut current.socket,
+                        &mode,
+                        &endpoint,
+                        &certificate_fingerprint,
+                    )
+                    .await
                 } else {
                     let error =
                         "Choose a picture mode for the current TV picture context".to_string();
@@ -1210,6 +1418,43 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                         sanitized_error_detail(error)
                     ),
                 }
+                // A mode write can be the request that finds the socket the
+                // TV already dropped (a 5s request timeout with no answer is
+                // the tell, a live TV answers in milliseconds). Recover the
+                // connection here so the arm below does not walk readbacks
+                // into a dead socket, and requeue the write so it lands on
+                // the fresh connection.
+                if write_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| is_picture_transport_failure(error))
+                    && current.client_key.is_some()
+                {
+                        let (recovered, interrupted, stop) =
+                            recover_lost_connection(&app, current, &mut receiver).await;
+                        if stop {
+                            break;
+                        }
+                        if let Some((next, resume)) = interrupted {
+                            pending_command = Some(next);
+                            resume_reconnect = resume;
+                            continue;
+                        }
+                        if let Some(recovered) = recovered {
+                            log::info!(
+                                "[tv] picture mode write requeued after connection recovery mode={}",
+                                sanitized_log_value(&mode)
+                            );
+                            connection = Some(recovered);
+                            pending_command = Some(WorkerCommand::SetPictureMode { mode, reply });
+                        } else if let Some(reply) = reply {
+                            let _ = reply.send(Err(
+                                "The TV connection was lost and could not be restored yet"
+                                    .to_string(),
+                            ));
+                        }
+                        continue;
+                }
                 if write_result.is_ok() {
                     tokio::time::sleep(PICTURE_MODE_SETTLE_DELAY).await;
                 }
@@ -1219,8 +1464,7 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 if write_result.is_ok() {
                     current.wait_for_picture_mode(&mode).await;
                 }
-                let volume = read_volume(&mut current.socket).await.ok();
-                let muted = read_mute(&mut current.socket).await.ok();
+                let (volume, muted) = cached_volume_mute(&app);
                 let write_error = match &write_result {
                     Ok(()) => picture_mode_write_error(&current.picture_context, &mode),
                     Err(error) => Some(error.clone()),
@@ -1244,11 +1488,13 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 };
                 let mut snapshot = current.snapshot(volume, muted, None);
                 snapshot.picture_write_error = write_error.unwrap_or_default();
-                // The reply carries the post write snapshot so the TV tab can
-                // merge the fresh mode and setting values into its local state
-                // without a global event waking the app shell.
+                // A command reply carries the post write snapshot so the TV tab
+                // can merge the fresh mode and setting values into its local
+                // state without a global event waking the app shell.
                 save_snapshot(&app, &snapshot);
-                let _ = reply.send(caller_result.map(|()| snapshot));
+                if let Some(reply) = reply {
+                    let _ = reply.send(caller_result.map(|()| snapshot));
+                }
                 connection = Some(current);
             }
             WorkerCommand::SetPictureSetting {
@@ -1267,17 +1513,41 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                             ..TvStateSnapshot::default()
                         },
                     );
-                    let _ = reply.send(Err(error));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(error));
+                    }
                     continue;
                 };
                 let spec = match picture_setting_spec(&setting_id) {
                     Ok(spec) => spec,
                     Err(error) => {
-                        let _ = reply.send(Err(error));
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(error));
+                        }
                         connection = Some(current);
                         continue;
                     }
                 };
+                // Dynamic Tone Mapping exists in HDR picture modes only. The TV
+                // tab hides its control outside them, so a hotkey bound to one
+                // of its values has to be refused the same way here instead of
+                // writing a value the TV will not honor.
+                if spec.kind == TvPictureSettingKind::Dtm
+                    && !current
+                        .picture_context
+                        .picture_mode
+                        .as_deref()
+                        .is_some_and(is_hdr_picture_mode_id)
+                {
+                    let error =
+                        "Dynamic Tone Mapping is only available in HDR picture modes".to_string();
+                    log::info!("[tv] picture setting write skipped: {error}");
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Err(error));
+                    }
+                    connection = Some(current);
+                    continue;
+                }
                 let safe_setting = sanitized_log_value(&setting_id);
                 let safe_value = sanitized_log_value(&value);
                 let mut pending = current.snapshot(None, None, None);
@@ -1290,8 +1560,15 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 );
                 let write_started = Instant::now();
                 let endpoint = current.endpoint.clone();
-                let write_result =
-                    set_picture_setting(&mut current.socket, spec, &value, &endpoint).await;
+                let certificate_fingerprint = current.certificate_fingerprint.clone();
+                let write_result = set_picture_setting(
+                    &mut current.socket,
+                    spec,
+                    &value,
+                    &endpoint,
+                    &certificate_fingerprint,
+                )
+                .await;
                 match &write_result {
                     Ok(()) => log::info!(
                         "[tv] picture setting write request completed setting={} elapsed_ms={}",
@@ -1305,14 +1582,53 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                         sanitized_error_detail(error)
                     ),
                 }
+                // Same dead socket check as the mode write: a 5s request
+                // timeout means the TV stopped answering, so recover and
+                // requeue once instead of walking the readbacks into a dead
+                // connection and reporting a misleading mismatch.
+                if write_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| is_picture_transport_failure(error))
+                    && current.client_key.is_some()
+                {
+                        let (recovered, interrupted, stop) =
+                            recover_lost_connection(&app, current, &mut receiver).await;
+                        if stop {
+                            break;
+                        }
+                        if let Some((next, resume)) = interrupted {
+                            pending_command = Some(next);
+                            resume_reconnect = resume;
+                            continue;
+                        }
+                        if let Some(recovered) = recovered {
+                            log::info!(
+                                "[tv] picture setting write requeued after connection recovery setting={} value={}",
+                                safe_setting,
+                                safe_value
+                            );
+                            connection = Some(recovered);
+                            pending_command = Some(WorkerCommand::SetPictureSetting {
+                                setting_id,
+                                value,
+                                reply,
+                            });
+                        } else if let Some(reply) = reply {
+                            let _ = reply.send(Err(
+                                "The TV connection was lost and could not be restored yet"
+                                    .to_string(),
+                            ));
+                        }
+                        continue;
+                }
                 if write_result.is_ok() {
                     tokio::time::sleep(PICTURE_MODE_SETTLE_DELAY).await;
                 }
                 current
                     .refresh_picture_context("post_setting_picture_context")
                     .await;
-                let volume = read_volume(&mut current.socket).await.ok();
-                let muted = read_mute(&mut current.socket).await.ok();
+                let (volume, muted) = cached_volume_mute(&app);
                 // A setting write is verified by comparing what the TV now
                 // reports for that key against the requested value. Some keys
                 // are clamped or remapped by firmware, so the reported value
@@ -1361,7 +1677,9 @@ async fn worker_loop(app: AppHandle, mut receiver: mpsc::Receiver<WorkerCommand>
                 // reply and the backend cache only. A global event would wake
                 // the app shell and can close menus while the user works.
                 save_snapshot(&app, &snapshot);
-                let _ = reply.send(caller_result.map(|()| snapshot));
+                if let Some(reply) = reply {
+                    let _ = reply.send(caller_result.map(|()| snapshot));
+                }
                 connection = Some(current);
             }
             WorkerCommand::Shutdown => break,
@@ -1377,8 +1695,98 @@ fn publish_discovery(app: &AppHandle, snapshot: TvDiscoverySnapshot) {
     let _ = app.emit("tv-discovery-changed", snapshot);
 }
 
+// The local IPv4 address Windows would use for ordinary outbound traffic.
+// An SSDP search has to be sent from the address of the LAN the TV is on. A
+// wildcard bind (0.0.0.0) does not guarantee that: when a machine also has a
+// Mobile Hotspot, a Wi-Fi Direct virtual adapter, or a VPN up, Windows resolves
+// the multicast group against whichever of those adapters it prefers, so the
+// search leaves from an address the TV has no route back to and the TV never
+// answers. Connecting a UDP socket only picks the route, it sends no packet,
+// so this probe is free and side effect free.
+fn primary_outbound_ipv4() -> Option<Ipv4Addr> {
+    let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    probe.connect((Ipv4Addr::new(1, 1, 1, 1), 9)).ok()?;
+    match probe.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if is_usable_local_discovery_ip(ip) => Some(ip),
+        _ => None,
+    }
+}
+
+// Addresses a discovery socket may search from, best first: the LAN address
+// first, then the wildcard as a fallback so a machine whose outbound address
+// is not the one the TV sits on still searches the way it always did.
+fn discovery_bind_targets() -> Vec<Ipv4Addr> {
+    let mut targets = Vec::new();
+    if let Some(ip) = primary_outbound_ipv4() {
+        targets.push(ip);
+    }
+    if !targets.contains(&Ipv4Addr::UNSPECIFIED) {
+        targets.push(Ipv4Addr::UNSPECIFIED);
+    }
+    targets
+}
+
+fn is_usable_local_discovery_ip(ip: Ipv4Addr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !ip.is_link_local()
+        && ip != Ipv4Addr::BROADCAST
+}
+
 async fn discover_ssdp() -> Result<Vec<TvDiscoveryCandidate>, String> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    let targets = discovery_bind_targets();
+    let searches = targets.iter().copied().map(ssdp_search_on).collect::<Vec<_>>();
+    let results = futures_util::future::join_all(searches).await;
+    let mut devices: BTreeMap<String, TvDiscoveryCandidate> = BTreeMap::new();
+    let mut responses = 0usize;
+    let mut accepted = 0usize;
+    let mut last_error: Option<String> = None;
+    for (source, result) in targets.iter().copied().zip(results) {
+        match result {
+            Ok(found) => {
+                responses += found.responses;
+                accepted += found.accepted;
+                for candidate in found.devices.into_values() {
+                    if devices.len() < MAX_DISCOVERED_TVS
+                        || devices.contains_key(&candidate.device_id)
+                    {
+                        merge_discovery_candidate(&mut devices, candidate);
+                    }
+                }
+            }
+            Err(error) => {
+                log::debug!("[tv] ssdp search from {source} failed detail={error}");
+                last_error = Some(error);
+            }
+        }
+    }
+    if devices.is_empty() && last_error.is_some() {
+        return Err(last_error.expect("error was recorded"));
+    }
+    log::debug!(
+        "[tv] ssdp search finished responses={responses} accepted={accepted} devices={}",
+        devices.len()
+    );
+
+    let mut candidates: Vec<_> = devices.into_values().collect();
+    candidates.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.host.cmp(&right.host))
+    });
+    Ok(candidates)
+}
+
+struct SsdpSearchResult {
+    devices: BTreeMap<String, TvDiscoveryCandidate>,
+    responses: usize,
+    accepted: usize,
+}
+
+async fn ssdp_search_on(bind_ip: Ipv4Addr) -> Result<SsdpSearchResult, String> {
+    let socket = UdpSocket::bind((bind_ip, 0))
         .await
         .map_err(|error| format!("Could not open the local network discovery socket: {error}"))?;
     let request = format!(
@@ -1423,19 +1831,11 @@ async fn discover_ssdp() -> Result<Vec<TvDiscoveryCandidate>, String> {
             }
         }
     }
-    log::debug!(
-        "[tv] ssdp search finished responses={responses} accepted={accepted} devices={}",
-        devices.len()
-    );
-
-    let mut candidates: Vec<_> = devices.into_values().collect();
-    candidates.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.host.cmp(&right.host))
-    });
-    Ok(candidates)
+    Ok(SsdpSearchResult {
+        devices,
+        responses,
+        accepted,
+    })
 }
 
 fn merge_discovery_candidate(
@@ -1644,6 +2044,10 @@ struct ConnectFailure {
     name: String,
     endpoint: String,
     authentication_rejected: bool,
+    // The peer presented a certificate that is not the pinned one. Retrying
+    // cannot fix it (a different device answered), so the reconnect loop
+    // stops and asks for a new pairing instead of backing off forever.
+    certificate_pin_rejected: bool,
 }
 
 impl ConnectFailure {
@@ -1654,6 +2058,24 @@ impl ConnectFailure {
         endpoint: impl Into<String>,
         authentication_rejected: bool,
     ) -> Self {
+        Self::with_pin_rejection(
+            message,
+            host,
+            name,
+            endpoint,
+            authentication_rejected,
+            false,
+        )
+    }
+
+    fn with_pin_rejection(
+        message: impl Into<String>,
+        host: impl Into<String>,
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        authentication_rejected: bool,
+        certificate_pin_rejected: bool,
+    ) -> Self {
         let message = message.into();
         let host = host.into();
         let endpoint = endpoint.into();
@@ -1662,10 +2084,11 @@ impl ConnectFailure {
             .map(|host| format!("lg-{host}"))
             .unwrap_or_default();
         log::warn!(
-            "[tv] connection failed host={} endpoint={} authentication_rejected={} detail={}",
+            "[tv] connection failed host={} endpoint={} authentication_rejected={} certificate_pin_rejected={} detail={}",
             sanitized_log_value(&host),
             sanitized_log_value(&endpoint),
             authentication_rejected,
+            certificate_pin_rejected,
             sanitized_error_detail(&message)
         );
         Self {
@@ -1675,6 +2098,7 @@ impl ConnectFailure {
             name: name.into(),
             endpoint,
             authentication_rejected,
+            certificate_pin_rejected,
         }
     }
 
@@ -1694,11 +2118,113 @@ impl ConnectFailure {
     }
 }
 
+struct ReconnectRequest {
+    device: TvDeviceConfig,
+    client_key: String,
+    credential_saved: bool,
+}
+
 enum ReconnectStop {
-    Command(WorkerCommand),
+    Command {
+        next: WorkerCommand,
+        resume: Option<ReconnectRequest>,
+    },
     PairingRequired,
-    Offline,
     Shutdown,
+}
+
+// The leaf certificate the TV just presented, as a lowercase hex SHA-256 of
+// its DER bytes. Any other digest choice is a config format change, so the
+// value is stored with an explicit prefix that keeps old and new pins
+// distinguishable and lets a future scheme be added without ambiguity.
+fn peer_certificate_fingerprint(socket: &Socket) -> Result<String, String> {
+    let MaybeTlsStream::NativeTls(stream) = socket.get_ref() else {
+        return Err("The TV connection is not using TLS".to_string());
+    };
+    let certificate = stream
+        .get_ref()
+        .peer_certificate()
+        .map_err(|error| format!("The TV certificate could not be read: {error}"))?
+        .ok_or_else(|| "The TV did not present a certificate".to_string())?;
+    let der = certificate
+        .to_der()
+        .map_err(|error| format!("The TV certificate could not be read: {error}"))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(der)))
+}
+
+// Normalize a stored fingerprint before comparing: trim, lowercase, drop the
+// separators a user or an older build may have written. An empty stored value
+// means the pairing predates pinning, which is treated as unpinned (see
+// expected_certificate_fingerprint).
+fn normalized_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != ':')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+// A saved TV can only be pinned once it has a stored fingerprint. Empty means
+// a pairing saved before pinning existed, which reconnects treat as unpinned
+// (and report as needing a fresh pairing) rather than trusting a new identity
+// silently.
+fn expected_certificate_fingerprint(device: &TvDeviceConfig) -> String {
+    normalized_fingerprint(&device.certificate_fingerprint)
+}
+
+fn fingerprints_match(presented: &str, expected: &str) -> bool {
+    let expected = normalized_fingerprint(expected);
+    !expected.is_empty() && normalized_fingerprint(presented) == expected
+}
+
+fn command_cancels_reconnect(command: &WorkerCommand) -> bool {
+    matches!(
+        command,
+        WorkerCommand::Pair { .. }
+            | WorkerCommand::Forget { .. }
+            | WorkerCommand::Reset
+            | WorkerCommand::Disconnect
+            | WorkerCommand::Shutdown
+    )
+}
+
+fn reject_command_while_reconnecting(app: &AppHandle, command: WorkerCommand) {
+    let error = "The TV is reconnecting. Try again when it is connected".to_string();
+    match command {
+        WorkerCommand::Discover => publish_discovery(
+            app,
+            TvDiscoverySnapshot {
+                state: "error".to_string(),
+                candidates: Vec::new(),
+                error,
+            },
+        ),
+        WorkerCommand::Restart { reply } => {
+            let _ = reply.send(Err(error));
+        }
+        WorkerCommand::RefreshPictureContext { reply } => {
+            let _ = reply.send(Err(error));
+        }
+        WorkerCommand::SetPictureMode { reply, .. }
+        | WorkerCommand::SetPictureSetting { reply, .. } => {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(error));
+            }
+        }
+        WorkerCommand::AdjustVolume(_) | WorkerCommand::ToggleMute => {
+            log::debug!("[tv] volume hotkey skipped while reconnecting");
+        }
+        WorkerCommand::ReconnectSaved { .. } => {
+            log::debug!("[tv] duplicate reconnect request ignored during recovery");
+        }
+        WorkerCommand::Pair { .. }
+        | WorkerCommand::Forget { .. }
+        | WorkerCommand::Reset
+        | WorkerCommand::Disconnect
+        | WorkerCommand::Shutdown => {
+            unreachable!("cancellation commands are handled before rejection")
+        }
+    }
 }
 
 async fn connect_and_register(
@@ -1706,7 +2232,9 @@ async fn connect_and_register(
     host: String,
     name: String,
     client_key: Option<&str>,
+    credential_saved: bool,
     mode_state: &str,
+    expected_fingerprint: &str,
 ) -> Result<ConnectedTv, ConnectFailure> {
     let parsed = match validate_host(&host) {
         Ok(host) => host,
@@ -1745,10 +2273,13 @@ async fn connect_and_register(
             ));
         }
     };
-    // The TV commonly uses a self signed certificate. The exception is
-    // scoped to this connector, which is only ever used with the validated
-    // numeric host and fixed secure port above. It is never installed into a
-    // process-wide TLS configuration.
+    // LG TVs ship a self signed certificate, so chain and hostname validation
+    // cannot succeed. Both exceptions are scoped to this one connector, which
+    // is only ever used with the validated numeric host and fixed secure port
+    // above, and the presented certificate is pinned below, so the accepted
+    // identity is the exact certificate the user paired with rather than any
+    // certificate any device on the network can present. The connector is
+    // never installed into a process-wide TLS configuration.
     let tls = match TlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
@@ -1794,6 +2325,40 @@ async fn connect_and_register(
             ));
         }
     };
+
+    // Pin check before anything else goes over this socket: the pairing key,
+    // the registration manifest, and every later picture-setting write. A
+    // mismatch means something other than the paired TV answered at that
+    // address, so the connection is dropped and the pairing is not used.
+    let certificate_fingerprint = match peer_certificate_fingerprint(&socket) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            return Err(ConnectFailure::new(
+                error,
+                parsed.to_string(),
+                name,
+                endpoint,
+                false,
+            ));
+        }
+    };
+    if !expected_fingerprint.is_empty()
+        && !fingerprints_match(&certificate_fingerprint, expected_fingerprint)
+    {
+        log::warn!("[tv] TLS certificate pin mismatch host={parsed}, refusing the connection");
+        return Err(ConnectFailure::with_pin_rejection(
+            "This address is not the paired TV: its secure certificate does not match. Forget the pairing and pair again with your TV",
+            parsed.to_string(),
+            name,
+            endpoint,
+            false,
+            true,
+        ));
+    }
+    log::info!(
+        "[tv] TLS certificate accepted host={parsed} pinned={}",
+        !expected_fingerprint.is_empty()
+    );
 
     // webOS 26 requires the normal hello and pre-registration system-info
     // exchange before it will accept a register message. Older firmware also
@@ -1911,11 +2476,12 @@ async fn connect_and_register(
     Ok(ConnectedTv {
         socket,
         client_key: returned_key.or_else(|| client_key.map(str::to_string)),
-        credential_saved: client_key.is_some(),
+        credential_saved,
         host: parsed.to_string(),
         name,
         device_id: format!("lg-{parsed}"),
         endpoint,
+        certificate_fingerprint,
         picture_context: PictureContext::default(),
     })
 }
@@ -1939,51 +2505,71 @@ async fn reconnect_saved(
     app: &AppHandle,
     device: TvDeviceConfig,
     client_key: String,
+    credential_saved: bool,
     receiver: &mut mpsc::Receiver<WorkerCommand>,
 ) -> Result<ConnectedTv, ReconnectStop> {
     let mut delay_index = 0;
+    // A saved pairing without a stored fingerprint predates pinning, so there
+    // is no identity to verify. Reconnecting it would silently adopt whatever
+    // certificate answers, so the user is asked to pair again instead.
+    let expected_fingerprint = expected_certificate_fingerprint(&device);
+    if expected_fingerprint.is_empty() {
+        publish(
+            app,
+            saved_device_snapshot_with_error(
+                &device,
+                "pairing_required",
+                "This saved pairing has no saved TV certificate. Pair again on the TV to authorize OLED Helper"
+                    .to_string(),
+            ),
+        );
+        return Err(ReconnectStop::PairingRequired);
+    }
     loop {
         let attempt = connect_and_register(
             app,
             device.host.clone(),
             device.name.clone(),
             Some(&client_key),
+            credential_saved,
             "reconnecting",
+            &expected_fingerprint,
         );
-        tokio::select! {
-            result = attempt => {
-                match result {
-                    Ok(connected) => return Ok(connected),
-                    Err(failure) if failure.authentication_rejected => {
-                        publish(app, saved_device_snapshot_with_error(&device, "pairing_required", failure.message));
-                        return Err(ReconnectStop::PairingRequired);
+        tokio::pin!(attempt);
+        let result = loop {
+            tokio::select! {
+                result = &mut attempt => break result,
+                command = receiver.recv() => match command {
+                    Some(command) if command_cancels_reconnect(&command) => {
+                        return Err(ReconnectStop::Command { next: command, resume: None });
                     }
-                    Err(failure) => {
-                        publish(app, saved_device_snapshot_with_error(&device, "reconnecting", failure.message));
-                    }
+                    Some(command) => reject_command_while_reconnecting(app, command),
+                    None => return Err(ReconnectStop::Shutdown),
                 }
             }
-            command = receiver.recv() => {
-                return Err(match command {
-                    Some(command) => ReconnectStop::Command(command),
-                    None => ReconnectStop::Shutdown,
-                });
+        };
+        match result {
+            Ok(connected) => return Ok(connected),
+            // A different device answered the address, or the TV replaced
+            // its certificate. Neither resolves on its own, so stop retrying
+            // and ask for a new pairing.
+            Err(failure) if failure.authentication_rejected || failure.certificate_pin_rejected => {
+                publish(
+                    app,
+                    saved_device_snapshot_with_error(&device, "pairing_required", failure.message),
+                );
+                return Err(ReconnectStop::PairingRequired);
+            }
+            Err(failure) => {
+                publish(
+                    app,
+                    saved_device_snapshot_with_error(&device, "reconnecting", failure.message),
+                );
             }
         }
 
-        if delay_index >= RECONNECT_DELAYS.len() {
-            publish(
-                app,
-                saved_device_snapshot_with_error(
-                    &device,
-                    "offline",
-                    "The TV is offline. Reconnect it from the TV Controller".to_string(),
-                ),
-            );
-            return Err(ReconnectStop::Offline);
-        }
-        let delay = RECONNECT_DELAYS[delay_index];
-        delay_index += 1;
+        let delay = reconnect_delay(delay_index);
+        delay_index = delay_index.saturating_add(1);
         publish(
             app,
             saved_device_snapshot_with_error(
@@ -1992,13 +2578,18 @@ async fn reconnect_saved(
                 format!("The TV is offline. Retrying in {} seconds", delay.as_secs()),
             ),
         );
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            command = receiver.recv() => {
-                return Err(match command {
-                    Some(command) => ReconnectStop::Command(command),
-                    None => ReconnectStop::Shutdown,
-                });
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                command = receiver.recv() => match command {
+                    Some(command) if command_cancels_reconnect(&command) => {
+                        return Err(ReconnectStop::Command { next: command, resume: None });
+                    }
+                    Some(command) => reject_command_while_reconnecting(app, command),
+                    None => return Err(ReconnectStop::Shutdown),
+                }
             }
         }
     }
@@ -2008,25 +2599,22 @@ async fn recover_lost_connection(
     app: &AppHandle,
     current: ConnectedTv,
     receiver: &mut mpsc::Receiver<WorkerCommand>,
-) -> (Option<ConnectedTv>, Option<WorkerCommand>, bool) {
-    if !current.credential_saved {
-        return (Some(current), None, false);
-    }
+) -> (Option<ConnectedTv>, Option<(WorkerCommand, Option<ReconnectRequest>)>, bool) {
     let Some(client_key) = current.client_key.clone() else {
         return (Some(current), None, false);
     };
+    let credential_saved = current.credential_saved;
     let device = device_from_connection(&current);
-    match reconnect_saved(app, device, client_key, receiver).await {
+    match reconnect_saved(app, device, client_key, credential_saved, receiver).await {
         Ok(mut connected) => {
-            let volume = read_volume(&mut connected.socket).await.ok();
-            let muted = read_mute(&mut connected.socket).await.ok();
+            let (volume, muted) = cached_volume_mute(app);
             connected
                 .refresh_picture_context("recovery_picture_context")
                 .await;
             publish(app, connected.snapshot(volume, muted, None));
             (Some(connected), None, false)
         }
-        Err(ReconnectStop::Command(next)) => (None, Some(next), false),
+        Err(ReconnectStop::Command { next, resume }) => (None, Some((next, resume)), false),
         Err(ReconnectStop::PairingRequired) => {
             if let Some(mut device) = crate::config::saved_tv_device() {
                 device.paired = false;
@@ -2036,7 +2624,6 @@ async fn recover_lost_connection(
             }
             (None, None, false)
         }
-        Err(ReconnectStop::Offline) => (None, None, false),
         Err(ReconnectStop::Shutdown) => (None, None, true),
     }
 }
@@ -2515,6 +3102,7 @@ async fn set_tv_quick_start(
         &mut connection.socket,
         &tv_restart_setting_params(value),
         &connection.endpoint,
+        &connection.certificate_fingerprint,
         describe,
     )
     .await?;
@@ -2743,8 +3331,13 @@ async fn read_mute(socket: &mut Socket) -> Result<bool, String> {
     parse_bool(&response, "muted").ok_or_else(|| "The TV did not report mute state".to_string())
 }
 
-async fn read_picture_context(socket: &mut Socket) -> PictureContext {
-    let mut context = PictureContext::default();
+async fn read_picture_context(socket: &mut Socket, previous: &PictureContext) -> PictureContext {
+    // Keep the last reported values while refreshing. A temporary TV timeout
+    // should not blank the controls or make a later mode write think the
+    // current picture mode is unknown.
+    let mut context = previous.clone();
+    context.error.clear();
+    context.picture_settings_error.clear();
     let mut errors = Vec::new();
 
     match send_request(
@@ -2762,7 +3355,14 @@ async fn read_picture_context(socket: &mut Socket) -> PictureContext {
                 .and_then(|value| clean_discovery_value(Some(value)))
                 .unwrap_or_default();
         }
-        Err(error) => errors.push(stable_error(&error)),
+        Err(error) => {
+            let stable = stable_error(&error);
+            errors.push(stable.clone());
+            if is_picture_transport_failure(&error) {
+                context.error = errors.join("; ");
+                return context;
+            }
+        }
     }
 
     if !context.input_id.is_empty() {
@@ -2777,7 +3377,14 @@ async fn read_picture_context(socket: &mut Socket) -> PictureContext {
             Ok(response) => {
                 context.input_label = input_label_from_response(&response, &context.input_id);
             }
-            Err(error) => errors.push(stable_error(&error)),
+            Err(error) => {
+                let stable = stable_error(&error);
+                errors.push(stable.clone());
+                if is_picture_transport_failure(&stable) {
+                    context.error = errors.join("; ");
+                    return context;
+                }
+            }
         }
     }
 
@@ -2786,10 +3393,21 @@ async fn read_picture_context(socket: &mut Socket) -> PictureContext {
             context.picture_mode = Some(mode.clone());
             context.picture_modes = picture_modes_for_mode(&mode);
         }
-        Err(error) => errors.push(error),
+        Err(error) => {
+            let stable = stable_error(&error);
+            errors.push(stable.clone());
+            if is_picture_transport_failure(&error) {
+                context.error = errors.join("; ");
+                return context;
+            }
+        }
     }
 
-    read_picture_settings(socket, &mut context).await;
+    if let Err(error) = read_picture_settings(socket, &mut context).await {
+        errors.push(error);
+        context.error = errors.join("; ");
+        return context;
+    }
 
     if !errors.is_empty() {
         context.error = errors.join("; ");
@@ -2867,19 +3485,28 @@ async fn read_picture_setting_keys(socket: &mut Socket, keys: &[String]) -> Resu
     .await
 }
 
-async fn read_picture_settings(socket: &mut Socket, context: &mut PictureContext) {
+async fn read_picture_settings(
+    socket: &mut Socket,
+    context: &mut PictureContext,
+) -> Result<(), String> {
     // First attempt: the usual combined read of every key that has not been
     // refused earlier in this session.
     let keys = picture_setting_keys();
-    let response = match read_picture_setting_keys(socket, &keys).await {
+    let combined = read_picture_setting_keys(socket, &keys).await;
+    if let Err(error) = &combined {
+        if is_picture_transport_failure(error) {
+            context.picture_settings_error =
+                "The TV did not respond while reading picture settings".to_string();
+            return Err(stable_error(error));
+        }
+    }
+    let response = match combined {
         Ok(response) if response_succeeded(&response) => response,
-        Ok(_) | Err(_) => {
-            // The combined read did not succeed. The failure can be a TV
-            // rejection (webOS refuses the whole call when one key is
-            // unknown, and an error style response arrives either as a false
-            // returnValue or as a request failure) or a dead socket. Both
-            // cases run the per key probe below; a dead socket is detected
-            // by the first key and the rest are skipped quietly.
+        _ => {
+            // Individual key probes are useful only when the TV answered and
+            // rejected the combined key list. A transport timeout was handled
+            // above and returns immediately without waiting through 8 more
+            // request timeouts.
             if crate::detailed_logging_enabled() {
                 log::debug!("[tv] combined picture settings read rejected, falling back per key");
             }
@@ -2887,7 +3514,6 @@ async fn read_picture_settings(socket: &mut Socket, context: &mut PictureContext
                 "payload": { "settings": {} }
             });
             let mut any_succeeded = false;
-            let mut saw_transport_failure = false;
             for key in &keys {
                 match read_picture_setting_keys(socket, std::slice::from_ref(key)).await {
                     Ok(single) if response_succeeded(&single) => {
@@ -2895,50 +3521,31 @@ async fn read_picture_settings(socket: &mut Socket, context: &mut PictureContext
                         if let Some(value) = picture_setting_value_from_response(&single, key) {
                             recovered["payload"]["settings"][key.as_str()] = Value::String(value);
                         } else {
-                            // The TV answered without the key, so the key
-                            // itself is not part of this firmware's settings.
                             remember_unsupported_picture_setting_key(key);
                         }
                     }
-                    Ok(_) => {
-                        // returnValue false for this key alone: unsupported.
-                        remember_unsupported_picture_setting_key(key);
+                    Ok(_) => remember_unsupported_picture_setting_key(key),
+                    Err(error) if is_picture_transport_failure(&error) => {
+                        context.picture_settings_error =
+                            "The TV did not respond while reading picture settings".to_string();
+                        return Err(stable_error(&error));
                     }
                     Err(error) => {
                         let stable = stable_error(&error);
-                        if can_try_picture_alert_fallback(&stable) {
-                            // The TV answered at the transport level but
-                            // rejected this key, an error style response
-                            // arrives here as a request failure. Treat the
-                            // key as unsupported so it stops breaking the
-                            // combined read on every poll.
+                        if can_try_picture_write_fallback(&stable) {
                             remember_unsupported_picture_setting_key(key);
                         } else {
-                            // The connection itself is down. Bail out of the
-                            // whole fallback quietly and keep the last known
-                            // values from the previous poll.
-                            saw_transport_failure = true;
-                            if crate::detailed_logging_enabled() {
-                                log::debug!(
-                                    "[tv] picture setting key read skipped key={} detail={}",
-                                    sanitized_log_value(key),
-                                    sanitized_error_detail(&stable)
-                                );
-                            }
-                            break;
+                            context.picture_settings_error =
+                                "The TV did not report the picture setting values".to_string();
+                            return Ok(());
                         }
                     }
                 }
             }
-            if saw_transport_failure || !any_succeeded {
-                // A transport failure keeps the last known values instead of
-                // flashing the controls empty; a rejection with no successful
-                // key at all surfaces as the settings error.
-                if !saw_transport_failure {
-                    context.picture_settings_error =
-                        "The TV did not report the picture setting values".to_string();
-                }
-                return;
+            if !any_succeeded {
+                context.picture_settings_error =
+                    "The TV did not report the picture setting values".to_string();
+                return Ok(());
             }
             recovered
         }
@@ -2964,6 +3571,32 @@ async fn read_picture_settings(socket: &mut Socket, context: &mut PictureContext
         }
     }
     context.picture_settings = settings;
+    Ok(())
+}
+
+fn is_picture_transport_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if ["401", "403", "404", "permission", "no such service", "rejected"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
+    [
+        "did not answer",
+        "timed out",
+        "timeout",
+        "closed the connection",
+        "connection reset",
+        "connection refused",
+        "could not connect",
+        "secure certificate",
+        "certificate",
+        "tls",
+        "the tv request failed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 async fn read_picture_mode(socket: &mut Socket) -> Result<String, String> {
@@ -2973,36 +3606,35 @@ async fn read_picture_mode(socket: &mut Socket) -> Result<String, String> {
         json!({ "category": "picture", "keys": [PICTURE_MODE_CONTEXT_KEY] }),
         "read_picture_mode",
     )
-    .await
-    .map_err(|error| stable_error(&error))?;
+    .await?;
     picture_mode_from_response(&response)
         .ok_or_else(|| "The TV did not report a picture mode".to_string())
 }
 
-async fn set_picture_mode_direct(socket: &mut Socket, mode: &str) -> Result<(), String> {
-    let response = send_request(
-        socket,
-        "ss://settings/setSystemSettings",
-        json!({ "category": "picture", "settings": { PICTURE_MODE_CONTEXT_KEY: mode } }),
-        "set_picture_mode_direct",
-    )
-    .await?;
+async fn write_picture_setting_direct(
+    socket: &mut Socket,
+    uri: &str,
+    params: &Value,
+    request_context: &'static str,
+    describe: &'static str,
+) -> Result<(), String> {
+    let response = send_request(socket, uri, params.clone(), request_context).await?;
     if response_succeeded(&response) {
         Ok(())
     } else {
         let detail = response_error_detail(&response).unwrap_or("returnValue was false");
         log::warn!(
-            "[tv] picture mode direct response rejected detail={}",
+            "[tv] {describe} direct response rejected detail={}",
             sanitized_error_detail(detail)
         );
-        Err("The TV rejected the picture mode change".to_string())
+        Err(format!("The TV rejected the {describe} change"))
     }
 }
 
-fn picture_mode_luna_params(mode: &str) -> Value {
+fn picture_setting_luna_params(key: &str, value: &str) -> Value {
     json!({
-        "category": "picture",
-        "settings": { PICTURE_MODE_CONTEXT_KEY: mode }
+        "category": PICTURE_SETTINGS_CONTEXT,
+        "settings": { key: value }
     })
 }
 
@@ -3029,9 +3661,26 @@ fn picture_alert_payload(params: &Value) -> Value {
     })
 }
 
+fn picture_silent_alert_payload(params: &Value) -> Value {
+    let close_action = json!({
+        "uri": PICTURE_MODE_LUNA_URI,
+        "params": params.clone()
+    });
+    json!({
+        "message": "Applying...",
+        "buttons": [{
+            "label": "",
+            "onClick": PICTURE_MODE_LUNA_URI,
+            "params": params.clone()
+        }],
+        "onclose": close_action.clone(),
+        "onfail": close_action
+    })
+}
+
 #[cfg(test)]
-fn picture_mode_alert_payload(mode: &str) -> Value {
-    picture_alert_payload(&picture_mode_luna_params(mode))
+fn picture_setting_alert_payload(key: &str, value: &str) -> Value {
+    picture_alert_payload(&picture_setting_luna_params(key, value))
 }
 
 fn response_identifier(value: &Value) -> Option<String> {
@@ -3051,7 +3700,7 @@ fn alert_id_from_response(response: &Value) -> Option<String> {
         .and_then(response_identifier)
 }
 
-fn can_try_picture_alert_fallback(error: &str) -> bool {
+fn can_try_picture_write_fallback(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     ![
         "closed",
@@ -3087,11 +3736,14 @@ fn specialized_socket_url(socket_path: &str, endpoint: &str) -> Result<String, S
     Ok(format!("{scheme}://{authority}{socket_path}"))
 }
 
-async fn open_specialized_socket(url: &str) -> Result<Socket, String> {
+async fn open_specialized_socket(url: &str, expected_fingerprint: &str) -> Result<Socket, String> {
     if url.starts_with("wss://") {
         let request = url
             .into_client_request()
             .map_err(|_| "The TV returned an invalid remote input socket".to_string())?;
+        // Same self signed exception as the main socket, and the same pin
+        // check: this socket carries button presses, so it must be the paired
+        // TV and not whatever answers at the address.
         let tls = TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
@@ -3105,6 +3757,18 @@ async fn open_specialized_socket(url: &str) -> Result<Socket, String> {
         .map_err(|_| "The TV did not answer the remote input socket in time".to_string())?
         .map_err(|error| stable_error(&error.to_string()))?;
         let (socket, _) = connected;
+        if !expected_fingerprint.is_empty() {
+            let presented = peer_certificate_fingerprint(&socket)?;
+            if !fingerprints_match(&presented, expected_fingerprint) {
+                log::warn!(
+                    "[tv] remote input socket certificate pin mismatch, refusing the connection"
+                );
+                return Err(
+                    "This address is not the paired TV: its secure certificate does not match"
+                        .to_string(),
+                );
+            }
+        }
         return Ok(socket);
     }
 
@@ -3122,6 +3786,7 @@ async fn open_specialized_socket(url: &str) -> Result<Socket, String> {
 async fn send_remote_button(
     socket: &mut Socket,
     endpoint: &str,
+    certificate_fingerprint: &str,
     button: &'static str,
 ) -> Result<(), String> {
     let response = send_request(
@@ -3136,7 +3801,7 @@ async fn send_remote_button(
         .and_then(Value::as_str)
         .ok_or_else(|| "The TV did not return a remote input socket".to_string())?;
     let socket_url = specialized_socket_url(socket_path, endpoint)?;
-    let mut pointer_socket = open_specialized_socket(&socket_url).await?;
+    let mut pointer_socket = open_specialized_socket(&socket_url, certificate_fingerprint).await?;
     let message = format!("type:button\nname:{button}\n\n");
     tokio::time::timeout(
         POINTER_SOCKET_TIMEOUT,
@@ -3154,6 +3819,7 @@ async fn write_settings_via_alert(
     socket: &mut Socket,
     params: &Value,
     endpoint: &str,
+    certificate_fingerprint: &str,
     describe: &'static str,
 ) -> Result<(), String> {
     let create_response = send_request(
@@ -3179,7 +3845,7 @@ async fn write_settings_via_alert(
     // focused alert button to receive ENTER. Try both against the same short
     // lived alert, then let the caller read back the setting when needed.
     tokio::time::sleep(PICTURE_ALERT_ENTER_DELAY).await;
-    let enter_result = send_remote_button(socket, endpoint, "ENTER").await;
+    let enter_result = send_remote_button(socket, endpoint, certificate_fingerprint, "ENTER").await;
     match &enter_result {
         Ok(()) => log::debug!("[tv] {describe} alert enter sent"),
         Err(error) => log::warn!(
@@ -3227,54 +3893,182 @@ async fn write_settings_via_alert(
     }
 }
 
-async fn set_picture_mode_via_alert(
+async fn write_settings_via_silent_alert(
+    socket: &mut Socket,
+    params: &Value,
+    describe: &'static str,
+) -> Result<(), String> {
+    let create_response = send_request(
+        socket,
+        "ssap://system.notifications/createAlert",
+        picture_silent_alert_payload(params),
+        "create_silent_settings_alert",
+    )
+    .await?;
+    if !response_succeeded(&create_response) {
+        let detail = response_error_detail(&create_response).unwrap_or("returnValue was false");
+        log::warn!(
+            "[tv] {describe} silent alert create response rejected detail={}",
+            sanitized_error_detail(detail)
+        );
+        return Err("The TV rejected the settings alert".to_string());
+    }
+    let Some(alert_id) = alert_id_from_response(&create_response) else {
+        return Err("The TV did not return a settings alert id".to_string());
+    };
+    log::debug!("[tv] {describe} silent alert created alert_id_present=true");
+    let close_result = send_request(
+        socket,
+        "ssap://system.notifications/closeAlert",
+        json!({ "alertId": alert_id }),
+        "close_silent_settings_alert",
+    )
+    .await;
+    if close_result
+        .as_ref()
+        .map(response_succeeded)
+        .unwrap_or(false)
+    {
+        if let Ok(close_response) = &close_result {
+            log::debug!(
+                "[tv] {describe} silent alert closed response_type={}",
+                response_type(close_response)
+            );
+        }
+        Ok(())
+    } else {
+        let detail = close_result
+            .as_ref()
+            .err()
+            .map(String::as_str)
+            .or_else(|| close_result.as_ref().ok().and_then(response_error_detail))
+            .unwrap_or("returnValue was false");
+        log::warn!(
+            "[tv] {describe} silent alert close response rejected detail={}",
+            sanitized_error_detail(detail)
+        );
+        Err("The TV did not execute the silent settings alert".to_string())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PictureWriteMethod {
+    Luna,
+    DirectSs,
+    SilentAlert,
+    VisibleAlert,
+}
+
+impl PictureWriteMethod {
+    fn as_str(&self) -> &'static str {
+        match self {
+            PictureWriteMethod::Luna => "luna",
+            PictureWriteMethod::DirectSs => "ss",
+            PictureWriteMethod::SilentAlert => "alert_silent",
+            PictureWriteMethod::VisibleAlert => "alert",
+        }
+    }
+}
+
+const PICTURE_WRITE_METHODS: [PictureWriteMethod; 4] = [
+    PictureWriteMethod::Luna,
+    PictureWriteMethod::DirectSs,
+    PictureWriteMethod::SilentAlert,
+    PictureWriteMethod::VisibleAlert,
+];
+
+async fn write_picture_setting_with_fallbacks(
+    socket: &mut Socket,
+    params: &Value,
+    endpoint: &str,
+    certificate_fingerprint: &str,
+    describe: &'static str,
+) -> Result<PictureWriteMethod, String> {
+    let mut last_error = None;
+    for method in PICTURE_WRITE_METHODS {
+        let result = match method {
+            PictureWriteMethod::Luna => {
+                write_picture_setting_direct(
+                    socket,
+                    PICTURE_MODE_LUNA_URI,
+                    params,
+                    "write_picture_setting_luna",
+                    describe,
+                )
+                .await
+            }
+            PictureWriteMethod::DirectSs => {
+                write_picture_setting_direct(
+                    socket,
+                    "ss://settings/setSystemSettings",
+                    params,
+                    "write_picture_setting_ss",
+                    describe,
+                )
+                .await
+            }
+            PictureWriteMethod::SilentAlert => {
+                write_settings_via_silent_alert(socket, params, describe).await
+            }
+            PictureWriteMethod::VisibleAlert => {
+                write_settings_via_alert(
+                    socket,
+                    params,
+                    endpoint,
+                    certificate_fingerprint,
+                    describe,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(()) => return Ok(method),
+            Err(error) => {
+                log::warn!(
+                    "[tv] {describe} write rejected path={} detail={}",
+                    method.as_str(),
+                    sanitized_error_detail(&error)
+                );
+                if !can_try_picture_write_fallback(&error) {
+                    return Err(stable_error(&error));
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("The TV rejected the {describe} change")))
+}
+
+async fn set_picture_mode(
     socket: &mut Socket,
     mode: &str,
     endpoint: &str,
+    certificate_fingerprint: &str,
 ) -> Result<(), String> {
-    write_settings_via_alert(
+    let mode = validate_picture_mode(mode)?;
+    let safe_mode = sanitized_log_value(&mode);
+    let params = picture_setting_luna_params(PICTURE_MODE_CONTEXT_KEY, &mode);
+    log::debug!("[tv] picture mode write started mode={safe_mode}");
+    match write_picture_setting_with_fallbacks(
         socket,
-        &picture_mode_luna_params(mode),
+        &params,
         endpoint,
+        certificate_fingerprint,
         "picture mode",
     )
     .await
-}
-
-async fn set_picture_mode(socket: &mut Socket, mode: &str, endpoint: &str) -> Result<(), String> {
-    let mode = validate_picture_mode(mode)?;
-    let safe_mode = sanitized_log_value(&mode);
-    log::debug!("[tv] picture mode write started mode={safe_mode}");
-    match set_picture_mode_direct(socket, &mode).await {
-        Ok(()) => {
-            log::debug!("[tv] picture mode direct write accepted mode={safe_mode}");
+    {
+        Ok(method) => {
+            log::info!(
+                "[tv] picture mode write accepted path={} mode={safe_mode}",
+                method.as_str()
+            );
             Ok(())
         }
-        Err(direct_error) => {
-            log::warn!(
-                "[tv] picture mode direct write rejected mode={safe_mode} detail={}",
-                sanitized_error_detail(&direct_error)
-            );
-            if !can_try_picture_alert_fallback(&direct_error) {
-                return Err(stable_error(&direct_error));
-            }
-            match set_picture_mode_via_alert(socket, &mode, endpoint).await {
-                Ok(()) => {
-                    log::info!("[tv] picture mode compatibility write accepted mode={safe_mode}");
-                    Ok(())
-                }
-                Err(alert_error) => {
-                    log::warn!(
-                        "[tv] picture mode compatibility write failed mode={safe_mode} detail={}",
-                        sanitized_error_detail(&alert_error)
-                    );
-                    Err(format!(
-                        "The TV rejected the picture mode change. {}",
-                        stable_error(&alert_error)
-                    ))
-                }
-            }
-        }
+        Err(error) => Err(format!(
+            "The TV rejected the picture mode change. {}",
+            stable_error(&error)
+        )),
     }
 }
 
@@ -3311,14 +4105,14 @@ fn validate_picture_setting_value(
                 Err("Choose a supported Dynamic Tone Mapping value".to_string())
             }
         }
-        TvPictureSettingKind::ColorTemperaturePreset => {
-            let matches = COLOR_TEMPERATURE_PRESET_VALUES
+        TvPictureSettingKind::ColorGamut => {
+            let matches = COLOR_GAMUT_SETTING_VALUES
                 .iter()
                 .any(|allowed| *allowed == trimmed);
             if matches {
                 Ok(trimmed.to_string())
             } else {
-                Err("Choose a supported color temperature preset".to_string())
+                Err("Choose a supported Color Gamut value".to_string())
             }
         }
     }
@@ -3329,6 +4123,7 @@ async fn set_picture_setting(
     spec: &TvPictureSettingSpec,
     value: &str,
     endpoint: &str,
+    certificate_fingerprint: &str,
 ) -> Result<(), String> {
     let value = validate_picture_setting_value(spec, value)?;
     let describe: &'static str = "picture setting";
@@ -3337,31 +4132,29 @@ async fn set_picture_setting(
         sanitized_log_value(spec.id),
         sanitized_log_value(&value)
     );
-    let params = json!({
-        "category": PICTURE_SETTINGS_CONTEXT,
-        "settings": { spec.key: value }
-    });
-    match write_settings_via_alert(socket, &params, endpoint, describe).await {
-        Ok(()) => {
+    let params = picture_setting_luna_params(spec.key, &value);
+    match write_picture_setting_with_fallbacks(
+        socket,
+        &params,
+        endpoint,
+        certificate_fingerprint,
+        describe,
+    )
+    .await
+    {
+        Ok(method) => {
             log::info!(
-                "[tv] picture setting compatibility write accepted setting={} value={}",
+                "[tv] picture setting write accepted path={} setting={} value={}",
+                method.as_str(),
                 sanitized_log_value(spec.id),
                 sanitized_log_value(&value)
             );
             Ok(())
         }
-        Err(alert_error) => {
-            log::warn!(
-                "[tv] picture setting compatibility write failed setting={} value={} detail={}",
-                sanitized_log_value(spec.id),
-                sanitized_log_value(&value),
-                sanitized_error_detail(&alert_error)
-            );
-            Err(format!(
-                "The TV rejected the picture setting change. {}",
-                stable_error(&alert_error)
-            ))
-        }
+        Err(error) => Err(format!(
+            "The TV rejected the picture setting change. {}",
+            stable_error(&error)
+        )),
     }
 }
 
@@ -3395,6 +4188,10 @@ fn picture_mode_from_response(response: &Value) -> Option<String> {
         .and_then(|value| clean_discovery_value(Some(value)))
 }
 
+fn is_hdr_picture_mode_id(mode: &str) -> bool {
+    mode.starts_with("hdr") || mode.starts_with("dolbyHdr")
+}
+
 fn picture_mode_allowed_for_context(mode: &str, current_mode: Option<&str>) -> bool {
     let Some(current_mode) = current_mode else {
         return false;
@@ -3412,7 +4209,7 @@ fn picture_modes_for_mode(current_mode: &str) -> Vec<TvPictureModeOption> {
     } else {
         return PICTURE_MODE_OPTIONS
             .iter()
-            .filter(|(id, _)| !id.starts_with("hdr") && !id.starts_with("dolbyHdr"))
+            .filter(|(id, _)| !is_hdr_picture_mode_id(id))
             .map(|(id, label)| TvPictureModeOption {
                 id: (*id).to_string(),
                 label: (*label).to_string(),
@@ -3553,11 +4350,10 @@ fn device_from_connection(connection: &ConnectedTv) -> TvDeviceConfig {
             .filter(|device| device.device_id == connection.device_id)
             .map(|device| device.auto_reconnect)
             .unwrap_or(true),
-        certificate_fingerprint: existing
-            .as_ref()
-            .filter(|device| device.device_id == connection.device_id)
-            .map(|device| device.certificate_fingerprint.clone())
-            .unwrap_or_default(),
+        // The certificate verified on the live connection, not a previous
+        // value: an explicit Pair adopts the newly presented certificate, and
+        // every reconnect had to match this one to get here.
+        certificate_fingerprint: connection.certificate_fingerprint.clone(),
     }
 }
 
@@ -3602,6 +4398,14 @@ fn forget_from_worker(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn cached_volume_mute(app: &AppHandle) -> (Option<u32>, Option<bool>) {
+    app.state::<TvControllerState>()
+        .snapshot
+        .lock()
+        .map(|snapshot| (snapshot.volume, snapshot.muted))
+        .unwrap_or((None, None))
+}
+
 impl ConnectedTv {
     async fn refresh_picture_context(&mut self, operation: &'static str) {
         let started = Instant::now();
@@ -3610,7 +4414,9 @@ impl ConnectedTv {
         if crate::detailed_logging_enabled() {
             log::debug!("[tv] {operation} started");
         }
-        self.picture_context = read_picture_context(&mut self.socket).await;
+        let previous = self.picture_context.clone();
+        let refreshed = read_picture_context(&mut self.socket, &previous).await;
+        self.picture_context = refreshed;
         let current_mode = self
             .picture_context
             .picture_mode
@@ -3633,7 +4439,24 @@ impl ConnectedTv {
     }
 
     async fn wait_for_picture_mode(&mut self, expected_mode: &str) {
+        if self.picture_context.picture_mode.as_deref() == Some(expected_mode) {
+            return;
+        }
         for attempt in 1..=PICTURE_MODE_READBACK_ATTEMPTS {
+            match read_picture_mode(&mut self.socket).await {
+                Ok(mode) => {
+                    self.picture_context.picture_modes = picture_modes_for_mode(&mode);
+                    self.picture_context.picture_mode = Some(mode);
+                }
+                Err(error) if is_picture_transport_failure(&error) => {
+                    log::warn!(
+                        "[tv] picture mode readback stopped after transport failure detail={}",
+                        sanitized_error_detail(&error)
+                    );
+                    return;
+                }
+                Err(_) => {}
+            }
             let actual_mode = self
                 .picture_context
                 .picture_mode
@@ -3650,8 +4473,6 @@ impl ConnectedTv {
             }
             if attempt < PICTURE_MODE_READBACK_ATTEMPTS {
                 tokio::time::sleep(PICTURE_MODE_READBACK_DELAY).await;
-                self.refresh_picture_context("post_write_picture_context")
-                    .await;
             }
         }
     }
@@ -3814,11 +4635,15 @@ pub fn tv_connect(
             crate::config::update_tv_device(&app, Some(device.clone()))?;
             let sender = ensure_worker(&app)?;
             let state = app.state::<TvControllerState>();
-            if let Ok(mut snapshot) = state.snapshot.lock() {
-                *snapshot = saved_device_snapshot(&device, "connecting");
-            }
-            sender
-                .try_send(WorkerCommand::ReconnectSaved { device })
+        if let Ok(mut snapshot) = state.snapshot.lock() {
+            *snapshot = saved_device_snapshot(&device, "connecting");
+        }
+        sender
+            .try_send(WorkerCommand::ReconnectSaved {
+                device,
+                client_key: None,
+                credential_saved: true,
+            })
                 .map_err(|_| "TV controller is shutting down".to_string())?;
             return Ok(tv_get_state(state));
         }
@@ -3884,7 +4709,10 @@ pub async fn tv_set_picture_mode(app: AppHandle, mode: String) -> Result<TvState
     let sender = ensure_worker(&app)?;
     let (reply, receiver) = oneshot::channel();
     sender
-        .try_send(WorkerCommand::SetPictureMode { mode, reply })
+        .try_send(WorkerCommand::SetPictureMode {
+            mode,
+            reply: Some(reply),
+        })
         .map_err(|_| "TV controller is shutting down".to_string())?;
     receiver
         .await
@@ -3906,7 +4734,7 @@ pub async fn tv_set_picture_setting(
         .try_send(WorkerCommand::SetPictureSetting {
             setting_id,
             value,
-            reply,
+            reply: Some(reply),
         })
         .map_err(|_| "TV controller is shutting down".to_string())?;
     receiver.await.map_err(|_| {
@@ -3915,13 +4743,33 @@ pub async fn tv_set_picture_setting(
 }
 
 #[tauri::command]
-pub fn tv_forget(app: AppHandle) -> Result<(), String> {
-    queue_forget(&app)
+pub async fn tv_forget(app: AppHandle) -> Result<(), String> {
+    forget_and_wait(&app).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_reconnect_does_not_cancel_an_active_reconnect() {
+        let command = WorkerCommand::ReconnectSaved {
+            device: TvDeviceConfig::default(),
+            client_key: None,
+            credential_saved: false,
+        };
+        assert!(!command_cancels_reconnect(&command));
+    }
+
+    #[test]
+    fn reconnect_delay_stays_at_the_maximum_after_initial_backoff() {
+        assert_eq!(reconnect_delay(0), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(5));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(15));
+        assert_eq!(reconnect_delay(3), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(30));
+        assert_eq!(reconnect_delay(100), Duration::from_secs(30));
+    }
 
     #[test]
     fn numeric_hosts_are_accepted() {
@@ -4070,6 +4918,16 @@ mod tests {
     }
 
     #[test]
+    fn hdr_picture_modes_are_recognized_by_id() {
+        // Dynamic Tone Mapping is gated on this check, in the TV tab and in
+        // the worker's picture setting write, so the two must agree.
+        assert!(is_hdr_picture_mode_id("hdrGame"));
+        assert!(is_hdr_picture_mode_id("dolbyHdrCinema"));
+        assert!(!is_hdr_picture_mode_id("game"));
+        assert!(!is_hdr_picture_mode_id("filmmaker"));
+    }
+
+    #[test]
     fn picture_mode_writes_require_a_known_identifier() {
         assert_eq!(validate_picture_mode("filmMaker").unwrap(), "filmMaker");
         assert!(validate_picture_mode("Game").is_err());
@@ -4108,23 +4966,35 @@ mod tests {
         assert!(validate_picture_setting_value(dtm, "hgig").is_err());
         assert!(validate_picture_setting_value(dtm, "always").is_err());
 
-        let preset = picture_setting_spec("colorTemperatureCode").unwrap();
+        let color_depth = picture_setting_spec("color").unwrap();
         assert_eq!(
-            validate_picture_setting_value(preset, "warm2").unwrap(),
-            "warm2"
+            validate_picture_setting_value(color_depth, "0").unwrap(),
+            "0"
         );
-        assert!(validate_picture_setting_value(preset, "Warm2").is_err());
-        assert!(validate_picture_setting_value(preset, "hot").is_err());
+        assert_eq!(
+            validate_picture_setting_value(color_depth, "100").unwrap(),
+            "100"
+        );
+        assert!(validate_picture_setting_value(color_depth, "-1").is_err());
+        assert!(validate_picture_setting_value(color_depth, "101").is_err());
+
+        let color_gamut = picture_setting_spec("colorGamut").unwrap();
+        for value in ["auto", "native", "dynamic", "adobeRGB"] {
+            assert_eq!(
+                validate_picture_setting_value(color_gamut, value).unwrap(),
+                value
+            );
+        }
+        for value in ["Auto", "extended", "wide", "srgb", "adobeRgb"] {
+            assert!(validate_picture_setting_value(color_gamut, value).is_err());
+        }
     }
 
     #[test]
     fn picture_setting_alert_payload_carries_the_requested_key() {
         let spec = picture_setting_spec("backlight").unwrap();
         let value = validate_picture_setting_value(spec, "42").unwrap();
-        let params = json!({
-            "category": PICTURE_SETTINGS_CONTEXT,
-            "settings": { spec.key: value }
-        });
+        let params = picture_setting_luna_params(spec.key, &value);
         let payload = picture_alert_payload(&params);
         assert_eq!(
             payload
@@ -4141,6 +5011,32 @@ mod tests {
             .to_string()
             .to_ascii_lowercase()
             .contains("client-key"));
+
+        let silent_payload =
+            picture_silent_alert_payload(&picture_setting_luna_params("colorGamut", "adobeRGB"));
+        assert_eq!(
+            silent_payload
+                .pointer("/buttons/0/params/settings/colorGamut")
+                .and_then(Value::as_str),
+            Some("adobeRGB")
+        );
+        assert_eq!(
+            silent_payload
+                .pointer("/onclose/params/settings/colorGamut")
+                .and_then(Value::as_str),
+            Some("adobeRGB")
+        );
+    }
+
+    #[test]
+    fn picture_setting_transport_failures_are_distinguished_from_rejections() {
+        assert!(is_picture_transport_failure("The TV did not answer in time"));
+        assert!(is_picture_transport_failure("The TV closed the connection"));
+        assert!(is_picture_transport_failure("The TV request failed"));
+        assert!(is_picture_transport_failure("connection reset by peer"));
+        assert!(!is_picture_transport_failure("401 insufficient permissions"));
+        assert!(!is_picture_transport_failure("404 no such service or method"));
+        assert!(!is_picture_transport_failure("The TV rejected the picture setting change"));
     }
 
     #[test]
@@ -4150,6 +5046,8 @@ mod tests {
                 "settings": {
                     "backlight": 45,
                     "contrast": "80",
+                    "color": "50",
+                    "colorGamut": "dynamic",
                     "hdrDynamicToneMapping": "HGIG"
                 }
             }
@@ -4163,6 +5061,14 @@ mod tests {
             Some("80")
         );
         assert_eq!(
+            picture_setting_value_from_response(&response, "color").as_deref(),
+            Some("50")
+        );
+        assert_eq!(
+            picture_setting_value_from_response(&response, "colorGamut").as_deref(),
+            Some("dynamic")
+        );
+        assert_eq!(
             picture_setting_value_from_response(&response, "hdrDynamicToneMapping").as_deref(),
             Some("HGIG")
         );
@@ -4173,8 +5079,23 @@ mod tests {
     }
 
     #[test]
-    fn picture_setting_specs_cover_the_phase_four_set() {
-        assert_eq!(PICTURE_SETTING_SPECS.len(), 6);
+    fn picture_setting_specs_cover_supported_controls() {
+        assert_eq!(PICTURE_SETTING_SPECS.len(), 7);
+        assert_eq!(
+            PICTURE_SETTING_SPECS
+                .iter()
+                .map(|spec| spec.id)
+                .collect::<Vec<_>>(),
+            vec![
+                "backlight",
+                "colorTemperature",
+                "contrast",
+                "color",
+                "brightness",
+                "colorGamut",
+                "hdrDynamicToneMapping",
+            ]
+        );
         for spec in PICTURE_SETTING_SPECS {
             assert!(!spec.id.is_empty());
             assert!(!spec.key.is_empty());
@@ -4184,7 +5105,8 @@ mod tests {
         assert!(picture_setting_spec("contrast").is_ok());
         assert!(picture_setting_spec("brightness").is_ok());
         assert!(picture_setting_spec("colorTemperature").is_ok());
-        assert!(picture_setting_spec("colorTemperatureCode").is_ok());
+        assert!(picture_setting_spec("color").is_ok());
+        assert!(picture_setting_spec("colorGamut").is_ok());
         assert!(picture_setting_spec("hdrDynamicToneMapping").is_ok());
         assert!(picture_setting_spec("peakBrightness").is_err());
     }
@@ -4257,7 +5179,7 @@ mod tests {
 
     #[test]
     fn picture_mode_alert_payload_uses_the_settings_service_handlers() {
-        let payload = picture_mode_alert_payload("hdrGame");
+        let payload = picture_setting_alert_payload(PICTURE_MODE_CONTEXT_KEY, "hdrGame");
         assert_eq!(
             payload.pointer("/message").and_then(Value::as_str),
             Some(" ")
@@ -4320,6 +5242,59 @@ mod tests {
     }
 
     #[test]
+    fn picture_setting_luna_params_match_direct_write_shape() {
+        let params = picture_setting_luna_params(PICTURE_MODE_CONTEXT_KEY, "hdrGame");
+        assert_eq!(
+            params.pointer("/category").and_then(Value::as_str),
+            Some("picture")
+        );
+        assert_eq!(
+            params
+                .pointer("/settings/pictureMode")
+                .and_then(Value::as_str),
+            Some("hdrGame")
+        );
+        assert!(params.get("current_app").is_none());
+    }
+
+    #[test]
+    fn picture_mode_silent_alert_payload_matches_colorcontrol_shape() {
+        let payload = picture_silent_alert_payload(&picture_setting_luna_params(
+            PICTURE_MODE_CONTEXT_KEY,
+            "hdrVivid",
+        ));
+        assert_eq!(
+            payload.pointer("/message").and_then(Value::as_str),
+            Some("Applying...")
+        );
+        assert_eq!(
+            payload
+                .pointer("/buttons/0/onClick")
+                .and_then(Value::as_str),
+            Some(PICTURE_MODE_LUNA_URI)
+        );
+        assert_eq!(
+            payload
+                .pointer("/buttons/0/params/settings/pictureMode")
+                .and_then(Value::as_str),
+            Some("hdrVivid")
+        );
+        assert_eq!(
+            payload.pointer("/onclose/uri").and_then(Value::as_str),
+            Some(PICTURE_MODE_LUNA_URI)
+        );
+        assert_eq!(
+            payload
+                .pointer("/onfail/params/settings/pictureMode")
+                .and_then(Value::as_str),
+            Some("hdrVivid")
+        );
+        assert!(payload.get("modal").is_none());
+        assert!(payload.get("type").is_none());
+        assert!(payload.get("isSysReq").is_none());
+    }
+
+    #[test]
     fn picture_alert_id_parser_accepts_webos_response_variants() {
         assert_eq!(
             alert_id_from_response(&json!({ "payload": { "alertId": "alert 1" } })),
@@ -4332,6 +5307,40 @@ mod tests {
         assert_eq!(
             alert_id_from_response(&json!({ "payload": { "alertId": "  " } })),
             None
+        );
+    }
+
+    #[test]
+    fn fingerprint_matching_is_strict_about_any_differing_digest() {
+        let paired = "sha256:aabbcc";
+        assert!(fingerprints_match("sha256:aabbcc", paired));
+        assert!(fingerprints_match("SHA256:AA:bb:cc", paired));
+        assert!(!fingerprints_match("sha256:aabbcd", paired));
+        assert!(!fingerprints_match("sha256:aabbc", paired));
+        // Nothing pinned yet: no presented value can be trusted, so nothing
+        // matches. The callers treat an empty pin as "unpinned" explicitly.
+        assert!(!fingerprints_match("sha256:aabbcc", ""));
+        assert!(!fingerprints_match("", "sha256:aabbcc"));
+    }
+
+    #[test]
+    fn unpinned_saved_pairings_have_no_expected_certificate() {
+        let legacy = TvDeviceConfig {
+            device_id: "lg-192.168.1.50".to_string(),
+            paired: true,
+            ..TvDeviceConfig::default()
+        };
+        assert!(expected_certificate_fingerprint(&legacy).is_empty());
+
+        let pinned = TvDeviceConfig {
+            device_id: "lg-192.168.1.50".to_string(),
+            paired: true,
+            certificate_fingerprint: "sha256:ddeeff".to_string(),
+            ..TvDeviceConfig::default()
+        };
+        assert_eq!(
+            expected_certificate_fingerprint(&pinned),
+            "sha256ddeeff".to_string()
         );
     }
 
@@ -4357,16 +5366,37 @@ mod tests {
     }
 
     #[test]
-    fn picture_alert_fallback_skips_transport_failures() {
-        assert!(can_try_picture_alert_fallback("The TV request failed"));
-        assert!(can_try_picture_alert_fallback("permission denied"));
-        assert!(!can_try_picture_alert_fallback(
+    fn picture_write_fallback_order_starts_with_direct_methods() {
+        assert_eq!(
+            PICTURE_WRITE_METHODS,
+            [
+                PictureWriteMethod::Luna,
+                PictureWriteMethod::DirectSs,
+                PictureWriteMethod::SilentAlert,
+                PictureWriteMethod::VisibleAlert,
+            ]
+        );
+        assert_eq!(PictureWriteMethod::SilentAlert.as_str(), "alert_silent");
+        assert_eq!(PictureWriteMethod::VisibleAlert.as_str(), "alert");
+    }
+
+    #[test]
+    fn picture_write_fallback_skips_transport_failures() {
+        assert!(can_try_picture_write_fallback("The TV request failed"));
+        assert!(can_try_picture_write_fallback("permission denied"));
+        assert!(can_try_picture_write_fallback(
+            "401 insufficient permissions"
+        ));
+        assert!(can_try_picture_write_fallback(
+            "404 no such service or method"
+        ));
+        assert!(!can_try_picture_write_fallback(
             "The TV closed the connection"
         ));
-        assert!(!can_try_picture_alert_fallback(
+        assert!(!can_try_picture_write_fallback(
             "The TV did not answer in time"
         ));
-        assert!(!can_try_picture_alert_fallback(
+        assert!(!can_try_picture_write_fallback(
             "The TV secure certificate was rejected"
         ));
     }
@@ -4396,6 +5426,46 @@ mod tests {
         assert!(!response_succeeded(&json!({
             "payload": { "returnValue": false }
         })));
+    }
+
+    #[test]
+    fn discovery_bind_targets_include_the_lan_address_and_a_fallback() {
+        let targets = discovery_bind_targets();
+        // The wildcard fallback always runs, so a machine whose outbound
+        // address is not the TV's subnet still searches the old way.
+        assert!(targets.contains(&Ipv4Addr::UNSPECIFIED));
+        assert!(targets.len() <= 2);
+        // On a host with a real LAN route the LAN address is searched too, and
+        // it is preferred over the wildcard.
+        if let Some(lan) = primary_outbound_ipv4() {
+            assert_eq!(targets.first(), Some(&lan));
+            assert!(is_usable_local_discovery_ip(lan));
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_adapter_addresses_that_cannot_reach_a_tv() {
+        // Loopback, unspecified, multicast, broadcast, and the 169.254/16
+        // self-assigned range a disconnected Wi-Fi adapter picks up are all
+        // unusable as an SSDP source.
+        for rejected in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "239.255.255.250",
+            "255.255.255.255",
+            "169.254.224.103",
+        ] {
+            assert!(
+                !is_usable_local_discovery_ip(rejected.parse().expect("valid literal")),
+                "expected address to be rejected: {rejected}"
+            );
+        }
+        for accepted in ["192.168.1.36", "10.0.0.5", "172.16.4.9"] {
+            assert!(
+                is_usable_local_discovery_ip(accepted.parse().expect("valid literal")),
+                "expected address to be accepted: {accepted}"
+            );
+        }
     }
 
     #[test]

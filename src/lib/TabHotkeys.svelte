@@ -2,11 +2,12 @@
   // Inlined data URI, see App.svelte for why icons never hit the network.
   import tabHotkeysIcon from './icons/tab_hotkeys.png?inline';
   import { emit } from '@tauri-apps/api/event';
+  import { captureHotkeyCombo } from './hotkey-capture.js';
   import { hotkeys, setHotkey, resetHotkeys, displayFavorites, favoriteHotkeyAction, monitors, activeMonitor } from './stores.svelte.js';
   import ConfirmModal from './ConfirmModal.svelte';
 
-  // The action list mirrors ACTIONS in src-tauri/src/hotkeys.rs. The combo
-  // strings produced by captureCombo must match the Rust parse_hotkey table.
+  // The action list mirrors ACTIONS in src-tauri/src/hotkeys.rs. The shared
+  // capture helper produces combo strings that match the Rust key table.
   const ROWS = [
     { key: 'toggle_black_crush', label: 'Toggle Black Crush', desc: 'Enable or disable the black level adjustment.' },
     { key: 'decrease_black_crush', label: 'Decrease Black Level', desc: 'Lower the black level. Hold to repeat.' },
@@ -78,97 +79,16 @@
     capturing = null;
   }
 
-  // KeyboardEvent → combo string, using the same key names as the Rust table.
-  // Requires at least one modifier, or an F-key, so a plain letter/digit can
-  // never hijack typing globally.
-  const KEY_NAMES = {
-    Enter: 'Enter',
-    Tab: 'Tab',
-    Backspace: 'Backspace',
-    Delete: 'Delete',
-    Insert: 'Insert',
-    Home: 'Home',
-    End: 'End',
-    PageUp: 'PgUp',
-    PageDown: 'PgDn',
-    ArrowUp: 'Up',
-    ArrowDown: 'Down',
-    ArrowLeft: 'Left',
-    ArrowRight: 'Right',
-    ',': ',',
-    '.': '.',
-    '/': '/',
-    ';': ';',
-    "'": "'",
-    '[': '[',
-    ']': ']',
-    '\\': '\\',
-    '`': '`',
-    '-': '-',
-    '=': '=',
-    NumLock: 'Num0', // placeholder, replaced below for digits
-  };
-
-  // e.code → key name for punctuation. e.key reports the SHIFTED character
-  // when Shift is held (e.g. Shift+/ gives '?'), but the Rust table only holds
-  // the unshifted layout characters, so map from e.code, which is stable.
-  const CODE_PUNCT = {
-    Comma: ',',
-    Period: '.',
-    Slash: '/',
-    Semicolon: ';',
-    Quote: "'",
-    BracketLeft: '[',
-    BracketRight: ']',
-    Backslash: '\\',
-    Backquote: '`',
-    Minus: '-',
-    Equal: '=',
-  };
-
   function captureCombo(e) {
-    if (e.key === 'Escape' || e.key === 'Delete') {
-      apply(capturing, 'None');
-      e.preventDefault();
+    const result = captureHotkeyCombo(e);
+    if (!result) return null;
+    if (result.error) {
+      captureError = result.error;
       return null;
     }
-    if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return null;
-
-    const parts = [];
-    if (e.metaKey) parts.push('Win');
-    if (e.ctrlKey) parts.push('Ctrl');
-    if (e.altKey) parts.push('Alt');
-    if (e.shiftKey) parts.push('Shift');
-
-    let name = null;
-    const code = e.code || '';
-    const key = e.key;
-    if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) name = code;          // F1-F24
-    else if (/^Key[A-Z]$/.test(code)) name = code.slice(3);          // A-Z
-    else if (/^Digit[0-9]$/.test(code)) name = code.slice(5);        // 0-9
-    else if (/^Numpad[0-9]$/.test(code)) name = `Num${code.slice(6)}`;
-    else if (code.startsWith('Numpad')) {
-      const map = { NumpadMultiply: 'Num*', NumpadAdd: 'Num+', NumpadSubtract: 'Num-', NumpadDecimal: 'Num.', NumpadDivide: 'Num/' };
-      name = map[code] || null;
-    } else if (CODE_PUNCT[code]) name = CODE_PUNCT[code];            // punctuation
-    else if (code === 'Space') name = 'Space';                        // Space
-    else if (KEY_NAMES[key]) name = KEY_NAMES[key];                  // Enter, Tab, arrows…
-    else if (typeof key === 'string' && key.length === 1) {
-      // Last resort (layout-specific keys): uppercase bare letters.
-      name = /^[a-z]$/.test(key) ? key.toUpperCase() : key;
-    }
-    if (!name) return null;
-
-    const combo = [...parts, name].join('+');
-    // Guard: a bare letter/digit without any modifier is refused. F-keys are
-    // allowed alone (they don't collide with typing).
-    if (parts.length === 0 && !/^F\d+$/.test(name)) {
-      captureError = 'Add a modifier (Ctrl, Alt, Shift or Win) or use an F-key.';
-      return null;
-    }
-    apply(capturing, combo);
+    void apply(capturing, result.combo);
     e.preventDefault();
-    return combo;
+    return result.combo;
   }
 
   $effect(() => {

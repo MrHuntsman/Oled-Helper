@@ -739,6 +739,39 @@ export async function setTvPictureMode(mode) {
   return invoke('tv_set_picture_mode', { mode });
 }
 
+const TV_PICTURE_MODE_HOTKEY_PREFIX = 'tv_picture_mode_';
+
+export function tvPictureModeHotkeyAction(mode) {
+  return typeof mode === 'string' && mode ? `${TV_PICTURE_MODE_HOTKEY_PREFIX}${mode}` : '';
+}
+
+export function tvPictureModeFromHotkeyAction(action) {
+  return typeof action === 'string' && action.startsWith(TV_PICTURE_MODE_HOTKEY_PREFIX)
+    ? action.slice(TV_PICTURE_MODE_HOTKEY_PREFIX.length)
+    : '';
+}
+
+const TV_PICTURE_SETTING_HOTKEY_PREFIX = 'tv_picture_setting_';
+
+// A picture setting hotkey binds one value of one setting, so the action name
+// carries both parts, as in tv_picture_setting_hdrDynamicToneMapping_HGIG.
+// The value is kept verbatim, because that is the exact string the TV stores.
+export function tvPictureSettingHotkeyAction(settingId, value) {
+  if (typeof settingId !== 'string' || !settingId) return '';
+  if (typeof value !== 'string' || !value) return '';
+  return `${TV_PICTURE_SETTING_HOTKEY_PREFIX}${settingId}_${value}`;
+}
+
+export function tvPictureSettingFromHotkeyAction(action) {
+  if (typeof action !== 'string' || !action.startsWith(TV_PICTURE_SETTING_HOTKEY_PREFIX)) {
+    return null;
+  }
+  const rest = action.slice(TV_PICTURE_SETTING_HOTKEY_PREFIX.length);
+  const separator = rest.indexOf('_');
+  if (separator <= 0 || separator === rest.length - 1) return null;
+  return { settingId: rest.slice(0, separator), value: rest.slice(separator + 1) };
+}
+
 export async function setTvPictureSetting(settingId, value) {
   return invoke('tv_set_picture_setting', { settingId, value });
 }
@@ -772,9 +805,8 @@ export async function resetHotkeys() {
   } catch (e) {
     console.warn('[hotkeys] reset failed', e);
   }
-  // Restore Tab Defaults clears every hotkey combo, including the per-
-  // favorite resolution hotkeys (the user chose "clear everything"). The
-  // saved favorites themselves are kept.
+  // Restore Tab Defaults clears every hotkey combo, including favorite
+  // resolution and TV picture mode hotkeys. Saved favorites are kept.
   for (const action of Object.keys(hotkeys)) delete hotkeys[action];
   scheduleHotkeySave();
 }

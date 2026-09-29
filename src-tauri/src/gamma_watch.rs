@@ -160,13 +160,19 @@ pub(crate) fn start() {
 // edge-triggered: the record is written (and the child spawned) on the first
 // active transition, so the hot slider/safety paths never touch the disk.
 // Called with clones of the same maps the ramp writer used.
-pub(crate) fn sync(global_lift: i32, per_monitor: &std::collections::HashMap<String, i32>, brightness: &std::collections::HashMap<String, u32>) {
+pub(crate) fn sync(
+    global_lift: i32,
+    per_monitor: &std::collections::HashMap<String, i32>,
+    brightness: &std::collections::HashMap<String, u32>,
+) {
     let active = global_lift != 0
         || per_monitor.values().any(|value| *value != 0)
         || brightness.values().any(|value| *value < 1000);
     let pid = std::process::id();
     let _sync_guard = SYNC_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let mut spawned = SPAWNED_CHILD.lock().unwrap_or_else(|error| error.into_inner());
+    let mut spawned = SPAWNED_CHILD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     // A healthy child watching THIS session means the watchdog is in place
     // and the record already matches this pid.
     if let Some((child_pid, watched_pid)) = *spawned {

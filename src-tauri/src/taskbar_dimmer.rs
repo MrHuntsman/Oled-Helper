@@ -85,7 +85,6 @@ mod platform {
         BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, MonitorFromWindow,
         BLACK_BRUSH, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
     };
-    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
     use windows::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID,
     };
@@ -94,21 +93,20 @@ mod platform {
         OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-        GetClassNameW, GetCursorInfo, GetCursorPos, GetForegroundWindow, GetMessageW, GetTopWindow,
-        GetWindow, GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible,
-        PostMessageW, PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes,
+        CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClassNameW,
+        GetCursorInfo, GetCursorPos, GetForegroundWindow, GetMessageW, GetTopWindow, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW, PostMessageW,
+        PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes,
         SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
-        UnhookWindowsHookEx,
-        HCURSOR, CURSORINFO, CURSORINFO_FLAGS, CURSOR_SHOWING, GWLP_HWNDPARENT, GWL_EXSTYLE,
-        GWL_STYLE,
-        GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, LoadCursorW, LWA_ALPHA,
-        MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOSENDCHANGING, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP, WM_MOUSEFIRST, WM_MOUSEHWHEEL,
-        WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_MAXIMIZE,
-        WS_POPUP, WS_THICKFRAME,
+        UnhookWindowsHookEx, CURSORINFO, CURSORINFO_FLAGS, CURSOR_SHOWING, GWLP_HWNDPARENT,
+        GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HCURSOR, HTTRANSPARENT, HWND_TOPMOST,
+        IDC_ARROW, LWA_ALPHA, MSG, SET_WINDOW_POS_FLAGS, SWP_HIDEWINDOW, SWP_NOACTIVATE,
+        SWP_NOSENDCHANGING, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WH_MOUSE_LL, WM_APP,
+        WM_MOUSEFIRST, WM_MOUSEHWHEEL, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETCURSOR, WNDCLASSW,
+        WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT, WS_MAXIMIZE, WS_POPUP, WS_THICKFRAME,
     };
 
     // One adaptive timer handles both cursor polling and animation. It runs
@@ -1185,9 +1183,10 @@ mod platform {
     fn taskbars() -> Vec<(HWND, RECT)> {
         let mut list: Vec<(HWND, RECT)> = Vec::new();
         unsafe {
-            let _ = EnumWindows(Some(enum_taskbar_proc), LPARAM(
-                &mut list as *mut Vec<(HWND, RECT)> as isize,
-            ));
+            let _ = EnumWindows(
+                Some(enum_taskbar_proc),
+                LPARAM(&mut list as *mut Vec<(HWND, RECT)> as isize),
+            );
         }
         list
     }
@@ -1250,7 +1249,11 @@ mod platform {
     // taskbar, so the overlay's own HMONITOR identifies its replacement.
     // Throttled via LAST_TASKBAR_REKEY so a taskbar that is genuinely
     // missing (Explorer restart) doesn't spin EnumWindows at tick cadence.
-    fn rekey_taskbar_for_overlay(hwnd: HWND, hwnd_raw: isize, now: Instant) -> Option<(isize, RECT)> {
+    fn rekey_taskbar_for_overlay(
+        hwnd: HWND,
+        hwnd_raw: isize,
+        now: Instant,
+    ) -> Option<(isize, RECT)> {
         {
             let mut last = LAST_TASKBAR_REKEY.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(prev) = *last {
@@ -1367,9 +1370,7 @@ mod platform {
     ) -> Option<FullscreenSample> {
         unsafe {
             let foreground = GetForegroundWindow();
-            if foreground.0.is_null()
-                || overlay.map(|hwnd| foreground == hwnd).unwrap_or(false)
-            {
+            if foreground.0.is_null() || overlay.map(|hwnd| foreground == hwnd).unwrap_or(false) {
                 return None;
             }
 
@@ -1531,7 +1532,8 @@ mod platform {
                         if VERBOSE_LOGGING.load(Ordering::Relaxed) {
                             emit_runtime(
                                 "info",
-                                "[taskbar-dimmer] fullscreen_hide synchronous (event callback)".into(),
+                                "[taskbar-dimmer] fullscreen_hide synchronous (event callback)"
+                                    .into(),
                             );
                         }
                     }
@@ -1991,7 +1993,9 @@ mod platform {
     pub fn on_display_change() {
         TASKBAR_CACHE_FORCE_REFRESH.store(true, Ordering::Relaxed);
         FULLSCREEN_RECHECK_REQUESTED.store(true, Ordering::Relaxed);
-        *DISPLAY_CHANGE_SINCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        *DISPLAY_CHANGE_SINCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         // Explorer can reorder the topmost band after a display change; the
         // forced-repair window re-asserts the overlay's position and z-order
         // a few times at the 250ms cadence, covering a late shell reflow.
@@ -2163,32 +2167,32 @@ mod platform {
 
     fn update_fade(hwnd: HWND) {
         let hwnd_raw = hwnd.0 as isize;
-    // This overlay's own taskbar window (copied before the FADES lock so
-    // the cache refresh below can re-fetch its rect without nesting a
-    // second lock).
-    let mut overlay_taskbar = overlays_map()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&hwnd_raw)
-        .map(|info| info.taskbar);
-    let now = Instant::now();
-    // Self-heal a stale taskbar HWND: after a display change Explorer can
-    // recreate Shell_TrayWnd with a new handle, and GetWindowRect on the old
-    // handle fails forever. With cached_taskbar None, hover detection and
-    // z-order repair both stop (the overlay ends up stuck behind the
-    // recreated taskbar) until the next apply() happens to re-enumerate.
-    // Re-point this overlay at the fresh taskbar on its monitor before the
-    // cache refresh below runs. This runs with no lock held, so it can never
-    // invert the OVERLAYS -> FADES lock order.
-    if let Some(raw) = overlay_taskbar {
-        let mut r = RECT::default();
-        let resolvable = unsafe { GetWindowRect(HWND(raw as *mut c_void), &mut r) }.is_ok();
-        if !resolvable {
-            overlay_taskbar = rekey_taskbar_for_overlay(hwnd, hwnd_raw, now)
-                .map(|(raw, _)| raw)
-                .or(Some(raw));
+        // This overlay's own taskbar window (copied before the FADES lock so
+        // the cache refresh below can re-fetch its rect without nesting a
+        // second lock).
+        let mut overlay_taskbar = overlays_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&hwnd_raw)
+            .map(|info| info.taskbar);
+        let now = Instant::now();
+        // Self-heal a stale taskbar HWND: after a display change Explorer can
+        // recreate Shell_TrayWnd with a new handle, and GetWindowRect on the old
+        // handle fails forever. With cached_taskbar None, hover detection and
+        // z-order repair both stop (the overlay ends up stuck behind the
+        // recreated taskbar) until the next apply() happens to re-enumerate.
+        // Re-point this overlay at the fresh taskbar on its monitor before the
+        // cache refresh below runs. This runs with no lock held, so it can never
+        // invert the OVERLAYS -> FADES lock order.
+        if let Some(raw) = overlay_taskbar {
+            let mut r = RECT::default();
+            let resolvable = unsafe { GetWindowRect(HWND(raw as *mut c_void), &mut r) }.is_ok();
+            if !resolvable {
+                overlay_taskbar = rekey_taskbar_for_overlay(hwnd, hwnd_raw, now)
+                    .map(|(raw, _)| raw)
+                    .or(Some(raw));
+            }
         }
-    }
 
         // Fullscreen suppression is decoupled from the animation tick: the
         // expensive detection chain result is cached, so the fade timer can
@@ -2227,9 +2231,8 @@ mod platform {
             } else {
                 FULLSCREEN_CHECK_INTERVAL_MS
             };
-            let timer_due =
-                now.duration_since(fade.last_fullscreen_check).as_millis() as u64
-                    >= fullscreen_cadence_ms;
+            let timer_due = now.duration_since(fade.last_fullscreen_check).as_millis() as u64
+                >= fullscreen_cadence_ms;
             // Event mode's catch-all only re-runs the expensive chain when
             // something might have changed: the foreground switched since the
             // last check, or the last checked window covered the monitor (a
@@ -2267,8 +2270,7 @@ mod platform {
                     .get_mut(&hwnd_raw)
                 {
                     f.last_fullscreen_foreground = foreground_raw;
-                    f.last_fullscreen_covers =
-                        sample.as_ref().map(|s| s.covers).unwrap_or(false);
+                    f.last_fullscreen_covers = sample.as_ref().map(|s| s.covers).unwrap_or(false);
                     f.fullscreen_active = active;
                 }
                 if VERBOSE_LOGGING.load(Ordering::Relaxed) {
@@ -2860,7 +2862,8 @@ mod platform {
                     .find(|(_, info)| info.taskbar == taskbar.0 as isize)
                     .map(|(h, _)| *h);
                 let hwnd = match existing {
-                    Some(h) => {                        if let Some(info) = overlays.get_mut(&h) {
+                    Some(h) => {
+                        if let Some(info) = overlays.get_mut(&h) {
                             // monitor_key_for_taskbar enumerates the whole
                             // monitor table (Win32 + CCD + SetupAPI), which is
                             // far too expensive to run on every slider tick
@@ -3002,7 +3005,7 @@ mod platform {
                 fade.last_taskbar_cache_refresh = Instant::now();
             }
         } // Thread lifecycle (tick, hooks) is managed once per apply() call
-        // based on whether any overlay is on, since the threads are global.
+          // based on whether any overlay is on, since the threads are global.
 
         unsafe {
             let old = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -3181,10 +3184,7 @@ pub fn set_taskbar_dimmer(
 // the nav switch and the hotkey, so the app keeps a one-switch-all way to
 // silence the dimmers even though the per-monitor on/off is now per display.
 #[tauri::command]
-pub fn set_taskbar_dimmer_enabled_for_all(
-    enabled: bool,
-    immediate: bool,
-) -> Result<(), String> {
+pub fn set_taskbar_dimmer_enabled_for_all(enabled: bool, immediate: bool) -> Result<(), String> {
     let connected: Vec<String> = {
         let mut profiles = profiles_map().lock().unwrap_or_else(|e| e.into_inner());
         // Toggle the persisted profiles for current monitors (and guard
@@ -3238,7 +3238,10 @@ pub(crate) fn sync_detection(mode: &str, poll_ms: u32) {
 pub fn set_taskbar_dimmer_hover_mode(mode: String) -> Result<(), String> {
     // Detection Method is global: keep the current poll interval, swap the
     // mode, then apply so the overlay/tick behavior follows immediately.
-    platform::sync_detection(&mode, platform::POLL_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed));
+    platform::sync_detection(
+        &mode,
+        platform::POLL_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    );
     platform::apply(false)
 }
 
@@ -3276,7 +3279,8 @@ pub fn get_taskbar_dimmer_status(
         fade_in_duration_ms: profile.fade_in_duration_ms,
         fade_out_duration_ms: profile.fade_out_duration_ms,
         // Detection method is global, not per monitor.
-        hover_detection: if platform::PREFER_EVENT_HOVER.load(std::sync::atomic::Ordering::Relaxed) {
+        hover_detection: if platform::PREFER_EVENT_HOVER.load(std::sync::atomic::Ordering::Relaxed)
+        {
             "event".to_string()
         } else {
             "poll".to_string()
@@ -3314,7 +3318,6 @@ pub fn set_flyout_hwnd(raw: isize) {
 pub fn on_display_change() {
     platform::on_display_change();
 }
-
 
 pub(crate) fn fullscreen_active_on_monitor(hmonitor: u32) -> bool {
     platform::fullscreen_active_on_monitor(hmonitor)

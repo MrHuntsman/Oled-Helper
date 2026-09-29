@@ -29,12 +29,10 @@ use windows::Win32::System::Registry::{
     REG_VALUE_TYPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, SystemParametersInfoW, FE_FONTSMOOTHINGCLEARTYPE,
-    FE_FONTSMOOTHINGORIENTATIONBGR, FE_FONTSMOOTHINGORIENTATIONRGB, FE_FONTSMOOTHINGSTANDARD,
-    HWND_BROADCAST, SPI_SETFONTSMOOTHING,
-    SPI_SETFONTSMOOTHINGORIENTATION, SPI_SETFONTSMOOTHINGTYPE,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE, WM_FONTCHANGE,
-    WM_SETTINGCHANGE,
+    PostMessageW, SystemParametersInfoW, FE_FONTSMOOTHINGCLEARTYPE, FE_FONTSMOOTHINGORIENTATIONBGR,
+    FE_FONTSMOOTHINGORIENTATIONRGB, FE_FONTSMOOTHINGSTANDARD, HWND_BROADCAST, SPIF_UPDATEINIFILE,
+    SPI_SETFONTSMOOTHING, SPI_SETFONTSMOOTHINGORIENTATION, SPI_SETFONTSMOOTHINGTYPE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_FONTCHANGE, WM_SETTINGCHANGE,
 };
 
 const DESKTOP_SUBKEY: &str = r"Control Panel\Desktop";
@@ -138,7 +136,9 @@ fn read_string(subkey: &str, value: &str) -> Result<Option<String>, String> {
         }
         if size_query != ERROR_SUCCESS || required == 0 || required > 64 {
             let _ = RegCloseKey(key);
-            return Err(format!("RegQueryValueExW size query failed: {size_query:?}"));
+            return Err(format!(
+                "RegQueryValueExW size query failed: {size_query:?}"
+            ));
         }
         let mut buf = vec![0u16; (required as usize).div_ceil(2)];
         let mut read = required;
@@ -230,12 +230,7 @@ fn broadcast_settings_change() {
 // as it is queued.
 fn broadcast_font_change() {
     unsafe {
-        let _ = PostMessageW(
-            Some(HWND_BROADCAST),
-            WM_FONTCHANGE,
-            WPARAM(0),
-            LPARAM(0),
-        );
+        let _ = PostMessageW(Some(HWND_BROADCAST), WM_FONTCHANGE, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -440,15 +435,15 @@ mod native_preview {
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-        FW_NORMAL, HDC, InvalidateRect, LOGFONTW,
-        SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, UpdateWindow,
-        COLORONCOLOR, SRCCOPY,
-        DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
-    };    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        InvalidateRect, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt,
+        UpdateWindow, COLORONCOLOR, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+        HDC, LOGFONTW, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    };
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, IDC_ARROW, LoadCursorW, RegisterClassW,
-        SetWindowPos, ShowWindow, WNDCLASSW, HWND_TOP, SW_HIDE, SWP_NOCOPYBITS, SWP_NOACTIVATE,
-        SWP_SHOWWINDOW, WM_APP, WM_ERASEBKGND, GetClientRect, WM_NCHITTEST, WM_PAINT, WM_SIZE,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, LoadCursorW, RegisterClassW,
+        SetWindowPos, ShowWindow, HWND_TOP, IDC_ARROW, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+        SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSW,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
@@ -583,10 +578,9 @@ mod native_preview {
                         // (8, 10, 12, 15); the right column zooms the last two
                         // sizes (12, 15) 4x. The "400% zoom" caption lives in
                         // the app HTML above the preview.
-                        let text: Vec<u16> =
-                            "The quick brown fox jumps over the lazy dog"
-                                .encode_utf16()
-                                .collect();
+                        let text: Vec<u16> = "The quick brown fox jumps over the lazy dog"
+                            .encode_utf16()
+                            .collect();
                         let row_sizes = [8i32, 10, 12, 15];
                         let right_sizes = [12i32, 15];
                         let zoom_factor = 4i32;
@@ -774,21 +768,29 @@ mod native_preview {
     }
 
     pub fn update(_app: &AppHandle, mode: String, gamma: u32, contrast: u32) -> Result<(), String> {
-        let hwnd = state()
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(|value| HWND(value.hwnd as *mut std::ffi::c_void)));
+        let hwnd = state().lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .map(|value| HWND(value.hwnd as *mut std::ffi::c_void))
+        });
         if let Some(hwnd) = hwnd {
             update_state(hwnd, mode, gamma, contrast)?;
         }
         Ok(())
     }
 
-    pub fn set_bounds(app: &AppHandle, x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
-        let hwnd = state()
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(|value| HWND(value.hwnd as *mut std::ffi::c_void)));
+    pub fn set_bounds(
+        app: &AppHandle,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), String> {
+        let hwnd = state().lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .map(|value| HWND(value.hwnd as *mut std::ffi::c_void))
+        });
         if let Some(hwnd) = hwnd {
             let main = crate::main_window::window(app)
                 .ok_or_else(|| "main window is unavailable".to_string())?;
@@ -824,11 +826,11 @@ mod native_preview {
     }
 
     pub fn hide(_app: &AppHandle) -> Result<(), String> {
-        if let Some(hwnd) = state()
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(|value| HWND(value.hwnd as *mut std::ffi::c_void)))
-        {
+        if let Some(hwnd) = state().lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .map(|value| HWND(value.hwnd as *mut std::ffi::c_void))
+        }) {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
@@ -845,10 +847,11 @@ mod native_preview {
     // text_preview_show) once the window is back and settled.
     pub fn destroy(_app: &AppHandle) -> Result<(), String> {
         // Capture the HWND before clearing the state, then destroy it.
-        let hwnd = state()
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(|value| HWND(value.hwnd as *mut std::ffi::c_void)));
+        let hwnd = state().lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .map(|value| HWND(value.hwnd as *mut std::ffi::c_void))
+        });
         // Clear the state so a later show() creates a fresh window and any
         // in-flight set_bounds/update calls become no-ops.
         if let Ok(mut current) = state().lock() {
@@ -957,7 +960,10 @@ pub fn text_preview_destroy(app: tauri::AppHandle) -> Result<(), String> {
 fn preview_font() -> Option<std::sync::Arc<[u8]>> {
     static FONT: std::sync::OnceLock<Option<std::sync::Arc<[u8]>>> = std::sync::OnceLock::new();
     FONT.get_or_init(|| {
-        for path in [r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf"] {
+        for path in [
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+        ] {
             if let Ok(data) = std::fs::read(path) {
                 if !data.is_empty() {
                     return Some(std::sync::Arc::from(data));
@@ -1009,7 +1015,8 @@ pub fn text_preview_render(
     if size <= 0.0 || size > 512.0 {
         return Err(format!("size out of range: {size}"));
     }
-    let font = preview_font().ok_or_else(|| "no system font available for the preview".to_string())?;
+    let font =
+        preview_font().ok_or_else(|| "no system font available for the preview".to_string())?;
     // Custom mode: the user's subpixel centers (per-channel x/y). Missing or
     // invalid values fall back to the mode default (render_format does this
     // in the rasterizer).
@@ -1103,7 +1110,7 @@ mod restore_settle {
             use windows::Win32::Foundation::{HWND, RECT};
             use windows::Win32::Graphics::Gdi::{
                 BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-                GetDIBits, ReleaseDC, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+                GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
                 DIB_RGB_COLORS, SRCCOPY,
             };
             use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
@@ -1320,7 +1327,10 @@ pub fn text_rendering_reset() -> Result<(), String> {
 // way to make OLED Helper's own text re-render. Reuses the tray-restart path
 // and forwards --open-tab so the user lands back on the tab they were using.
 #[tauri::command]
-pub fn text_rendering_restart_app(app: tauri::AppHandle, tab: Option<String>) -> Result<(), String> {
+pub fn text_rendering_restart_app(
+    app: tauri::AppHandle,
+    tab: Option<String>,
+) -> Result<(), String> {
     crate::process::request_restart(&app, tab.as_deref());
     Ok(())
 }

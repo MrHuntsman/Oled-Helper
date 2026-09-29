@@ -110,7 +110,12 @@ fn wide(s: &str) -> Vec<u16> {
 /// Black Crush land on secondary displays.
 pub unsafe fn set_monitor_ramp(device_name: &str, ramp: &GammaRamp) -> bool {
     let device = wide(device_name);
-    let hdc = CreateDCW(PCWSTR::null(), PCWSTR(device.as_ptr()), PCWSTR::null(), None);
+    let hdc = CreateDCW(
+        PCWSTR::null(),
+        PCWSTR(device.as_ptr()),
+        PCWSTR::null(),
+        None,
+    );
     if hdc.0.is_null() {
         return false;
     }

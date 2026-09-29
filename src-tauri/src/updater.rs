@@ -28,15 +28,28 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
+use url::Url;
 
 const MANIFEST_URL: &str =
     "https://github.com/MrHuntsman/Oled-Helper/releases/latest/download/latest.json";
 // Used only for release notes/date in the update modal (best effort).
-const RELEASE_API_URL: &str =
-    "https://api.github.com/repos/MrHuntsman/Oled-Helper/releases/latest";
+const RELEASE_API_URL: &str = "https://api.github.com/repos/MrHuntsman/Oled-Helper/releases/latest";
 // Sanity cap on the staged download. A corrupt/bad manifest must never be able
 // to point the updater at a multi-GB file and exhaust the disk next to the exe.
 const MAX_UPDATE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
+
+// The only hosts that may serve the staged exe. The manifest itself is already
+// fetched over HTTPS from the project's own release, but its download URL is
+// handed back to the frontend and passed straight into download_update, and
+// the sha256 that "verifies" the download comes from that same manifest. A
+// manifest (or a caller) that points at any other host could therefore stage
+// an arbitrary executable, so the host is pinned to the GitHub release
+// endpoints the project actually publishes to.
+const UPDATE_HOSTS: [&str; 3] = [
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 
 #[derive(Serialize, Clone)]
 pub struct UpdateInfo {
@@ -67,6 +80,29 @@ struct GithubRelease {
 struct Progress {
     downloaded: u64,
     total: u64,
+}
+
+// Validate the download URL beyond its scheme: it must be an absolute HTTPS
+// URL with no embedded credentials and a host from UPDATE_HOSTS, so a
+// manipulated manifest cannot redirect the staged, checksum-verified
+// executable download to an attacker controlled host.
+fn validate_update_url(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url.trim())
+        .map_err(|_| "the update manifest returned an invalid download address.".to_string())?;
+    if parsed.scheme() != "https" {
+        return Err("update downloads must use HTTPS; the update was aborted.".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("the update download address was rejected for safety.".into());
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if !UPDATE_HOSTS.iter().any(|allowed| host == *allowed) {
+        return Err(
+            "the update download address is not a recognized release host; the update was aborted."
+                .into(),
+        );
+    }
+    Ok(parsed)
 }
 
 // Compares semver-ish "x.y.z" strings (a leading "v" is tolerated). Returns
@@ -112,7 +148,7 @@ fn update_staging_path() -> Result<PathBuf, String> {
     let stem = exe
         .file_stem()
         .and_then(|s| s.to_str())
-.unwrap_or("OledHelper");
+        .unwrap_or("OledHelper");
     Ok(dir.join(format!("{stem}.new.exe")))
 }
 
@@ -180,16 +216,15 @@ pub async fn download_update(
                 .into(),
         );
     }
-    // Only HTTPS is acceptable for the download itself. The URL is normally
-    // read back from the manifest, but the command is otherwise unconstrained,
-    // so enforce the scheme rather than trusting the caller.
-    if !url.trim().to_ascii_lowercase().starts_with("https://") {
-        return Err("update downloads must use HTTPS; the update was aborted.".into());
-    }
+    // Only an HTTPS URL on a known release host is acceptable for the download
+    // itself. The URL is normally read back from the manifest, but the command
+    // is otherwise unconstrained, so enforce both here rather than trusting
+    // the caller.
+    let download_url = validate_update_url(&url)?;
     let target = update_staging_path()?;
     let client = http_client()?;
     let response = client
-        .get(&url)
+        .get(download_url)
         .send()
         .await
         .map_err(|error| format!("could not download the update: {error}"))?;
@@ -322,7 +357,7 @@ pub fn handle_apply_update_mode() -> bool {
     let stem = target
         .file_stem()
         .and_then(|s| s.to_str())
-.unwrap_or("OledHelper");
+        .unwrap_or("OledHelper");
     let old_backup = target.with_file_name(format!("{stem}.old"));
 
     // 1. Move the old (exited) exe aside.
@@ -366,4 +401,48 @@ pub fn handle_apply_update_mode() -> bool {
     }
     let _ = std::fs::remove_file(&self_exe);
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_downloads_are_limited_to_https_release_hosts() {
+        for accepted in [
+            "https://github.com/MrHuntsman/Oled-Helper/releases/download/v1.0.3/OledHelper.exe",
+            "https://objects.githubusercontent.com/github-production-release-asset/1234",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1234",
+            "  https://github.com/MrHuntsman/Oled-Helper/releases/latest/download/OledHelper.exe  ",
+        ] {
+            assert!(
+                validate_update_url(accepted).is_ok(),
+                "expected release URL to be accepted: {accepted}"
+            );
+        }
+        for rejected in [
+            "http://github.com/MrHuntsman/Oled-Helper/releases/download/v1.0.3/OledHelper.exe",
+            "https://github.com.evil.example/MrHuntsman/Oled-Helper/releases/download/v1.0.3/OledHelper.exe",
+            "https://evil.example/MrHuntsman/Oled-Helper/releases/download/v1.0.3/OledHelper.exe",
+            "https://user:pass@github.com/MrHuntsman/Oled-Helper/releases/download/v1.0.3/OledHelper.exe",
+            "file:///C:/Windows/System32/calc.exe",
+            "/C:/Windows/System32/calc.exe",
+            "",
+        ] {
+            assert!(
+                validate_update_url(rejected).is_err(),
+                "expected URL to be rejected: {rejected}"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_semver_is_detected_with_optional_v_prefix() {
+        assert!(version_greater("1.0.3", "1.0.2"));
+        assert!(version_greater("v1.1.0", "1.0.9"));
+        assert!(version_greater("2.0.0", "1.9.9"));
+        assert!(!version_greater("1.0.2", "1.0.2"));
+        assert!(!version_greater("1.0.1", "1.0.2"));
+        assert!(!version_greater("1.0.2", "v1.0.2"));
+    }
 }

@@ -47,10 +47,10 @@ use windows::Win32::Graphics::Gdi::{
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    GA_ROOT, GWL_EXSTYLE, GWL_STYLE, IsWindowVisible, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow,
-    SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE,
-    WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    IsWindowVisible, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GA_ROOT,
+    GWL_EXSTYLE, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 pub(crate) const LABEL: &str = "tray-menu";
@@ -216,7 +216,8 @@ fn tray_phase() -> TrayMenuPhase {
 
 fn set_tray_phase(phase: TrayMenuPhase) {
     TRAY_PHASE.store(phase as u8, Ordering::Release);
-}/// Forgets the phase recorded for the current window when that window is
+}
+/// Forgets the phase recorded for the current window when that window is
 /// destroyed for the tray teardown (see main_window). The next open builds a
 /// fresh window and has to start from Hidden: a stale Shown/Hiding would make
 /// the first click on the rebuilt menu hide it instead of showing it.
@@ -381,9 +382,7 @@ fn apply_hit_region(window: &tauri::WebviewWindow, rects: &[TrayMenuRect]) {
     let fallback_scale = window.scale_factor().unwrap_or(1.0).max(0.5);
     let scale_x = first
         .and_then(|rect| {
-            (rect.viewport_width.is_finite()
-                && rect.viewport_width > 0.0
-                && native_size.is_some())
+            (rect.viewport_width.is_finite() && rect.viewport_width > 0.0 && native_size.is_some())
                 .then(|| native_size.unwrap().width as f64 / rect.viewport_width)
         })
         .filter(|value| value.is_finite() && *value > 0.0)
@@ -393,7 +392,7 @@ fn apply_hit_region(window: &tauri::WebviewWindow, rects: &[TrayMenuRect]) {
             (rect.viewport_height.is_finite()
                 && rect.viewport_height > 0.0
                 && native_size.is_some())
-                .then(|| native_size.unwrap().height as f64 / rect.viewport_height)
+            .then(|| native_size.unwrap().height as f64 / rect.viewport_height)
         })
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(fallback_scale);
@@ -495,7 +494,9 @@ fn log_native_window_state(window: &tauri::WebviewWindow, phase: &str) {
 fn log_native_window_state(_window: &tauri::WebviewWindow, _phase: &str) {}
 
 fn native_window_visible(window: &tauri::WebviewWindow) -> bool {
-    let Ok(hwnd) = window.hwnd() else { return false };
+    let Ok(hwnd) = window.hwnd() else {
+        return false;
+    };
     unsafe { IsWindowVisible(HWND(hwnd.0)).as_bool() }
 }
 
@@ -566,13 +567,14 @@ fn request_tray_hide(window: &tauri::WebviewWindow) {
 fn force_borderless_window(window: &tauri::WebviewWindow) {
     let Ok(hwnd) = window.hwnd() else { return };
     unsafe {
-        let old_style = GetWindowLongPtrW(HWND(hwnd.0), windows::Win32::UI::WindowsAndMessaging::GWL_STYLE);
+        let old_style = GetWindowLongPtrW(
+            HWND(hwnd.0),
+            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        );
         log_native_window_state(window, "before-borderless");
-        let frame_bits = (WS_CAPTION.0
-            | WS_THICKFRAME.0
-            | WS_SYSMENU.0
-            | WS_MINIMIZEBOX.0
-            | WS_MAXIMIZEBOX.0) as isize;
+        let frame_bits =
+            (WS_CAPTION.0 | WS_THICKFRAME.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0)
+                as isize;
         let new_style = (old_style & !frame_bits) | WS_POPUP.0 as isize;
         if new_style != old_style {
             SetWindowLongPtrW(
@@ -956,11 +958,7 @@ pub fn prewarm(app: &AppHandle) {
 /// against the taskbar edge near the tray icon. anchor_x is the click's
 /// physical-pixel x-coordinate from the TrayIconEvent, used to center the
 /// popup on wherever the tray icon actually sits.
-fn schedule_post_show_event(
-    window: &tauri::WebviewWindow,
-    payload: Value,
-    generation: u64,
-) {
+fn schedule_post_show_event(window: &tauri::WebviewWindow, payload: Value, generation: u64) {
     let delayed_window = window.clone();
     std::thread::spawn(move || {
         for delay_ms in [30_u64, 120, 300] {
@@ -970,10 +968,15 @@ fn schedule_post_show_event(
             {
                 return;
             }
-            tray_debug!("[tray-debug] show retry generation={generation}, delay_ms={delay_ms}, visible={}", native_window_visible(&delayed_window));
+            tray_debug!(
+                "[tray-debug] show retry generation={generation}, delay_ms={delay_ms}, visible={}",
+                native_window_visible(&delayed_window)
+            );
             match delayed_window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
                 Ok(()) => tray_debug!("[tray-debug] show retry emitted generation={generation}"),
-                Err(error) => log::warn!("[tray-debug] show retry emit failed generation={generation}: {error}"),
+                Err(error) => log::warn!(
+                    "[tray-debug] show retry emit failed generation={generation}: {error}"
+                ),
             }
         }
     });
@@ -1160,7 +1163,9 @@ fn reveal_now(window: &tauri::WebviewWindow, anchor_x_px: Option<i32>) {
     }
     match window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
         Ok(()) => tray_debug!("[tray-debug] reveal-now show emitted generation={generation}"),
-        Err(error) => log::warn!("[tray-debug] reveal-now show emit failed generation={generation}: {error}"),
+        Err(error) => {
+            log::warn!("[tray-debug] reveal-now show emit failed generation={generation}: {error}")
+        }
     }
     match window.set_focus() {
         Ok(()) => tray_debug!("[tray-debug] reveal-now focus request succeeded"),
@@ -1207,7 +1212,10 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     }
     MENU_GENERATION.fetch_add(1, Ordering::AcqRel);
     set_tray_phase(TrayMenuPhase::Revealing);
-    tray_debug!("[tray-debug] toggle generation={}", MENU_GENERATION.load(Ordering::Acquire));
+    tray_debug!(
+        "[tray-debug] toggle generation={}",
+        MENU_GENERATION.load(Ordering::Acquire)
+    );
     SUBMENU_EXPANDED.store(false, Ordering::Release);
     // A display change since the window was last shown means its DPI context
     // is stale: Windows applies a hidden window's DPI transition at the next
@@ -1225,10 +1233,12 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     // cannot process it until it is resumed.
     crate::webview_env::set_active(app, LABEL);
     let payload = cached_tray_state();
-    tray_debug!("[tray-debug] cache lookup complete, has_payload={}", payload.is_some());
+    tray_debug!(
+        "[tray-debug] cache lookup complete, has_payload={}",
+        payload.is_some()
+    );
     let payload = payload.unwrap_or(Value::Null);
-    let deferred_reveal =
-        LAST_DISPLAY_CHANGE_MS.load(Ordering::Acquire) > last_show_at;
+    let deferred_reveal = LAST_DISPLAY_CHANGE_MS.load(Ordering::Acquire) > last_show_at;
     if !deferred_reveal {
         match window.emit_to(LABEL, "tray-menu-show", payload.clone()) {
             Ok(()) => tray_debug!("[tray-debug] initial show event emitted"),
@@ -1262,7 +1272,10 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     {
         let _ = window.show();
     }
-    tray_debug!("[tray-debug] native show succeeded, visible_after={}", native_window_visible(&window));
+    tray_debug!(
+        "[tray-debug] native show succeeded, visible_after={}",
+        native_window_visible(&window)
+    );
     log_native_window_state(&window, "after-show");
     // Tauri or Windows can reapply the configured decorated style as part of
     // show(). Remove it again immediately, before the WebView presents the
@@ -1305,7 +1318,10 @@ pub fn toggle(app: &AppHandle, anchor_x: f64) {
     if !deferred_reveal {
         start_foreground_watcher(&window, generation);
     }
-    tray_debug!("[tray-debug] toggle complete generation={generation}, visible_after={}", native_window_visible(&window));
+    tray_debug!(
+        "[tray-debug] toggle complete generation={generation}, visible_after={}",
+        native_window_visible(&window)
+    );
 }
 
 pub fn hide(app: &AppHandle) {
@@ -1319,15 +1335,14 @@ pub fn hide(app: &AppHandle) {
 }
 
 fn tray_primary_key(display: Option<&crate::display_info::DisplayInfo>) -> Option<String> {
-    display
-        .and_then(|info| {
-            let key = if info.profile_id.is_empty() {
-                &info.monitor_id
-            } else {
-                &info.profile_id
-            };
-            (!key.is_empty()).then(|| key.to_string())
-        })
+    display.and_then(|info| {
+        let key = if info.profile_id.is_empty() {
+            &info.monitor_id
+        } else {
+            &info.profile_id
+        };
+        (!key.is_empty()).then(|| key.to_string())
+    })
 }
 
 fn collect_tray_menu_state(
@@ -1337,10 +1352,8 @@ fn collect_tray_menu_state(
     let display = tray_menu_get_display_info().ok();
     let monitor_key = tray_primary_key(display.as_ref());
     let config = crate::config::load_config(app.clone());
-    let taskbar_dimmer = crate::taskbar_dimmer::get_taskbar_dimmer_status(
-        taskbar_state,
-        monitor_key.clone(),
-    );
+    let taskbar_dimmer =
+        crate::taskbar_dimmer::get_taskbar_dimmer_status(taskbar_state, monitor_key.clone());
     let screen_dimmer = crate::power::power_get_screen_dimmer_status(monitor_key);
     let hdr_status = crate::hdr_toggle::get_windows_hdr_status().ok().flatten();
     let vendor_info = crate::vendor_info::query_vendor_display_info();
@@ -1351,7 +1364,9 @@ fn collect_tray_menu_state(
         let monitors = crate::monitors::all_monitors();
         let selected = monitors
             .iter()
-            .find(|monitor| !config.active_monitor_sig.is_empty() && monitor.sig() == config.active_monitor_sig)
+            .find(|monitor| {
+                !config.active_monitor_sig.is_empty() && monitor.sig() == config.active_monitor_sig
+            })
             .or_else(|| monitors.iter().find(|monitor| monitor.primary));
         selected
             .map(|monitor| {
@@ -1423,10 +1438,7 @@ pub fn refresh_cached_state(app: &AppHandle) {
         let snapshot = collect_tray_menu_state(&refresh_app, taskbar_state);
         let payload = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
         if STATE_REFRESH_GENERATION.load(Ordering::Acquire) == generation {
-            if let Ok(mut cached) = CACHED_TRAY_STATE
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-            {
+            if let Ok(mut cached) = CACHED_TRAY_STATE.get_or_init(|| Mutex::new(None)).lock() {
                 *cached = Some(payload.clone());
             }
             let _ = refresh_app.emit("tray-menu-state-updated", payload);
@@ -1502,7 +1514,10 @@ pub fn tray_menu_get_display_info() -> Result<crate::display_info::DisplayInfo, 
     // which monitors.rs and display_info.rs both resolve today. Keep the
     // substitution anyway so the tray always reports exactly what the main
     // app's monitor list uses, even if the two resolutions ever drift.
-    if let Some(primary) = crate::monitors::all_monitors().into_iter().find(|m| m.primary) {
+    if let Some(primary) = crate::monitors::all_monitors()
+        .into_iter()
+        .find(|m| m.primary)
+    {
         if !primary.monitor_id.is_empty() {
             info.monitor_id = primary.monitor_id.clone();
         }
@@ -1560,13 +1575,15 @@ pub fn tray_menu_set_resolution(
                 }
                 resolved
             }
-            None => match monitor_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+            None => match monitor_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
                 Some(id) => {
                     let resolved = crate::monitors::all_monitors()
                         .into_iter()
-                        .find(|m| {
-                            !m.monitor_id.is_empty() && m.monitor_id.eq_ignore_ascii_case(id)
-                        })
+                        .find(|m| !m.monitor_id.is_empty() && m.monitor_id.eq_ignore_ascii_case(id))
                         .map(|m| m.device_name)
                         .filter(|name| !name.is_empty());
                     if resolved.is_none() {
@@ -1594,7 +1611,13 @@ pub fn tray_menu_set_resolution(
         {
             return;
         }
-        match crate::display_info::set_resolution(width, height, target_hz, device_name, skip_confirmation.unwrap_or(false)) {
+        match crate::display_info::set_resolution(
+            width,
+            height,
+            target_hz,
+            device_name,
+            skip_confirmation.unwrap_or(false),
+        ) {
             Ok(mode) => {
                 if mode.skip_confirmation {
                     if let Err(error) = crate::display_info::confirm_mode_change() {

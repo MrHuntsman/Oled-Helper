@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { emit, listen } from '@tauri-apps/api/event';
-  import { app, appSettings, crush, taskbarDimmer, screenDimmer, screenDimmerHelper, refreshScreenDimmerHelperReady, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId, loadTvState, syncTvState, loadTvDiscovery, syncTvDiscovery } from './lib/stores.svelte.js';
+  import { app, appSettings, crush, taskbarDimmer, screenDimmer, screenDimmerHelper, refreshScreenDimmerHelperReady, blackLift, pollDisplayInfo, scheduleDisplayInfoRefresh, refreshVendorDisplayInfo, pollHDRStatus, pollHDRLuminance, refreshSdrWhiteLevel, setSdrWhiteNits, saveConfig, setDimmerSuspendedForFullscreen, setTaskbarDimmer, setTaskbarDimmerEnabledForAll, applyBlackLevelProfileForRefreshRate, persistCurrentBlackLevelProfile, blackLevelDisplayForRefreshRate, displayMenuPrefs, setResolutionSort, setResolutionGroupBy, setShowTags, setRefreshRateSort, dismissCtxMenus, displayFavorites, displayModeFavoriteKey, isDisplayModeFavorited, addFavoriteDisplayMode, removeFavoriteDisplayMode, markFavoriteConfirmed, favoriteForAction, updateState, checkForUpdates, monitors, activeMonitor, loadMonitors, setActiveMonitor, applyGamma, setScreenDimmerEnabled, startReferenceModePolling, stopReferenceModePolling, configLoaded, monProfileId, loadTvState, syncTvState, loadTvDiscovery, syncTvDiscovery, tvController, setTvPictureMode, setTvPictureSetting, tvPictureModeFromHotkeyAction, tvPictureSettingFromHotkeyAction } from './lib/stores.svelte.js';
   import { invoke } from '@tauri-apps/api/core';
   import { getVersion } from '@tauri-apps/api/app';
   import TabCrush from './lib/TabCrush.svelte';
@@ -349,6 +349,7 @@
       // the exact moment the automatic rollback fires, no matter how long the
       // show handshake took.
       confirmationDeadlineMs: result.confirmation_deadline_ms,
+      token: result.token,
     }).catch((e) => {
       resolutionError = String(e);
       app.displayModeBusy = false;
@@ -1061,6 +1062,47 @@
       .catch((e) => console.warn('[sidebar] screen dimmer helper setup failed', e));
   }
 
+  function applyTvPictureModeHotkey(mode) {
+    if (!mode || tvController.state !== 'connected' || tvController.pending) return;
+    if (tvController.pictureMode === mode) return;
+    if (!tvController.pictureModes.some((option) => option.id === mode)) return;
+    void setTvPictureMode(mode)
+      .then((snapshot) => {
+        if (snapshot && typeof snapshot === 'object') syncTvState(snapshot);
+      })
+      .catch((error) => {
+        console.warn('[hotkey] TV picture mode change failed', error);
+        void loadTvState();
+      });
+  }
+
+  // Picture setting hotkeys (for example the three Dynamic Tone Mapping
+  // values) write the value the action name carries. The TV tab owns the
+  // detailed setting state and picks the change up on its next status read.
+  // A picture write takes the worker a second or two, so holding a key down
+  // would otherwise queue one identical write per repeat; only the value the
+  // write is already heading for is skipped.
+  const tvPictureSettingWrites = new Map();
+
+  function applyTvPictureSettingHotkey(settingId, value) {
+    if (!settingId || !value || tvController.state !== 'connected' || tvController.pending) return;
+    if (tvPictureSettingWrites.get(settingId) === value) return;
+    tvPictureSettingWrites.set(settingId, value);
+    void setTvPictureSetting(settingId, value)
+      .then((snapshot) => {
+        if (snapshot && typeof snapshot === 'object') syncTvState(snapshot);
+      })
+      .catch((error) => {
+        console.warn('[hotkey] TV picture setting change failed', error);
+        void loadTvState();
+      })
+      .finally(() => {
+        if (tvPictureSettingWrites.get(settingId) === value) {
+          tvPictureSettingWrites.delete(settingId);
+        }
+      });
+  }
+
   function handleHotkeyAction(action) {
     switch (action) {
       case 'toggle_black_crush':
@@ -1103,6 +1145,16 @@
         invoke('power_turn_off_display').catch(() => {});
         break;
       default: {
+        const pictureMode = tvPictureModeFromHotkeyAction(action);
+        if (pictureMode) {
+          applyTvPictureModeHotkey(pictureMode);
+          break;
+        }
+        const pictureSetting = tvPictureSettingFromHotkeyAction(action);
+        if (pictureSetting) {
+          applyTvPictureSettingHotkey(pictureSetting.settingId, pictureSetting.value);
+          break;
+        }
         // Per-favorite resolution hotkeys (action name embeds the favorite's
         // id): apply the favorite to the monitor it was saved on. No-ops
         // safely when the favorite no longer exists; a disconnected monitor
@@ -1655,14 +1707,15 @@
     <button class="nav-btn" class:active={app.activeTab === 'windows-hdr'} aria-current={app.activeTab === 'windows-hdr' ? 'page' : undefined} onclick={() => app.activeTab = 'windows-hdr'}>
       <img class="nav-icon" src={tabHdrIcon} alt="" /> Windows HDR <span class="nav-global-tag">Global</span>
     </button>
-    <button class="nav-btn" class:active={app.activeTab === 'tv-controller'} aria-current={app.activeTab === 'tv-controller' ? 'page' : undefined} onclick={() => app.activeTab = 'tv-controller'}>
-      <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> TV Controller
-    </button>
     <button class="nav-btn" class:active={app.activeTab === 'power'} aria-current={app.activeTab === 'power' ? 'page' : undefined} onclick={() => app.activeTab = 'power'}>
       <TabPowerIcon class="nav-icon" /> Power Saving <span class="nav-global-tag">Global</span>
     </button>
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} aria-current={app.activeTab === 'hotkeys' ? 'page' : undefined} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
+    </button>
+    <div class="sidebar-sep" role="separator"></div>
+    <button class="nav-btn" class:active={app.activeTab === 'tv-controller'} aria-current={app.activeTab === 'tv-controller' ? 'page' : undefined} onclick={() => app.activeTab = 'tv-controller'}>
+      <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> TV Controller
     </button>
 
     <div class="sidebar-spacer"></div>
@@ -1677,18 +1730,18 @@
         <TabDimmer />
       {:else if app.activeTab === 'screen-dimmer'}
         <TabDimmer screen={true} />
-      {:else if app.activeTab === 'hotkeys'}
-        <TabHotkeys />
       {:else if app.activeTab === 'text'}
         <TabText modalOpen={!!favoritePendingRemove || exitConfirmOpen || updateState.modalOpen} menuOpen={resMenuOpen || hzMenuOpen || favoritesMenuOpen || resCtxMenu.open || hzCtxMenu.open} />
       {:else if app.activeTab === 'windows-font'}
         <TabWindowsFont />
-      {:else if app.activeTab === 'tv-controller'}
-        <TabTvController />
       {:else if app.activeTab === 'power'}
         <TabPower />
       {:else if app.activeTab === 'windows-hdr'}
         <TabWindowsHdr />
+      {:else if app.activeTab === 'hotkeys'}
+        <TabHotkeys />
+      {:else if app.activeTab === 'tv-controller'}
+        <TabTvController />
       {:else if app.activeTab === 'debug'}
         <TabDebug />
       {:else if app.activeTab === 'system'}

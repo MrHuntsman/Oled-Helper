@@ -22,6 +22,11 @@
   // Tracks which slider the user is mid-drag on, so the periodic re-read of
   // Windows settings never stomps a value they are actively changing.
   let dragging = $state({ display: false, sleep: false, screensaver: false });
+  // True while a display or sleep timeout write is still in flight. Those
+  // writes spawn powercfg, so Windows reports the old value for a moment after
+  // the slider moved; a poll landing in that window would snap the slider back.
+  // Screensaver writes land synchronously, so they need no such guard.
+  let saving = $state({ display: false, sleep: false });
 
   // The current path may be a third-party .scr that lives outside the
   // enumerated system dirs; surface it as its own option so the dropdown never
@@ -65,8 +70,8 @@
   }
 
   function mergeState(s) {
-    if (!dragging.display) state.displayTimeout = s.display_timeout_minutes;
-    if (!dragging.sleep) state.sleepTimeout = s.sleep_timeout_minutes;
+    if (!dragging.display && !saving.display) state.displayTimeout = s.display_timeout_minutes;
+    if (!dragging.sleep && !saving.sleep) state.sleepTimeout = s.sleep_timeout_minutes;
     state.screensaverEnabled = s.screensaver_enabled;
     if (!dragging.screensaver) {
       state.screensaverTimeout = Math.max(1, s.screensaver_timeout_minutes);
@@ -104,20 +109,26 @@
   }
 
   async function setDisplayTimeout() {
+    saving.display = true;
     try {
       await invoke('power_set_display_timeout', { minutes: state.displayTimeout });
       error = '';
     } catch (e) {
       error = String(e);
+    } finally {
+      saving.display = false;
     }
   }
 
   async function setSleepTimeout() {
+    saving.sleep = true;
     try {
       await invoke('power_set_sleep_timeout', { minutes: state.sleepTimeout });
       error = '';
     } catch (e) {
       error = String(e);
+    } finally {
+      saving.sleep = false;
     }
   }
 

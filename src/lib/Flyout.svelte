@@ -46,6 +46,7 @@
   let visible = $state(false); // becomes true only after Rust confirms the native window is shown
   let exiting = $state(false); // plays the exit ease before the window hides
   let timer = null;
+  let countdownDeadlineMs = 0;
   let shownFallbackTimer = null; // safety net: never leave the modal stuck at opacity 0
   let keepBtnEl = $state(null);
   let revertBtnEl = $state(null);
@@ -140,9 +141,9 @@
     clearTimer();
     remaining = seconds;
     totalSeconds = Math.max(1, seconds);
-    const deadline = deadlineMs || Date.now() + Math.max(1, seconds) * 1000;
+    countdownDeadlineMs = deadlineMs || Date.now() + Math.max(1, seconds) * 1000;
     timer = setInterval(() => {
-      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      const left = Math.max(0, Math.ceil((countdownDeadlineMs - Date.now()) / 1000));
       remaining = left;
       if (left <= 0) {
         clearTimer();
@@ -249,10 +250,19 @@
   // the extended deadline on its next tick. Sent at most once per dialog: the
   // backend rejects repeated extensions by token anyway.
   let extensionReported = false;
-  function reportLateShow(deadlineMs) {
-    if (extensionReported || !deadlineMs) return;
+  function reportLateShow() {
+    if (extensionReported || !mode) return;
     extensionReported = true;
-    invoke('extend_mode_confirmation', { deadlineMs }).catch(() => {});
+    const seconds = Math.max(1, Number(mode.confirmation_seconds) || 15);
+    const visibleDeadlineMs = Date.now() + seconds * 1000;
+    invoke('extend_mode_confirmation', { token: mode.token, deadlineMs: visibleDeadlineMs })
+      .then((deadlineMs) => {
+        const confirmedDeadline = Number(deadlineMs);
+        if (Number.isFinite(confirmedDeadline) && confirmedDeadline > 0) {
+          countdownDeadlineMs = confirmedDeadline;
+        }
+      })
+      .catch(() => {});
   }
 
   function applyPayload(payload) {
@@ -315,7 +325,7 @@
       // The window is on screen now. If most of the confirmation window was
       // eaten by the show handshake, ask the backend to push the rollback
       // deadline out so the countdown the user sees is the window they get.
-      reportLateShow(Number(mode?.confirmation_deadline_ms) || 0);
+      reportLateShow();
       // Dwell briefly after the window becomes visible, then play the
       // entrance animation so the user actually sees it.
       showWithEntranceDelay();

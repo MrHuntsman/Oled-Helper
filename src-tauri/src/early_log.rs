@@ -159,7 +159,10 @@ fn prune_archived(dir: &std::path::Path, file_name: &str, keep: usize) {
             if name == active || !name.starts_with(&prefix) || !name.ends_with(".log") {
                 return None;
             }
-            let stamp = name.strip_prefix(&prefix)?.strip_suffix(".log")?.to_string();
+            let stamp = name
+                .strip_prefix(&prefix)?
+                .strip_suffix(".log")?
+                .to_string();
             Some((entry.path(), stamp))
         })
         .collect();

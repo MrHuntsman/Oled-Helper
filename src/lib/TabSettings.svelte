@@ -160,7 +160,7 @@
   <button class="settings-row" disabled={!ready} onclick={toggleStartOnBoot}>
     <div class="settings-row-text">
       <span class="settings-row-label">Start on Boot</span>
-      <span class="settings-row-desc">Launch OLED Helper automatically when Windows starts.</span>
+      <span class="settings-row-desc">Launch OLED Helper automatically when Windows starts, minimized to the tray.</span>
     </div>
     <div class="pill-wrap">
       {#if ready}

@@ -21,6 +21,7 @@ use windows::Win32::Graphics::Gdi::{
     DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
     ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_QUERY_VALUE,
 };
@@ -137,37 +138,80 @@ fn now_ms() -> u64 {
 // Pushes the pending transaction's rollback deadline out so the user gets the
 // full confirmation window from the moment the dialog is actually visible.
 //
-// The deadline is computed at apply time, but on a cold start the flyout's
-// WebView2 can take several seconds to come up (log evidence: a tray change
-// showed its dialog 6s into a 15s window, so the user got 9s and the mode
-// reverted while they were still reading). The frontend reports when the
-// dialog became visible; if that was late, the deadline moves by the same
-// amount. The countdown the dialog displays is anchored to the same deadline
-// value, so it jumps to the full remaining window on the next tick. Guarded
-// by the pending token so a late report from an older transaction can never
-// stretch the current one, and by a once-flag per transaction so a repeated
-// event cannot extend it twice.
-pub fn extend_mode_confirmation(deadline_ms: u64) {
-    let Some(entry) = pending_mode().lock().ok().and_then(|guard| guard.clone()) else {
-        return;
-    };
-    let token = entry.token;
-    let already_extended = extended_tokens()
-        .lock()
-        .map(|mut guard| !guard.insert(token))
-        .unwrap_or(true);
-    if already_extended {
-        return;
+// The deadline is computed at apply time, but a cold flyout may take long
+// enough to show that the countdown is already nearly over. The frontend
+// reports a fresh deadline when the dialog becomes visible. Serialize that
+// update with confirm, rollback, and new mode changes so a stale report cannot
+// stretch a newer transaction's deadline.
+fn confirmation_deadline_extension(
+    current_deadline_ms: u64,
+    requested_deadline_ms: u64,
+    now_ms: u64,
+) -> Option<u64> {
+    let maximum_deadline = now_ms
+        .saturating_add((MODE_CONFIRMATION_SECONDS as u64) * 1000 + 1_000);
+    (requested_deadline_ms > current_deadline_ms && requested_deadline_ms <= maximum_deadline)
+        .then_some(requested_deadline_ms)
+}
+
+pub fn extend_mode_confirmation(token: u64, deadline_ms: u64) -> Option<u64> {
+    let _operation_guard = mode_operation_lock().lock().ok()?;
+    let entry = pending_mode().lock().ok().and_then(|guard| guard.clone())?;
+    if entry.token != token {
+        return None;
     }
     let current = ROLLBACK_DEADLINE_MS.load(Ordering::Acquire);
-    if deadline_ms <= current {
-        return;
+    let Some(extended_deadline) =
+        confirmation_deadline_extension(current, deadline_ms, now_ms())
+    else {
+        return Some(current);
+    };
+    if extended_tokens()
+        .lock()
+        .ok()?
+        .contains(&entry.token)
+    {
+        return Some(current);
     }
-    ROLLBACK_DEADLINE_MS.store(deadline_ms, Ordering::Release);
+
+    let _recovery_guard = lock_recovery_state().ok()?;
+    let path = recovery_path();
+    let recovery_data = fs::read(&path).ok()?;
+    let mut recovery: RecoveryRecord = serde_json::from_slice(&recovery_data).ok()?;
+    if recovery.token != entry.token {
+        return None;
+    }
+    recovery.deadline_ms = extended_deadline.saturating_add(RECOVERY_WATCHDOG_GRACE_MS);
+    write_recovery_record_value(&recovery).ok()?;
+    extended_tokens().lock().ok()?.insert(entry.token);
+
+    ROLLBACK_DEADLINE_MS.store(extended_deadline, Ordering::Release);
     log::info!(
-        "[display-info] flyout was shown {} ms late; extended the confirmation deadline to match",
-        deadline_ms - current
+        "[display-info] flyout was shown late; extended the confirmation deadline by {} ms",
+        extended_deadline - current
     );
+    Some(extended_deadline)
+}
+
+fn write_recovery_record_value(record: &RecoveryRecord) -> Result<(), String> {
+    let path = recovery_path();
+    let temp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    fs::write(&temp, data)
+        .map_err(|error| format!("could not save display recovery state: {error}"))?;
+    let temp_w = wide(&temp.to_string_lossy());
+    let path_w = wide(&path.to_string_lossy());
+    unsafe {
+        if let Err(error) = MoveFileExW(
+            PCWSTR(temp_w.as_ptr()),
+            PCWSTR(path_w.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        ) {
+            let _ = fs::remove_file(&temp);
+            return Err(format!("could not publish display recovery state: {error}"));
+        }
+    }
+    Ok(())
 }
 
 fn write_recovery_record_until(
@@ -176,7 +220,7 @@ fn write_recovery_record_until(
     deadline_ms: u64,
     token: u64,
 ) -> Result<(), String> {
-    let record = RecoveryRecord {
+    write_recovery_record_value(&RecoveryRecord {
         device_name: target.device_name.clone(),
         monitor_id: target.monitor_id.clone(),
         width: previous.dmPelsWidth,
@@ -185,15 +229,7 @@ fn write_recovery_record_until(
         bits_per_pixel: previous.dmBitsPerPel,
         deadline_ms,
         token,
-    };
-    let path = recovery_path();
-    let temp = path.with_extension("json.tmp");
-    let data = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
-    fs::write(&temp, data)
-        .map_err(|error| format!("could not save display recovery state: {error}"))?;
-    fs::rename(&temp, &path)
-        .map_err(|error| format!("could not publish display recovery state: {error}"))?;
-    Ok(())
+    })
 }
 
 fn write_recovery_record(
@@ -307,7 +343,10 @@ fn restore_recovery_record(record: &RecoveryRecord) -> Result<(), String> {
     // guards against a reused device name pointing at a different physical
     // monitor after a hotplug.
     let detected = display_target_for_device(&record.device_name).ok_or_else(|| {
-        format!("recovery could not detect the recorded monitor {}", record.device_name)
+        format!(
+            "recovery could not detect the recorded monitor {}",
+            record.device_name
+        )
     })?;
     if detected.device_name != record.device_name {
         return Err(format!(
@@ -397,8 +436,15 @@ pub fn run_recovery_watchdog() {
         let Ok(latest) = serde_json::from_slice::<RecoveryRecord>(&latest_data) else {
             return;
         };
-        if latest.token != record.token || latest.deadline_ms != record.deadline_ms {
+        if latest.token != record.token {
             return;
+        }
+        if latest.deadline_ms != record.deadline_ms {
+            // The parent extended this same transaction while this watchdog
+            // was waiting for the cross-process mutex. Re-read and wait for
+            // the updated deadline instead of abandoning crash recovery.
+            drop(_recovery_guard);
+            continue;
         }
         match restore_recovery_record(&latest) {
             Ok(()) => match clear_recovery_record_for(latest.token) {
@@ -455,8 +501,7 @@ fn resolve_target(device_name: Option<&str>) -> Result<DisplayTarget, String> {
     match device_name {
         Some(name) if !name.trim().is_empty() => display_target_for_device(name)
             .ok_or_else(|| format!("the monitor {name} is not connected")),
-        _ => primary_display_target()
-            .ok_or_else(|| "no primary monitor was detected".to_string()),
+        _ => primary_display_target().ok_or_else(|| "no primary monitor was detected".to_string()),
     }
 }
 
@@ -487,7 +532,9 @@ fn display_target_matching(primary_only: bool, device_name: Option<&str>) -> Opt
                 if (adapter.StateFlags.0 & DISPLAY_DEVICE_PRIMARY_DEVICE.0) == 0 {
                     continue;
                 }
-            } else if !device_name.map_or(true, |wanted| candidate_name.eq_ignore_ascii_case(wanted)) {
+            } else if !device_name
+                .map_or(true, |wanted| candidate_name.eq_ignore_ascii_case(wanted))
+            {
                 continue;
             }
             let device_name = candidate_name;
@@ -1333,7 +1380,8 @@ unsafe fn edid_serial_for_monitor_uncached(monitor_id: &str) -> Option<String> {
         KEY_QUERY_VALUE.0,
     )
     .ok()?;
-    let result = read_edid_blob_from_registry_key(key).and_then(|blob| edid_serial_from_blob(&blob));
+    let result =
+        read_edid_blob_from_registry_key(key).and_then(|blob| edid_serial_from_blob(&blob));
     let _ = RegCloseKey(key);
     let _ = SetupDiDestroyDeviceInfoList(devices);
     result
@@ -1581,9 +1629,11 @@ const MODE_CONFIRMATION_SECONDS: u32 = 15;
 // succeed by retrying, and the record would otherwise block every future mode
 // change forever.
 const RECOVERY_GIVE_UP_MS: u64 = 30_000;
+const RECOVERY_WATCHDOG_GRACE_MS: u64 = 10_000;
 
 #[derive(Clone, serde::Serialize)]
 pub struct AppliedMode {
+    pub token: u64,
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
@@ -1950,18 +2000,12 @@ fn begin_mode_change(
         });
     }
     // Absolute deadline for both the rollback thread and the flyout
-    // countdown, so the confirmation reaches zero at the same moment the
-    // automatic rollback fires even when the show handshake delays the
-    // flyout's first paint. Published in the atomic too: the rollback thread
-    // re-reads it, and extend_mode_confirmation moves it out when the dialog
-    // becomes visible late.
+    // countdown. The rollback thread re-reads the atomic, which the visible
+    // flyout can extend once if its show handshake takes a while.
     let confirmation_deadline_ms = now_ms() + (MODE_CONFIRMATION_SECONDS as u64) * 1000;
     ROLLBACK_DEADLINE_MS.store(confirmation_deadline_ms, Ordering::Release);
-    // A token can only be extended once (see extend_mode_confirmation); drop
-    // the previous transaction's entry so the set cannot grow unbounded.
     if let Ok(mut guard) = extended_tokens().lock() {
-        guard.retain(|existing| *existing >= token);
-        guard.insert(token);
+        guard.clear();
     }
     std::thread::spawn(move || {
         // Sleep until the active deadline, re-reading it in short increments.
@@ -1988,7 +2032,7 @@ fn begin_mode_change(
         // confirmation with seconds still on its countdown, leaving the user
         // unable to Keep or Revert until the second timeout restored the
         // mode.
-        let expired = (|| -> bool {
+        let expired = loop {
             // Decide before taking any lock: if the user already resolved
             // this transaction, do nothing and leave the flyout alone. A
             // poisoned lock is treated as still-pending so the fallback hide
@@ -1998,7 +2042,7 @@ fn begin_mode_change(
                 .map(|guard| guard.as_ref().is_some_and(|entry| entry.token == token))
                 .unwrap_or(true);
             if !entry_exists {
-                return false;
+                break false;
             }
             // Serialize the automatic rollback with confirmation and manual
             // rollback. Without this guard, the timeout thread could restore
@@ -2008,22 +2052,31 @@ fn begin_mode_change(
                 log::error!(
                     "[display-info] automatic rollback could not acquire the mode operation lock"
                 );
-                return true;
+                break true;
             };
             let Ok(_recovery_guard) = lock_recovery_state() else {
                 log::error!("[display-info] automatic rollback could not lock recovery state");
-                return true;
+                break true;
             };
             let entry = pending_mode()
                 .lock()
                 .ok()
                 .and_then(|guard| guard.as_ref().filter(|entry| entry.token == token).cloned());
             let Some(entry) = entry else {
-                return false;
+                break false;
             };
+            // An extension may have won the operation lock just as this
+            // watchdog reached its old deadline. Re-check after acquiring
+            // both locks so this thread cannot roll back on a stale timeout.
+            if now_ms() < ROLLBACK_DEADLINE_MS.load(Ordering::Acquire) {
+                drop(_recovery_guard);
+                drop(_operation_guard);
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             if let Err(error) = target_is_current(&entry.target) {
                 log::error!("[display-info] automatic rollback refused: {error}");
-                return true;
+                break true;
             }
             match apply_previous_mode(&entry.target, &entry.previous) {
                 Ok(()) => {
@@ -2033,7 +2086,7 @@ fn begin_mode_change(
                     // retry still retain the only recovery path.
                     if let Err(error) = clear_recovery_record_for(token) {
                         log::error!("[display-info] automatic rollback succeeded but recovery cleanup failed: {error}");
-                        return true;
+                        break true;
                     }
                     if let Ok(mut guard) = pending_mode().lock() {
                         if guard.as_ref().is_some_and(|current| current.token == token) {
@@ -2070,8 +2123,8 @@ fn begin_mode_change(
                     }
                 }
             }
-            true
-        })();
+            break true;
+        };
         if expired {
             // The confirmation window expired without the user deciding. The
             // frontend countdown normally hides the flyout itself, but when
@@ -2099,6 +2152,7 @@ fn begin_mode_change(
         }
     });
     Ok(AppliedMode {
+        token,
         width: mode.dmPelsWidth,
         height: mode.dmPelsHeight,
         refresh_hz: mode.dmDisplayFrequency,
@@ -2350,6 +2404,17 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_deadline_extension_only_moves_forward() {
+        assert_eq!(
+            confirmation_deadline_extension(15_000, 20_000, 5_000),
+            Some(20_000)
+        );
+        assert_eq!(confirmation_deadline_extension(15_000, 15_000, 5_000), None);
+        assert_eq!(confirmation_deadline_extension(15_000, 10_000, 5_000), None);
+        assert_eq!(confirmation_deadline_extension(15_000, 100_000, 5_000), None);
+    }
+
+    #[test]
     fn decode_dtd_rejects_zero_pixel_clock() {
         // All-zero DTD = monitor descriptor (name/range), not video timing.
         assert!(decode_dtd(&[0u8; 18]).is_none());
@@ -2447,7 +2512,10 @@ mod tests {
     fn edid_serial_parses_ff_descriptor() {
         let mut edid = base_block(0, None);
         edid[54..54 + 18].copy_from_slice(&serial_descriptor("ABC1234567890"));
-        assert_eq!(edid_serial_from_blob(&edid), Some("ABC1234567890".to_string()));
+        assert_eq!(
+            edid_serial_from_blob(&edid),
+            Some("ABC1234567890".to_string())
+        );
     }
 
     #[test]

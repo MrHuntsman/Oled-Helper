@@ -69,11 +69,7 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
 // One procedure serves both hooks: they share the same (code, wparam, lparam)
 // signature. Every delivered event is genuine keyboard/mouse activity.
-unsafe extern "system" fn input_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn input_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         LAST_KB_MOUSE_INPUT.store(GetTickCount64() as u32, Ordering::Release);
     }

@@ -693,13 +693,15 @@ fn enqueue_config_write(app: &AppHandle, config: &AppConfig) -> Result<(), Strin
     Ok(())
 }
 
+fn sync_backend_owned_fields(config: &mut AppConfig, tv_device: Option<TvDeviceConfig>) {
+    // TV metadata is managed with the pairing credential in Rust. Always use
+    // the latest backend value, not the frontend's potentially stale snapshot.
+    config.tv_device = tv_device;
+}
+
 #[tauri::command]
 pub fn save_config(app: AppHandle, mut config: AppConfig) -> Result<(), String> {
-    // The frontend mirrors the ordinary settings, but it must not clear TV
-    // metadata that was loaded or updated by the Rust credential workflow.
-    if config.tv_device.is_none() {
-        config.tv_device = saved_tv_device();
-    }
+    sync_backend_owned_fields(&mut config, saved_tv_device());
     enqueue_config_write(&app, &config)
 }
 #[tauri::command]
@@ -767,6 +769,28 @@ mod tests {
         migrate_legacy_ease_duration("not json", &mut config);
         assert_eq!(config.taskbar_dimmer_fade_out_duration_ms, 200);
     }
+    #[test]
+    fn save_config_uses_current_backend_tv_metadata() {
+        let stale = TvDeviceConfig {
+            device_id: "lg-old".into(),
+            ..TvDeviceConfig::default()
+        };
+        let current = TvDeviceConfig {
+            device_id: "lg-current".into(),
+            ..TvDeviceConfig::default()
+        };
+        let mut config = AppConfig {
+            tv_device: Some(stale),
+            ..AppConfig::default()
+        };
+
+        sync_backend_owned_fields(&mut config, Some(current.clone()));
+        assert_eq!(config.tv_device, Some(current));
+
+        sync_backend_owned_fields(&mut config, None);
+        assert_eq!(config.tv_device, None);
+    }
+
     #[test]
     fn tv_device_metadata_round_trip_without_a_client_key() {
         let config = AppConfig {

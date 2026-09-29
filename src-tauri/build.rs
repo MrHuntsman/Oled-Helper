@@ -27,9 +27,13 @@ fn build_explorer_hook() {
             "build",
             "--release",
             "--manifest-path",
-            hook_manifest.to_str().expect("hook manifest path is not valid UTF-8"),
+            hook_manifest
+                .to_str()
+                .expect("hook manifest path is not valid UTF-8"),
             "--target-dir",
-            hook_target.to_str().expect("hook target dir path is not valid UTF-8"),
+            hook_target
+                .to_str()
+                .expect("hook target dir path is not valid UTF-8"),
         ])
         .status()
         .expect("failed to run cargo to build explorer-hook");

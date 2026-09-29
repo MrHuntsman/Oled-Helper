@@ -293,7 +293,9 @@ fn cache_insert(key: GlyphCacheKey, glyph: Arc<CachedGlyph>) {
     {
         if let Some(old_key) = cache.order.pop_front() {
             if let Some(old) = cache.map.remove(&old_key) {
-                cache.bytes = cache.bytes.saturating_sub(old.coverage.len() + GLYPH_ENTRY_OVERHEAD);
+                cache.bytes = cache
+                    .bytes
+                    .saturating_sub(old.coverage.len() + GLYPH_ENTRY_OVERHEAD);
             }
         }
     }
@@ -304,10 +306,7 @@ fn cache_insert(key: GlyphCacheKey, glyph: Arc<CachedGlyph>) {
 
 /// Cumulative cache stats (hits, misses, live entries) for diagnostics.
 pub fn glyph_cache_stats() -> (u64, u64, usize) {
-    let entries = glyph_cache()
-        .lock()
-        .map(|c| c.map.len())
-        .unwrap_or(0);
+    let entries = glyph_cache().lock().map(|c| c.map.len()).unwrap_or(0);
     (
         CACHE_HITS.load(Ordering::Relaxed),
         CACHE_MISSES.load(Ordering::Relaxed),
@@ -348,9 +347,14 @@ fn glyph_cache_key(
     opts: RenderOptions,
 ) -> GlyphCacheKey {
     let (sub_rx, sub_ry, sub_gx, sub_gy, sub_bx, sub_by) = match opts.subpixel_offsets {
-        Some([[rx, ry], [gx, gy], [bx, by]]) => {
-            (rx.to_bits(), ry.to_bits(), gx.to_bits(), gy.to_bits(), bx.to_bits(), by.to_bits())
-        }
+        Some([[rx, ry], [gx, gy], [bx, by]]) => (
+            rx.to_bits(),
+            ry.to_bits(),
+            gx.to_bits(),
+            gy.to_bits(),
+            bx.to_bits(),
+            by.to_bits(),
+        ),
         None => (0, 0, 0, 0, 0, 0),
     };
     GlyphCacheKey {
@@ -396,7 +400,9 @@ fn rasterize_glyph_cached(
     mode: RenderMode,
     opts: RenderOptions,
 ) -> GlyphResult {
-    let key = glyph_cache_key(font_ptr, font_index, pixel_size, glyph_id, offset, mode, opts);
+    let key = glyph_cache_key(
+        font_ptr, font_index, pixel_size, glyph_id, offset, mode, opts,
+    );
     if let Some(cached) = cache_get(&key) {
         return GlyphResult::Rendered(cached);
     }
@@ -455,9 +461,22 @@ fn rasterize_glyph_uncached(
     }
     let mut data = image.data;
     if matches!(image.content, Content::SubpixelMask) {
-        postprocess_subpixel(&mut data, image.placement.width, image.placement.height, opts);
+        postprocess_subpixel(
+            &mut data,
+            image.placement.width,
+            image.placement.height,
+            opts,
+        );
     }
-    let glyph = finish_glyph(key, image.placement.left, image.placement.top, image.placement.width, image.placement.height, data, mode);
+    let glyph = finish_glyph(
+        key,
+        image.placement.left,
+        image.placement.top,
+        image.placement.width,
+        image.placement.height,
+        data,
+        mode,
+    );
     GlyphResult::Rendered(glyph)
 }
 
@@ -570,7 +589,15 @@ fn rasterize_glyph_2d(
         }
     }
     postprocess_subpixel(&mut data, width, height, opts);
-    let glyph = finish_glyph(key, min_left, min_top, width, height, data, RenderMode::Custom);
+    let glyph = finish_glyph(
+        key,
+        min_left,
+        min_top,
+        width,
+        height,
+        data,
+        RenderMode::Custom,
+    );
     GlyphResult::Rendered(glyph)
 }
 
@@ -611,7 +638,9 @@ pub fn rasterize(
     // keep their reference point (it is unused by the blit for empty runs).
     if text.chars().all(|c| c.is_whitespace()) {
         let proxy = MetricsProxy::from_font(&font);
-        let glyph_metrics = proxy.materialize_glyph_metrics(&font, &[]).scale(pixel_size);
+        let glyph_metrics = proxy
+            .materialize_glyph_metrics(&font, &[])
+            .scale(pixel_size);
         let advance = text
             .chars()
             .map(|c| glyph_metrics.advance_width(font.charmap().map(c)))
@@ -776,7 +805,15 @@ pub fn rasterize_glyphs(
     let keys: Vec<GlyphCacheKey> = glyph_ids
         .iter()
         .map(|&id| {
-            glyph_cache_key(font_ptr, font_index, pixel_size, id, Vector::new(0.0, 0.0), mode, opts)
+            glyph_cache_key(
+                font_ptr,
+                font_index,
+                pixel_size,
+                id,
+                Vector::new(0.0, 0.0),
+                mode,
+                opts,
+            )
         })
         .collect();
     let mut cached = cache_get_batch(&keys);
@@ -962,15 +999,18 @@ mod tests {
             eprintln!("no system font available; skipping");
             return;
         };
-        let out =
-            rasterize(&font, 0, 16.0, "Ag", RenderMode::Grayscale, RenderOptions::default())
-                .expect("font parses");
+        let out = rasterize(
+            &font,
+            0,
+            16.0,
+            "Ag",
+            RenderMode::Grayscale,
+            RenderOptions::default(),
+        )
+        .expect("font parses");
         assert!(out.advance > 0.0);
         assert!(!out.glyphs.is_empty());
-        assert!(out
-            .glyphs
-            .iter()
-            .any(|g| g.coverage.iter().any(|&c| c > 0)));
+        assert!(out.glyphs.iter().any(|g| g.coverage.iter().any(|&c| c > 0)));
     }
 
     #[test]
@@ -979,9 +1019,15 @@ mod tests {
             eprintln!("no system font available; skipping");
             return;
         };
-        let out =
-            rasterize(&font, 0, 16.0, "Ag", RenderMode::Crisp, RenderOptions::default())
-                .expect("font parses");
+        let out = rasterize(
+            &font,
+            0,
+            16.0,
+            "Ag",
+            RenderMode::Crisp,
+            RenderOptions::default(),
+        )
+        .expect("font parses");
         assert!(!out.glyphs.is_empty());
         for g in &out.glyphs {
             assert!(g.coverage.iter().all(|&c| c == 0 || c == 255));
@@ -1020,8 +1066,15 @@ mod tests {
         };
         // Custom mode with explicit offsets must rasterize as 4bpp subpixel
         // and produce a different fringe than the default WOLED quad layout.
-        let default = rasterize(&font, 0, 16.0, "A", RenderMode::Custom, RenderOptions::default())
-            .expect("font parses");
+        let default = rasterize(
+            &font,
+            0,
+            16.0,
+            "A",
+            RenderMode::Custom,
+            RenderOptions::default(),
+        )
+        .expect("font parses");
         let tuned = rasterize(
             &font,
             0,
@@ -1086,7 +1139,9 @@ mod tests {
             "2D subpixel coverage must be 4 bytes/pixel"
         );
         assert!(
-            g.coverage.chunks(4).any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0),
+            g.coverage
+                .chunks(4)
+                .any(|px| px[0] > 0 || px[1] > 0 || px[2] > 0),
             "2D subpixel coverage must carry ink"
         );
         // The vertical shift must change the fringe versus the flat x-only
@@ -1225,13 +1280,19 @@ mod tests {
             eprintln!("no system font available; skipping");
             return;
         };
-        let run = rasterize(&font, 0, 16.0, "Ag", RenderMode::Grayscale, RenderOptions::default())
-            .expect("font parses");
+        let run = rasterize(
+            &font,
+            0,
+            16.0,
+            "Ag",
+            RenderMode::Grayscale,
+            RenderOptions::default(),
+        )
+        .expect("font parses");
         let bmp = composite_run(&run).expect("non-empty run");
         assert!(bmp.width > 0 && bmp.height > 0);
         assert_eq!(bmp.content, Content::Mask);
         assert_eq!(bmp.data.len(), (bmp.width * bmp.height) as usize);
         assert!(bmp.data.iter().any(|&c| c > 0));
     }
-
 }

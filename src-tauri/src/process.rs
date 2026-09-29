@@ -7,6 +7,26 @@ use tauri::AppHandle;
 // Command-line flags shared by the restart/elevation paths and parsed by run().
 pub(crate) const ARG_RESTART_PARENT: &str = "--restart-parent";
 pub(crate) const ARG_OPEN_TAB_PREFIX: &str = "--open-tab=";
+// Passed by the Start on Boot entry (the autostart plugin builds the Run value
+// from the args given to tauri_plugin_autostart::init): launch straight into
+// the tray instead of showing the main window. A login launch must not steal
+// focus, and the app is designed to idle in the tray with its webview torn
+// down anyway (see main_window), so this is the same state a close-to-tray
+// reaches, just from the first frame. Restart children and manual launches
+// never carry it; the UAC relaunch and tray Restart strip nothing because
+// they build their own argument lists.
+pub(crate) const ARG_START_TRAY: &str = "--start-tray";
+
+// True when this launch was an autostart (Start on Boot) launch.
+static START_IN_TRAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn start_in_tray() -> bool {
+    START_IN_TRAY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn set_start_in_tray() {
+    START_IN_TRAY.store(true, std::sync::atomic::Ordering::Release);
+}
 
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
 // used to validate --open-tab forwarding on restart.
@@ -55,6 +75,146 @@ pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi:
     stripped
 }
 
+// One-time migration for Start on Boot entries created before the app could
+// start into the tray: the autostart plugin's registry value was just the exe
+// path with no --start-tray, so a config that predates this flag would keep
+// opening a visible window at login forever. When the Run entry exists and
+// lacks the flag, rewrite it to the same value the plugin would write today
+// (path + current args), leaving the StartupApproved enable/disable byte the
+// Task Manager shows untouched. Enabled autostart entries only; an entry the
+// user disabled in Task Manager must stay as it is. Runs once per process,
+// from run(), before the Tauri builder is created.
+#[cfg(target_os = "windows")]
+pub(crate) fn migrate_autostart_entry() {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ,
+    };
+
+    // Cheap gate: only the exe path needs rewriting, and a value that already
+    // carries the flag is correct as is.
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => return,
+    };
+    let exe_str = exe.display().to_string();
+
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    // Must match the app_name the autostart plugin used when it enabled the
+    // entry: it defaults to package_info().name, which tauri.conf.json sets
+    // to "OLED Helper".
+    const VALUE_NAME: &str = "OLED Helper";
+
+    let run_key_w: Vec<u16> = RUN_KEY
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name_w: Vec<u16> = VALUE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(run_key_w.as_ptr()),
+            None,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return; // no Run key or no entry: nothing to migrate
+        }
+
+        // Read the current command line (REG_SZ). Missing value: autostart
+        // has never been enabled, nothing to do.
+        let mut size: u32 = 0;
+        let query = RegGetValueW(
+            hkey,
+            PCWSTR::null(),
+            PCWSTR(value_name_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            None,
+            Some(&mut size),
+        );
+        if query.is_err() || size == 0 {
+            let _ = RegCloseKey(hkey);
+            return;
+        }
+        let mut buf = vec![0u16; (size as usize) / 2];
+        if RegGetValueW(
+            hkey,
+            PCWSTR::null(),
+            PCWSTR(value_name_w.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        )
+        .is_err()
+        {
+            let _ = RegCloseKey(hkey);
+            return;
+        }
+        // The registry hands back the length in bytes; the buffer is NUL
+        // terminated, so trim to the first NUL.
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let current: String = String::from_utf16_lossy(&buf[..len]);
+        let _ = RegCloseKey(hkey);
+
+        // Already migrated (or enabled through a newer build): nothing to do.
+        // Also leave entries that do not point at this exe alone; a user who
+        // hand-edited the command owns it.
+        if current.contains(ARG_START_TRAY) || !current.contains(&exe_str) {
+            return;
+        }
+
+        // Rewrite to exactly what the plugin writes for a fresh enable with
+        // the --start-tray arg: "<exe> --start-tray". The plugin quotes
+        // nothing on Windows (auto-launch joins path + args with spaces), so
+        // this matches byte for byte for a normally installed path.
+        let new_value = format!("{exe_str} {ARG_START_TRAY}");
+        let new_w: Vec<u16> = new_value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(run_key_w.as_ptr()),
+            None,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let status = RegSetValueExW(
+            hkey,
+            PCWSTR(value_name_w.as_ptr()),
+            None,
+            REG_SZ,
+            Some(std::slice::from_raw_parts(
+                new_w.as_ptr() as *const u8,
+                new_w.len() * 2,
+            )),
+        );
+        let _ = RegCloseKey(hkey);
+        if status.is_ok() {
+            log::info!("[autostart] migrated the Start on Boot entry to launch into the tray");
+        } else {
+            log::warn!("[autostart] could not migrate the Start on Boot entry: {status:?}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn migrate_autostart_entry() {}
+
 pub(crate) fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
     // Always perform a real process restart, including when launched through
     // `tauri dev`. Spawn first so a failure leaves the current instance fully
@@ -86,9 +246,7 @@ pub(crate) fn request_restart(app: &AppHandle, open_tab: Option<&str>) {
     // Milestone for the early logger: with pre-Tauri logging in place the
     // replacement's parent wait and lock race are captured, and this line
     // timestamps the exact moment the old instance began its own teardown.
-    log::info!(
-        "restart handoff: replacement spawned; this instance is exiting"
-    );
+    log::info!("restart handoff: replacement spawned; this instance is exiting");
 
     // Release the single-instance lock now that the replacement is running.
     // The named mutex lives until this process's kernel handles are closed,
@@ -146,19 +304,13 @@ pub fn open_url(url: String) -> Result<(), String> {
 pub(crate) fn process_is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_ACCESS_MASK,
+        GetTokenInformation, TOKEN_ACCESS_MASK, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
         let mut token = windows::Win32::Foundation::HANDLE::default();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ACCESS_MASK(0x0008),
-            &mut token,
-        )
-        .is_err()
-        {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ACCESS_MASK(0x0008), &mut token).is_err() {
             return false;
         }
         let mut elevation = TOKEN_ELEVATION::default();
@@ -196,9 +348,7 @@ pub(crate) fn foreground_process_is_elevated() -> bool {
     use windows::Win32::System::Threading::{
         OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
     unsafe {
         let foreground = GetForegroundWindow();
@@ -263,8 +413,6 @@ pub(crate) fn foreground_process_is_elevated() -> bool {
 pub(crate) fn foreground_process_is_elevated() -> bool {
     false
 }
-
-
 
 // Launches a copy of the current executable elevated (ShellExecuteW "runas",
 // UAC prompt). Forwards the current command-line arguments plus
@@ -354,8 +502,8 @@ pub(crate) fn grab_foreground_after_restart(app: AppHandle) {
         keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, HWND_NOTOPMOST, HWND_TOPMOST,
-        IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, SWP_NOMOVE, SWP_NOSIZE,
+        FlashWindowEx, IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, FLASHWINFO,
+        FLASHW_ALL, FLASHW_TIMERNOFG, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE,
         SWP_SHOWWINDOW, SW_RESTORE,
     };
 
@@ -513,8 +661,7 @@ unsafe fn enable_security_privilege() {
         return;
     }
     let mut luid = windows::Win32::Foundation::LUID::default();
-    if LookupPrivilegeValueW(windows::core::PCWSTR::null(), SE_SECURITY_NAME, &mut luid).is_err()
-    {
+    if LookupPrivilegeValueW(windows::core::PCWSTR::null(), SE_SECURITY_NAME, &mut luid).is_err() {
         let _ = CloseHandle(token);
         return;
     }
@@ -700,7 +847,10 @@ unsafe fn create_instance_mutex(
 // by the normal primary path and by a restart child that takes the lock over
 // after a retry, so both set up exactly the same signal.
 #[cfg(target_os = "windows")]
-unsafe fn create_watcher_event(name: windows::core::PCWSTR, with_sacl: Option<&PermissiveSecurity>) {
+unsafe fn create_watcher_event(
+    name: windows::core::PCWSTR,
+    with_sacl: Option<&PermissiveSecurity>,
+) {
     use windows::Win32::System::Threading::CreateEventW;
 
     match CreateEventW(
@@ -913,8 +1063,8 @@ pub(crate) fn wait_for_restart_parent(parent_pid: u32) -> bool {
         CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
     };
     use windows::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-        TerminateProcess, WaitForSingleObject,
+        GetExitCodeProcess, OpenProcess, TerminateProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
     let deadline = std::time::Instant::now() + RESTART_PARENT_MAX_WAIT;
     unsafe {

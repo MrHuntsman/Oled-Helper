@@ -21,8 +21,8 @@ use std::time::Duration;
 use windows::core::{BOOL, GUID};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconGetRect, Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
-    NOTIFYICONIDENTIFIER, NIF_INFO, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER, NIM_MODIFY,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_INFO, NIIF_INFO, NIIF_LARGE_ICON, NIIF_USER,
+    NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NOTIFYICONIDENTIFIER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, EnumWindows, GetWindowThreadProcessId, HICON,
@@ -94,8 +94,8 @@ unsafe fn find_real_tray_icon() -> Option<(HWND, u32)> {
 }
 
 unsafe fn show_on_real_icon(title: &str, message: &str) -> Result<(), String> {
-    let (hwnd, uid) = find_real_tray_icon()
-        .ok_or_else(|| "could not locate the app's tray icon".to_string())?;
+    let (hwnd, uid) =
+        find_real_tray_icon().ok_or_else(|| "could not locate the app's tray icon".to_string())?;
 
     // App icon in the balloon body is a nice-to-have; a missing icon must not
     // suppress the notification, so fall back to the plain info style.
@@ -109,9 +109,8 @@ unsafe fn show_on_real_icon(title: &str, message: &str) -> Result<(), String> {
     // balloon's large-icon slot, which stays crisp at any display DPI. The
     // old small-icon balloon handed the shell a 16px source that it upscaled
     // into that slot, that is what looked blurry.
-    let icon = crate::window_icon::materialize_icon_file().and_then(|icon_path| {
-        crate::window_icon::load_icon(&icon_path, 256, 256)
-    });
+    let icon = crate::window_icon::materialize_icon_file()
+        .and_then(|icon_path| crate::window_icon::load_icon(&icon_path, 256, 256));
     let dw_info_flags = if icon.is_some() {
         NIIF_USER | NIIF_LARGE_ICON
     } else {

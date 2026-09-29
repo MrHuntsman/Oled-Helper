@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
-    FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, NAMED_PIPE_MODE};
 
@@ -150,9 +150,7 @@ fn server_thread_loop() {
                 // Single instance so a stale pipe can never linger. Access
                 // duplex (both directions): the app writes queries, the
                 // observer writes replies.
-                FILE_FLAGS_AND_ATTRIBUTES(
-                    PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0,
-                ),
+                FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0),
                 // Byte mode, blocking reads (all three constants are 0).
                 NAMED_PIPE_MODE(0),
                 1,
@@ -199,9 +197,11 @@ fn server_thread_loop() {
         // is shutting down). Queries only arrive while a hold is active, so
         // the thread sits idle in the channel recv between holds.
         for query in rx {
-            let payload =
-                serde_json::to_string(&KeyQuery { vk: query.vk, mods: query.mods })
-                    .unwrap_or_default();
+            let payload = serde_json::to_string(&KeyQuery {
+                vk: query.vk,
+                mods: query.mods,
+            })
+            .unwrap_or_default();
             if !write_all(handle, format!("{payload}\n").as_bytes()) {
                 break;
             }
@@ -255,19 +255,17 @@ fn request_respawn() {
     let name = pipe_name();
     let _ = std::thread::Builder::new()
         .name("key-observer-spawn".into())
-        .spawn(move || {
-            match crate::helper::launch_key_observer(&name) {
-                Ok(()) => {}
-                Err(error) => {
-                    if SPAWN_WARNED.get().is_none() {
-                        let _ = SPAWN_WARNED.get_or_init(|| {
-                            log::debug!(
-                                "[key-observer] elevated observer unavailable: {error}. \
+        .spawn(move || match crate::helper::launch_key_observer(&name) {
+            Ok(()) => {}
+            Err(error) => {
+                if SPAWN_WARNED.get().is_none() {
+                    let _ = SPAWN_WARNED.get_or_init(|| {
+                        log::debug!(
+                            "[key-observer] elevated observer unavailable: {error}. \
                                  Hold-to-compare over elevated (admin) windows will use the \
                                  local fallback until the privileged helper task is registered."
-                            );
-                        });
-                    }
+                        );
+                    });
                 }
             }
         });
@@ -284,7 +282,10 @@ pub(crate) fn combo_held(vk: u32, mods: u32) -> Option<bool> {
         request_respawn();
         return None;
     }
-    let sender = query_tx().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let sender = query_tx()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     let Some(sender) = sender else {
         return None;
     };
@@ -371,8 +372,7 @@ pub(crate) fn run_elevated_observer(pipe_name: &str) {
             let Ok(query) = serde_json::from_slice::<KeyQuery>(&line) else {
                 continue;
             };
-            let held =
-                crate::hotkeys::combo_is_down(query.vk as u32, query.mods);
+            let held = crate::hotkeys::combo_is_down(query.vk as u32, query.mods);
             let reply = serde_json::to_string(&KeyReply { held }).unwrap_or_default();
             if !write_all(handle, format!("{reply}\n").as_bytes()) {
                 break;

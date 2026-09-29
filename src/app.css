@@ -68,6 +68,9 @@
    Solid variants: primary is accent filled, danger is red filled, and the
    ghost variant is a bordered neutral button for inline strip actions. */
 .tv-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 5px 10px;
   border: 1px solid var(--control-border);
   border-radius: 5px;
@@ -91,6 +94,31 @@
 .tv-btn:disabled {
   opacity: 0.45;
   cursor: default;
+}
+/* Busy state for the TV search: a rotating ring in front of the label, so a
+   search that comes back empty still reads as "it tried" rather than broken. */
+.tv-btn-busy {
+  opacity: 1;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.tv-btn-spinner {
+  display: none;
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: tv-btn-spin 0.75s linear infinite;
+}
+.tv-btn-busy .tv-btn-spinner {
+  display: block;
+}
+@keyframes tv-btn-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .tv-btn-primary {
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
@@ -125,14 +153,11 @@
 .tv-pairing-strip-btn {
   flex: 0 0 auto;
 }
-.tv-video-panel {
+.tv-video-panel,
+.tv-dtm-panel {
   width: 100%;
   max-width: 760px;
   gap: 10px;
-}
-.tv-context-refresh-btn {
-  flex: 0 0 auto;
-  padding: 8px 12px;
 }
 .tv-state-chip {
   padding: 3px 8px;
@@ -193,49 +218,29 @@
 .tv-endpoint {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
-.tv-context-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+.tv-picture-mode-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
 }
-.tv-context-item {
+.tv-picture-mode-row .tv-field {
+  flex: 0 1 190px;
+}
+.tv-picture-mode-row .tv-field select {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.tv-picture-mode-hotkey {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-  padding: 9px;
-  border: 1px solid var(--divider);
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.12);
-}
-.tv-context-label {
+  gap: 5px;
   color: var(--text-weak);
   font-size: 11px;
   font-weight: 600;
 }
-.tv-context-value {
-  overflow: hidden;
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.tv-picture-mode-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
-}
-.tv-picture-mode-row .tv-field {
-  flex: 1 1 auto;
-}
-.tv-picture-mode-row > button {
-  flex: 0 0 auto;
-}
-.tv-context-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+.tv-picture-mode-hotkey .hotkey-pill {
+  min-width: 132px;
 }
 .tv-settings-panel {
   width: 100%;
@@ -277,36 +282,76 @@
 .tv-setting-select:disabled {
   opacity: 0.55;
 }
-.tv-setting-stepper {
-  flex: 0 0 auto;
+.tv-setting-number-control {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
 }
-.tv-setting-step-btn {
-  width: 28px;
-  padding: 6px 0;
-  text-align: center;
-}
-.tv-setting-input {
-  width: 56px;
-  padding: 6px 4px;
+.tv-setting-number-step {
+  display: inline-flex;
+  flex: 0 0 24px;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 28px;
+  padding: 0;
   border: 1px solid var(--control-border);
   border-radius: 6px;
   color: var(--text);
   background: var(--bg);
-  font: 13px var(--font);
-  font-weight: 600;
-  text-align: center;
+  font: 600 15px/1 var(--font);
+  cursor: pointer;
+  user-select: none;
+}
+.tv-setting-number-step:hover:not(:disabled),
+.tv-setting-number-step:focus-visible {
+  color: var(--text);
+  border-color: var(--control-border-strong);
+  background: var(--hover);
+  outline: none;
+}
+.tv-setting-number-step:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.tv-setting-number-step:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.tv-setting-number {
+  box-sizing: border-box;
+  flex: 0 0 46px;
+  width: 46px;
+  min-width: 0;
+  height: 28px;
+  padding: 5px 4px;
+  border: 1px solid var(--control-border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--bg);
+  font: 600 12px var(--font);
   font-variant-numeric: tabular-nums;
+  text-align: center;
+  outline: none;
+  appearance: textfield;
+  -moz-appearance: textfield;
 }
-.tv-setting-input:disabled {
-  opacity: 0.55;
-}
-.tv-setting-input::-webkit-inner-spin-button,
-.tv-setting-input::-webkit-outer-spin-button {
-  -webkit-appearance: none;
+.tv-setting-number::-webkit-inner-spin-button,
+.tv-setting-number::-webkit-outer-spin-button {
   margin: 0;
+  -webkit-appearance: none;
+}
+.tv-setting-number:hover:not(:disabled),
+.tv-setting-number:focus-visible {
+  border-color: var(--control-border-strong);
+}
+.tv-setting-number:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.tv-setting-number:disabled {
+  opacity: 0.55;
 }
 .tv-setting-pending {
   flex: 0 0 auto;

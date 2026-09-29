@@ -228,7 +228,6 @@ mod display_change_events {
             Err("SetWindowSubclass failed".into())
         }
     }
-
 }
 
 // ── Pre-WebView log history ────────────────────────────────────────────────
@@ -315,7 +314,6 @@ mod log_history {
     }
 }
 
-
 // Bridge for frontend warnings/errors and uncaught JS errors, so the
 // on-disk log captures actionable failures even if the app hangs or crashes
 // before the user can open DevTools or the in-app Diagnostics tab.
@@ -391,7 +389,13 @@ async fn set_resolution(
     skip_confirmation: Option<bool>,
     favorite_id: Option<String>,
 ) -> Result<display_info::AppliedMode, String> {
-    let result = display_info::set_resolution(width, height, preferred_hz, device_name, skip_confirmation.unwrap_or(false))?;
+    let result = display_info::set_resolution(
+        width,
+        height,
+        preferred_hz,
+        device_name,
+        skip_confirmation.unwrap_or(false),
+    )?;
     if result.skip_confirmation {
         display_info::confirm_mode_change()?;
     } else if let Some(favorite_id) = favorite_id.as_deref() {
@@ -449,8 +453,8 @@ async fn rollback_display_mode_change(app: AppHandle) -> Result<(), String> {
 // user still gets the full window from the moment the dialog is on screen.
 // See display_info::extend_mode_confirmation.
 #[tauri::command]
-fn extend_mode_confirmation(deadline_ms: u64) {
-    display_info::extend_mode_confirmation(deadline_ms);
+fn extend_mode_confirmation(token: u64, deadline_ms: u64) -> Option<u64> {
+    display_info::extend_mode_confirmation(token, deadline_ms)
 }
 
 #[tauri::command]
@@ -767,10 +771,23 @@ pub fn run() {
     // the restart can complete, and only an unverifiable parent aborts this
     // child rather than competing for the profile.
     let is_restart_child = std::env::args().any(|arg| arg == process::ARG_RESTART_PARENT);
+    // Start on Boot launches carry --start-tray (baked into the registry Run
+    // entry by the autostart plugin args): open straight into the tray, same
+    // idle state a close-to-tray reaches, without stealing focus at login.
+    // Migration first: an entry created by an older build lacks the flag, and
+    // rewriting it here means even a never-re-enabled Start on Boot starts in
+    // the tray from now on.
+    if std::env::args().any(|arg| arg == process::ARG_START_TRAY) {
+        process::set_start_in_tray();
+    }
+    process::migrate_autostart_entry();
     #[cfg(target_os = "windows")]
     {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-        if let Some(pos) = args.iter().position(|arg| arg == process::ARG_RESTART_PARENT) {
+        if let Some(pos) = args
+            .iter()
+            .position(|arg| arg == process::ARG_RESTART_PARENT)
+        {
             if let Some(pid) = args
                 .get(pos + 1)
                 .and_then(|arg| arg.to_str())
@@ -798,8 +815,10 @@ pub fn run() {
     // A tray restart can carry the tab the user was on (--open-tab=<tab>);
     // take_startup_tab hands it to the frontend once so the UI opens on the
     // same tab after the restart.
-    let startup_tab: Option<String> =
-        std::env::args().find_map(|arg| arg.strip_prefix(process::ARG_OPEN_TAB_PREFIX).map(str::to_string));
+    let startup_tab: Option<String> = std::env::args().find_map(|arg| {
+        arg.strip_prefix(process::ARG_OPEN_TAB_PREFIX)
+            .map(str::to_string)
+    });
     if let Some(tab) = startup_tab {
         if let Ok(mut guard) = STARTUP_TAB.get_or_init(|| Mutex::new(None)).lock() {
             *guard = Some(tab);
@@ -955,9 +974,14 @@ pub fn run() {
             reset_tray_notice,
             main_frontend_ready,
         ])
+        // The Start on Boot entry launches with --start-tray so a login
+        // autostart opens straight into the tray (see process::start_in_tray);
+        // manual launches never carry the flag and behave as before. The
+        // one-time migration in run() rewrites entries created before this
+        // arg existed.
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![process::ARG_START_TRAY]),
         ))
         .plugin(tauri_plugin_positioner::init())
         // Persist and restore the main window's geometry (size, position,
@@ -970,9 +994,10 @@ pub fn run() {
         // Scoped to the "main" window only: the flyout and tray-menu popups
         // are positioned programmatically every time and must not be
         // restored. Flags exclude VISIBLE/DECORATIONS/FULLSCREEN so a
-        // close-to-tray hide can never be restored as a hidden window (this
-        // app always starts visible); size/position/maximized are saved on
-        // resize/move/close and flushed on exit.
+        // close-to-tray hide can never be restored as a hidden window (an
+        // autostart launch starts hidden by design, see main_window::create);
+        // size/position/maximized are saved on resize/move/close and flushed
+        // on exit.
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_filter(|label| label == "main")
@@ -992,6 +1017,17 @@ pub fn run() {
             // through the window-state plugin, which is registered at the
             // builder level above so it sees this window too.
             main_window::create(app.handle())?;
+
+            // An autostart launch begins without a webview (the window was
+            // created hidden), the same state a close-to-tray teardown
+            // reaches, so hand the global hotkeys to the Rust dispatcher
+            // right away: FRONTEND_ALIVE otherwise still says true from its
+            // static default and every hotkey would be emitted into a
+            // webview that does not exist yet. The rebuilt frontend flips it
+            // back on its first reveal (on_page_load / main_frontend_ready).
+            if process::start_in_tray() {
+                hotkeys::set_frontend_alive(false);
+            }
 
             // Watch for a second launch: when another instance starts (the
             // single-instance mutex already existed) it signals the named

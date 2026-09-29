@@ -47,6 +47,8 @@ windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Graphics_
 # the GitHub release, downloads the new exe next to the running one, and
 # swaps it in place after the old process exits.
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# Absolute URL parsing for the updater download host check (updater.rs).
+url = "2"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tokio-tungstenite = { version = "0.27", features = ["native-tls"] }

@@ -184,23 +184,13 @@ struct DiDeviceInstanceW {
     guid_instance: GUID,
 }
 
-type DiCreateDeviceFn = unsafe extern "system" fn(
-    *mut c_void,
-    *const GUID,
-    *mut *mut c_void,
-    *mut c_void,
-) -> i32;
+type DiCreateDeviceFn =
+    unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void, *mut c_void) -> i32;
 
-type DiEnumCallback =
-    unsafe extern "system" fn(*const DiDeviceInstanceW, *mut c_void) -> i32;
+type DiEnumCallback = unsafe extern "system" fn(*const DiDeviceInstanceW, *mut c_void) -> i32;
 
-type DiEnumDevicesFn = unsafe extern "system" fn(
-    *mut c_void,
-    u32,
-    Option<DiEnumCallback>,
-    *mut c_void,
-    u32,
-) -> i32;
+type DiEnumDevicesFn =
+    unsafe extern "system" fn(*mut c_void, u32, Option<DiEnumCallback>, *mut c_void, u32) -> i32;
 
 type DiReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
 type DiAcquireFn = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -209,13 +199,8 @@ type DiGetDeviceStateFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_voi
 type DiSetDataFormatFn = unsafe extern "system" fn(*mut c_void, *const c_void) -> i32;
 type DiSetCooperativeLevelFn = unsafe extern "system" fn(*mut c_void, *mut c_void, u32) -> i32;
 
-type DirectInput8CreateFn = unsafe extern "system" fn(
-    *mut c_void,
-    u32,
-    *const GUID,
-    *mut *mut c_void,
-    *mut c_void,
-) -> i32;
+type DirectInput8CreateFn =
+    unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void, *mut c_void) -> i32;
 
 // The two COM interface vtables only spell out the methods we call; the usize
 // slots are the same pointer size as a method and keep every later index in
@@ -254,7 +239,7 @@ struct IDirectInputDevice8WVtbl {
 }
 
 struct DiDevice {
-    device: *mut c_void,          // IDirectInputDevice8W*
+    device: *mut c_void,       // IDirectInputDevice8W*
     prev: Option<DiJoyState2>, // last polled state, for delta detection
 }
 

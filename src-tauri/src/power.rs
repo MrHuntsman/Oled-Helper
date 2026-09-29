@@ -15,10 +15,10 @@
 
 #![allow(non_snake_case)]
 
-use std::fs;
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::fs;
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -29,15 +29,13 @@ use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LPARAM, WPARAM};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE,
-    REG_SZ, REG_VALUE_TYPE,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PostMessageW, SystemParametersInfoW,
-    HWND_BROADCAST, SC_MONITORPOWER,
+    PostMessageW, SystemParametersInfoW, HWND_BROADCAST, SC_MONITORPOWER, SPIF_UPDATEINIFILE,
     SPI_GETSCREENSAVEACTIVE, SPI_GETSCREENSAVETIMEOUT, SPI_SETSCREENSAVEACTIVE,
-    SPI_SETSCREENSAVETIMEOUT, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPIF_UPDATEINIFILE,
-    WM_SYSCOMMAND,
+    SPI_SETSCREENSAVETIMEOUT, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SYSCOMMAND,
 };
 
 // powercfg GUIDs (the same constants powercfg uses internally). Data4 is the
@@ -179,6 +177,9 @@ fn powercfg_change(setting: &str, minutes: u32) -> Result<(), String> {
         let arg = format!("{setting}-{suffix}");
         let output = std::process::Command::new("powercfg")
             .args(["/change", &arg, &minutes.to_string()])
+            // CREATE_NO_WINDOW: powercfg is a console app, so without this a
+            // console window flashes on screen for every change.
+            .creation_flags(0x0800_0000)
             .output()
             .map_err(|e| format!("could not run powercfg: {e}"))?;
         if output.status.success() {
@@ -243,13 +244,8 @@ fn set_screensaver_timeout_seconds(seconds: u32) -> Result<(), String> {
     unsafe {
         // SPI_SETSCREENSAVETIMEOUT takes the timeout (seconds) in uiParam,
         // NOT pvParam.
-        SystemParametersInfoW(
-            SPI_SETSCREENSAVETIMEOUT,
-            seconds,
-            None,
-            update_flags(),
-        )
-        .map_err(|e| format!("SPI_SETSCREENSAVETIMEOUT failed: {e}"))
+        SystemParametersInfoW(SPI_SETSCREENSAVETIMEOUT, seconds, None, update_flags())
+            .map_err(|e| format!("SPI_SETSCREENSAVETIMEOUT failed: {e}"))
     }
 }
 
@@ -286,7 +282,9 @@ fn read_string(subkey: &str, value: &str) -> Result<Option<String>, String> {
         }
         if size_query != ERROR_SUCCESS || required == 0 || required > 1024 {
             let _ = RegCloseKey(key);
-            return Err(format!("RegQueryValueExW size query failed: {size_query:?}"));
+            return Err(format!(
+                "RegQueryValueExW size query failed: {size_query:?}"
+            ));
         }
         let mut buf = vec![0u16; (required as usize).div_ceil(2)];
         let mut read = required;
@@ -635,8 +633,7 @@ fn probe_worker_sender() -> &'static std::sync::mpsc::SyncSender<()> {
             .spawn(move || {
                 // Coalescing gate: at most one helper run per second, the
                 // cadence the inline probe used.
-                let mut last_run =
-                    std::time::Instant::now() - std::time::Duration::from_secs(60);
+                let mut last_run = std::time::Instant::now() - std::time::Duration::from_secs(60);
                 while receiver.recv().is_ok() {
                     // Drain queued asks so a burst of readout polls collapses
                     // into a single probe.
@@ -715,7 +712,8 @@ fn run_elevated_power_probe() -> Vec<DisplayRequestInfo> {
 
 // Per-monitor settings pushed by the frontend, shared by the Tauri commands
 // and the watcher thread.
-static SCREEN_DIMMER_PROFILES: OnceLock<Mutex<HashMap<String, ScreenDimmerProfile>>> = OnceLock::new();
+static SCREEN_DIMMER_PROFILES: OnceLock<Mutex<HashMap<String, ScreenDimmerProfile>>> =
+    OnceLock::new();
 
 pub(crate) fn screen_dimmer_profiles_map() -> &'static Mutex<HashMap<String, ScreenDimmerProfile>> {
     SCREEN_DIMMER_PROFILES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1366,14 +1364,12 @@ fn dim_watcher_loop() {
     let mut display_request_active = false;
     let mut display_requests: Vec<DisplayRequestInfo> = Vec::new();
     let mut last_published_dimmed = false;
-    let mut last_monitor_refresh =
-        std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut last_monitor_refresh = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut last_fullscreen_check =
         std::time::Instant::now() - std::time::Duration::from_millis(FULLSCREEN_CHECK_INTERVAL_MS);
     let mut last_gamepad_check =
         std::time::Instant::now() - std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS);
-    let mut last_idle_diag =
-        std::time::Instant::now() - std::time::Duration::from_secs(5);
+    let mut last_idle_diag = std::time::Instant::now() - std::time::Duration::from_secs(5);
     let mut gamepad_active = false;
     // Per-monitor re-baselined countdowns from the previous tick, consumed by
     // the request-probe gate below and the diagnostics snapshot.
@@ -1386,7 +1382,9 @@ fn dim_watcher_loop() {
     while !DIM_SHUTDOWN.load(Ordering::Acquire) {
         let enabled = DIM_ENABLED.load(Ordering::Acquire);
         let now = std::time::Instant::now();
-        if monitors.is_empty() || last_monitor_refresh.elapsed() >= std::time::Duration::from_secs(1) {
+        if monitors.is_empty()
+            || last_monitor_refresh.elapsed() >= std::time::Duration::from_secs(1)
+        {
             monitors = crate::monitors::all_monitors();
             last_monitor_refresh = now;
             fullscreen_by_monitor.clear();
@@ -1399,7 +1397,10 @@ fn dim_watcher_loop() {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        if enabled && last_gamepad_check.elapsed() >= std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS) {
+        if enabled
+            && last_gamepad_check.elapsed()
+                >= std::time::Duration::from_millis(GAMEPAD_CHECK_INTERVAL_MS)
+        {
             let active = crate::gamepad::gamepad_input_active();
             if active != gamepad_active {
                 log::debug!(
@@ -1415,8 +1416,7 @@ fn dim_watcher_loop() {
         }
 
         if enabled
-            && last_fullscreen_check.elapsed().as_millis() as u64
-                >= FULLSCREEN_CHECK_INTERVAL_MS
+            && last_fullscreen_check.elapsed().as_millis() as u64 >= FULLSCREEN_CHECK_INTERVAL_MS
         {
             // Reuse the Taskbar Dimmer's fullscreen geometry/style detector,
             // but evaluate it independently for every connected monitor.
@@ -1572,8 +1572,7 @@ fn dim_watcher_loop() {
                 .get(&key)
                 .map(|t| t.elapsed().as_secs().min(u32::MAX as u64) as u32)
                 .unwrap_or(u32::MAX);
-            let countdown =
-                dim_countdown_seconds(idle, timeout, blocked, since_clear);
+            let countdown = dim_countdown_seconds(idle, timeout, blocked, since_clear);
             dim_idle_baseline.insert(key.clone(), countdown as u64);
             let target = if enabled && countdown >= timeout {
                 dim_level_for_opacity(profile.opacity)
@@ -1784,7 +1783,8 @@ pub fn power_get_state() -> Result<PowerState, String> {
         // Windows' own dialog disables the screen saver by clearing SCRNSAVE.EXE
         // (its "(None)" entry). Treat an empty value as disabled even if the SPI
         // active flag was left on, so both states agree.
-        screensaver_enabled: read_screensaver_active().unwrap_or(false) && !screensaver_path.is_empty(),
+        screensaver_enabled: read_screensaver_active().unwrap_or(false)
+            && !screensaver_path.is_empty(),
         screensaver_timeout_minutes: read_screensaver_timeout_seconds().unwrap_or(0) / 60,
         screensaver_path,
         screensavers: list_screensavers(),
@@ -1798,13 +1798,30 @@ pub fn power_get_state() -> Result<PowerState, String> {
 }
 
 #[tauri::command]
-pub fn power_set_display_timeout(minutes: u32) -> Result<(), String> {
-    powercfg_change("monitor-timeout", minutes)
+pub async fn power_set_display_timeout(minutes: u32) -> Result<(), String> {
+    // `powercfg /change` spawns a process and blocks until it exits, once per
+    // power source (AC then DC). A synchronous command body runs on the main
+    // thread, so the UI froze for the length of both runs every time a slider
+    // moved. spawn_blocking parks that wait on a worker thread and still
+    // reports failures back to the frontend.
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        powercfg_change("monitor-timeout", minutes)
+    })
+    .await
+    .map_err(|error| format!("the powercfg task failed: {error}"))?;
+    run
 }
 
 #[tauri::command]
-pub fn power_set_sleep_timeout(minutes: u32) -> Result<(), String> {
-    powercfg_change("standby-timeout", minutes)
+pub async fn power_set_sleep_timeout(minutes: u32) -> Result<(), String> {
+    // Same reason as the display timeout above: the two blocking powercfg runs
+    // must not sit on the main thread.
+    let run = tauri::async_runtime::spawn_blocking(move || {
+        powercfg_change("standby-timeout", minutes)
+    })
+    .await
+    .map_err(|error| format!("the powercfg task failed: {error}"))?;
+    run
 }
 
 #[tauri::command]
@@ -2095,10 +2112,7 @@ mod tests {
     fn unblocked_idle_without_a_prior_blocker_is_unchanged() {
         // No blocker ever seen: the sentinel since_clear leaves raw idle
         // intact, so the classic countdown behavior is preserved.
-        assert_eq!(
-            super::dim_countdown_seconds(35, 40, false, u32::MAX),
-            35
-        );
+        assert_eq!(super::dim_countdown_seconds(35, 40, false, u32::MAX), 35);
     }
 
     #[test]

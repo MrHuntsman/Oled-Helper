@@ -66,9 +66,7 @@ pub(crate) fn reset_per_monitor_ramps(per_monitor: &Mutex<HashMap<String, i32>>)
     }
     for key in map.keys() {
         for monitor in crate::monitors::all_monitors() {
-            if crate::monitors::monitor_key(&monitor) == *key
-                && !monitor.device_name.is_empty()
-            {
+            if crate::monitors::monitor_key(&monitor) == *key && !monitor.device_name.is_empty() {
                 unsafe {
                     crate::gamma_ramp::reset_monitor_ramp(&monitor.device_name);
                 }
@@ -98,7 +96,11 @@ pub(crate) fn apply_screen_gamma_ramps(
     // Keep the external gamma watchdog's record in step with the state this
     // helper is about to write. Edge-triggered inside sync, so the every-5s
     // safety tick never touches the disk after the first transition.
-    crate::gamma_watch::sync(desired.load(Ordering::Relaxed), &values, brightness_by_monitor);
+    crate::gamma_watch::sync(
+        desired.load(Ordering::Relaxed),
+        &values,
+        brightness_by_monitor,
+    );
     let primary_fallback = desired.load(Ordering::Relaxed);
     for monitor in crate::monitors::all_monitors() {
         if monitor.device_name.is_empty() {
@@ -125,7 +127,11 @@ pub(crate) fn apply_screen_gamma_ramps(
         // value during startup. Every write below is still per-monitor; the
         // global SetDeviceGammaRamp path is never used for screen dimming.
         let lift = values.get(&key).copied().unwrap_or_else(|| {
-            if monitor.primary { primary_fallback } else { 0 }
+            if monitor.primary {
+                primary_fallback
+            } else {
+                0
+            }
         });
         let has_profile = values.contains_key(&key);
         if (has_profile && (lift != 0 || dimmed || restore_unconfigured))

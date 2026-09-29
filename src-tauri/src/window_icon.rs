@@ -75,18 +75,19 @@ pub(crate) unsafe fn load_icon(
     Some(windows::Win32::UI::WindowsAndMessaging::HICON(handle.0))
 }
 
-/// Loads the system-DPI-sized small ICO frame through Win32 and converts that
-/// already-selected native frame into the RGBA Image required by Tauri's tray API.
-/// This avoids decoding the ICO through a single arbitrary frame and then scaling
-/// it in the tray implementation.
+/// Loads the largest ICO frame through Win32 and converts it to the RGBA Image
+/// required by Tauri's tray API. The tray-icon Windows backend builds a fixed-size
+/// HICON from RGBA, so give the shell the full-resolution source to downsample for
+/// its current notification-area DPI. A system-sized frame can be stretched and
+/// become blurry when the display DPI changes before the next tray refresh.
 #[cfg(target_os = "windows")]
 pub fn crisp_tray_image() -> Option<tauri::image::Image<'static>> {
+    const TRAY_ICON_SOURCE_SIZE: i32 = 256;
+
     let icon_path = materialize_icon_file()?;
 
     unsafe {
-        let width = GetSystemMetrics(SM_CXSMICON).max(1) as u32;
-        let height = GetSystemMetrics(SM_CYSMICON).max(1) as u32;
-        let hicon = load_icon(&icon_path, width as i32, height as i32)?;
+        let hicon = load_icon(&icon_path, TRAY_ICON_SOURCE_SIZE, TRAY_ICON_SOURCE_SIZE)?;
 
         let mut icon_info: ICONINFO = std::mem::zeroed();
         if GetIconInfo(hicon, &mut icon_info).is_err() {

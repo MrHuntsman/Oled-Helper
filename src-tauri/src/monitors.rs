@@ -25,9 +25,9 @@ use windows::Win32::Devices::Display::{
 use windows::Win32::Foundation::{LPARAM, RECT, WIN32_ERROR};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, EnumDisplayMonitors, EnumDisplaySettingsW, GetDC, GetDeviceCaps,
-    GetMonitorInfoW, HDC, HORZRES, HORZSIZE, LOGPIXELSX, LOGPIXELSY, MONITORINFO, ReleaseDC,
-    VERTRES, VERTSIZE, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
-    ENUM_CURRENT_SETTINGS, HMONITOR, GET_DEVICE_CAPS_INDEX,
+    GetMonitorInfoW, ReleaseDC, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+    ENUM_CURRENT_SETTINGS, GET_DEVICE_CAPS_INDEX, HDC, HMONITOR, HORZRES, HORZSIZE, LOGPIXELSX,
+    LOGPIXELSY, MONITORINFO, VERTRES, VERTSIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
@@ -109,8 +109,8 @@ unsafe extern "system" fn monitor_enum_proc(
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
-    let primary = GetMonitorInfoW(hmon, &mut info).as_bool()
-        && (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    let primary =
+        GetMonitorInfoW(hmon, &mut info).as_bool() && (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
     list.push(AppMonitor {
         hmonitor: hmon.0 as usize as u32,
         width: caps(HORZRES),
@@ -194,7 +194,10 @@ pub fn all_monitors() -> Vec<AppMonitor> {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, m) in list.iter().enumerate() {
         if !m.monitor_id.is_empty() {
-            groups.entry(monitor_base(&m.monitor_id)).or_default().push(i);
+            groups
+                .entry(monitor_base(&m.monitor_id))
+                .or_default()
+                .push(i);
         }
     }
     for members in groups.values() {
@@ -209,8 +212,8 @@ pub fn all_monitors() -> Vec<AppMonitor> {
             })
             .collect();
         let mut seen = std::collections::HashSet::new();
-        let serials_distinct = serials.len() == members.len()
-            && serials.iter().all(|s| seen.insert(*s));
+        let serials_distinct =
+            serials.len() == members.len() && serials.iter().all(|s| seen.insert(*s));
         for &i in members {
             let m = &mut list[i];
             let key = (
@@ -334,7 +337,10 @@ fn current_refresh_hz(device_name: &str) -> u32 {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
     };
-    let name_wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let name_wide: Vec<u16> = device_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let ok = unsafe {
         EnumDisplaySettingsW(PCWSTR(name_wide.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
     };
@@ -465,9 +471,9 @@ pub(crate) fn resolve_monitor_for_apply(
             return Some(monitor.clone());
         }
     }
-    monitors.into_iter().find(|m| {
-        m.sig() == sig || (!m.monitor_id.is_empty() && m.monitor_id == sig)
-    })
+    monitors
+        .into_iter()
+        .find(|m| m.sig() == sig || (!m.monitor_id.is_empty() && m.monitor_id == sig))
 }
 
 // GDI display devices (adapter device name + monitor EDID id) keyed by the
@@ -500,8 +506,10 @@ fn display_devices_by_position() -> HashMap<(i32, i32), (String, String)> {
                 continue;
             }
             let adapter_name = trim_utf16(&adapter.DeviceName);
-            let adapter_name_wide: Vec<u16> =
-                adapter_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let adapter_name_wide: Vec<u16> = adapter_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             for monitor_index in 0u32.. {
                 let mut monitor = DISPLAY_DEVICEW {
                     cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
@@ -529,7 +537,10 @@ fn display_devices_by_position() -> HashMap<(i32, i32), (String, String)> {
                 let pos = current_mode_position(&monitor_name)
                     .or_else(|| current_mode_position(&adapter_name));
                 let Some((x, y)) = pos else { continue };
-                map.insert((x, y), (adapter_name.clone(), trim_utf16(&monitor.DeviceID)));
+                map.insert(
+                    (x, y),
+                    (adapter_name.clone(), trim_utf16(&monitor.DeviceID)),
+                );
             }
         }
     }
@@ -546,7 +557,10 @@ fn current_mode_position(device_name: &str) -> Option<(i32, i32)> {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
     };
-    let name_wide: Vec<u16> = device_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let name_wide: Vec<u16> = device_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let ok = unsafe {
         EnumDisplaySettingsW(PCWSTR(name_wide.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool()
     };
@@ -617,7 +631,12 @@ fn ccd_info_by_rect() -> HashMap<(i32, i32, i32, i32), CcdTargetInfo> {
             continue;
         }
         let src = unsafe { modes[idx].Anonymous.sourceMode };
-        let key = (src.position.x, src.position.y, src.width as i32, src.height as i32);
+        let key = (
+            src.position.x,
+            src.position.y,
+            src.width as i32,
+            src.height as i32,
+        );
         map.insert(
             key,
             CcdTargetInfo {
@@ -667,7 +686,9 @@ pub(crate) fn query_active_paths(
             // display waking up); retry once more if the buffer is now too small.
             if query_result == windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER {
                 if attempt == MAX_TOPOLOGY_RETRIES {
-                    return Err("display topology kept changing while querying display paths".into());
+                    return Err(
+                        "display topology kept changing while querying display paths".into(),
+                    );
                 }
                 std::thread::yield_now();
                 continue;
@@ -684,7 +705,9 @@ pub(crate) fn query_active_paths(
     }
 }
 
-pub(crate) fn target_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<DISPLAYCONFIG_TARGET_DEVICE_NAME> {
+pub(crate) fn target_device_name(
+    path: &DISPLAYCONFIG_PATH_INFO,
+) -> Option<DISPLAYCONFIG_TARGET_DEVICE_NAME> {
     unsafe {
         let mut name = DISPLAYCONFIG_TARGET_DEVICE_NAME {
             header: DISPLAYCONFIG_DEVICE_INFO_HEADER {

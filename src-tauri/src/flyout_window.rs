@@ -719,9 +719,11 @@ pub fn show_mode_confirmation(
     monitor_name: Option<String>,
     confirmation_seconds: Option<u32>,
     confirmation_deadline_ms: Option<u64>,
+    token: Option<u64>,
 ) -> Result<(), String> {
     let confirmation_seconds = confirmation_seconds.unwrap_or(15);
     let mode = AppliedMode {
+        token: token.unwrap_or(0),
         width,
         height,
         refresh_hz,
@@ -732,14 +734,13 @@ pub fn show_mode_confirmation(
         // back to a fresh now+seconds deadline for any caller that did not
         // round-trip an AppliedMode.
         skip_confirmation: false,
-        confirmation_deadline_ms: confirmation_deadline_ms
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0)
-                    + (confirmation_seconds as u64) * 1000
-            }),
+        confirmation_deadline_ms: confirmation_deadline_ms.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+                + (confirmation_seconds as u64) * 1000
+        }),
     };
     std::thread::spawn(move || {
         if let Err(error) = show_after_ready(&app, mode) {

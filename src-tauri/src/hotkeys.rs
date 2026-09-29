@@ -53,21 +53,45 @@ pub const ACTIONS: [(&str, i32, bool); 10] = [
     ("toggle_screen_dimmer", HK_TOGGLE_SCREEN_DIMMER, false),
 ];
 
-// ── Favorite hotkeys (bound directly to each favorite) ───────────────
-// Favorite resolution hotkeys are registered dynamically on demand (see
-// DYNAMIC_IDS below), so any number of favorites can have a hotkey with no
-// fixed cap. The action name embeds the favorite's stable id
-// ("favorite_<favId>"), so a hotkey stays bound to a specific saved favorite
-// even if the favorites list is reordered, and removing a favorite makes its
-// action inert (the frontend prunes it). Ids only need to be unique and
-// stable within a process lifetime: WM_HOTKEY dispatch reverse-looks up the
-// id through the same map, so allocation order across restarts does not
-// matter.
+// ── Dynamic hotkeys ───────────────────────────────────────────────────
+// Favorite resolution, TV picture mode and TV picture setting hotkeys are
+// registered on demand through the ids below, so there is no fixed cap.
+// Favorite actions embed the saved favorite's stable id, picture mode actions
+// embed the TV's mode id, and picture setting actions embed the setting id
+// plus the value, as in tv_picture_setting_hdrDynamicToneMapping_HGIG.
+// Ids only need to be unique and stable within a process lifetime:
+// WM_HOTKEY dispatch reverse-looks up the id through the same map.
 static DYNAMIC_IDS: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
 static NEXT_DYNAMIC_ID: AtomicI32 = AtomicI32::new(4096);
+const TV_PICTURE_MODE_ACTION_PREFIX: &str = "tv_picture_mode_";
+const TV_PICTURE_SETTING_ACTION_PREFIX: &str = "tv_picture_setting_";
 
 fn is_favorite_action(action: &str) -> bool {
-    action.strip_prefix("favorite_").is_some_and(|id| !id.is_empty())
+    action
+        .strip_prefix("favorite_")
+        .is_some_and(|id| !id.is_empty())
+}
+
+fn is_tv_picture_mode_action(action: &str) -> bool {
+    action
+        .strip_prefix(TV_PICTURE_MODE_ACTION_PREFIX)
+        .is_some_and(|mode| !mode.is_empty())
+}
+
+/// A picture setting action carries the setting id and the value it applies,
+/// joined by an underscore. Neither part may be empty, so a bare prefix or a
+/// setting without a value is not a bindable action.
+fn is_tv_picture_setting_action(action: &str) -> bool {
+    action
+        .strip_prefix(TV_PICTURE_SETTING_ACTION_PREFIX)
+        .and_then(|rest| rest.split_once('_'))
+        .is_some_and(|(setting_id, value)| !setting_id.is_empty() && !value.is_empty())
+}
+
+fn is_dynamic_action(action: &str) -> bool {
+    is_favorite_action(action)
+        || is_tv_picture_mode_action(action)
+        || is_tv_picture_setting_action(action)
 }
 
 fn dynamic_id(action: &str) -> i32 {
@@ -365,7 +389,7 @@ pub fn register_all() -> Result<(), String> {
         for (_, id, _) in ACTIONS {
             let _ = UnregisterHotKey(Some(hwnd), id);
         }
-        // Also release any dynamically allocated favorite-slot ids.
+        // Also release every dynamically allocated action id.
         if let Some(map) = DYNAMIC_IDS.get() {
             if let Ok(guard) = map.lock() {
                 for (_, id) in guard.iter() {
@@ -381,10 +405,10 @@ pub fn register_all() -> Result<(), String> {
             register_combo(hwnd, action, combo, id, repeat, &mut errors);
         }
     }
-    // Favorite slots beyond the static pool register through dynamically
-    // allocated ids, so any number of favorites can be bound.
+    // Dynamic actions beyond the static pool use allocated ids. RegisterHotKey
+    // rejects a combo already in use, so two picture modes cannot share one.
     for (action, combo) in &bindings {
-        if is_favorite_action(action) && !ACTIONS.iter().any(|(name, _, _)| name == action) {
+        if is_dynamic_action(action) && !ACTIONS.iter().any(|(name, _, _)| name == action) {
             let id = dynamic_id(action);
             register_combo(hwnd, action, combo, id, false, &mut errors);
         }
@@ -438,7 +462,7 @@ fn register_combo(
 
 #[tauri::command]
 pub fn set_hotkey(action: String, combo: String) -> Result<(), String> {
-    let known = ACTIONS.iter().any(|(name, _, _)| *name == action) || is_favorite_action(&action);
+    let known = ACTIONS.iter().any(|(name, _, _)| *name == action) || is_dynamic_action(&action);
     if !known {
         return Err(format!("unknown hotkey action '{action}'"));
     }
@@ -525,12 +549,17 @@ fn action_for_id(id: i32) -> Option<String> {
     if let Some((action, _, _)) = ACTIONS.iter().find(|(_, hk, _)| *hk == id) {
         return Some((*action).to_string());
     }
-    // Favorite-slot actions beyond the static pool live in the dynamic id
-    // map; reverse-look up the action name and dispatch normally.
+    // Dynamic actions beyond the static pool live in the id map. Reverse-look
+    // up the action name and dispatch normally.
     DYNAMIC_IDS
         .get()
         .and_then(|map| map.lock().ok())
-        .and_then(|guard| guard.iter().find(|(_, v)| **v == id).map(|(k, _)| k.clone()))
+        .and_then(|guard| {
+            guard
+                .iter()
+                .find(|(_, v)| **v == id)
+                .map(|(k, _)| k.clone())
+        })
 }
 
 pub fn handle_timer(timer_id: usize) {
@@ -587,10 +616,7 @@ fn finish_hold_restore() -> bool {
         HOLD_STATE.store(HOLD_IDLE, Ordering::Release);
         return true;
     };
-    let brightness = brightness
-        .lock()
-        .map(|map| map.clone())
-        .unwrap_or_default();
+    let brightness = brightness.lock().map(|map| map.clone()).unwrap_or_default();
     crate::gamma::apply_screen_gamma_ramps(
         desired.as_ref(),
         per_monitor.as_ref(),
@@ -816,6 +842,34 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_dynamic_tv_picture_mode_actions() {
+        assert!(is_favorite_action("favorite_abc123"));
+        assert!(is_tv_picture_mode_action("tv_picture_mode_hdrGame"));
+        assert!(is_dynamic_action("tv_picture_mode_dolbyHdrCinema"));
+        assert!(!is_tv_picture_mode_action("tv_picture_mode_"));
+        assert!(!is_tv_picture_mode_action("tv_picture_mode"));
+    }
+
+    #[test]
+    fn recognizes_dynamic_tv_picture_setting_actions() {
+        assert!(is_tv_picture_setting_action(
+            "tv_picture_setting_hdrDynamicToneMapping_HGIG"
+        ));
+        assert!(is_tv_picture_setting_action(
+            "tv_picture_setting_hdrDynamicToneMapping_off"
+        ));
+        assert!(is_dynamic_action(
+            "tv_picture_setting_hdrDynamicToneMapping_on"
+        ));
+        assert!(!is_tv_picture_setting_action("tv_picture_setting_"));
+        assert!(!is_tv_picture_setting_action(
+            "tv_picture_setting_hdrDynamicToneMapping_"
+        ));
+        assert!(!is_tv_picture_setting_action("tv_picture_setting_off"));
+        assert!(!is_tv_picture_setting_action("tv_picture_setting"));
+    }
+
+    #[test]
     fn rejects_invalid_or_unbound() {
         assert_eq!(parse_hotkey("None"), None);
         assert_eq!(parse_hotkey(""), None);
@@ -830,14 +884,15 @@ mod tests {
         // duplicate name (or two names that differ only by case) would be
         // ambiguous and the first match would silently win.
         let names: Vec<&str> = key_table().iter().map(|(name, _)| *name).collect();
-        let mut lowered: Vec<String> = names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect();
+        let mut lowered: Vec<String> = names.iter().map(|name| name.to_ascii_lowercase()).collect();
         let unique = lowered.len();
         lowered.sort();
         lowered.dedup();
-        assert_eq!(unique, lowered.len(), "key names must be unique (case-insensitively)");
+        assert_eq!(
+            unique,
+            lowered.len(),
+            "key names must be unique (case-insensitively)"
+        );
         assert!(!names.is_empty());
     }
     #[test]

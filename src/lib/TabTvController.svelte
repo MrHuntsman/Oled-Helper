@@ -2,6 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import TabHeading from './TabHeading.svelte';
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
+  import { captureHotkeyCombo } from './hotkey-capture.js';
   import {
     tvController,
     pairTv,
@@ -12,6 +13,10 @@
     restartTv,
     setTvPictureMode,
     setTvPictureSetting,
+    hotkeys,
+    setHotkey,
+    tvPictureModeHotkeyAction,
+    tvPictureSettingHotkeyAction,
     runtimeLogSettings,
     tvDiscovery,
     discoverTvs,
@@ -31,20 +36,38 @@
     volume: tvController.volume,
     muted: tvController.muted,
     pictureError: tvController.pictureError || '',
-    pictureWriteError: tvController.pictureWriteError || '',
   });
   // Per setting pending and error flags are keyed by setting id so one slow
   // alert write never blocks the other controls.
+  let pictureSettingsLoading = $state(false);
+  let previousConnectionState = tvController.state;
   let settingPending = $state({});
   let settingErrors = $state({});
   let settingDrafts = $state({});
+  // One capture at a time across the tab: scope marks the panel that owns the
+  // live pill and shows the capture error.
+  let hotkeyCapture = $state({ scope: '', action: '', error: '' });
   let inFlightWrites = {};
-  let debounceTimers = {};
+  // A pick made while that setting's write is still running. It is written
+  // next, so switching a value twice quickly keeps the last choice instead
+  // of dropping it.
+  let queuedSettingWrites = {};
+  let settingStepTimers = {};
   const STATUS_REFRESH_INTERVAL = 5000;
+  const NUMERIC_SETTING_STEP_DELAY = 500;
+  // A picture write is a round trip to the TV plus its readback, and the
+  // worker only answers once the write finishes. Cap the wait so a slow or
+  // unanswered write cannot pin a control on "Applying…" forever; the next
+  // status read reconciles the value the TV really has.
+  const TV_WRITE_TIMEOUT = 20000;
+  const TV_WRITE_TIMEOUT_MESSAGE = 'The TV has not confirmed this change yet. '
+    + 'It may still apply, and the value updates once the TV reports back.';
+  // The status read itself rides the same worker as the writes, so it answers
+  // only when the worker is idle. Cap the wait so a wedged worker cannot
+  // leave the refresh hanging forever.
+  const STATUS_REFRESH_TIMEOUT = 10000;
   let refreshInFlight = $state(false);
-  let manualRefreshInFlight = $state(false);
   let refreshQueued = false;
-  let refreshQueuedKind = '';
   let refreshDisposed = false;
   let statusRevision = 0;
   let statusEffectReady = false;
@@ -126,9 +149,6 @@
       : Number(source.volume);
     status.muted = typeof source.muted === 'boolean' ? source.muted : null;
     status.pictureError = typeof source.pictureError === 'string' ? source.pictureError : '';
-    status.pictureWriteError = typeof source.pictureWriteError === 'string'
-      ? source.pictureWriteError
-      : '';
     status.pictureSettingsError = typeof source.pictureSettingsError === 'string'
       ? source.pictureSettingsError
       : '';
@@ -145,18 +165,16 @@
       let tvValueChanged = false;
       const previousById = new Map(status.pictureSettings.map((s) => [s.id, s.value]));
       for (const setting of nextPictureSettings) {
-        if (!inFlightWrites[setting.id] && previousById.get(setting.id) !== setting.value) {
+        if (!inFlightWrites[setting.id]
+          && !queuedSettingWrites[setting.id]
+          && previousById.get(setting.id) !== setting.value) {
           settingDrafts[setting.id] = setting.value ?? '';
           tvValueChanged = true;
         }
       }
       status.pictureSettings = nextPictureSettings;
       if (tvValueChanged) {
-        for (const id of Object.keys(settingErrors)) {
-          if (settingErrors[id] && previousById.get(id) !== nextPictureSettings.find((s) => s.id === id)?.value) {
-            settingErrors[id] = '';
-          }
-        }
+        clearSettingErrors();
       }
     }
   }
@@ -177,9 +195,17 @@
       volume: tvController.volume,
       muted: tvController.muted,
       pictureError: tvController.pictureError,
-      pictureWriteError: tvController.pictureWriteError,
     };
     untrack(() => applyStatusSource(source));
+    if (
+      statusEffectReady
+      && source.connectionState === 'connected'
+      && previousConnectionState !== 'connected'
+    ) {
+      untrack(() => void refreshPictureContext('connected'));
+    }
+    previousConnectionState = source.connectionState;
+    if (source.connectionState !== 'connected') pictureSettingsLoading = false;
     if (statusEffectReady) statusRevision += 1;
     else statusEffectReady = true;
   });
@@ -223,10 +249,6 @@
           : 'Pair TV',
   );
   const discoveryPending = $derived(tvDiscovery.state === 'scanning');
-  const currentInput = $derived(
-    status.inputLabel || status.inputId || 'Unknown input',
-  );
-  const currentPictureMode = $derived(status.pictureMode || 'Unavailable');
   const canApplyPictureMode = $derived(
     tvController.state === 'connected'
       && !tvController.pending
@@ -235,77 +257,225 @@
       && Boolean(selectedPictureMode)
       && selectedPictureMode !== status.pictureMode,
   );
-  const visiblePictureSettings = $derived(
-    status.pictureSettings.filter((setting) => (
-      setting.supported
-      && (setting.id !== 'hdrDynamicToneMapping' || isHdrPictureMode(status.pictureMode))
-    )),
-  );
-  const hasPictureSettings = $derived(visiblePictureSettings.length > 0);
-  const pictureSettingsBlocked = $derived(
-    tvController.state !== 'connected' || tvController.pending,
-  );
+
+  function pictureModeHotkeyBinding() {
+    const action = tvPictureModeHotkeyAction(selectedPictureMode);
+    return action ? (hotkeys[action] || 'None') : 'None';
+  }
+
+  function pictureModeHotkeyLabel() {
+    return status.pictureModes.find((option) => option.id === selectedPictureMode)?.label || 'picture mode';
+  }
+
+  function togglePictureModeHotkeyCapture() {
+    const action = tvPictureModeHotkeyAction(selectedPictureMode);
+    if (!action) return;
+    hotkeyCapture = hotkeyCapture.action === action
+      ? { scope: '', action: '', error: '' }
+      : { scope: 'pictureMode', action, error: '' };
+  }
+
+  function toggleDtmHotkeyCapture() {
+    if (!dtmHotkeyAction) return;
+    hotkeyCapture = hotkeyCapture.action === dtmHotkeyAction
+      ? { scope: '', action: '', error: '' }
+      : { scope: 'dtm', action: dtmHotkeyAction, error: '' };
+  }
+
+  // The action a pending capture still belongs to, or '' once the field it
+  // was started for no longer offers it.
+  function liveHotkeyAction() {
+    if (hotkeyCapture.scope === 'dtm') return dtmHotkeyAction;
+    if (hotkeyCapture.scope === 'pictureMode') return tvPictureModeHotkeyAction(selectedPictureMode);
+    return '';
+  }
+
+  // Every hotkey field in the tab shares one capture lifecycle; scope only
+  // decides which panel reports the result.
+  async function applyHotkey(scope, action, combo) {
+    if (!action) return;
+    const result = await setHotkey(action, combo);
+    hotkeyCapture = { scope, action: '', error: result.ok ? '' : result.error };
+  }
+
+  function captureHotkey(e) {
+    const action = hotkeyCapture.action;
+    if (!action) return false;
+    const result = captureHotkeyCombo(e);
+    if (!result) return false;
+    if (result.error) {
+      hotkeyCapture = { ...hotkeyCapture, error: result.error };
+      return false;
+    }
+    void applyHotkey(hotkeyCapture.scope, action, result.combo);
+    e.preventDefault();
+    return true;
+  }
+
+  $effect(() => {
+    if (!hotkeyCapture.action) return;
+    // The field a capture was started for can move underneath it: the picture
+    // mode or the Dynamic Tone Mapping value changes, for example from one of
+    // the hotkeys being tested. Drop the stale capture instead of leaving the
+    // handler below to swallow every key press with no pill showing it.
+    if (hotkeyCapture.action !== liveHotkeyAction()) {
+      hotkeyCapture = { scope: '', action: '', error: '' };
+      return;
+    }
+    function onKeyDown(e) {
+      if (captureHotkey(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  });
+
+  const DTM_SETTING_ID = 'hdrDynamicToneMapping';
+  const DTM_SETTING_LABEL = 'Dynamic Tone Mapping';
   const DTM_SETTING_OPTIONS = [
     { value: 'off', label: 'Off' },
     { value: 'on', label: 'On' },
     { value: 'HGIG', label: 'HGIG' },
   ];
-  const COLOR_TEMPERATURE_PRESET_OPTIONS = [
-    { value: 'warm2', label: 'Warm 2' },
-    { value: 'warm1', label: 'Warm 1' },
-    { value: 'normal', label: 'Normal' },
-    { value: 'cool1', label: 'Cool 1' },
-    { value: 'cool2', label: 'Cool 2' },
+  const dtmSetting = $derived(
+    status.pictureSettings.find((setting) => setting.id === DTM_SETTING_ID) || null,
+  );
+  // Only HDR picture modes report and honor the setting, so the panel stays
+  // hidden everywhere else, the same way its row in the list used to be.
+  const showDtmPanel = $derived(
+    Boolean(dtmSetting && dtmSetting.supported && isHdrPictureMode(status.pictureMode)),
+  );
+  const dtmSelectedValue = $derived(dtmSetting ? settingDraftValue(dtmSetting) : '');
+  const dtmHotkeyAction = $derived(
+    showDtmPanel ? tvPictureSettingHotkeyAction(DTM_SETTING_ID, dtmSelectedValue) : '',
+  );
+  const dtmHotkeyBinding = $derived(
+    dtmHotkeyAction ? (hotkeys[dtmHotkeyAction] || 'None') : 'None',
+  );
+  const dtmHotkeyLabel = $derived(
+    `${DTM_SETTING_LABEL} ${DTM_SETTING_OPTIONS.find((option) => option.value === dtmSelectedValue)?.label || ''}`.trim(),
+  );
+  // Dynamic Tone Mapping has its own panel under Picture mode, so the settings
+  // list below renders every other setting the TV reported.
+  const visiblePictureSettings = $derived(
+    status.pictureSettings.filter((setting) => setting.supported && setting.id !== DTM_SETTING_ID),
+  );
+  const hasPictureSettings = $derived(visiblePictureSettings.length > 0);
+  const pictureSettingsBlocked = $derived(
+    tvController.state !== 'connected' || tvController.pending,
+  );
+  const COLOR_GAMUT_SETTING_OPTIONS = [
+    { value: 'auto', label: 'Auto' },
+    { value: 'native', label: 'Native' },
+    { value: 'dynamic', label: 'Dynamic' },
+    { value: 'adobeRGB', label: 'Adobe RGB' },
   ];
+  const activeSettingError = $derived(
+    Object.entries(settingErrors)
+      .find(([id, message]) => id !== DTM_SETTING_ID && Boolean(message))?.[1] || '',
+  );
 
   function settingDraftValue(setting) {
     const draft = settingDrafts[setting.id];
-    return draft === undefined || draft === '' ? (setting.value ?? '') : draft;
+    return draft === undefined ? (setting.value ?? '') : draft;
   }
 
-  function clampNumericDraft(setting, delta) {
-    const current = Number(settingDrafts[setting.id] ?? setting.value ?? 0);
-    const base = Number.isFinite(current) ? current : 0;
-    const next = Math.min(setting.max, Math.max(setting.min, base + delta));
-    settingDrafts[setting.id] = String(Math.round(next));
-    settingErrors[setting.id] = '';
-    scheduleSettingWrite(setting);
+  function sliderDraftValue(setting) {
+    const value = settingDraftValue(setting);
+    return value === '' ? (setting.value ?? setting.min) : value;
   }
 
-  function onNumericDraftInput(setting) {
-    settingErrors[setting.id] = '';
-    // Only arm the debounced write once the typed draft is a complete
-    // in range number, so intermediate states like an empty field or a
-    // lone minus sign never fire a request.
-    const parsed = Number(settingDrafts[setting.id]);
-    if (settingDrafts[setting.id] === '' || !Number.isInteger(parsed)) return;
-    if (parsed < setting.min || parsed > setting.max) return;
-    scheduleSettingWrite(setting);
+  function settingFillPercent(setting) {
+    const value = Number(sliderDraftValue(setting));
+    const min = Number(setting.min);
+    const max = Number(setting.max);
+    const range = max - min;
+    if (!Number.isFinite(value) || !Number.isFinite(range) || range <= 0) return 0;
+    return Math.min(100, Math.max(0, ((value - min) / range) * 100));
   }
 
-  function onEnumDraftChange(setting) {
-    settingErrors[setting.id] = '';
-    scheduleSettingWrite(setting, 0);
-  }
-
-  // Stepper clicks are debounced so a burst of clicks becomes one TV write,
-  // the same way the TV remote behaves. Dropdowns apply immediately.
-  function scheduleSettingWrite(setting, delay = 600) {
-    if (delay > 0) {
-      clearTimeout(debounceTimers[setting.id]);
-      debounceTimers[setting.id] = setTimeout(() => {
-        delete debounceTimers[setting.id];
-        void writeSetting(setting.id);
-      }, delay);
-    } else {
-      clearTimeout(debounceTimers[setting.id]);
-      delete debounceTimers[setting.id];
-      void writeSetting(setting.id);
+  function clearSettingErrors() {
+    for (const id of Object.keys(settingErrors)) {
+      settingErrors[id] = '';
     }
   }
 
+  function cancelNumericStep(settingId) {
+    const timer = settingStepTimers[settingId];
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    delete settingStepTimers[settingId];
+  }
+
+  function clearNumericStepTimers() {
+    for (const timer of Object.values(settingStepTimers)) {
+      clearTimeout(timer);
+    }
+    settingStepTimers = {};
+  }
+
+  function onNumericSliderInput(setting, value) {
+    cancelNumericStep(setting.id);
+    settingDrafts[setting.id] = String(value);
+    clearSettingErrors();
+  }
+
+  function commitNumericSlider(setting) {
+    const value = String(settingDrafts[setting.id] ?? '').trim();
+    const parsed = Number(value);
+    if (value === '' || !Number.isInteger(parsed) || parsed < setting.min || parsed > setting.max) {
+      settingErrors[setting.id] = `Enter a whole number between ${setting.min} and ${setting.max}`;
+      return;
+    }
+    void writeSetting(setting.id);
+  }
+
+  function stepNumericSetting(setting, delta) {
+    if (pictureSettingsBlocked) return;
+    if (inFlightWrites[setting.id]) {
+      // The draft below is the newer value, so let the running write hand off
+      // to it instead of dropping the step.
+      queuedSettingWrites[setting.id] = true;
+    }
+    cancelNumericStep(setting.id);
+    const draft = settingDraftValue(setting);
+    const parsed = Number(draft);
+    const fallback = Number(setting.value ?? setting.min);
+    const current = draft !== '' && Number.isFinite(parsed) ? parsed : fallback;
+    const min = Number(setting.min);
+    const max = Number(setting.max);
+    if (!Number.isFinite(current) || !Number.isFinite(min) || !Number.isFinite(max)) return;
+    const next = Math.min(max, Math.max(min, current + delta));
+    clearSettingErrors();
+    settingDrafts[setting.id] = String(next);
+    if (next === current) return;
+    settingStepTimers[setting.id] = setTimeout(() => {
+      delete settingStepTimers[setting.id];
+      if (pictureSettingsBlocked) return;
+      if (inFlightWrites[setting.id]) {
+        queuedSettingWrites[setting.id] = true;
+        return;
+      }
+      void writeSetting(setting.id);
+    }, NUMERIC_SETTING_STEP_DELAY);
+  }
+
+  function onEnumDraftChange(setting) {
+    clearSettingErrors();
+    void writeSetting(setting.id);
+  }
+
   async function writeSetting(settingId) {
-    if (pictureSettingsBlocked || inFlightWrites[settingId]) return;
+    if (pictureSettingsBlocked) return;
+    if (inFlightWrites[settingId]) {
+      // This setting is still being written. Hold the newer pick and apply it
+      // when the running write finishes, so switching a value twice quickly
+      // ends on the value the user chose last.
+      queuedSettingWrites[settingId] = true;
+      return;
+    }
+    cancelNumericStep(settingId);
     const setting = status.pictureSettings.find((entry) => entry.id === settingId);
     if (!setting) return;
     const value = settingDrafts[settingId];
@@ -313,13 +483,13 @@
       return;
     }
     error = '';
-    settingErrors[settingId] = '';
+    clearSettingErrors();
     settingPending[settingId] = true;
     inFlightWrites[settingId] = true;
     const startedAt = performance.now();
     console.debug('[tv] picture setting write requested', { settingId, value });
     try {
-      const snapshot = await setTvPictureSetting(settingId, String(value));
+      const snapshot = await withTvWriteTimeout(setTvPictureSetting(settingId, String(value)));
       console.debug('[tv] picture setting write request completed', {
         settingId,
         value,
@@ -341,24 +511,51 @@
       settingErrors[settingId] = safeLogText(e);
       delete inFlightWrites[settingId];
       // Snap the draft back to what the TV last reported so the control
-      // does not keep showing a value the TV refused.
-      const current = status.pictureSettings.find((entry) => entry.id === settingId);
-      if (current) settingDrafts[settingId] = current.value ?? '';
+      // does not keep showing a value the TV refused. A newer pick is left
+      // alone, because the queued write below is about to carry it.
+      if (!queuedSettingWrites[settingId]) {
+        const current = status.pictureSettings.find((entry) => entry.id === settingId);
+        if (current) settingDrafts[settingId] = current.value ?? '';
+      }
     } finally {
       settingPending[settingId] = false;
       delete inFlightWrites[settingId];
+      if (queuedSettingWrites[settingId]) {
+        delete queuedSettingWrites[settingId];
+        void writeSetting(settingId);
+      }
     }
+  }
+
+  function withTvWriteTimeout(promise, timeout = TV_WRITE_TIMEOUT, message = TV_WRITE_TIMEOUT_MESSAGE) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), timeout);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
   }
 
   $effect(() => {
     const current = status.pictureMode || '';
+    const currentIsAvailable = status.pictureModes.some((option) => option.id === current);
     const selectedStillAvailable = status.pictureModes.some(
       (option) => option.id === selectedPictureMode,
     );
+    if (modeWriteInFlight && selectedStillAvailable) return;
+    if (currentIsAvailable && selectedPictureMode !== current) {
+      selectedPictureMode = current;
+      return;
+    }
     if (selectedStillAvailable) return;
-    selectedPictureMode = status.pictureModes.some((option) => option.id === current)
-      ? current
-      : (status.pictureModes[0]?.id ?? '');
+    selectedPictureMode = currentIsAvailable ? current : (status.pictureModes[0]?.id ?? '');
   });
 
   async function findTvs() {
@@ -424,42 +621,51 @@
   }
 
   function refreshDebugLog(kind, message, details = {}) {
-    if (runtimeLogSettings.verbosePeriodic || kind === 'manual') {
+    if (runtimeLogSettings.verbosePeriodic) {
       console.debug(message, details);
     }
   }
 
   function canRefreshStatus() {
-    return tvController.state === 'connected'
-      && !tvController.pending
-      && document.visibilityState === 'visible';
+    // A connected TV is polled even while the shared pending flag is set.
+    // A write the frontend never issued (a hotkey handled in the tray while
+    // the main webview was down) reports its completion only into the
+    // backend's cached snapshot, so a rebuilt webview can inherit a pending
+    // flag nothing will ever clear. The status read is what proves the
+    // worker is idle again and lets the flag be reconciled below.
+    return tvController.state === 'connected';
   }
 
-  async function refreshPictureContext(kind = 'manual') {
+  async function refreshPictureContext(kind = 'automatic') {
     if (refreshDisposed || !canRefreshStatus()) return;
     if (refreshInFlight) {
       refreshQueued = true;
-      if (kind === 'manual') refreshQueuedKind = 'manual';
       refreshDebugLog(kind, '[tv] status refresh coalesced', { requestedKind: kind });
       return;
     }
 
     refreshInFlight = true;
-    if (kind === 'manual') {
-      manualRefreshInFlight = true;
-      error = '';
+    if (status.pictureSettings.length === 0 && tvController.state === 'connected') {
+      pictureSettingsLoading = true;
     }
     const startedAt = performance.now();
     const startedStatusRevision = statusRevision;
     const beforeInputId = status.inputId;
     const beforePictureMode = status.pictureMode;
+    // A poll that races a write comes back stale once the write's own reply
+    // merges, so only a snapshot taken after the flag flipped can clear it.
+    const sharedWasPending = tvController.pending;
     refreshDebugLog(kind, '[tv] status refresh started', {
       kind,
       inputId: beforeInputId,
       pictureMode: beforePictureMode,
     });
     try {
-      const snapshot = await refreshTvPictureContext();
+      const snapshot = await withTvWriteTimeout(
+        refreshTvPictureContext(),
+        STATUS_REFRESH_TIMEOUT,
+        'The TV status read timed out',
+      );
       if (!snapshot || typeof snapshot !== 'object') {
         throw new Error('The TV status refresh returned no snapshot');
       }
@@ -474,6 +680,17 @@
         refreshDebugLog(kind, '[tv] status refresh result ignored after a TV state event', { kind });
       } else {
         applyStatusSource(snapshot);
+        // The shared pending flag survives a webview rebuild through the
+        // backend cache, and tray side writes never emit a clear for it. A
+        // status read that the worker answered proves no write is running,
+        // so the flag is stale and is cleared here. The revision guard above
+        // keeps a poll that raced a real write from clearing it early: the
+        // write's own reply applied through a TV state event bumps the
+        // revision, and that path clears the flag by itself.
+        if (sharedWasPending && tvController.pending) {
+          tvController.pending = false;
+          console.debug('[tv] stale pending flag cleared after status read');
+        }
       }
       refreshDebugLog(kind, '[tv] status refresh completed', {
         kind,
@@ -487,21 +704,15 @@
         elapsedMs: Math.round(performance.now() - startedAt),
         error: safeLogText(e),
       });
-      if (kind === 'manual') error = String(e);
     } finally {
       refreshInFlight = false;
-      if (kind === 'manual') manualRefreshInFlight = false;
       if (!refreshDisposed && refreshQueued) {
         refreshQueued = false;
-        const queuedKind = refreshQueuedKind || 'coalesced';
-        refreshQueuedKind = '';
-        void refreshPictureContext(queuedKind);
+        void refreshPictureContext('coalesced');
+      } else {
+        pictureSettingsLoading = false;
       }
     }
-  }
-
-  function manualRefresh() {
-    void refreshPictureContext('manual');
   }
 
   let restartInFlight = $state(false);
@@ -527,10 +738,13 @@
     }
   }
 
-  let modeWriteInFlight = false;
+  let modeWriteInFlight = $state(false);
 
   async function onPictureModeChange() {
     if (!canApplyPictureMode || modeWriteInFlight) return;
+    clearNumericStepTimers();
+    settingDrafts = {};
+    clearSettingErrors();
     error = '';
     modeWriteInFlight = true;
     const startedAt = performance.now();
@@ -538,7 +752,7 @@
     const inputId = status.inputId;
     console.debug('[tv] picture mode write requested', { requestedMode, inputId });
     try {
-      const snapshot = await setTvPictureMode(requestedMode);
+      const snapshot = await withTvWriteTimeout(setTvPictureMode(requestedMode));
       console.debug('[tv] picture mode write request completed', {
         requestedMode,
         inputId,
@@ -573,19 +787,22 @@
         activeTab: 'tv-controller',
       });
     }
-    void refreshPictureContext('initial');
+    if (tvController.state === 'connected') {
+      void refreshPictureContext('initial');
+    }
     const timer = setInterval(() => {
       if (!canRefreshStatus()) return;
       void refreshPictureContext('automatic');
     }, STATUS_REFRESH_INTERVAL);
+    // The TV tab is a regular window, not the status bar. Keep polling the
+    // TV's input/picture context even while the app is hidden in the tray so
+    // the "Current input" / picture mode stays current instead of showing
+    // stale values (or "Unknown input") while minimized.
     return () => {
       refreshDisposed = true;
       refreshQueued = false;
       clearInterval(timer);
-      for (const id of Object.keys(debounceTimers)) {
-        clearTimeout(debounceTimers[id]);
-        delete debounceTimers[id];
-      }
+      clearNumericStepTimers();
       if (runtimeLogSettings.verbosePeriodic) {
         console.debug('[tv] controller unmounted', {
           visibility: document.visibilityState,
@@ -638,10 +855,11 @@
       <div class="tv-action-row">
         <button
           class="tv-btn"
+          class:tv-btn-busy={discoveryPending}
           onclick={findTvs}
           disabled={discoveryPending || tvController.pending}
         >
-          {discoveryPending ? 'Finding…' : 'Find TVs'}
+          <span class="tv-btn-spinner" aria-hidden="true"></span>{discoveryPending ? 'Finding…' : 'Find TVs'}
         </button>
         <button
           class="tv-btn tv-btn-primary"
@@ -671,7 +889,10 @@
       {:else if tvDiscovery.error}
         <p class="gpu-error" role="alert">{tvDiscovery.error}</p>
       {:else if tvDiscovery.state === 'complete' && tvDiscovery.candidates.length === 0}
-        <p class="tv-pairing-note">No LG webOS TVs answered the search. You can still enter an IP address above.</p>
+        <p class="tv-pairing-note">
+          No LG webOS TVs answered the search. On the TV, turn on All settings → Network → Mobile
+          Device Connection, then search again. You can also enter the IP address above.
+        </p>
       {/if}
       {#if tvDiscovery.candidates.length > 0}
         <div class="tv-discovery-list" aria-label="Discovered TVs">
@@ -754,7 +975,7 @@
         <p class="tv-pairing-note">{restartStatus}</p>
       {/if}
       {#if tvController.state === 'reconnecting'}
-        <p class="tv-pairing-note">OLED Helper is retrying the saved connection with bounded backoff.</p>
+        <p class="tv-pairing-note">OLED Helper will keep retrying the saved connection until the TV is available.</p>
       {/if}
       {#if tvController.state === 'pairing_required'}
         <p class="tv-pairing-note">Pair again on the TV to authorize OLED Helper. Open the pairing view by disconnecting first.</p>
@@ -763,16 +984,6 @@
 
     <div class="settings-section-heading">Video</div>
     <div class="dimmer-control tv-video-panel">
-      <div class="tv-context-grid">
-        <div class="tv-context-item">
-          <span class="tv-context-label">Current input</span>
-          <span class="tv-context-value">{currentInput}</span>
-        </div>
-        <div class="tv-context-item">
-          <span class="tv-context-label">Picture mode</span>
-          <span class="tv-context-value">{currentPictureMode}</span>
-        </div>
-      </div>
       <div class="tv-picture-mode-row">
         <label class="tv-field" for="tv-picture-mode">
           <span>Picture mode</span>
@@ -787,38 +998,123 @@
             {/each}
           </select>
         </label>
-        <button
-          class="tv-btn tv-pairing-strip-btn"
-          onclick={manualRefresh}
-          disabled={tvController.state !== 'connected' || tvController.pending || manualRefreshInFlight}
-        >
-          Refresh
-        </button>
+        {#if tvController.state === 'connected'}
+          <div class="tv-picture-mode-hotkey">
+            <span>Hotkey</span>
+            <div class="hotkey-row-controls">
+              <button
+                type="button"
+                class="hotkey-pill"
+                class:capturing={hotkeyCapture.action === tvPictureModeHotkeyAction(selectedPictureMode)}
+                class:bound={pictureModeHotkeyBinding() !== 'None'}
+                onclick={togglePictureModeHotkeyCapture}
+                disabled={tvController.pending || modeWriteInFlight || !selectedPictureMode}
+                aria-label={`Set hotkey for ${pictureModeHotkeyLabel()}`}
+              >
+                {hotkeyCapture.action === tvPictureModeHotkeyAction(selectedPictureMode)
+                  ? 'Press keys… (Esc to clear)'
+                  : pictureModeHotkeyBinding()}
+              </button>
+              <button
+                type="button"
+                class="hotkey-clear"
+                disabled={pictureModeHotkeyBinding() === 'None'}
+                onclick={() => applyHotkey('pictureMode', tvPictureModeHotkeyAction(selectedPictureMode), 'None')}
+                title="Clear this hotkey"
+                aria-label={`Clear hotkey for ${pictureModeHotkeyLabel()}`}
+              >×</button>
+            </div>
+          </div>
+        {/if}
         {#if modeWriteInFlight || tvController.pending}
           <span class="tv-setting-pending">Applying…</span>
         {/if}
       </div>
-      {#if status.pictureWriteError}
-        <p class="gpu-error" role="alert">{status.pictureWriteError}</p>
+      {#if hotkeyCapture.scope === 'pictureMode' && hotkeyCapture.error}
+        <p class="hotkey-error" role="status">{hotkeyCapture.error}</p>
       {/if}
       {#if status.pictureError}
         <p class="tv-pairing-note">{status.pictureError}</p>
       {/if}
     </div>
 
+    <!-- Dynamic Tone Mapping: same row shape as Picture mode, right below it,
+         with a hotkey per value (Off, On, HGIG). -->
+    {#if showDtmPanel}
+      <div class="dimmer-control tv-dtm-panel">
+        <div class="tv-picture-mode-row">
+          <label class="tv-field" for="tv-dynamic-tone-mapping">
+            <span>{DTM_SETTING_LABEL}</span>
+            <select
+              id="tv-dynamic-tone-mapping"
+              bind:value={settingDrafts[DTM_SETTING_ID]}
+              onchange={() => dtmSetting && onEnumDraftChange(dtmSetting)}
+              disabled={pictureSettingsBlocked || settingPending[DTM_SETTING_ID]}
+              aria-label={DTM_SETTING_LABEL}
+            >
+              {#each DTM_SETTING_OPTIONS as option (option.value)}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
+          </label>
+          {#if tvController.state === 'connected'}
+            <div class="tv-picture-mode-hotkey">
+              <span>Hotkey</span>
+              <div class="hotkey-row-controls">
+                <button
+                  type="button"
+                  class="hotkey-pill"
+                  class:capturing={hotkeyCapture.action === dtmHotkeyAction}
+                  class:bound={dtmHotkeyBinding !== 'None'}
+                  onclick={toggleDtmHotkeyCapture}
+                  disabled={tvController.pending || settingPending[DTM_SETTING_ID] || !dtmHotkeyAction}
+                  aria-label={`Set hotkey for ${dtmHotkeyLabel}`}
+                >
+                  {hotkeyCapture.action === dtmHotkeyAction
+                    ? 'Press keys… (Esc to clear)'
+                    : dtmHotkeyBinding}
+                </button>
+                <button
+                  type="button"
+                  class="hotkey-clear"
+                  disabled={dtmHotkeyBinding === 'None'}
+                  onclick={() => applyHotkey('dtm', dtmHotkeyAction, 'None')}
+                  title="Clear this hotkey"
+                  aria-label={`Clear hotkey for ${dtmHotkeyLabel}`}
+                >×</button>
+              </div>
+            </div>
+          {/if}
+          {#if settingPending[DTM_SETTING_ID]}
+            <span class="tv-setting-pending">Applying…</span>
+          {/if}
+        </div>
+        {#if hotkeyCapture.scope === 'dtm' && hotkeyCapture.error}
+          <p class="hotkey-error" role="status">{hotkeyCapture.error}</p>
+        {/if}
+        {#if settingErrors[DTM_SETTING_ID]}
+          <p class="gpu-error" role="alert">{settingErrors[DTM_SETTING_ID]}</p>
+        {/if}
+      </div>
+    {/if}
+
     <div class="dimmer-control tv-settings-panel">
-      {#if pictureSettingsBlocked || !hasPictureSettings}
+      {#if pictureSettingsBlocked}
         <p class="tv-pairing-note">
-          {pictureSettingsBlocked
-            ? 'Connect to the TV to read and change its picture settings.'
-            : 'The TV did not report its picture setting values yet.'}
+          Connect to the TV to read and change its picture settings.
+        </p>
+      {:else if pictureSettingsLoading}
+        <p class="tv-pairing-note" role="status">Reading picture settings…</p>
+      {:else if !hasPictureSettings}
+        <p class="tv-pairing-note" role="status">
+          {status.pictureSettingsError || 'The TV has not reported its picture setting values.'}
         </p>
       {:else}
         <div class="tv-settings-list">
           {#each visiblePictureSettings as setting (setting.id)}
             <div class="tv-setting-row">
               <span class="tv-setting-label">{setting.label}</span>
-              {#if setting.kind === 'dtm'}
+              {#if setting.kind === 'colorGamut'}
                 <select
                   class="tv-setting-select"
                   bind:value={settingDrafts[setting.id]}
@@ -826,46 +1122,60 @@
                   disabled={pictureSettingsBlocked || settingPending[setting.id]}
                   aria-label={setting.label}
                 >
-                  {#each DTM_SETTING_OPTIONS as option (option.value)}
-                    <option value={option.value}>{option.label}</option>
-                  {/each}
-                </select>
-              {:else if setting.kind === 'colorTemperaturePreset'}
-                <select
-                  class="tv-setting-select"
-                  bind:value={settingDrafts[setting.id]}
-                  onchange={() => onEnumDraftChange(setting)}
-                  disabled={pictureSettingsBlocked || settingPending[setting.id]}
-                  aria-label={setting.label}
-                >
-                  {#each COLOR_TEMPERATURE_PRESET_OPTIONS as option (option.value)}
+                  {#each COLOR_GAMUT_SETTING_OPTIONS as option (option.value)}
                     <option value={option.value}>{option.label}</option>
                   {/each}
                 </select>
               {:else}
-                <div class="tv-setting-stepper">
-                  <button
-                    class="tv-btn tv-setting-step-btn"
-                    onclick={() => clampNumericDraft(setting, -1)}
-                    disabled={pictureSettingsBlocked || settingPending[setting.id]}
-                    aria-label="Decrease {setting.label}"
-                  >−</button>
+                <div class="slider-track-wrap slider-track-wrap-sm" role="presentation">
                   <input
-                    class="tv-setting-input"
-                    type="number"
-                    bind:value={settingDrafts[setting.id]}
-                    oninput={() => onNumericDraftInput(setting)}
+                    type="range"
+                    class="slider-sm"
                     min={setting.min}
                     max={setting.max}
                     step="1"
+                    value={sliderDraftValue(setting)}
+                    oninput={(event) => onNumericSliderInput(setting, event.currentTarget.value)}
+                    onchange={() => commitNumericSlider(setting)}
+                    style="--fill:{settingFillPercent(setting)}%"
                     disabled={pictureSettingsBlocked || settingPending[setting.id]}
-                    aria-label="{setting.label} value"
+                    aria-label={`${setting.label} slider`}
+                  />
+                </div>
+                <div class="tv-setting-number-control">
+                  <button
+                    type="button"
+                    class="tv-setting-number-step"
+                    onclick={() => stepNumericSetting(setting, -1)}
+                    disabled={pictureSettingsBlocked || settingPending[setting.id]}
+                    aria-label={`Decrease ${setting.label}`}
+                    title={`Decrease ${setting.label}`}
+                  >−</button>
+                  <input
+                    type="number"
+                    class="tv-setting-number"
+                    min={setting.min}
+                    max={setting.max}
+                    step="1"
+                    inputmode="numeric"
+                    value={settingDraftValue(setting)}
+                    oninput={(event) => onNumericSliderInput(setting, event.currentTarget.value)}
+                    onchange={() => commitNumericSlider(setting)}
+                    onkeydown={(event) => {
+                      if (event.key !== 'Enter') return;
+                      event.preventDefault();
+                      commitNumericSlider(setting);
+                    }}
+                    disabled={pictureSettingsBlocked || settingPending[setting.id]}
+                    aria-label={`${setting.label} exact value`}
                   />
                   <button
-                    class="tv-btn tv-setting-step-btn"
-                    onclick={() => clampNumericDraft(setting, 1)}
+                    type="button"
+                    class="tv-setting-number-step"
+                    onclick={() => stepNumericSetting(setting, 1)}
                     disabled={pictureSettingsBlocked || settingPending[setting.id]}
-                    aria-label="Increase {setting.label}"
+                    aria-label={`Increase ${setting.label}`}
+                    title={`Increase ${setting.label}`}
                   >+</button>
                 </div>
               {/if}
@@ -873,16 +1183,13 @@
                 <span class="tv-setting-pending">Applying…</span>
               {/if}
             </div>
-            {#if settingErrors[setting.id]}
-              <p class="gpu-error tv-setting-error" role="alert">{settingErrors[setting.id]}</p>
-            {/if}
           {/each}
         </div>
+        {#if activeSettingError}
+          <p class="gpu-error tv-setting-error" role="alert">{activeSettingError}</p>
+        {/if}
         {#if status.pictureSettingsError}
           <p class="tv-pairing-note">{status.pictureSettingsError}</p>
-        {/if}
-        {#if status.pictureWriteError}
-          <p class="gpu-error" role="alert">{status.pictureWriteError}</p>
         {/if}
       {/if}
     </div>

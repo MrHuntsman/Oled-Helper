@@ -15,10 +15,10 @@
 // Log prefix: [font]
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Emitter;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::Storage::FileSystem::{
@@ -58,7 +58,12 @@ fn windows_font_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from(windir).join("Fonts"));
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        dirs.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
+        dirs.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
     }
     dirs
 }
@@ -138,10 +143,14 @@ fn is_symbol_font(face: &ttf_parser::Face) -> bool {
     let mut has_symbol = false;
     let mut has_unicode = false;
     for i in 0..cmap.subtables.len() {
-        let Some(subtable) = cmap.subtables.get(i) else { continue };
+        let Some(subtable) = cmap.subtables.get(i) else {
+            continue;
+        };
         if subtable.is_unicode() {
             has_unicode = true;
-        } else if subtable.platform_id == ttf_parser::PlatformId::Windows && subtable.encoding_id == 0 {
+        } else if subtable.platform_id == ttf_parser::PlatformId::Windows
+            && subtable.encoding_id == 0
+        {
             has_symbol = true;
         }
     }
@@ -256,28 +265,133 @@ struct SystemFontSlot {
 }
 
 const SYSTEM_FONT_SLOTS: &[SystemFontSlot] = &[
-    SystemFontSlot { key: "regular", filename: "segoeui.ttf", weight_class: 400, italic: false, mono: false },
-    SystemFontSlot { key: "bold", filename: "segoeuib.ttf", weight_class: 700, italic: false, mono: false },
-    SystemFontSlot { key: "italic", filename: "segoeuii.ttf", weight_class: 400, italic: true, mono: false },
-    SystemFontSlot { key: "bold_italic", filename: "segoeuiz.ttf", weight_class: 700, italic: true, mono: false },
-    SystemFontSlot { key: "light", filename: "segoeuil.ttf", weight_class: 300, italic: false, mono: false },
-    SystemFontSlot { key: "semilight", filename: "segoeuisl.ttf", weight_class: 350, italic: false, mono: false },
-    SystemFontSlot { key: "semibold", filename: "seguisb.ttf", weight_class: 600, italic: false, mono: false },
-    SystemFontSlot { key: "black", filename: "seguibl.ttf", weight_class: 900, italic: false, mono: false },
-    SystemFontSlot { key: "black_italic", filename: "seguibli.ttf", weight_class: 900, italic: true, mono: false },
-    SystemFontSlot { key: "light_italic", filename: "seguili.ttf", weight_class: 300, italic: true, mono: false },
-    SystemFontSlot { key: "semibold_italic", filename: "seguisbi.ttf", weight_class: 600, italic: true, mono: false },
-    SystemFontSlot { key: "semilight_italic", filename: "seguisli.ttf", weight_class: 350, italic: true, mono: false },
-    SystemFontSlot { key: "variable", filename: "SegUIVar.ttf", weight_class: 400, italic: false, mono: false },
-    SystemFontSlot { key: "consolas_regular", filename: "consola.ttf", weight_class: 400, italic: false, mono: true },
-    SystemFontSlot { key: "consolas_bold", filename: "consolab.ttf", weight_class: 700, italic: false, mono: true },
-    SystemFontSlot { key: "consolas_italic", filename: "consolai.ttf", weight_class: 400, italic: true, mono: true },
-    SystemFontSlot { key: "consolas_bold_italic", filename: "consolaz.ttf", weight_class: 700, italic: true, mono: true },
+    SystemFontSlot {
+        key: "regular",
+        filename: "segoeui.ttf",
+        weight_class: 400,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "bold",
+        filename: "segoeuib.ttf",
+        weight_class: 700,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "italic",
+        filename: "segoeuii.ttf",
+        weight_class: 400,
+        italic: true,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "bold_italic",
+        filename: "segoeuiz.ttf",
+        weight_class: 700,
+        italic: true,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "light",
+        filename: "segoeuil.ttf",
+        weight_class: 300,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "semilight",
+        filename: "segoeuisl.ttf",
+        weight_class: 350,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "semibold",
+        filename: "seguisb.ttf",
+        weight_class: 600,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "black",
+        filename: "seguibl.ttf",
+        weight_class: 900,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "black_italic",
+        filename: "seguibli.ttf",
+        weight_class: 900,
+        italic: true,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "light_italic",
+        filename: "seguili.ttf",
+        weight_class: 300,
+        italic: true,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "semibold_italic",
+        filename: "seguisbi.ttf",
+        weight_class: 600,
+        italic: true,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "semilight_italic",
+        filename: "seguisli.ttf",
+        weight_class: 350,
+        italic: true,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "variable",
+        filename: "SegUIVar.ttf",
+        weight_class: 400,
+        italic: false,
+        mono: false,
+    },
+    SystemFontSlot {
+        key: "consolas_regular",
+        filename: "consola.ttf",
+        weight_class: 400,
+        italic: false,
+        mono: true,
+    },
+    SystemFontSlot {
+        key: "consolas_bold",
+        filename: "consolab.ttf",
+        weight_class: 700,
+        italic: false,
+        mono: true,
+    },
+    SystemFontSlot {
+        key: "consolas_italic",
+        filename: "consolai.ttf",
+        weight_class: 400,
+        italic: true,
+        mono: true,
+    },
+    SystemFontSlot {
+        key: "consolas_bold_italic",
+        filename: "consolaz.ttf",
+        weight_class: 700,
+        italic: true,
+        mono: true,
+    },
 ];
 
 fn system_fonts_root() -> PathBuf {
     let windir = std::env::var("WINDIR").or_else(|_| std::env::var("SystemRoot"));
-    windir.map_or_else(|_| PathBuf::from(r"C:\Windows"), |w| PathBuf::from(w).join("Fonts"))
+    windir.map_or_else(
+        |_| PathBuf::from(r"C:\Windows"),
+        |w| PathBuf::from(w).join("Fonts"),
+    )
 }
 
 /// Slots whose canonical file actually exists on this system (Win10 lacks
@@ -346,15 +460,26 @@ pub fn detect_weight_files(primary: &Path) -> std::collections::HashMap<String, 
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()).map(|e| !e.eq_ignore_ascii_case("ttf")).unwrap_or(true) {
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| !e.eq_ignore_ascii_case("ttf"))
+                .unwrap_or(true)
+            {
                 continue;
             }
-            let Ok(data) = std::fs::read(&path) else { continue };
-            let Some(family) = family_of(&data) else { continue };
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(family) = family_of(&data) else {
+                continue;
+            };
             if !family.eq_ignore_ascii_case(&primary_family) {
                 continue;
             }
-            let Ok(face) = ttf_parser::Face::parse(&data, 0) else { continue };
+            let Ok(face) = ttf_parser::Face::parse(&data, 0) else {
+                continue;
+            };
             let key = slot_key_for(face.weight().to_number(), face.is_italic());
             if let Some(key) = key {
                 out.entry(key.to_string()).or_insert_with(|| path.clone());
@@ -372,7 +497,8 @@ pub fn detect_weight_files(primary: &Path) -> std::collections::HashMap<String, 
         .unwrap_or("regular");
     out.insert(primary_key.to_string(), primary.to_path_buf());
     for slot in manifest_slots() {
-        out.entry(slot.key.to_string()).or_insert_with(|| primary.to_path_buf());
+        out.entry(slot.key.to_string())
+            .or_insert_with(|| primary.to_path_buf());
     }
     out
 }
@@ -453,7 +579,11 @@ pub fn build_all_artifacts(primary: &Path, staging: &Path) -> Result<Vec<Artifac
         });
     }
 
-    log::info!("[font] built {} impersonated artifacts in {}", artifacts.len(), staging.display());
+    log::info!(
+        "[font] built {} impersonated artifacts in {}",
+        artifacts.len(),
+        staging.display()
+    );
     Ok(artifacts)
 }
 
@@ -498,9 +628,18 @@ fn backup_original(slot: &SystemFontSlot) -> Result<PathBuf, String> {
             return Ok(backup);
         }
     }
-    std::fs::copy(&source, &backup)
-        .map_err(|e| format!("could not back up {} from {}: {e}", slot.filename, source.display()))?;
-    log::info!("[font] backed up {} from {}", slot.filename, source.display());
+    std::fs::copy(&source, &backup).map_err(|e| {
+        format!(
+            "could not back up {} from {}: {e}",
+            slot.filename,
+            source.display()
+        )
+    })?;
+    log::info!(
+        "[font] backed up {} from {}",
+        slot.filename,
+        source.display()
+    );
     Ok(backup)
 }
 
@@ -509,7 +648,8 @@ fn backup_original(slot: &SystemFontSlot) -> Result<PathBuf, String> {
 /// original code did) made each backup take ~6s and froze the shell, hence a
 /// single cached walk, indexed by lowercased filename with the parsed family
 /// name stored alongside.
-fn winsxs_index() -> &'static std::collections::HashMap<String, Vec<(u64, PathBuf, Option<String>)>> {
+fn winsxs_index() -> &'static std::collections::HashMap<String, Vec<(u64, PathBuf, Option<String>)>>
+{
     static INDEX: std::sync::OnceLock<
         std::collections::HashMap<String, Vec<(u64, PathBuf, Option<String>)>>,
     > = std::sync::OnceLock::new();
@@ -521,7 +661,10 @@ fn build_winsxs_index() -> std::collections::HashMap<String, Vec<(u64, PathBuf, 
         std::collections::HashMap::new();
     let winsxs = {
         let windir = std::env::var("WINDIR").or_else(|_| std::env::var("SystemRoot"));
-        windir.map_or_else(|_| PathBuf::from(r"C:\Windows\WinSxS"), |w| PathBuf::from(w).join("WinSxS"))
+        windir.map_or_else(
+            |_| PathBuf::from(r"C:\Windows\WinSxS"),
+            |w| PathBuf::from(w).join("WinSxS"),
+        )
     };
     if !winsxs.is_dir() {
         return index;
@@ -529,7 +672,9 @@ fn build_winsxs_index() -> std::collections::HashMap<String, Vec<(u64, PathBuf, 
 
     let mut stack = vec![winsxs];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             let Ok(ft) = entry.file_type() else { continue };
@@ -542,10 +687,15 @@ fn build_winsxs_index() -> std::collections::HashMap<String, Vec<(u64, PathBuf, 
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !SYSTEM_FONT_SLOTS.iter().any(|s| s.filename.eq_ignore_ascii_case(&name)) {
+            if !SYSTEM_FONT_SLOTS
+                .iter()
+                .any(|s| s.filename.eq_ignore_ascii_case(&name))
+            {
                 continue;
             }
-            let Ok(data) = std::fs::read(&path) else { continue };
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
             let size = data.len() as u64;
             let family = family_of(&data);
             index
@@ -565,7 +715,11 @@ fn find_winsxs_authentic(slot: &SystemFontSlot) -> Option<PathBuf> {
     let candidates = winsxs_index().get(&slot.filename.to_lowercase())?;
     let mut best: Option<(u64, PathBuf)> = None;
     for (size, path, family) in candidates {
-        if family.as_ref().map(|f| f.eq_ignore_ascii_case(&expected)).unwrap_or(false) {
+        if family
+            .as_ref()
+            .map(|f| f.eq_ignore_ascii_case(&expected))
+            .unwrap_or(false)
+        {
             if best.as_ref().map(|(s, _)| size > s).unwrap_or(true) {
                 best = Some((*size, path.clone()));
             }
@@ -726,14 +880,18 @@ fn capture_original_owners(slots: &[SystemFontSlot]) {
     let script = format!(
         "$paths = @({list}); foreach ($p in $paths) {{ if (Test-Path $p) {{ \"$p`t\" + (Get-Acl $p).Owner }} }}"
     );
-    let Some(out) = run_hidden("powershell", &["-NoProfile", "-NonInteractive", "-Command", &script])
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-    else {
+    let Some(out) = run_hidden(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+    )
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok()) else {
         return;
     };
     for line in out.lines() {
-        let Some((p, owner)) = line.split_once('\t') else { continue };
+        let Some((p, owner)) = line.split_once('\t') else {
+            continue;
+        };
         let owner = owner.trim().to_string();
         if owner.is_empty() {
             continue;
@@ -799,7 +957,10 @@ fn restore_original_acl(filename: &str, path: &Path) {
                     owner.replace('\'', "''"),
                     p_esc
                 );
-                match run_hidden("powershell", &["-NoProfile", "-NonInteractive", "-Command", &script]) {
+                match run_hidden(
+                    "powershell",
+                    &["-NoProfile", "-NonInteractive", "-Command", &script],
+                ) {
                     Ok(out) if !out.status.success() => log::warn!(
                         "[font] owner restore {} failed: {}",
                         filename,
@@ -997,23 +1158,125 @@ pub struct DownloadableFont {
 
 fn download_catalog() -> Vec<DownloadableFont> {
     vec![
-        DownloadableFont { key: "inter".to_string(), family: "Inter".to_string(), license: "SIL Open Font License".to_string(), description: "Built for UI screens".to_string(), filter: "Inter_18pt-".to_string() },
-        DownloadableFont { key: "roboto".to_string(), family: "Roboto".to_string(), license: "Apache License 2.0".to_string(), description: "Android's system font".to_string(), filter: "Roboto-".to_string() },
-        DownloadableFont { key: "noto-sans".to_string(), family: "Noto Sans".to_string(), license: "SIL Open Font License".to_string(), description: "Google's neutral system font".to_string(), filter: "NotoSans-".to_string() },
-        DownloadableFont { key: "source-sans-3".to_string(), family: "Source Sans 3".to_string(), license: "SIL Open Font License".to_string(), description: "Adobe's UI font".to_string(), filter: "SourceSans3-".to_string() },
-        DownloadableFont { key: "ibm-plex-sans".to_string(), family: "IBM Plex Sans".to_string(), license: "SIL Open Font License".to_string(), description: "IBM's corporate font".to_string(), filter: "IBMPlexSans-".to_string() },
-        DownloadableFont { key: "ubuntu-sans".to_string(), family: "Ubuntu Sans".to_string(), license: "Ubuntu Font License".to_string(), description: "Ubuntu's system font".to_string(), filter: "UbuntuSans-".to_string() },
-        DownloadableFont { key: "open-sans".to_string(), family: "Open Sans".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "OpenSans-".to_string() },
-        DownloadableFont { key: "lato".to_string(), family: "Lato".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Lato-".to_string() },
-        DownloadableFont { key: "montserrat".to_string(), family: "Montserrat".to_string(), license: "SIL Open Font License".to_string(), description: "Urban typography style".to_string(), filter: "Montserrat-".to_string() },
-        DownloadableFont { key: "poppins".to_string(), family: "Poppins".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Poppins-".to_string() },
-        DownloadableFont { key: "work-sans".to_string(), family: "Work Sans".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "WorkSans-".to_string() },
-        DownloadableFont { key: "fira-sans".to_string(), family: "Fira Sans".to_string(), license: "SIL Open Font License".to_string(), description: "Mozilla's UI font".to_string(), filter: "FiraSans-".to_string() },
-        DownloadableFont { key: "public-sans".to_string(), family: "Public Sans".to_string(), license: "SIL Open Font License".to_string(), description: "The US government font".to_string(), filter: "PublicSans-".to_string() },
-        DownloadableFont { key: "karla".to_string(), family: "Karla".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Karla-".to_string() },
-        DownloadableFont { key: "overpass".to_string(), family: "Overpass".to_string(), license: "SIL Open Font License".to_string(), description: "Highway signage style".to_string(), filter: "Overpass-".to_string() },
-        DownloadableFont { key: "barlow".to_string(), family: "Barlow".to_string(), license: "SIL Open Font License".to_string(), description: String::new(), filter: "Barlow-".to_string() },
-        DownloadableFont { key: "geist".to_string(), family: "Geist".to_string(), license: "SIL Open Font License".to_string(), description: "Vercel's UI font".to_string(), filter: "Geist-".to_string() },
+        DownloadableFont {
+            key: "inter".to_string(),
+            family: "Inter".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Built for UI screens".to_string(),
+            filter: "Inter_18pt-".to_string(),
+        },
+        DownloadableFont {
+            key: "roboto".to_string(),
+            family: "Roboto".to_string(),
+            license: "Apache License 2.0".to_string(),
+            description: "Android's system font".to_string(),
+            filter: "Roboto-".to_string(),
+        },
+        DownloadableFont {
+            key: "noto-sans".to_string(),
+            family: "Noto Sans".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Google's neutral system font".to_string(),
+            filter: "NotoSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "source-sans-3".to_string(),
+            family: "Source Sans 3".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Adobe's UI font".to_string(),
+            filter: "SourceSans3-".to_string(),
+        },
+        DownloadableFont {
+            key: "ibm-plex-sans".to_string(),
+            family: "IBM Plex Sans".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "IBM's corporate font".to_string(),
+            filter: "IBMPlexSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "ubuntu-sans".to_string(),
+            family: "Ubuntu Sans".to_string(),
+            license: "Ubuntu Font License".to_string(),
+            description: "Ubuntu's system font".to_string(),
+            filter: "UbuntuSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "open-sans".to_string(),
+            family: "Open Sans".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: String::new(),
+            filter: "OpenSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "lato".to_string(),
+            family: "Lato".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: String::new(),
+            filter: "Lato-".to_string(),
+        },
+        DownloadableFont {
+            key: "montserrat".to_string(),
+            family: "Montserrat".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Urban typography style".to_string(),
+            filter: "Montserrat-".to_string(),
+        },
+        DownloadableFont {
+            key: "poppins".to_string(),
+            family: "Poppins".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: String::new(),
+            filter: "Poppins-".to_string(),
+        },
+        DownloadableFont {
+            key: "work-sans".to_string(),
+            family: "Work Sans".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: String::new(),
+            filter: "WorkSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "fira-sans".to_string(),
+            family: "Fira Sans".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Mozilla's UI font".to_string(),
+            filter: "FiraSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "public-sans".to_string(),
+            family: "Public Sans".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "The US government font".to_string(),
+            filter: "PublicSans-".to_string(),
+        },
+        DownloadableFont {
+            key: "karla".to_string(),
+            family: "Karla".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: String::new(),
+            filter: "Karla-".to_string(),
+        },
+        DownloadableFont {
+            key: "overpass".to_string(),
+            family: "Overpass".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Highway signage style".to_string(),
+            filter: "Overpass-".to_string(),
+        },
+        DownloadableFont {
+            key: "barlow".to_string(),
+            family: "Barlow".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: String::new(),
+            filter: "Barlow-".to_string(),
+        },
+        DownloadableFont {
+            key: "geist".to_string(),
+            family: "Geist".to_string(),
+            license: "SIL Open Font License".to_string(),
+            description: "Vercel's UI font".to_string(),
+            filter: "Geist-".to_string(),
+        },
     ]
 }
 
@@ -1079,7 +1342,9 @@ pub async fn font_preview_sources() -> Vec<FontPreviewSource> {
     let mut sources = Vec::new();
     for (entry, response) in download_catalog().iter().zip(responses) {
         let Ok(response) = response else { continue };
-        let Ok(text) = response.text().await else { continue };
+        let Ok(text) = response.text().await else {
+            continue;
+        };
         let text = text.strip_prefix(")]}'").unwrap_or(&text);
         let Ok(manifest) = serde_json::from_str::<GfManifest>(text) else {
             continue;
@@ -1155,7 +1420,11 @@ const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 /// Download `url` with a hard size cap, rejecting oversized responses by
 /// content-length before buffering, and by actual size after reading (in case
 /// the header is missing or lies).
-async fn fetch_limited(client: &reqwest::Client, url: &str, label: &str) -> Result<Vec<u8>, String> {
+async fn fetch_limited(
+    client: &reqwest::Client,
+    url: &str,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .send()
@@ -1181,8 +1450,15 @@ async fn fetch_limited(client: &reqwest::Client, url: &str, label: &str) -> Resu
 /// return the path of the primary (Regular weight 400) file, ready for
 /// `apply_replacement`. The cache dir is under the runtime root, so it needs
 /// no admin rights and is not enumerated as an installed font.
-async fn download_family(entry: &DownloadableFont, app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
-    emit_progress(app, "download", &format!("Fetching {} from Google Fonts…", entry.family));
+async fn download_family(
+    entry: &DownloadableFont,
+    app: Option<&tauri::AppHandle>,
+) -> Result<PathBuf, String> {
+    emit_progress(
+        app,
+        "download",
+        &format!("Fetching {} from Google Fonts…", entry.family),
+    );
     let client = reqwest::Client::builder()
         .user_agent("OLED-Helper-Fonts")
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -1226,7 +1502,8 @@ async fn download_family(entry: &DownloadableFont, app: Option<&tauri::AppHandle
         // otherwise be scheduled onto the Segoe slots.
         let face = ttf_parser::Face::parse(&bytes, 0)
             .map_err(|_| format!("{name} is not a valid TrueType font"))?;
-        let family = family_of(&bytes).ok_or_else(|| format!("{name} has no readable family name"))?;
+        let family =
+            family_of(&bytes).ok_or_else(|| format!("{name} has no readable family name"))?;
         if !family.eq_ignore_ascii_case(&entry.family) {
             return Err(format!(
                 "{name} reports family {family:?}, expected {:?}",
@@ -1234,7 +1511,8 @@ async fn download_family(entry: &DownloadableFont, app: Option<&tauri::AppHandle
             ));
         }
 
-        std::fs::write(&out, &bytes).map_err(|e| format!("could not write {}: {e}", out.display()))?;
+        std::fs::write(&out, &bytes)
+            .map_err(|e| format!("could not write {}: {e}", out.display()))?;
         downloaded += 1;
         emit_progress(
             app,
@@ -1366,11 +1644,14 @@ fn restore_slot(slot: &SystemFontSlot, batch: &str) -> Result<(), String> {
 /// Full apply: preflight, build every impersonated artifact, back up the
 /// current originals, schedule the boot-time replace, purge the cache, and
 /// persist state. Returns the family name + count of files scheduled.
-pub fn apply_replacement(primary: &Path, app: Option<&tauri::AppHandle>) -> Result<ReplaceState, String> {
+pub fn apply_replacement(
+    primary: &Path,
+    app: Option<&tauri::AppHandle>,
+) -> Result<ReplaceState, String> {
     ensure_elevated()?;
     emit_progress(app, "build", "Building font files…");
-    let primary_data = std::fs::read(primary)
-        .map_err(|e| format!("could not read {}: {e}", primary.display()))?;
+    let primary_data =
+        std::fs::read(primary).map_err(|e| format!("could not read {}: {e}", primary.display()))?;
     let family = family_of(&primary_data)
         .ok_or_else(|| "the selected file is not a valid TrueType font".to_string())?;
 
@@ -1489,7 +1770,11 @@ pub fn restore_originals(app: Option<&tauri::AppHandle>) -> Result<(), String> {
     let slots: Vec<SystemFontSlot> = manifest_slots();
     let total = slots.len();
     for (i, slot) in slots.iter().enumerate() {
-        emit_progress(app, "restore", &format!("Restoring originals ({}/{total})…", i + 1));
+        emit_progress(
+            app,
+            "restore",
+            &format!("Restoring originals ({}/{total})…", i + 1),
+        );
         restore_slot(&slot, &batch)?;
     }
     emit_progress(app, "cache", "Clearing font cache…");
@@ -1525,7 +1810,10 @@ fn restart_pending() -> bool {
 }
 
 #[tauri::command]
-pub async fn font_apply(app: tauri::AppHandle, primary_path: String) -> Result<ReplaceState, String> {
+pub async fn font_apply(
+    app: tauri::AppHandle,
+    primary_path: String,
+) -> Result<ReplaceState, String> {
     // An elevated legacy session applies in-process (with live progress
     // events). A normal session runs the whole apply in the transient
     // privileged helper child, which is elevated for the takeown/icacls and
@@ -1546,11 +1834,7 @@ pub async fn font_restore(app: tauri::AppHandle) -> Result<(), String> {
         format!("Font restore needs a one-time elevated helper setup. {setup_error}")
     })?;
     let run = tauri::async_runtime::spawn_blocking(|| {
-        crate::helper::run_request(
-            "font-restore",
-            |_| {},
-            std::time::Duration::from_secs(120),
-        )
+        crate::helper::run_request("font-restore", |_| {}, std::time::Duration::from_secs(120))
     })
     .await
     .map_err(|error| format!("the privileged helper task failed: {error}"))?;
@@ -1622,7 +1906,10 @@ mod tests {
                 continue;
             };
             let face = ttf_parser::Face::parse(&data, 0).expect("parse should succeed");
-            assert!(is_symbol_font(&face), "{name} should be detected as a symbol font");
+            assert!(
+                is_symbol_font(&face),
+                "{name} should be detected as a symbol font"
+            );
         }
     }
 
@@ -1687,7 +1974,11 @@ mod tests {
             (600, true, "semibold_italic"),
             (350, true, "semilight_italic"),
         ] {
-            assert_eq!(slot_key_for(weight, italic), Some(key), "weight {weight} italic {italic}");
+            assert_eq!(
+                slot_key_for(weight, italic),
+                Some(key),
+                "weight {weight} italic {italic}"
+            );
         }
         // Non-standard weights map to no slot.
         assert_eq!(slot_key_for(500, false), None);
@@ -1713,15 +2004,32 @@ mod tests {
             filter: "Roboto-".into(),
         };
         let refs = vec![
-            GfFileRef { filename: "Roboto-Regular.ttf".into(), url: "https://example.test/a".into() },
-            GfFileRef { filename: "Roboto-Bold.ttf".into(), url: "https://example.test/b".into() },
-            GfFileRef { filename: "Roboto_Condensed-Regular.ttf".into(), url: "https://example.test/c".into() },
-            GfFileRef { filename: "Roboto-VariableFont_wdth,wght.ttf".into(), url: "https://example.test/d".into() },
-            GfFileRef { filename: "OFL.txt".into(), url: "https://example.test/e".into() },
+            GfFileRef {
+                filename: "Roboto-Regular.ttf".into(),
+                url: "https://example.test/a".into(),
+            },
+            GfFileRef {
+                filename: "Roboto-Bold.ttf".into(),
+                url: "https://example.test/b".into(),
+            },
+            GfFileRef {
+                filename: "Roboto_Condensed-Regular.ttf".into(),
+                url: "https://example.test/c".into(),
+            },
+            GfFileRef {
+                filename: "Roboto-VariableFont_wdth,wght.ttf".into(),
+                url: "https://example.test/d".into(),
+            },
+            GfFileRef {
+                filename: "OFL.txt".into(),
+                url: "https://example.test/e".into(),
+            },
         ];
         let files = select_static_files(&entry, &refs);
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|f| f.filename.starts_with("Roboto-")));
-        assert!(!files.iter().any(|f| f.filename.contains("Condensed") || f.filename.contains("Variable")));
+        assert!(!files
+            .iter()
+            .any(|f| f.filename.contains("Condensed") || f.filename.contains("Variable")));
     }
 }

@@ -173,7 +173,8 @@ fn task_registered_and_current() -> bool {
 // handled first and launches a detached elevated observer child. /SC ONCE is
 // only the trigger used by schtasks /Run; it has no useful automatic schedule.
 fn create_task() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| format!("could not resolve app path: {error}"))?;
+    let exe =
+        std::env::current_exe().map_err(|error| format!("could not resolve app path: {error}"))?;
     let command = format!("\"{}\" {}", exe.display(), ARG_PRIVILEGED_HELPER);
     let output = run_hidden(
         "schtasks",
@@ -204,7 +205,6 @@ fn create_task() -> Result<(), String> {
         })
     }
 }
-
 
 // Ensures the Task Scheduler task exists. Idempotent. When the app is
 // elevated (installer, legacy always-elevated session) it creates the task
@@ -345,7 +345,8 @@ pub(crate) fn run_request(
     let Some(dir) = request_file.parent() else {
         return Err("app data folder is unavailable".to_string());
     };
-    std::fs::create_dir_all(dir).map_err(|error| format!("could not create app data folder: {error}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("could not create app data folder: {error}"))?;
 
     // The helper child re-enters the app with no Tauri logger, so it can
     // never log; the request/result files are the whole conversation.
@@ -407,7 +408,10 @@ pub(crate) fn run_request(
         }
         if std::time::Instant::now() >= deadline {
             let _ = std::fs::remove_file(&request_file);
-            return Err(format!("the privileged helper did not answer within {}s", timeout.as_secs()));
+            return Err(format!(
+                "the privileged helper did not answer within {}s",
+                timeout.as_secs()
+            ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -462,9 +466,7 @@ pub(crate) fn run_privileged_helper() {
         if let Ok(content) = std::fs::read_to_string(&observer_request_file) {
             if let Ok(request) = serde_json::from_str::<HelperRequest>(&content) {
                 let _ = std::fs::remove_file(&observer_request_file);
-                if request.op == "key-observer"
-                    && crate::process::process_is_elevated()
-                {
+                if request.op == "key-observer" && crate::process::process_is_elevated() {
                     if let Some(pipe) = request.pipe_name.as_deref() {
                         let Ok(exe) = std::env::current_exe() else {
                             std::process::exit(1);
@@ -545,7 +547,10 @@ pub(crate) fn run_privileged_helper() {
             },
             "font-apply" => match request.primary_path.as_deref() {
                 Some(path) => {
-                    match crate::font_replacement::apply_replacement(std::path::Path::new(path), None) {
+                    match crate::font_replacement::apply_replacement(
+                        std::path::Path::new(path),
+                        None,
+                    ) {
                         Ok(state) => {
                             result.data = serde_json::to_value(state).ok();
                             result.ok = result.data.is_some();
@@ -554,7 +559,8 @@ pub(crate) fn run_privileged_helper() {
                     }
                 }
                 None => {
-                    result.error = Some("font-apply request is missing its primary path".to_string());
+                    result.error =
+                        Some("font-apply request is missing its primary path".to_string());
                 }
             },
             "font-restore" => match crate::font_replacement::restore_originals(None) {
@@ -568,8 +574,7 @@ pub(crate) fn run_privileged_helper() {
     }
 
     if let Ok(json) = serde_json::to_vec(&result) {
-        let _ = std::fs::File::create(&result_file)
-            .and_then(|mut file| file.write_all(&json));
+        let _ = std::fs::File::create(&result_file).and_then(|mut file| file.write_all(&json));
     }
     let _ = std::fs::remove_file(&request_file);
     std::process::exit(0);

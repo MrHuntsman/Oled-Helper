@@ -32,6 +32,10 @@ use crate::monitors::ListedMonitor;
 /// Step/min/max for the SDR Content Brightness hotkeys; must match
 /// SDR_BRIGHTNESS_STEP_NITS / _MIN_NITS / _MAX_NITS in App.svelte.
 const SDR_STEP_NITS: f32 = 50.0;
+// The two dynamic action prefixes, kept in step with the frontend's
+// tvPictureModeHotkeyAction / tvPictureSettingHotkeyAction.
+const TV_PICTURE_MODE_ACTION_PREFIX: &str = "tv_picture_mode_";
+const TV_PICTURE_SETTING_ACTION_PREFIX: &str = "tv_picture_setting_";
 const SDR_MIN_NITS: f32 = 80.0;
 const SDR_MAX_NITS: f32 = 480.0;
 
@@ -50,6 +54,8 @@ enum Action {
     StepSdrBrightness(f32),
     TurnOffDisplay,
     Favorite(String),
+    TvPictureMode(String),
+    TvPictureSetting { setting_id: String, value: String },
 }
 
 fn parse(action: &str) -> Option<Action> {
@@ -64,15 +70,55 @@ fn parse(action: &str) -> Option<Action> {
         "increase_sdr_brightness" => Action::StepSdrBrightness(SDR_STEP_NITS),
         "turn_off_display" => Action::TurnOffDisplay,
         other => {
-            // Per-favorite resolution hotkeys: the action name embeds the
-            // favorite's stable id (see hotkeys::is_favorite_action).
-            let fav_id = other.strip_prefix("favorite_")?;
-            if fav_id.is_empty() {
-                return None;
+            if let Some(fav_id) = other.strip_prefix("favorite_") {
+                if fav_id.is_empty() {
+                    return None;
+                }
+                Action::Favorite(fav_id.to_string())
+            } else if let Some((setting_id, value)) = other
+                .strip_prefix(TV_PICTURE_SETTING_ACTION_PREFIX)
+                .and_then(|rest| rest.split_once('_'))
+            {
+                if setting_id.is_empty() || value.is_empty() {
+                    return None;
+                }
+                Action::TvPictureSetting {
+                    setting_id: setting_id.to_string(),
+                    value: value.to_string(),
+                }
+            } else {
+                let mode = other.strip_prefix(TV_PICTURE_MODE_ACTION_PREFIX)?;
+                if mode.is_empty() {
+                    return None;
+                }
+                Action::TvPictureMode(mode.to_string())
             }
-            Action::Favorite(fav_id.to_string())
         }
     })
+}
+
+// A TV picture write keeps the worker busy for about a second (round trip,
+// settle delay, readback), so rapid presses of the same hotkey would queue one
+// write per press and walk the TV through every intermediate value. Only the
+// newest value matters, so a queued write is replaced by a newer write to the
+// same target. The write already running (popped off the queue) is never
+// touched. These actions always queue without a reply, so dropping one
+// cannot strand a caller.
+fn tv_write_supersedes(incoming: &Action, queued: &Action) -> bool {
+    match (incoming, queued) {
+        (Action::TvPictureMode(_), Action::TvPictureMode(_)) => true,
+        (
+            Action::TvPictureSetting {
+                setting_id: incoming_id,
+                ..
+            },
+            Action::TvPictureSetting {
+                setting_id: queued_id,
+                ..
+            },
+        ) => incoming_id == queued_id,
+        _ => false,
+    }
 }
 
 // ── Work queue ───────────────────────────────────────────────────────────────
@@ -81,7 +127,8 @@ static APP: OnceLock<AppHandle> = OnceLock::new();
 static QUEUE: OnceLock<(Mutex<VecDeque<Action>>, Condvar)> = OnceLock::new();
 static WORKER_STARTED: OnceLock<()> = OnceLock::new();
 
-/// Queues one hotkey action (a `hotkeys::ACTIONS` name, or `favorite_<id>`).
+/// Queues one static action, a `favorite_<id>`, a `tv_picture_mode_<id>`, or a
+/// `tv_picture_setting_<setting id>_<value>`.
 /// Returns false for an unknown action name, so the caller can report it.
 pub fn dispatch(app: &AppHandle, action: &str) -> bool {
     let Some(action) = parse(action) else {
@@ -119,6 +166,15 @@ pub fn dispatch(app: &AppHandle, action: &str) -> bool {
         _ => false,
     };
     if !merged {
+        // Same idea for the TV picture writes: a queued write to the same
+        // setting or the picture mode slot is replaced by the newer request.
+        let replaces_back = matches!(
+            pending.back(),
+            Some(queued) if tv_write_supersedes(&action, queued)
+        );
+        if replaces_back {
+            pending.pop_back();
+        }
         pending.push_back(action);
     }
     drop(pending);
@@ -163,6 +219,10 @@ fn perform(app: &AppHandle, action: Action) -> Result<(), String> {
         Action::StepSdrBrightness(delta) => step_sdr_brightness(app, delta),
         Action::TurnOffDisplay => crate::power::power_turn_off_display(),
         Action::Favorite(fav_id) => apply_favorite(app, &fav_id),
+        Action::TvPictureMode(mode) => crate::tv::queue_picture_mode(app, &mode),
+        Action::TvPictureSetting { setting_id, value } => {
+            crate::tv::queue_picture_setting(app, &setting_id, &value)
+        }
     }
 }
 
@@ -197,9 +257,9 @@ struct SelectedMonitor {
 
 fn resolve_target(config: &AppConfig) -> Option<Target> {
     let monitors = crate::monitors::list_monitors();
-    let selected = monitors
-        .iter()
-        .find(|monitor| !config.active_monitor_sig.is_empty() && monitor.sig == config.active_monitor_sig);
+    let selected = monitors.iter().find(|monitor| {
+        !config.active_monitor_sig.is_empty() && monitor.sig == config.active_monitor_sig
+    });
     if let Some(monitor) = selected {
         return Some(Target {
             identity: monitor_profile_id(monitor),
@@ -295,7 +355,9 @@ fn set_black_crush(app: &AppHandle, step: Option<i32>) -> Result<(), String> {
         .as_ref()
         .map(|target| target.identity.clone())
         .unwrap_or_default();
-    let profile_key = target.as_ref().and_then(|target| target.profile_key.clone());
+    let profile_key = target
+        .as_ref()
+        .and_then(|target| target.profile_key.clone());
     // The target's current value for this mode, else the flat value: the same
     // fallback applyBlackLevelProfileForRefreshRate applies when it loads a
     // profile that does not exist yet.
@@ -310,7 +372,9 @@ fn set_black_crush(app: &AppHandle, step: Option<i32>) -> Result<(), String> {
         None => config.black_enabled = !config.black_enabled,
     }
     if let Some(key) = &profile_key {
-        config.black_lift_profiles.insert(key.clone(), adjustment as f64 / 10.0);
+        config
+            .black_lift_profiles
+            .insert(key.clone(), adjustment as f64 / 10.0);
     }
     // The frontend persists the active monitor's view in the flat field too
     // (saveConfig writes black_lift unconditionally), so it stays the
@@ -370,7 +434,10 @@ fn toggle_taskbar_dimmer(app: &AppHandle) -> Result<(), String> {
         status.fade_out_duration_ms,
         false,
     )?;
-    let entry = config.taskbar_dimmer_profiles.entry(key.clone()).or_default();
+    let entry = config
+        .taskbar_dimmer_profiles
+        .entry(key.clone())
+        .or_default();
     entry.enabled = enabled;
     entry.opacity = status.opacity;
     entry.fade_in_duration_ms = status.fade_in_duration_ms;
@@ -546,6 +613,7 @@ fn apply_favorite(app: &AppHandle, fav_id: &str) -> Result<(), String> {
             Some(applied.monitor_name.clone()),
             Some(applied.confirmation_seconds),
             Some(applied.confirmation_deadline_ms),
+            Some(applied.token),
         )?;
     }
     Ok(())
@@ -555,7 +623,9 @@ fn apply_favorite(app: &AppHandle, fav_id: &str) -> Result<(), String> {
 /// device name of the monitor it was saved on, None for a legacy favorite
 /// saved without a monitor (apply to the primary), or an error when that
 /// monitor is not currently connected.
-fn favorite_target_device(favorite: &crate::config::FavoriteDisplayMode) -> Result<Option<String>, String> {
+fn favorite_target_device(
+    favorite: &crate::config::FavoriteDisplayMode,
+) -> Result<Option<String>, String> {
     if favorite.monitor_device.is_empty()
         && favorite.monitor_id.is_empty()
         && favorite.monitor_sig.is_empty()
@@ -598,7 +668,10 @@ mod tests {
 
     #[test]
     fn parses_known_actions() {
-        assert!(matches!(parse("toggle_black_crush"), Some(Action::ToggleBlackCrush)));
+        assert!(matches!(
+            parse("toggle_black_crush"),
+            Some(Action::ToggleBlackCrush)
+        ));
         assert!(matches!(
             parse("increase_black_crush"),
             Some(Action::StepBlackCrush(step)) if step == CRUSH_STEP
@@ -611,18 +684,64 @@ mod tests {
             parse("increase_sdr_brightness"),
             Some(Action::StepSdrBrightness(step)) if step == SDR_STEP_NITS
         ));
-        assert!(matches!(parse("turn_off_display"), Some(Action::TurnOffDisplay)));
+        assert!(matches!(
+            parse("turn_off_display"),
+            Some(Action::TurnOffDisplay)
+        ));
         assert!(matches!(
             parse("favorite_abc123"),
             Some(Action::Favorite(id)) if id == "abc123"
+        ));
+        assert!(matches!(
+            parse("tv_picture_mode_hdrGame"),
+            Some(Action::TvPictureMode(mode)) if mode == "hdrGame"
+        ));
+        assert!(matches!(
+            parse("tv_picture_setting_hdrDynamicToneMapping_HGIG"),
+            Some(Action::TvPictureSetting { setting_id, value })
+                if setting_id == "hdrDynamicToneMapping" && value == "HGIG"
+        ));
+    }
+
+    #[test]
+    fn tv_picture_writes_supersede_only_the_same_target() {
+        let dtm = |value: &str| Action::TvPictureSetting {
+            setting_id: "hdrDynamicToneMapping".to_string(),
+            value: value.to_string(),
+        };
+        let color_gamut = Action::TvPictureSetting {
+            setting_id: "colorGamut".to_string(),
+            value: "auto".to_string(),
+        };
+        // A newer value for the same setting replaces the queued write.
+        assert!(tv_write_supersedes(&dtm("off"), &dtm("HGIG")));
+        // A different setting does not.
+        assert!(!tv_write_supersedes(&color_gamut, &dtm("HGIG")));
+        // Picture mode writes replace each other regardless of the mode.
+        assert!(tv_write_supersedes(
+            &Action::TvPictureMode("hdrGame".to_string()),
+            &Action::TvPictureMode("hdrVivid".to_string())
+        ));
+        // Writes never merge across the two kinds.
+        assert!(!tv_write_supersedes(
+            &Action::TvPictureMode("hdrGame".to_string()),
+            &dtm("HGIG")
+        ));
+        assert!(!tv_write_supersedes(
+            &dtm("HGIG"),
+            &Action::StepBlackCrush(10)
         ));
     }
 
     #[test]
     fn rejects_unknown_actions() {
         assert!(parse("not_a_hotkey").is_none());
-        // The bare prefix is not a favorite id.
+        // Bare prefixes are not action ids.
         assert!(parse("favorite_").is_none());
+        assert!(parse("tv_picture_mode_").is_none());
+        assert!(parse("tv_picture_setting_").is_none());
+        assert!(parse("tv_picture_setting_hdrDynamicToneMapping_").is_none());
+        assert!(parse("tv_picture_setting_off").is_none());
         // hold_compare is handled entirely in hotkeys.rs (it owns no config or
         // UI state), so it must not resolve here.
         assert!(parse("hold_compare").is_none());
@@ -644,8 +763,14 @@ mod tests {
             Some("unknown-display|1920x1080|60".to_string())
         );
         // No mode to scope the profile to.
-        assert_eq!(crush_profile_key("MONITOR\\LGD05XX", "", "", 3840, 2160, 0), None);
-        assert_eq!(crush_profile_key("MONITOR\\LGD05XX", "", "", 0, 0, 144), None);
+        assert_eq!(
+            crush_profile_key("MONITOR\\LGD05XX", "", "", 3840, 2160, 0),
+            None
+        );
+        assert_eq!(
+            crush_profile_key("MONITOR\\LGD05XX", "", "", 0, 0, 144),
+            None
+        );
     }
 
     #[test]
@@ -658,7 +783,10 @@ mod tests {
 
     #[test]
     fn stable_sig_part_drops_the_resolution() {
-        assert_eq!(stable_sig_part("3840x2160|1600x900|192x192"), "1600x900|192x192");
+        assert_eq!(
+            stable_sig_part("3840x2160|1600x900|192x192"),
+            "1600x900|192x192"
+        );
         assert_eq!(stable_sig_part("3840x2160"), "3840x2160");
         assert_eq!(stable_sig_part(""), "");
     }

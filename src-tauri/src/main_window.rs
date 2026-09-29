@@ -60,18 +60,32 @@ const MIN_WIDTH: f64 = 600.0;
 const MIN_HEIGHT: f64 = 400.0;
 
 /// Creates the main window and its webview. Called once from setup().
+///
+/// An autostart launch (--start-tray, Start on Boot) builds the window
+/// hidden and with no webview: the process comes up in the app's own idle
+/// tray state, the same one a close-to-tray reaches, so a login launch never
+/// flashes a window or steals focus. Everything that hangs off the HWND (the
+/// subclass, hotkeys, the icon) is created with the window; only the webview
+/// is missing, and reveal() rebuilds it on the first open exactly as it does
+/// after a tray teardown.
 pub(crate) fn create(app: &AppHandle) -> Result<Window, String> {
+    let start_in_tray = crate::process::start_in_tray();
     let window = tauri::window::WindowBuilder::new(app, LABEL)
         .title(TITLE)
         .inner_size(WIDTH, HEIGHT)
         .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
         .resizable(true)
+        .visible(!start_in_tray)
         // No native shadow/border: the app draws its own rounded chrome, and
         // Windows otherwise paints a hairline rectangle around it.
         .shadow(false)
         .build()
         .map_err(|error| format!("could not create the main window: {error}"))?;
-    build_webview(&window)?;
+    if start_in_tray {
+        log::info!("[window] autostart launch: main window created hidden, webview deferred");
+    } else {
+        build_webview(&window)?;
+    }
     Ok(window)
 }
 
@@ -125,7 +139,11 @@ fn build_webview(window: &Window) -> Result<Webview, String> {
     let webview = window
         .add_child(builder, LogicalPosition::new(0.0, 0.0), size)
         .map_err(|error| format!("could not create the main webview: {error}"))?;
-    log::info!("[window] main webview built ({}x{})", size.width, size.height);
+    log::info!(
+        "[window] main webview built ({}x{})",
+        size.width,
+        size.height
+    );
     Ok(webview)
 }
 

@@ -28,18 +28,18 @@ use std::time::Duration;
 use tauri::Manager;
 use windows::core::{s, w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, FreeLibrary, HINSTANCE, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM, HWND,
+    CloseHandle, FreeLibrary, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
-};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetClassNameW, GetWindowThreadProcessId, PostMessageW,
     SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HWND_BROADCAST, WH_CBT, WM_FONTCHANGE,
@@ -293,18 +293,12 @@ fn write_state_table() -> Result<(), String> {
                 .copied()
                 .unwrap_or([[0.0; 2]; 3]);
             std::ptr::write_volatile(entry as *mut u32, e.hmonitor);
-            std::ptr::write_volatile(
-                entry.add(4) as *mut u32,
-                e.width | (e.height << 16),
-            );
+            std::ptr::write_volatile(entry.add(4) as *mut u32, e.width | (e.height << 16));
             std::ptr::write_volatile(
                 entry.add(8) as *mut u32,
                 e.phys_width | (e.phys_height << 16),
             );
-            std::ptr::write_volatile(
-                entry.add(12) as *mut u32,
-                e.dpi_x | (e.dpi_y << 16),
-            );
+            std::ptr::write_volatile(entry.add(12) as *mut u32, e.dpi_x | (e.dpi_y << 16));
             std::ptr::write_volatile(
                 entry.add(16) as *mut u32,
                 modes
@@ -410,9 +404,13 @@ fn write_scope() -> Result<(), String> {
             MAX_BLOCKLIST * BLOCKLIST_ENTRY_STRIDE,
         );
         for (i, exe) in entries.iter().enumerate() {
-            let entry = base.add(STATE_BLOCKLIST_ENTRIES_OFFSET + i * BLOCKLIST_ENTRY_STRIDE)
-                as *mut u16;
-            for (j, unit) in exe.encode_utf16().take(BLOCKLIST_ENTRY_WORDS - 1).enumerate() {
+            let entry =
+                base.add(STATE_BLOCKLIST_ENTRIES_OFFSET + i * BLOCKLIST_ENTRY_STRIDE) as *mut u16;
+            for (j, unit) in exe
+                .encode_utf16()
+                .take(BLOCKLIST_ENTRY_WORDS - 1)
+                .enumerate()
+            {
                 *entry.add(j) = unit;
             }
         }
@@ -484,10 +482,7 @@ fn sweep_process_slots() {
             if first_pid == 0 || first_pid & PROCESS_SLOT_WRITING != 0 {
                 continue;
             }
-            let words = std::slice::from_raw_parts(
-                slot.add(4) as *const u16,
-                PROCESS_NAME_WORDS,
-            );
+            let words = std::slice::from_raw_parts(slot.add(4) as *const u16, PROCESS_NAME_WORDS);
             let mut len = 0;
             while len < words.len() && words[len] != 0 {
                 len += 1;
@@ -544,10 +539,7 @@ fn read_process_names() -> Vec<String> {
             if first_pid == 0 || first_pid & PROCESS_SLOT_WRITING != 0 {
                 continue;
             }
-            let words = std::slice::from_raw_parts(
-                slot.add(4) as *const u16,
-                PROCESS_NAME_WORDS,
-            );
+            let words = std::slice::from_raw_parts(slot.add(4) as *const u16, PROCESS_NAME_WORDS);
             let mut len = 0;
             while len < words.len() && words[len] != 0 {
                 len += 1;
@@ -579,10 +571,7 @@ fn read_hooked_processes() -> Vec<(u32, String)> {
             if first_pid == 0 || first_pid & PROCESS_SLOT_WRITING != 0 {
                 continue;
             }
-            let words = std::slice::from_raw_parts(
-                slot.add(4) as *const u16,
-                PROCESS_NAME_WORDS,
-            );
+            let words = std::slice::from_raw_parts(slot.add(4) as *const u16, PROCESS_NAME_WORDS);
             let mut len = 0;
             while len < words.len() && words[len] != 0 {
                 len += 1;
@@ -669,9 +658,7 @@ unsafe extern "system" fn invalidate_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             return BOOL(1);
         }
         let class = String::from_utf16_lossy(&class[..len as usize]);
-        if class == "Shell_TrayWnd"
-            || class == "Shell_SecondaryTrayWnd"
-            || class == "CabinetWClass"
+        if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" || class == "CabinetWClass"
         {
             let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
@@ -706,8 +693,7 @@ fn global_hook() -> &'static Mutex<Option<usize>> {
 // build_explorer_hook in build.rs), so the app stays a single portable exe. At
 // runtime the bytes are written to the config dir and that on-disk path is
 // what both the app's LoadLibraryW and the hook loader in explorer.exe open.
-static EMBEDDED_HOOK_DLL: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/explorer_hook.dll"));
+static EMBEDDED_HOOK_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/explorer_hook.dll"));
 
 // Layout-generation marker. MUST match explorer-hook's HOOK_LAYOUT_MARKER
 // (explorer-hook/src/lib.rs); bump both whenever STATE_SIZE / the
@@ -863,13 +849,16 @@ fn install_hook(app: &tauri::AppHandle) -> Result<(), String> {
     // Windows maps the DLL into each GUI process for us. WH_CBT fires on
     // window creation, before fonts rasterize, so fast-starting applets get
     // the detour in time.
-    let hook = match unsafe { SetWindowsHookExW(WH_CBT, Some(proc), Some(HINSTANCE(module.0)), 0) } {
+    let hook = match unsafe { SetWindowsHookExW(WH_CBT, Some(proc), Some(HINSTANCE(module.0)), 0) }
+    {
         Ok(hook) => hook,
         Err(error) => {
             // The hook did not take ownership of this module reference. Free
             // it so the watchdog's one-second retry loop cannot accumulate
             // LoadLibrary references while Windows rejects the hook.
-            unsafe { let _ = FreeLibrary(module); }
+            unsafe {
+                let _ = FreeLibrary(module);
+            }
             return Err(format!("SetWindowsHookExW failed: {error}"));
         }
     };
@@ -970,10 +959,7 @@ pub fn explorer_hook_set_per_monitor(enabled: bool) -> Result<(), String> {
 /// hatch. Written into shared memory so the DLL's per-draw guard applies it
 /// live (newly started processes take it at attach).
 #[tauri::command]
-pub fn explorer_hook_set_scope(
-    hook_all: bool,
-    blocklist: Vec<String>,
-) -> Result<(), String> {
+pub fn explorer_hook_set_scope(hook_all: bool, blocklist: Vec<String>) -> Result<(), String> {
     HOOK_ALL_APPS.store(hook_all, Ordering::Release);
     {
         let mut list = BLOCKLIST
@@ -1309,10 +1295,8 @@ pub fn explorer_hook_status() -> Result<ExplorerHookStatus, String> {
     let enabled = TOGGLE.load(Ordering::Acquire);
     let current = explorer_target().map(|(pid, _)| pid).unwrap_or(0);
     let (reported_pid, status) = read_hook_report();
-    let active = enabled
-        && current != 0
-        && reported_pid == current
-        && status & STATUS_HOOK_W_INSTALLED != 0;
+    let active =
+        enabled && current != 0 && reported_pid == current && status & STATUS_HOOK_W_INSTALLED != 0;
     let applied = active && RESTARTED_WHILE_ACTIVE.load(Ordering::Acquire);
     Ok(ExplorerHookStatus {
         enabled,
@@ -1354,7 +1338,9 @@ fn verify_report(pid: u32) {
 /// every GUI process automatically (including ones started later), so there is
 /// no per-process install work, this only ensures the single hook exists.
 fn ensure_hooked(app: &tauri::AppHandle) -> Result<(), String> {
-    let _guard = HOOK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let installed = global_hook()
         .lock()
         .unwrap_or_else(|p| p.into_inner())

@@ -189,8 +189,7 @@ mod platform {
     use std::sync::atomic::Ordering;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2, ICoreWebView2_19, ICoreWebView2_3,
-        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
-        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
     };
     use windows_core::Interface;
 
@@ -223,7 +222,9 @@ mod platform {
             let core = match unsafe { controller.CoreWebView2() } {
                 Ok(core) => core,
                 Err(error) => {
-                    log::warn!("[webview] {label}: no CoreWebView2 for the memory policy ({error})");
+                    log::warn!(
+                        "[webview] {label}: no CoreWebView2 for the memory policy ({error})"
+                    );
                     return;
                 }
             };
@@ -263,7 +264,9 @@ mod platform {
             }
         });
         if let Err(error) = result {
-            log::warn!("[webview] {log_label}: memory policy could not reach the webview ({error})");
+            log::warn!(
+                "[webview] {log_label}: memory policy could not reach the webview ({error})"
+            );
         }
     }
 
@@ -327,11 +330,5 @@ mod tests {
 mod platform {
     use super::{Tracked, Webview};
 
-    pub(super) fn apply(
-        _webview: &Webview,
-        _tracked: &'static Tracked,
-        _active: bool,
-        _seq: u64,
-    ) {
-    }
+    pub(super) fn apply(_webview: &Webview, _tracked: &'static Tracked, _active: bool, _seq: u64) {}
 }
