@@ -489,11 +489,13 @@ const PICTURE_MODE_OPTIONS: &[(&str, &str)] = &[
     ("hdrVivid", "HDR Vivid"),
     ("hdrStandard", "HDR Standard"),
     ("hdrCinema", "HDR Cinema"),
+    ("hdrCinemaBright", "HDR Cinema Home"),
     ("hdrGame", "HDR Game"),
     ("hdrFilmMaker", "HDR Filmmaker Mode"),
     ("dolbyHdrVivid", "Dolby Vision Vivid"),
     ("dolbyHdrStandard", "Dolby Vision Standard"),
     ("dolbyHdrCinema", "Dolby Vision Cinema"),
+    ("dolbyHdrCinemaBright", "Dolby Vision Cinema Home"),
     ("dolbyHdrGame", "Dolby Vision Game"),
 ];
 
@@ -501,6 +503,7 @@ const HDR_PICTURE_MODE_IDS: &[&str] = &[
     "hdrVivid",
     "hdrStandard",
     "hdrCinema",
+    "hdrCinemaBright",
     "hdrGame",
     "hdrFilmMaker",
 ];
@@ -509,6 +512,7 @@ const DOLBY_HDR_PICTURE_MODE_IDS: &[&str] = &[
     "dolbyHdrVivid",
     "dolbyHdrStandard",
     "dolbyHdrCinema",
+    "dolbyHdrCinemaBright",
     "dolbyHdrGame",
 ];
 
@@ -3415,10 +3419,10 @@ async fn read_picture_context(socket: &mut Socket, previous: &PictureContext) ->
     context
 }
 
-fn picture_setting_keys() -> Vec<String> {
+fn picture_setting_keys(picture_mode: Option<&str>) -> Vec<String> {
     let mut keys: Vec<String> = PICTURE_SETTING_SPECS
         .iter()
-        .filter(|spec| !is_unsupported_picture_setting_key(spec.key))
+        .filter(|spec| !is_unsupported_picture_setting_key(picture_mode, spec.key))
         .map(|spec| spec.key.to_string())
         .collect();
     keys.push(PICTURE_MODE_CONTEXT_KEY.to_string());
@@ -3427,30 +3431,37 @@ fn picture_setting_keys() -> Vec<String> {
     keys
 }
 
-// Keys the TV has refused are remembered for the session so a permanently
-// unsupported key cannot fail every later poll. webOS rejects the whole
-// getSystemSettings call when even one key is unknown, so the reader falls
-// back to one key per request and drops the offenders from the combined read.
-fn unsupported_picture_setting_keys() -> &'static Mutex<Vec<String>> {
-    static UNSUPPORTED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+// A setting key rejected in one picture mode can still be valid in another.
+// webOS rejects the whole getSystemSettings call when even one key is unknown,
+// so remember rejected keys per mode before retrying the remaining keys.
+fn unsupported_picture_setting_keys() -> &'static Mutex<Vec<(String, String)>> {
+    static UNSUPPORTED: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
     UNSUPPORTED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn is_unsupported_picture_setting_key(key: &str) -> bool {
+fn is_unsupported_picture_setting_key(picture_mode: Option<&str>, key: &str) -> bool {
+    let picture_mode = picture_mode.unwrap_or_default();
     unsupported_picture_setting_keys()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .iter()
-        .any(|existing| existing == key)
+        .any(|(mode, existing)| mode == picture_mode && existing == key)
 }
 
-fn remember_unsupported_picture_setting_key(key: &str) {
+fn remember_unsupported_picture_setting_key(picture_mode: Option<&str>, key: &str) {
+    let picture_mode = picture_mode.unwrap_or_default();
     let mut keys = unsupported_picture_setting_keys()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if !keys.iter().any(|existing| existing == key) {
-        keys.push(key.to_string());
-        log::info!("[tv] picture setting key skipped after rejection key={key}");
+    if !keys
+        .iter()
+        .any(|(mode, existing)| mode == picture_mode && existing == key)
+    {
+        keys.push((picture_mode.to_string(), key.to_string()));
+        log::info!(
+            "[tv] picture setting key skipped after rejection mode={} key={key}",
+            sanitized_log_value(picture_mode)
+        );
     }
 }
 
@@ -3475,6 +3486,14 @@ fn picture_setting_value_from_response(response: &Value, key: &str) -> Option<St
         .filter(|value| !value.is_empty())
 }
 
+fn merge_picture_setting_value(response: &mut Value, key: &str, single: &Value) -> bool {
+    let Some(value) = picture_setting_value_from_response(single, key) else {
+        return false;
+    };
+    response["payload"]["settings"][key] = Value::String(value);
+    true
+}
+
 async fn read_picture_setting_keys(socket: &mut Socket, keys: &[String]) -> Result<Value, String> {
     send_request(
         socket,
@@ -3489,9 +3508,10 @@ async fn read_picture_settings(
     socket: &mut Socket,
     context: &mut PictureContext,
 ) -> Result<(), String> {
-    // First attempt: the usual combined read of every key that has not been
-    // refused earlier in this session.
-    let keys = picture_setting_keys();
+    // First attempt: the usual combined read of every key not refused in
+    // this picture mode. Some setting keys are mode-specific on webOS.
+    let picture_mode = context.picture_mode.clone();
+    let keys = picture_setting_keys(picture_mode.as_deref());
     let combined = read_picture_setting_keys(socket, &keys).await;
     if let Err(error) = &combined {
         if is_picture_transport_failure(error) {
@@ -3500,7 +3520,7 @@ async fn read_picture_settings(
             return Err(stable_error(error));
         }
     }
-    let response = match combined {
+    let mut response = match combined {
         Ok(response) if response_succeeded(&response) => response,
         _ => {
             // Individual key probes are useful only when the TV answered and
@@ -3520,11 +3540,11 @@ async fn read_picture_settings(
                         any_succeeded = true;
                         if let Some(value) = picture_setting_value_from_response(&single, key) {
                             recovered["payload"]["settings"][key.as_str()] = Value::String(value);
-                        } else {
-                            remember_unsupported_picture_setting_key(key);
                         }
                     }
-                    Ok(_) => remember_unsupported_picture_setting_key(key),
+                    Ok(_) => {
+                        remember_unsupported_picture_setting_key(picture_mode.as_deref(), key)
+                    }
                     Err(error) if is_picture_transport_failure(&error) => {
                         context.picture_settings_error =
                             "The TV did not respond while reading picture settings".to_string();
@@ -3533,7 +3553,7 @@ async fn read_picture_settings(
                     Err(error) => {
                         let stable = stable_error(&error);
                         if can_try_picture_write_fallback(&stable) {
-                            remember_unsupported_picture_setting_key(key);
+                            remember_unsupported_picture_setting_key(picture_mode.as_deref(), key);
                         } else {
                             context.picture_settings_error =
                                 "The TV did not report the picture setting values".to_string();
@@ -3551,6 +3571,41 @@ async fn read_picture_settings(
         }
     };
 
+    // Either read path can omit optional controls. Probe their keys directly
+    // instead of treating an omission as proof that this mode does not support
+    // the setting.
+    for spec in PICTURE_SETTING_SPECS.iter().filter(|spec| {
+        matches!(spec.key, "colorGamut" | "hdrDynamicToneMapping")
+            && (spec.key != "hdrDynamicToneMapping"
+                || picture_mode.as_deref().is_some_and(is_hdr_picture_mode_id))
+    }) {        if picture_setting_value_from_response(&response, spec.key).is_some()
+            || is_unsupported_picture_setting_key(picture_mode.as_deref(), spec.key)
+        {
+            continue;
+        }
+        match read_picture_setting_keys(socket, &[spec.key.to_string()]).await {
+            Ok(single) if response_succeeded(&single) => {
+                merge_picture_setting_value(&mut response, spec.key, &single);
+            }
+            Ok(_) => remember_unsupported_picture_setting_key(picture_mode.as_deref(), spec.key),
+            Err(error) if is_picture_transport_failure(&error) => {
+                context.picture_settings_error =
+                    "The TV did not respond while reading picture settings".to_string();
+                return Err(stable_error(&error));
+            }
+            Err(error) => {
+                let stable = stable_error(&error);
+                if can_try_picture_write_fallback(&stable) {
+                    remember_unsupported_picture_setting_key(picture_mode.as_deref(), spec.key);
+                } else {
+                    context.picture_settings_error =
+                        "The TV did not report the picture setting values".to_string();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let mut settings = PICTURE_SETTING_SPECS
         .iter()
         .map(|spec| TvPictureSettingState {
@@ -3560,11 +3615,11 @@ async fn read_picture_settings(
             min: spec.min,
             max: spec.max,
             value: picture_setting_value_from_response(&response, spec.key),
-            supported: !is_unsupported_picture_setting_key(spec.key),
+            supported: !is_unsupported_picture_setting_key(picture_mode.as_deref(), spec.key),
         })
         .collect::<Vec<_>>();
-    // A key the TV answered with but reported no value for is also treated
-    // as unsupported, so the control does not render as an empty input.
+    // A key with no value is unavailable in this mode for the current
+    // snapshot, but it is not cached because another mode may report it.
     for setting in &mut settings {
         if setting.value.is_none() {
             setting.supported = false;
@@ -4895,11 +4950,15 @@ mod tests {
 
         let hdr = picture_modes_for_mode("hdrGame");
         assert!(hdr.iter().any(|option| option.id == "hdrFilmMaker"));
+        assert!(hdr.iter().any(|option| option.id == "hdrCinema"));
+        assert!(hdr.iter().any(|option| option.id == "hdrCinemaBright"));
         assert!(!hdr.iter().any(|option| option.id == "game"));
         assert!(!hdr.iter().any(|option| option.id.starts_with("dolbyHdr")));
 
         let dolby = picture_modes_for_mode("dolbyHdrCinema");
         assert!(dolby.iter().any(|option| option.id == "dolbyHdrGame"));
+        assert!(dolby.iter().any(|option| option.id == "dolbyHdrCinema"));
+        assert!(dolby.iter().any(|option| option.id == "dolbyHdrCinemaBright"));
         assert!(!dolby.iter().any(|option| option.id.starts_with("hdr")));
     }
 
@@ -4908,6 +4967,14 @@ mod tests {
         assert!(picture_mode_allowed_for_context(
             "hdrGame",
             Some("hdrCinema")
+        ));
+        assert!(picture_mode_allowed_for_context(
+            "hdrCinemaBright",
+            Some("hdrCinema")
+        ));
+        assert!(picture_mode_allowed_for_context(
+            "dolbyHdrCinemaBright",
+            Some("dolbyHdrCinema")
         ));
         assert!(!picture_mode_allowed_for_context("game", Some("hdrCinema")));
         assert!(!picture_mode_allowed_for_context(
@@ -4930,6 +4997,14 @@ mod tests {
     #[test]
     fn picture_mode_writes_require_a_known_identifier() {
         assert_eq!(validate_picture_mode("filmMaker").unwrap(), "filmMaker");
+        assert_eq!(
+            validate_picture_mode("hdrCinemaBright").unwrap(),
+            "hdrCinemaBright"
+        );
+        assert_eq!(
+            validate_picture_mode("dolbyHdrCinemaBright").unwrap(),
+            "dolbyHdrCinemaBright"
+        );
         assert!(validate_picture_mode("Game").is_err());
         assert!(validate_picture_mode("game; shutdown").is_err());
     }
@@ -5079,6 +5154,53 @@ mod tests {
     }
 
     #[test]
+    fn missing_combined_picture_settings_are_merged_from_single_key_reads() {
+        let mut combined = json!({
+            "payload": {
+                "settings": {
+                    "backlight": 45
+                }
+            }
+        });
+        let gamut = json!({
+            "payload": {
+                "settings": {
+                    "colorGamut": "dynamic"
+                }
+            }
+        });
+        let dtm = json!({
+            "payload": {
+                "settings": {
+                    "hdrDynamicToneMapping": "HGIG"
+                }
+            }
+        });        assert!(merge_picture_setting_value(&mut combined, "colorGamut", &gamut));
+        assert!(merge_picture_setting_value(
+            &mut combined,
+            "hdrDynamicToneMapping",
+            &dtm
+        ));
+        assert_eq!(
+            picture_setting_value_from_response(&combined, "backlight").as_deref(),
+            Some("45")
+        );
+        assert_eq!(
+            picture_setting_value_from_response(&combined, "colorGamut").as_deref(),
+            Some("dynamic")
+        );
+        assert_eq!(
+            picture_setting_value_from_response(&combined, "hdrDynamicToneMapping").as_deref(),
+            Some("HGIG")
+        );
+        assert!(!merge_picture_setting_value(
+            &mut combined,
+            "colorGamut",
+            &json!({ "payload": { "settings": {} } })
+        ));
+    }
+
+    #[test]
     fn picture_setting_specs_cover_supported_controls() {
         assert_eq!(PICTURE_SETTING_SPECS.len(), 7);
         assert_eq!(
@@ -5114,24 +5236,37 @@ mod tests {
     #[test]
     fn rejected_picture_setting_keys_are_skipped_and_recoverable() {
         clear_unsupported_picture_setting_keys();
-        assert!(picture_setting_keys().contains(&"contrast".to_string()));
-        remember_unsupported_picture_setting_key("contrast");
-        assert!(is_unsupported_picture_setting_key("contrast"));
-        assert!(!picture_setting_keys().contains(&"contrast".to_string()));
+        let hdr_mode = Some("hdrCinemaBright");
+        assert!(picture_setting_keys(hdr_mode).contains(&"contrast".to_string()));
+        remember_unsupported_picture_setting_key(hdr_mode, "contrast");
+        assert!(is_unsupported_picture_setting_key(hdr_mode, "contrast"));
+        assert!(!picture_setting_keys(hdr_mode).contains(&"contrast".to_string()));
+        assert!(
+            picture_setting_keys(Some("dolbyHdrCinemaBright")).contains(&"contrast".to_string())
+        );
+        assert!(!is_unsupported_picture_setting_key(
+            Some("dolbyHdrCinemaBright"),
+            "contrast"
+        ));
         // pictureMode is always requested, even if every setting key fails.
-        assert!(picture_setting_keys().contains(&PICTURE_MODE_CONTEXT_KEY.to_string()));
-        // Repeating the record must not duplicate the entry.
-        remember_unsupported_picture_setting_key("contrast");
+        assert!(picture_setting_keys(hdr_mode).contains(&PICTURE_MODE_CONTEXT_KEY.to_string()));
+        // Repeating the record must not duplicate the entry for this mode.
+        remember_unsupported_picture_setting_key(hdr_mode, "contrast");
         let keys = unsupported_picture_setting_keys()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        assert_eq!(keys.iter().filter(|key| *key == "contrast").count(), 1);
+        assert_eq!(
+            keys.iter()
+                .filter(|(mode, key)| mode == "hdrCinemaBright" && key == "contrast")
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn unsupported_keys_mark_their_setting_state() {
         clear_unsupported_picture_setting_keys();
-        remember_unsupported_picture_setting_key("colorTemperature");
+        remember_unsupported_picture_setting_key(Some("cinema"), "colorTemperature");
         let mut context = PictureContext::default();
         context.picture_settings = PICTURE_SETTING_SPECS
             .iter()
@@ -5142,7 +5277,7 @@ mod tests {
                 min: spec.min,
                 max: spec.max,
                 value: Some("50".to_string()),
-                supported: !is_unsupported_picture_setting_key(spec.key),
+                supported: !is_unsupported_picture_setting_key(Some("cinema"), spec.key),
             })
             .collect();
         let color = context

@@ -4,6 +4,11 @@
   import tabScreenDimmerIcon from './icons/tab_screen_dimmer.png?inline';
   import { captureHotkeyCombo } from './hotkey-capture.js';
   import {
+    enumSettingOptions,
+    enumSettingValue,
+    updatePictureSettingDrafts,
+  } from './tv-picture-settings.js';
+  import {
     tvController,
     pairTv,
     connectTv,
@@ -141,9 +146,11 @@
 
   function applyStatusSource(source) {
     if (!source || typeof source !== 'object') return;
+    const nextPictureMode = typeof source.pictureMode === 'string' ? source.pictureMode : null;
+    const previousPictureMode = status.pictureMode;
     status.inputId = typeof source.inputId === 'string' ? source.inputId : '';
     status.inputLabel = typeof source.inputLabel === 'string' ? source.inputLabel : '';
-    status.pictureMode = typeof source.pictureMode === 'string' ? source.pictureMode : null;
+    status.pictureMode = nextPictureMode;
     status.volume = source.volume == null || !Number.isFinite(Number(source.volume))
       ? null
       : Number(source.volume);
@@ -157,25 +164,19 @@
       status.pictureModes = nextPictureModes;
     }
     const nextPictureSettings = normalizePictureSettings(source.pictureSettings);
-    if (!samePictureSettings(status.pictureSettings, nextPictureSettings)) {
-      // Track whether the TV itself changed any reported value, for example
-      // after a picture mode switch, a remote control change, or a firmware
-      // clamp. Those changes must reach the controls even though the list
-      // shape stayed the same.
-      let tvValueChanged = false;
-      const previousById = new Map(status.pictureSettings.map((s) => [s.id, s.value]));
-      for (const setting of nextPictureSettings) {
-        if (!inFlightWrites[setting.id]
-          && !queuedSettingWrites[setting.id]
-          && previousById.get(setting.id) !== setting.value) {
-          settingDrafts[setting.id] = setting.value ?? '';
-          tvValueChanged = true;
-        }
-      }
-      status.pictureSettings = nextPictureSettings;
-      if (tvValueChanged) {
-        clearSettingErrors();
-      }
+    const pictureSettingsChanged = !samePictureSettings(status.pictureSettings, nextPictureSettings);
+    const tvValueChanged = updatePictureSettingDrafts({
+      currentMode: previousPictureMode,
+      nextMode: nextPictureMode,
+      currentSettings: status.pictureSettings,
+      nextSettings: nextPictureSettings,
+      drafts: settingDrafts,
+      inFlightWrites,
+      queuedSettingWrites,
+    });
+    if (pictureSettingsChanged) status.pictureSettings = nextPictureSettings;
+    if (tvValueChanged) {
+      clearSettingErrors();
     }
   }
 
@@ -249,15 +250,6 @@
           : 'Pair TV',
   );
   const discoveryPending = $derived(tvDiscovery.state === 'scanning');
-  const canApplyPictureMode = $derived(
-    tvController.state === 'connected'
-      && !tvController.pending
-      && !refreshInFlight
-      && Boolean(status.pictureMode)
-      && Boolean(selectedPictureMode)
-      && selectedPictureMode !== status.pictureMode,
-  );
-
   function pictureModeHotkeyBinding() {
     const action = tvPictureModeHotkeyAction(selectedPictureMode);
     return action ? (hotkeys[action] || 'None') : 'None';
@@ -346,7 +338,9 @@
   const showDtmPanel = $derived(
     Boolean(dtmSetting && dtmSetting.supported && isHdrPictureMode(status.pictureMode)),
   );
-  const dtmSelectedValue = $derived(dtmSetting ? settingDraftValue(dtmSetting) : '');
+  const dtmSelectedValue = $derived(
+    dtmSetting ? enumSettingValue(dtmSetting, settingDrafts) : '',
+  );
   const dtmHotkeyAction = $derived(
     showDtmPanel ? tvPictureSettingHotkeyAction(DTM_SETTING_ID, dtmSelectedValue) : '',
   );
@@ -379,6 +373,12 @@
   function settingDraftValue(setting) {
     const draft = settingDrafts[setting.id];
     return draft === undefined ? (setting.value ?? '') : draft;
+  }
+
+  function onEnumDraftChange(setting, event) {
+    settingDrafts[setting.id] = event.currentTarget.value;
+    clearSettingErrors();
+    void writeSetting(setting.id);
   }
 
   function sliderDraftValue(setting) {
@@ -459,11 +459,6 @@
       }
       void writeSetting(setting.id);
     }, NUMERIC_SETTING_STEP_DELAY);
-  }
-
-  function onEnumDraftChange(setting) {
-    clearSettingErrors();
-    void writeSetting(setting.id);
   }
 
   async function writeSetting(settingId) {
@@ -740,15 +735,38 @@
 
   let modeWriteInFlight = $state(false);
 
-  async function onPictureModeChange() {
-    if (!canApplyPictureMode || modeWriteInFlight) return;
+  async function onPictureModeChange(event) {
+    const requestedMode = event.currentTarget.value;
+    console.debug('[tv] picture mode selector event', {
+      eventType: event.type,
+      requestedMode,
+      currentMode: status.pictureMode,
+      connectionState: tvController.state,
+      pending: tvController.pending,
+      modeWriteInFlight,
+    });
+    if (!requestedMode || modeWriteInFlight) return;
+
+    // Read the selection from the native select event rather than relying on
+    // bind:value having updated the rune before this handler runs. Keep the
+    // requested value stable while status effects and the TV write complete.
+    modeWriteInFlight = true;
+    selectedPictureMode = requestedMode;
+    if (tvController.state !== 'connected' || tvController.pending) {
+      selectedPictureMode = status.pictureMode || '';
+      modeWriteInFlight = false;
+      return;
+    }
+    if (requestedMode === status.pictureMode) {
+      modeWriteInFlight = false;
+      return;
+    }
+
     clearNumericStepTimers();
     settingDrafts = {};
     clearSettingErrors();
     error = '';
-    modeWriteInFlight = true;
     const startedAt = performance.now();
-    const requestedMode = selectedPictureMode;
     const inputId = status.inputId;
     console.debug('[tv] picture mode write requested', { requestedMode, inputId });
     try {
@@ -990,8 +1008,8 @@
           <select
             id="tv-picture-mode"
             bind:value={selectedPictureMode}
-            onchange={onPictureModeChange}
-            disabled={tvController.state !== 'connected' || tvController.pending || status.pictureModes.length === 0}
+            oninput={onPictureModeChange}
+            disabled={tvController.state !== 'connected' || tvController.pending || modeWriteInFlight || status.pictureModes.length === 0}
           >
             {#each status.pictureModes as option (option.id)}
               <option value={option.id}>{option.label}</option>
@@ -1047,12 +1065,12 @@
             <span>{DTM_SETTING_LABEL}</span>
             <select
               id="tv-dynamic-tone-mapping"
-              bind:value={settingDrafts[DTM_SETTING_ID]}
-              onchange={() => dtmSetting && onEnumDraftChange(dtmSetting)}
+              value={dtmSetting ? enumSettingValue(dtmSetting, settingDrafts) : ''}
+              onchange={(event) => dtmSetting && onEnumDraftChange(dtmSetting, event)}
               disabled={pictureSettingsBlocked || settingPending[DTM_SETTING_ID]}
               aria-label={DTM_SETTING_LABEL}
             >
-              {#each DTM_SETTING_OPTIONS as option (option.value)}
+              {#each enumSettingOptions(dtmSetting, DTM_SETTING_OPTIONS, settingDrafts) as option (option.value)}
                 <option value={option.value}>{option.label}</option>
               {/each}
             </select>
@@ -1117,12 +1135,12 @@
               {#if setting.kind === 'colorGamut'}
                 <select
                   class="tv-setting-select"
-                  bind:value={settingDrafts[setting.id]}
-                  onchange={() => onEnumDraftChange(setting)}
+                  value={enumSettingValue(setting, settingDrafts)}
+                  onchange={(event) => onEnumDraftChange(setting, event)}
                   disabled={pictureSettingsBlocked || settingPending[setting.id]}
                   aria-label={setting.label}
                 >
-                  {#each COLOR_GAMUT_SETTING_OPTIONS as option (option.value)}
+                  {#each enumSettingOptions(setting, COLOR_GAMUT_SETTING_OPTIONS, settingDrafts) as option (option.value)}
                     <option value={option.value}>{option.label}</option>
                   {/each}
                 </select>

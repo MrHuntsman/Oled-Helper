@@ -13,8 +13,8 @@ pub(crate) const ARG_OPEN_TAB_PREFIX: &str = "--open-tab=";
 // focus, and the app is designed to idle in the tray with its webview torn
 // down anyway (see main_window), so this is the same state a close-to-tray
 // reaches, just from the first frame. Restart children and manual launches
-// never carry it; the UAC relaunch and tray Restart strip nothing because
-// they build their own argument lists.
+// never carry it; restart handoffs strip this startup-only flag before they
+// forward the current process arguments.
 pub(crate) const ARG_START_TRAY: &str = "--start-tray";
 
 // True when this launch was an autostart (Start on Boot) launch.
@@ -54,8 +54,9 @@ const KNOWN_TABS: [&str; 11] = [
 //   - "--open-tab=...", "--rtx-hdr-flags=...", "--rtx-hdr-enabled=...",
 //     "--hdr-mode=...", "--screen-dimmer-enabled=...": one-shot intent that
 //     was already applied (or that the user changed since). Re-forwarding it
-//     would force the old tab on every restart of an always-elevated session
-//     and re-apply the old setting even after the user disabled it.
+//     would force stale startup intent on the replacement process.
+//   - "--start-tray": startup-only behavior; forwarding it to a restart
+//     leaves the main window hidden without a webview.
 // The caller re-appends the flags it actually wants for the new process.
 pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let mut stripped = Vec::with_capacity(args.len());
@@ -67,12 +68,37 @@ pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi:
             continue;
         }
         let text = arg.to_string_lossy();
-        if text.starts_with(ARG_OPEN_TAB_PREFIX) {
+        if arg == ARG_START_TRAY || text.starts_with(ARG_OPEN_TAB_PREFIX) {
             continue;
         }
         stripped.push(arg);
     }
     stripped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_handoff_args;
+    use std::ffi::OsString;
+
+    #[test]
+    fn restart_arguments_do_not_keep_starting_in_the_tray() {
+        let args = [
+            "--start-tray",
+            "--restart-parent",
+            "1234",
+            "--open-tab=tv-controller",
+            "--preserved-option",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+
+        assert_eq!(
+            strip_handoff_args(args),
+            vec![OsString::from("--preserved-option")]
+        );
+    }
 }
 
 // One-time migration for Start on Boot entries created before the app could
