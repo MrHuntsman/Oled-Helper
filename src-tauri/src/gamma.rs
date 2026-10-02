@@ -358,3 +358,65 @@ pub fn apply_gamma_ramp_for(
     );
     Ok(())
 }
+
+/// Seeds the backend's Black Crush state from persisted config, so a session
+/// that starts with the main webview deferred (autostart, or a restart into
+/// the tray) still applies every monitor's saved profile. The frontend
+/// resolves the same per-display keys once it runs, but until it does the
+/// backend is the only writer; without this seed only the primary monitor
+/// received anything (from the global fallback) and every other monitor's
+/// Black Crush stayed unapplied until the app window was opened.
+///
+/// Profile keys have the frontend's `"<identity>|WxH|HZ"` form (see
+/// stores.svelte.js's profileKey), where identity is the monitor's profile id
+/// (falling back to the EDID id, then the GDI device name). Each connected
+/// monitor is matched against the profile key its OWN current mode produces.
+///
+/// The primary's newly resolved value also becomes the global fallback
+/// (`desired`): the safety loop's global write targets the primary through
+/// `set_display_ramp`, so a stale `desired` would otherwise overwrite the
+/// primary's per-monitor ramp on every tick. `black_lift` remains the legacy
+/// fallback when the primary has no profile of its own.
+pub(crate) fn seed_black_crush_from_config(
+    state: &GammaState,
+    config: &crate::config::AppConfig,
+) {
+    // Black Crush off means every profile resolves to zero, matching the
+    // frontend's blackLift() gate; do not resurrect a lift the user disabled.
+    if !config.black_enabled {
+        state.desired.store(0, Ordering::Release);
+        return;
+    }
+    let legacy_fallback = (config.black_lift * 10.0).round().clamp(-150.0, 150.0) as i32;
+    let mut primary_lift = None;
+    let mut per_monitor = state
+        .per_monitor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for monitor in crate::monitors::list_monitors() {
+        if monitor.profile_id.is_empty() || monitor.width == 0 || monitor.height == 0 {
+            continue;
+        }
+        let hz = monitor.refresh_hz;
+        if hz == 0 {
+            continue;
+        }
+        // Same identity the frontend's displayIdentity uses: the profile id
+        // (the EDID id, disambiguated for identical panels).
+        let key = format!(
+            "{}|{}x{}|{}",
+            monitor.profile_id, monitor.width, monitor.height, hz
+        );
+        let Some(value) = config.black_lift_profiles.get(&key) else {
+            continue;
+        };
+        let lift = (value * 10.0).round().clamp(-150.0, 150.0) as i32;
+        if monitor.primary {
+            primary_lift = Some(lift);
+        }
+        per_monitor.insert(monitor.profile_id.clone(), lift);
+    }
+    state
+        .desired
+        .store(primary_lift.unwrap_or(legacy_fallback), Ordering::Release);
+}

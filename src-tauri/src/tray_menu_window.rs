@@ -1632,7 +1632,12 @@ pub fn tray_menu_set_resolution(
                 if let Some(favorite_id) = favorite_id.as_deref() {
                     crate::favorite_credit::arm(favorite_id);
                 }
-                crate::flyout_window::show_after_ready(&app, mode).ok();
+                // Log a failed show: this path has no main window to report
+                // to, and silently swallowing the error is what hid the cold
+                // flyout handshake failure (the mode then just reverted).
+                if let Err(error) = crate::flyout_window::show_after_ready(&app, mode) {
+                    log::warn!("[tray-menu] mode confirmation failed to show: {error}");
+                }
             }
             Err(e) => log::warn!("[tray-menu] resolution change failed: {e}"),
         }
@@ -1653,7 +1658,9 @@ pub fn tray_menu_set_refresh_rate(app: AppHandle, hz: u32) {
         }
         match crate::display_info::set_refresh_rate(hz, None) {
             Ok(mode) => {
-                crate::flyout_window::show_after_ready(&app, mode).ok();
+                if let Err(error) = crate::flyout_window::show_after_ready(&app, mode) {
+                    log::warn!("[tray-menu] mode confirmation failed to show: {error}");
+                }
             }
             Err(e) => log::warn!("[tray-menu] refresh rate change failed: {e}"),
         }

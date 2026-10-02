@@ -562,9 +562,29 @@ fn ensure_window(app: &AppHandle) -> Result<(), String> {
     }
 }
 
+// Releases one WebView2 active hold on the flyout when the show handshake
+// ends, whatever its outcome. See show_after_ready for why the hold exists.
+struct ActiveHold;
+
+impl Drop for ActiveHold {
+    fn drop(&mut self) {
+        crate::webview_env::unpin(FLYOUT_LABEL);
+    }
+}
+
 // Full hidden-WebView handshake. This is called from the tray worker, not the
 // Tauri/UI thread, so waiting for JavaScript never freezes event processing.
 pub fn show_after_ready(app: &AppHandle, mode: AppliedMode) -> Result<(), String> {
+    // Hold the flyout active for the whole handshake. The window stays hidden
+    // until finish_show, so the visibility-based memory policy would otherwise
+    // be free to suspend the renderer partway through (it polls once a second
+    // and the cold-create path here can span several polls). A suspend during
+    // the handshake freezes the page before its `flyout-show` listener is
+    // registered, so the dialog comes up blank and the mode times out with no
+    // popup, exactly the failure a cold flyout showed. The guard releases the
+    // hold on every return path, success or error.
+    crate::webview_env::pin_active(FLYOUT_LABEL);
+    let _active_hold = ActiveHold;
     log::debug!(
         "[flyout] show_after_ready called for {}x{}@{} from thread {:?}",
         mode.width,

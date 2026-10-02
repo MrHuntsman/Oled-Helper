@@ -1122,17 +1122,16 @@ pub fn run() {
             }
             tray_menu_window::set_keep_tray_menu_warm(saved_config.keep_tray_menu_warm);
 
-            // Seed the backend's global gamma fallback before the screen-
-            // protector worker starts. Per-monitor Black Crush profiles are
-            // keyed by display identity + mode and are resolved by the
-            // frontend's existing monitor-profile path immediately afterward;
-            // the backend map is populated by apply_gamma_ramp_for.
+            // Seed the backend's Black Crush state before the screen-protector
+            // worker starts. This resolves each connected monitor's saved
+            // per-display profile from config (display identity + mode), so a
+            // session that starts with the main webview deferred (autostart,
+            // close-to-tray) still applies every monitor's Black Crush, not
+            // just the primary. The frontend re-applies the same values once
+            // it runs; this seed is what covers the window before it does.
             {
                 let state = app.state::<gamma::GammaState>();
-                state.desired.store(
-                    (saved_config.black_lift * 10.0).round().clamp(-150.0, 150.0) as i32,
-                    Ordering::Release,
-                );
+                gamma::seed_black_crush_from_config(&state, &saved_config);
             }
 
             // Seed the taskbar dimmer state from the persisted config. The

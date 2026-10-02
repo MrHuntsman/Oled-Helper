@@ -22,7 +22,7 @@
 //! window, and the tray menu is hidden from a delayed fade thread.
 //! https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/performance
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tauri::{AppHandle, Manager, Webview};
 
@@ -48,10 +48,17 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 // re-shown by the very next click). Each dispatch carries the sequence it was
 // created with and does nothing if a newer request has been made since, which
 // is what keeps a stale suspend from freezing a popup that is already open.
+//
+// `pins` is a temporary active hold a caller can take while it is showing a
+// window that is still hidden. The visibility poll below would otherwise
+// suspend the renderer for a hidden window in the middle of a show handshake
+// and freeze the page before it can register its listeners, which is exactly
+// how a cold flyout used to come up blank and let its mode revert.
 struct Tracked {
     label: &'static str,
     applied: AtomicBool,
     seq: AtomicU64,
+    pins: AtomicU32,
 }
 
 impl Tracked {
@@ -60,7 +67,12 @@ impl Tracked {
             label,
             applied: AtomicBool::new(true),
             seq: AtomicU64::new(0),
+            pins: AtomicU32::new(0),
         }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pins.load(Ordering::Acquire) > 0
     }
 }
 
@@ -111,6 +123,31 @@ pub(crate) fn set_inactive(app: &AppHandle, label: &str) {
     apply(app, label, false);
 }
 
+/// Holds a window active until the matching `unpin` call, independent of its
+/// native visibility. Used while a hidden overlay is mid-show: the flyout's
+/// handshake runs with the window still hidden and can span a policy poll,
+/// and a renderer suspended during that handshake never finishes registering
+/// its listeners, so the dialog comes up blank and the mode reverts. Pin
+/// before the window is created and unpin once it is on screen (or the show
+/// has failed and the window returned to plain hidden).
+pub(crate) fn pin_active(label: &str) {
+    if let Some(tracked) = TRACKED.iter().find(|tracked| tracked.label == label) {
+        tracked.pins.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Releases one `pin_active` hold. A saturating decrement keeps a stray extra
+/// unpin from wrapping the count and re-pinning the window.
+pub(crate) fn unpin(label: &str) {
+    if let Some(tracked) = TRACKED.iter().find(|tracked| tracked.label == label) {
+        let _ = tracked
+            .pins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pins| {
+                Some(pins.saturating_sub(1))
+            });
+    }
+}
+
 // The main window is different from the overlays. A taskbar minimize keeps
 // its native window visible and its webview mounted, so it must not enter the
 // inactive policy. Only a real tray hide makes the main webview inactive.
@@ -138,6 +175,13 @@ fn apply(app: &AppHandle, label: &str, active: bool) {
     if tracked.applied.swap(active, Ordering::AcqRel) == active {
         return; // already in this state
     }
+    // A pinned window must not be suspended while it is mid-show, no matter
+    // who asks: skip the inactive request and leave `applied` claiming active
+    // so a later poll re-derives the real state once the pin is released.
+    if !active && tracked.is_pinned() {
+        tracked.applied.store(true, Ordering::Release);
+        return;
+    }
     let seq = tracked.seq.fetch_add(1, Ordering::AcqRel) + 1;
     platform::apply(&webview, tracked, active, seq);
 }
@@ -162,6 +206,11 @@ pub(crate) fn start_policy(app: AppHandle) {
             std::thread::sleep(POLL_INTERVAL);
             for tracked in TRACKED.iter() {
                 let label = tracked.label;
+                // A show handshake holds the window active through its hidden
+                // phase; the poll must not suspend it underneath that.
+                if tracked.is_pinned() {
+                    continue;
+                }
                 let Some(window) = app.get_window(label) else {
                     continue;
                 };
@@ -308,6 +357,24 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::{policy_active, FLYOUT_LABEL, MAIN_LABEL, TRAY_MENU_LABEL};
+
+    #[test]
+    fn pin_holds_active_until_every_hold_is_released() {
+        let tracked = super::TRACKED
+            .iter()
+            .find(|tracked| tracked.label == FLYOUT_LABEL)
+            .expect("flyout is tracked");
+        assert!(!tracked.is_pinned());
+        super::pin_active(FLYOUT_LABEL);
+        super::pin_active(FLYOUT_LABEL);
+        assert!(tracked.is_pinned());
+        super::unpin(FLYOUT_LABEL);
+        assert!(tracked.is_pinned());
+        super::unpin(FLYOUT_LABEL);
+        assert!(!tracked.is_pinned());
+        super::unpin(FLYOUT_LABEL);
+        assert!(!tracked.is_pinned());
+    }
 
     #[test]
     fn main_taskbar_minimize_stays_active() {
