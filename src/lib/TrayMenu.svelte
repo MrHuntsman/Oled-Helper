@@ -11,7 +11,7 @@
   // Favorites submenu does.
   import { onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { emit, listen } from '@tauri-apps/api/event';
+  import { emit, emitTo, listen } from '@tauri-apps/api/event';
   import { getVersion } from '@tauri-apps/api/app';
   import appIcon from './icons/app-icon.png?inline';
   import tabDimmerIcon from './icons/tab_dimmer.png?inline';
@@ -837,11 +837,8 @@
     // update the native hit region without waiting for disk I/O.
     syncHitRegion();
     const operation = favoritesSaveQueue.then(async () => {
-      const cfg = await invoke('load_config');
-      await invoke('save_config', {
-        config: { ...cfg, favorite_display_modes: savedFavorites },
-      });
-      await emit('favorites-changed', savedFavorites);
+      await invoke('tray_menu_save_favorites', { favorites: savedFavorites });
+      await emitTo('main', 'favorites-changed', savedFavorites);
     });
     favoritesSaveQueue = operation.catch(() => {});
     try {
@@ -1216,7 +1213,7 @@
     if (!width || !height || !hz) return;
     const fav = { width, height, hz };
     if (isFavoriteMode(width, height, hz)) {
-      requestFavoriteRemove(fav);
+      requestFavoriteRemove({ ...fav, monitor_id: trayMonitorIdentity() });
       return;
     }
     // Save scoped to the primary monitor (the tray's scope), so the main

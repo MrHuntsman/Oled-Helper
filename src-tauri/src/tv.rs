@@ -2552,17 +2552,29 @@ async fn reconnect_saved(
                 }
             }
         };
+        let mut pairing_rejected = false;
         match result {
-            Ok(connected) => return Ok(connected),
-            // A different device answered the address, or the TV replaced
-            // its certificate. Neither resolves on its own, so stop retrying
-            // and ask for a new pairing.
-            Err(failure) if failure.authentication_rejected || failure.certificate_pin_rejected => {
+            Ok(mut connected) => {
+                // The IP-derived id is only the original pairing's credential
+                // namespace, not the TV's current network identity.
+                connected.device_id = device.device_id.clone();
+                return Ok(connected);
+            }
+            Err(failure) if failure.authentication_rejected => {
+                pairing_rejected = true;
                 publish(
                     app,
-                    saved_device_snapshot_with_error(&device, "pairing_required", failure.message),
+                    saved_device_snapshot_with_error(&device, "reconnecting", failure.message),
                 );
-                return Err(ReconnectStop::PairingRequired);
+            }
+            // An old DHCP address may now belong to a different device. Search
+            // for the saved certificate before concluding that the TV needs a
+            // new pairing.
+            Err(failure) if failure.certificate_pin_rejected => {
+                publish(
+                    app,
+                    saved_device_snapshot_with_error(&device, "reconnecting", failure.message),
+                );
             }
             Err(failure) => {
                 publish(
@@ -2570,6 +2582,46 @@ async fn reconnect_saved(
                     saved_device_snapshot_with_error(&device, "reconnecting", failure.message),
                 );
             }
+        }
+
+        // Search after the first failed connection and periodically thereafter.
+        // This recovers a changed DHCP address without continuously sending
+        // multicast traffic while a TV is offline.
+        if delay_index == 0 || delay_index % 3 == 2 {
+            match reconnect_from_discovery(
+                app,
+                &device,
+                &client_key,
+                credential_saved,
+                &expected_fingerprint,
+                receiver,
+            )
+            .await?
+            {
+                Some(connected) => return Ok(connected),
+                None if pairing_rejected => {
+                    publish(
+                        app,
+                        saved_device_snapshot_with_error(
+                            &device,
+                            "pairing_required",
+                            "The TV rejected its saved pairing. Pair with the TV again to authorize OLED Helper".to_string(),
+                        ),
+                    );
+                    return Err(ReconnectStop::PairingRequired);
+                }
+                None => {}
+            }
+        } else if pairing_rejected {
+            publish(
+                app,
+                saved_device_snapshot_with_error(
+                    &device,
+                    "pairing_required",
+                    "The TV rejected its saved pairing. Pair with the TV again to authorize OLED Helper".to_string(),
+                ),
+            );
+            return Err(ReconnectStop::PairingRequired);
         }
 
         let delay = reconnect_delay(delay_index);
@@ -2597,6 +2649,104 @@ async fn reconnect_saved(
             }
         }
     }
+}
+
+// If the saved address is stale, scan for LG TVs and let the pinned TLS
+// certificate identify the paired device. SSDP names and model strings are
+// useful hints, not authentication, so every candidate goes through the same
+// certificate check before the stored client key can be sent.
+async fn reconnect_from_discovery(
+    app: &AppHandle,
+    device: &TvDeviceConfig,
+    client_key: &str,
+    credential_saved: bool,
+    expected_fingerprint: &str,
+    receiver: &mut mpsc::Receiver<WorkerCommand>,
+) -> Result<Option<ConnectedTv>, ReconnectStop> {
+    let candidates = tokio::select! {
+        result = discover_ssdp() => match result {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                log::debug!("[tv] discovery reconnect scan failed detail={}", sanitized_error_detail(&error));
+                Vec::new()
+            }
+        },
+        command = receiver.recv() => match command {
+            Some(command) if command_cancels_reconnect(&command) => {
+                return Err(ReconnectStop::Command { next: command, resume: None });
+            }
+            Some(command) => {
+                reject_command_while_reconnecting(app, command);
+                return Ok(None);
+            }
+            None => return Err(ReconnectStop::Shutdown),
+        }
+    };
+
+    for candidate in candidates {
+        if candidate.host == device.host {
+            continue;
+        }
+        let attempt = connect_and_register(
+            app,
+            candidate.host,
+            device.name.clone(),
+            Some(client_key),
+            credential_saved,
+            "reconnecting",
+            expected_fingerprint,
+        );
+        tokio::pin!(attempt);
+        let result = loop {
+            tokio::select! {
+                result = &mut attempt => break result,
+                command = receiver.recv() => match command {
+                    Some(command) if command_cancels_reconnect(&command) => {
+                        return Err(ReconnectStop::Command { next: command, resume: None });
+                    }
+                    Some(command) => reject_command_while_reconnecting(app, command),
+                    None => return Err(ReconnectStop::Shutdown),
+                }
+            }
+        };
+        match result {
+            Ok(mut connected) => {
+                // The Credential Manager target is keyed by this saved id.
+                // Keep it stable while updating the current network address.
+                connected.device_id = device.device_id.clone();
+                let updated_device = device_with_discovered_host(&device, &connected.host);
+                if let Err(error) = crate::config::update_tv_device(app, Some(updated_device)) {
+                    log::warn!("[tv] could not save the TV's new network address: {error}");
+                }
+                log::info!("[tv] reconnected to the paired TV at its discovered address");
+                return Ok(Some(connected));
+            }
+            Err(failure) if failure.authentication_rejected => {
+                publish(
+                    app,
+                    saved_device_snapshot_with_error(device, "pairing_required", failure.message),
+                );
+                return Err(ReconnectStop::PairingRequired);
+            }
+            // A certificate mismatch means this candidate is not the paired
+            // TV. Keep searching without ever sending its saved pairing key,
+            // including when no match is found in this particular scan.
+            Err(failure) if failure.certificate_pin_rejected => {}
+            Err(failure) => log::debug!(
+                "[tv] discovered TV did not accept the reconnect host={} detail={}",
+                sanitized_log_value(&failure.host),
+                sanitized_error_detail(&failure.message)
+            ),
+        }
+    }
+    Ok(None)
+}
+
+fn device_with_discovered_host(device: &TvDeviceConfig, host: &str) -> TvDeviceConfig {
+    let mut updated = device.clone();
+    updated.host = host.to_string();
+    updated.endpoint = format!("wss://{host}:{SECURE_PORT}");
+    updated
 }
 
 async fn recover_lost_connection(
@@ -5601,6 +5751,35 @@ mod tests {
                 "expected address to be accepted: {accepted}"
             );
         }
+    }
+
+    #[test]
+    fn discovered_tv_ip_updates_without_changing_the_pairing_identity() {
+        let device = TvDeviceConfig {
+            device_id: "lg-192.168.1.50".to_string(),
+            name: "OLED TV".to_string(),
+            host: "192.168.1.50".to_string(),
+            endpoint: "wss://192.168.1.50:3001".to_string(),
+            model: "OLED55C4".to_string(),
+            firmware: "26.10.05".to_string(),
+            paired: true,
+            auto_reconnect: true,
+            certificate_fingerprint: "sha256:paired-certificate".to_string(),
+        };
+
+        let updated = device_with_discovered_host(&device, "192.168.1.72");
+
+        assert_eq!(updated.device_id, device.device_id);
+        assert_eq!(updated.host, "192.168.1.72");
+        assert_eq!(updated.endpoint, "wss://192.168.1.72:3001");
+        assert_eq!(
+            updated.certificate_fingerprint,
+            device.certificate_fingerprint
+        );
+        assert_eq!(updated.model, device.model);
+        assert_eq!(updated.firmware, device.firmware);
+        assert!(updated.paired);
+        assert_eq!(device.host, "192.168.1.50");
     }
 
     #[test]

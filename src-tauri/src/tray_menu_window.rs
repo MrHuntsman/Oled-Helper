@@ -341,6 +341,7 @@ static STATE_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static STATE_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static STATE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 static CACHED_TRAY_STATE: OnceLock<Mutex<Option<Value>>> = OnceLock::new();
+static FAVORITES_VERSION: AtomicU64 = AtomicU64::new(0);
 // The resolution submenu includes the same friendly/UW/native labels as the
 // main app, so reserve enough left-side space to keep those tags readable.
 // The fixed canvas is deliberately larger than the visible cards. The cards
@@ -1416,6 +1417,32 @@ pub fn tray_menu_get_state(
     collect_tray_menu_state(&app, state)
 }
 
+#[tauri::command]
+pub fn tray_menu_save_favorites(
+    app: AppHandle,
+    favorites: Vec<crate::config::FavoriteDisplayMode>,
+) -> Result<(), String> {
+    crate::config::save_display_favorites(&app, favorites.clone())?;
+    let favorite_value = serde_json::to_value(favorites).map_err(|error| error.to_string())?;
+    if let Ok(mut cached) = CACHED_TRAY_STATE.get_or_init(|| Mutex::new(None)).lock() {
+        // Version and cache must change under the same lock used when a fresh
+        // snapshot is installed. Otherwise a refresh can pass its version
+        // check, then overwrite this favorite between the cache update and the
+        // version bump.
+        FAVORITES_VERSION.fetch_add(1, Ordering::AcqRel);
+        if let Some(config) = cached
+            .as_mut()
+            .and_then(|snapshot| snapshot.get_mut("config"))
+            .and_then(Value::as_object_mut)
+        {
+            config.insert("favorite_display_modes".into(), favorite_value);
+        }
+    } else {
+        FAVORITES_VERSION.fetch_add(1, Ordering::AcqRel);
+    }
+    Ok(())
+}
+
 fn cached_tray_state() -> Option<Value> {
     CACHED_TRAY_STATE
         .get_or_init(|| Mutex::new(None))
@@ -1434,11 +1461,24 @@ pub fn refresh_cached_state(app: &AppHandle) {
     let generation = STATE_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     let refresh_app = app.clone();
     std::thread::spawn(move || {
+        let favorites_version = FAVORITES_VERSION.load(Ordering::Acquire);
         let taskbar_state = refresh_app.state::<crate::taskbar_dimmer::TaskbarDimmerState>();
         let snapshot = collect_tray_menu_state(&refresh_app, taskbar_state);
-        let payload = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+        let mut payload = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
         if STATE_REFRESH_GENERATION.load(Ordering::Acquire) == generation {
             if let Ok(mut cached) = CACHED_TRAY_STATE.get_or_init(|| Mutex::new(None)).lock() {
+                if FAVORITES_VERSION.load(Ordering::Acquire) != favorites_version {
+                    let cached_favorites = cached
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.get("config"))
+                        .and_then(|config| config.get("favorite_display_modes"))
+                        .cloned();
+                    if let Some(cached_favorites) = cached_favorites {
+                        if let Some(config) = payload.get_mut("config").and_then(Value::as_object_mut) {
+                            config.insert("favorite_display_modes".into(), cached_favorites);
+                        }
+                    }
+                }
                 *cached = Some(payload.clone());
             }
             let _ = refresh_app.emit("tray-menu-state-updated", payload);

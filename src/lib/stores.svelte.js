@@ -1,6 +1,6 @@
 // Svelte 5 runes stores, $state object pattern
 import { invoke } from '@tauri-apps/api/core';
-import { emit, listen } from '@tauri-apps/api/event';
+import { emit, emitTo, listen } from '@tauri-apps/api/event';
 import { HIGH_NITS_DEFAULT_MIN, HIGH_NITS_DEFAULT_STEP, HIGH_NITS_DEFAULT_MAX, HIGH_NITS_CELLS, HIGH_NITS_MAX_CEILING, HIGH_NITS_MAX_STOPS, highNitsStepForMax } from './calibration.js';
 
 export const app = $state({
@@ -901,13 +901,8 @@ export function isDisplayModeFavorited(width, height, hz, monitorId = '', monito
   const key = displayModeFavoriteKey(width, height, hz, monitorId, monitorSig);
   return displayFavorites.some((f) => displayModeFavoriteKey(f.width, f.height, f.hz, f.monitorId, f.monitorSig) === key);
 }
-let favoritesSaveTimer = null;
-function scheduleFavoritesSave() {
-  clearTimeout(favoritesSaveTimer);
-  favoritesSaveTimer = setTimeout(() => { favoritesSaveTimer = null; saveConfig(); }, 300);
-}
-function emitFavoritesChanged() {
-  emit('favorites-changed', displayFavorites.map((fav) => ({
+function serializedDisplayFavorites() {
+  return displayFavorites.map((fav) => ({
     width: fav.width,
     height: fav.height,
     hz: fav.hz,
@@ -917,7 +912,19 @@ function emitFavoritesChanged() {
     monitor_device: fav.monitorDevice,
     monitor_name: fav.monitorName,
     confirmed_monitor_id: fav.confirmedMonitorId || '',
-  }))).catch(() => {});
+  }));
+}
+let favoritesSaveTimer = null;
+function scheduleFavoritesSave() {
+  clearTimeout(favoritesSaveTimer);
+  favoritesSaveTimer = setTimeout(() => {
+    favoritesSaveTimer = null;
+    invoke('tray_menu_save_favorites', { favorites: serializedDisplayFavorites() })
+      .catch((e) => console.warn('[favorites] save failed', e));
+  }, 300);
+}
+function emitFavoritesChanged() {
+  emitTo('tray-menu', 'favorites-changed', serializedDisplayFavorites()).catch(() => {});
 }
 // Accepts both the internal camelCase shape and the config/tray snake_case
 // shape (fav_id, monitor_id, monitor_sig, monitor_device, monitor_name), so
@@ -1725,16 +1732,7 @@ export function saveConfig() {
     display_menu_show_tags: displayMenuPrefs.showTags,
     display_menu_refresh_rate_sort: displayMenuPrefs.refreshRateSort,
     hotkeys: { ...hotkeys },
-    favorite_display_modes: displayFavorites.map((f) => ({
-      width: f.width,
-      height: f.height,
-      hz: f.hz,
-      fav_id: f.favId,
-      monitor_id: f.monitorId,
-      monitor_sig: f.monitorSig,
-      monitor_name: f.monitorName,
-      confirmed_monitor_id: f.confirmedMonitorId || '',
-    })),
+    favorite_display_modes: serializedDisplayFavorites(),
   } }).catch((e) => {
     console.warn('[config] save failed', e);
     return undefined;

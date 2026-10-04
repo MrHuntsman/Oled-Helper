@@ -197,6 +197,13 @@ mod display_change_events {
             // floating at the old position for a visible beat.
             crate::taskbar_dimmer::on_display_change();
             crate::power::rekey_profiles();
+            // Black Crush profiles are keyed per display AND mode, but the
+            // runtime gamma table is keyed per monitor only, so a mode change
+            // left the outgoing mode's lift in place and the safety thread kept
+            // re-applying it until a frontend resolved the incoming mode's
+            // key, which only happens while the main webview exists. Re-resolve
+            // here so the screen follows the mode straight from the tray.
+            crate::gamma::reapply_after_display_change(app);
         }
         let _ = app.emit("display-changed", source);
         if refresh_hook_table {
@@ -960,6 +967,7 @@ pub fn run() {
             flyout_window::show_mode_confirmation,
             tray_menu_window::tray_menu_get_display_info,
             tray_menu_window::tray_menu_get_state,
+            tray_menu_window::tray_menu_save_favorites,
             tray_menu_window::tray_menu_set_resolution,
             tray_menu_window::tray_menu_set_refresh_rate,
             tray_menu_window::tray_menu_hide,

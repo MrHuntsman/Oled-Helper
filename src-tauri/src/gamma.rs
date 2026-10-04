@@ -7,10 +7,11 @@
 //! without user interaction.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use tauri::State;
+use std::time::Duration;
+use tauri::{AppHandle, Manager, State};
 
 pub(crate) struct GammaShutdown {
     pub(crate) requested: AtomicBool,
@@ -366,57 +367,366 @@ pub fn apply_gamma_ramp_for(
 /// backend is the only writer; without this seed only the primary monitor
 /// received anything (from the global fallback) and every other monitor's
 /// Black Crush stayed unapplied until the app window was opened.
-///
-/// Profile keys have the frontend's `"<identity>|WxH|HZ"` form (see
-/// stores.svelte.js's profileKey), where identity is the monitor's profile id
-/// (falling back to the EDID id, then the GDI device name). Each connected
-/// monitor is matched against the profile key its OWN current mode produces.
-///
-/// The primary's newly resolved value also becomes the global fallback
-/// (`desired`): the safety loop's global write targets the primary through
-/// `set_display_ramp`, so a stale `desired` would otherwise overwrite the
-/// primary's per-monitor ramp on every tick. `black_lift` remains the legacy
-/// fallback when the primary has no profile of its own.
 pub(crate) fn seed_black_crush_from_config(
     state: &GammaState,
     config: &crate::config::AppConfig,
 ) {
-    // Black Crush off means every profile resolves to zero, matching the
-    // frontend's blackLift() gate; do not resurrect a lift the user disabled.
-    if !config.black_enabled {
-        state.desired.store(0, Ordering::Release);
-        return;
+    let monitors = crate::monitors::list_monitors();
+    resolve_profiles(state, config, &monitors);
+}
+
+// A Black Crush profile key in the pre-display-identity format: a bare
+// refresh rate in Hz. Those entries are a migration fallback only (the
+// frontend keeps them in `legacyBlackProfiles` for the same reason); every
+// key written today is display-scoped.
+fn is_legacy_rate_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+// Stored profile values are adjustment tenths; the runtime tables keep the
+// integer ramp units the ramp builder wants.
+fn lift_from_stored(value: f64) -> i32 {
+    if !value.is_finite() {
+        return 0;
     }
-    let legacy_fallback = (config.black_lift * 10.0).round().clamp(-150.0, 150.0) as i32;
-    let mut primary_lift = None;
-    let mut per_monitor = state
+    (value * 10.0).round().clamp(-150.0, 150.0) as i32
+}
+
+// The profile key one monitor's CURRENT mode produces. Same
+// "<identity>|WxH|HZ" shape the frontend's profileKey builds (see
+// stores.svelte.js), with the identity being the monitor's profile id (the
+// EDID id, disambiguated for identical panels). Monitors whose mode could not
+// be read produce no key, so they keep the value they already had.
+fn profile_key_for(monitor: &crate::monitors::ListedMonitor) -> Option<String> {
+    if monitor.profile_id.is_empty() || monitor.width == 0 || monitor.height == 0 {
+        return None;
+    }
+    if monitor.refresh_hz == 0 {
+        return None;
+    }
+    Some(format!(
+        "{}|{}x{}|{}",
+        monitor.profile_id, monitor.width, monitor.height, monitor.refresh_hz
+    ))
+}
+
+// The value one monitor resolves to for the mode it is in, mirroring the
+// frontend's applyBlackLevelProfileForRefreshRate: the scoped
+// "<identity>|WxH|HZ" profile first, then the legacy per-rate entry, then the
+// flat legacy value, and zero when display-scoped profiles exist but none of
+// them covers this mode (the frontend's own fallback for a new mode).
+fn resolve_profile_lift(
+    config: &crate::config::AppConfig,
+    key: &str,
+    hz: u32,
+    has_scoped_profiles: bool,
+) -> i32 {
+    if let Some(value) = config.black_lift_profiles.get(key) {
+        return lift_from_stored(*value);
+    }
+    if let Some(value) = config.black_lift_profiles.get(&hz.to_string()) {
+        return lift_from_stored(*value);
+    }
+    if has_scoped_profiles {
+        return 0;
+    }
+    lift_from_stored(config.black_lift)
+}
+
+// Re-resolves every connected monitor's Black Crush profile for the mode it
+// is in and installs the result in the runtime tables. Returns whether
+// anything changed, which the caller uses to decide whether the follow-up
+// ramp write also has to touch the monitors that resolve to zero.
+//
+// The tables are keyed by the resolution-independent monitor id, so a mode
+// change does not re-key them: without this pass the outgoing mode's lift
+// stays in place and the safety thread re-applies it every five seconds until
+// a frontend resolves the incoming mode's profile, which only happens while
+// the main webview exists. Resolving here makes the screen follow the mode
+// from the tray, with no window open.
+fn resolve_profiles(
+    state: &GammaState,
+    config: &crate::config::AppConfig,
+    monitors: &[crate::monitors::ListedMonitor],
+) -> bool {
+    let previous = state
         .per_monitor
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    for monitor in crate::monitors::list_monitors() {
-        if monitor.profile_id.is_empty() || monitor.width == 0 || monitor.height == 0 {
-            continue;
+        .map(|map| map.clone())
+        .unwrap_or_default();
+    let previous_desired = state.desired.load(Ordering::Acquire);
+    let mut next: HashMap<String, i32> = HashMap::new();
+    let mut primary_lift = None;
+    // Black Crush off means every profile resolves to zero, matching the
+    // frontend's blackLift() gate; do not resurrect a lift the user disabled.
+    if config.black_enabled {
+        let has_scoped_profiles = config
+            .black_lift_profiles
+            .keys()
+            .any(|key| !is_legacy_rate_key(key));
+        for monitor in monitors {
+            let Some(key) = profile_key_for(monitor) else {
+                continue;
+            };
+            let lift = resolve_profile_lift(config, &key, monitor.refresh_hz, has_scoped_profiles);
+            if monitor.primary {
+                primary_lift = Some(lift);
+            }
+            next.insert(monitor.profile_id.clone(), lift);
         }
-        let hz = monitor.refresh_hz;
-        if hz == 0 {
-            continue;
-        }
-        // Same identity the frontend's displayIdentity uses: the profile id
-        // (the EDID id, disambiguated for identical panels).
-        let key = format!(
-            "{}|{}x{}|{}",
-            monitor.profile_id, monitor.width, monitor.height, hz
-        );
-        let Some(value) = config.black_lift_profiles.get(&key) else {
-            continue;
-        };
-        let lift = (value * 10.0).round().clamp(-150.0, 150.0) as i32;
-        if monitor.primary {
-            primary_lift = Some(lift);
-        }
-        per_monitor.insert(monitor.profile_id.clone(), lift);
     }
-    state
-        .desired
-        .store(primary_lift.unwrap_or(legacy_fallback), Ordering::Release);
+    // The primary's newly resolved value also becomes the global fallback
+    // (`desired`): the safety loop's global write targets the primary through
+    // `set_display_ramp`, so a stale `desired` would otherwise overwrite the
+    // primary's per-monitor ramp on every tick. `black_lift` remains the
+    // legacy fallback when the primary's own mode is unknown.
+    let desired = if config.black_enabled {
+        primary_lift.unwrap_or_else(|| lift_from_stored(config.black_lift))
+    } else {
+        0
+    };
+    let changed = next != previous || desired != previous_desired;
+    // Replace the table rather than merge into it, so a lift the user turned
+    // off, or an entry for a monitor that is gone, cannot be re-applied by a
+    // later tick.
+    if let Ok(mut map) = state.per_monitor.lock() {
+        *map = next;
+    }
+    state.desired.store(desired, Ordering::Release);
+    changed
+}
+
+// A display change arrives as a burst (hotplug plus the mode change itself
+// broadcast several messages), so each new change takes over the wait from the
+// one before it. The generation check makes the superseded wait drop out
+// instead of racing the current one.
+static REAPPLY_GENERATION: AtomicU64 = AtomicU64::new(0);
+// A mode change broadcasts WM_DISPLAYCHANGE when the switch starts, before the
+// driver has activated the incoming mode, so the first read after the burst
+// can still see the outgoing mode.
+const REAPPLY_SETTLE_DELAY: Duration = Duration::from_millis(400);
+const REAPPLY_SETTLE_POLL: Duration = Duration::from_millis(150);
+// Bounded so a display that keeps flapping (a driver resetting the mode
+// repeatedly) cannot spin here.
+const REAPPLY_SETTLE_ATTEMPTS: usize = 20;
+
+// The connected monitors' current modes, read until two consecutive reads
+// agree. Reading once would resolve against a mode Windows is still
+// switching, which is what left the wrong profile in place in the first
+// place. Returns the last read when the wait expires, and the previous read
+// when a newer change took over.
+fn wait_for_settled_modes(generation: u64) -> Vec<crate::monitors::ListedMonitor> {
+    let mut previous: Vec<crate::monitors::ListedMonitor> = Vec::new();
+    for attempt in 0..REAPPLY_SETTLE_ATTEMPTS {
+        std::thread::sleep(if attempt == 0 {
+            REAPPLY_SETTLE_DELAY
+        } else {
+            REAPPLY_SETTLE_POLL
+        });
+        if REAPPLY_GENERATION.load(Ordering::Acquire) != generation {
+            return previous;
+        }
+        let current = crate::monitors::list_monitors();
+        if attempt > 0 && mode_signature(&current) == mode_signature(&previous) {
+            return current;
+        }
+        previous = current;
+    }
+    previous
+}
+
+// Identity plus mode for every monitor, so two reads can be compared for the
+// topology and mode changes the profiles are keyed by.
+fn mode_signature(monitors: &[crate::monitors::ListedMonitor]) -> Vec<(String, u32, u32, u32)> {
+    monitors
+        .iter()
+        .map(|monitor| {
+            (
+                monitor.profile_id.clone(),
+                monitor.width,
+                monitor.height,
+                monitor.refresh_hz,
+            )
+        })
+        .collect()
+}
+
+/// Re-resolves and re-applies the Black Crush profiles after a display mode or
+/// topology change (wired from lib.rs's display-change notification). Without
+/// this the screen keeps the outgoing mode's profile: the runtime table is
+/// keyed per monitor, the safety thread re-asserts it every five seconds, and
+/// only opening the main window (whose frontend resolves the incoming mode's
+/// key) ever corrected it. Runs on a worker thread, since the notification
+/// itself is delivered on the main thread.
+pub(crate) fn reapply_after_display_change(app: &AppHandle) {
+    let generation = REAPPLY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let monitors = wait_for_settled_modes(generation);
+        // A newer change landed while the modes settled; that one owns the
+        // re-resolve.
+        if REAPPLY_GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+        // Hold-to-compare owns the hardware while it is down, and the safety
+        // thread skips its tick for the same reason; the next tick picks the
+        // resolved values up once the hold is released.
+        if crate::hotkeys::is_hold_compare_active() {
+            return;
+        }
+        let config = crate::config::load_config(app.clone());
+        let state = app.state::<GammaState>();
+        let changed = resolve_profiles(&state, &config, &monitors);
+        let brightness = state
+            .screen_dim_brightness
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default();
+        // Write now instead of leaving the outgoing mode's ramp on screen until
+        // the safety thread's next tick. The forced pass is what clears a mode
+        // that resolves to zero (no profile covers it): apply_screen_gamma_ramps
+        // leaves a zero lift alone otherwise, and the tick would keep
+        // re-asserting the value this pass just replaced. It is only needed
+        // when a profile actually changed, so a mode change that keeps the
+        // same value never writes a ramp to a monitor we do not manage.
+        apply_screen_gamma_ramps(&state.desired, &state.per_monitor, &brightness, changed);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Leaked on purpose: GammaState's Drop resets the real display gamma, and
+    // a unit test has no business touching the gamma of the machine running
+    // it. Each call is a fresh state, and the test process is short lived.
+    fn test_state() -> &'static GammaState {
+        Box::leak(Box::new(GammaState {
+            desired: Arc::new(AtomicI32::new(0)),
+            per_monitor: Arc::new(Mutex::new(HashMap::new())),
+            screen_dim_brightness: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: Arc::new(GammaShutdown {
+                requested: AtomicBool::new(false),
+                wake: Condvar::new(),
+                lock: Mutex::new(()),
+            }),
+            safety_thread: Mutex::new(None),
+        }))
+    }
+
+    fn monitor(profile_id: &str, width: u32, height: u32, hz: u32, primary: bool) -> crate::monitors::ListedMonitor {
+        crate::monitors::ListedMonitor {
+            sig: format!("sig-{profile_id}"),
+            friendly_name: "Test Panel".into(),
+            primary,
+            width,
+            height,
+            monitor_id: profile_id.into(),
+            device_name: format!(r"\\.\{profile_id}"),
+            edid_serial: String::new(),
+            profile_id: profile_id.into(),
+            refresh_hz: hz,
+        }
+    }
+
+    fn lift_of(state: &GammaState, key: &str) -> i32 {
+        *state.per_monitor.lock().unwrap().get(key).unwrap_or(&0)
+    }
+
+    #[test]
+    fn a_mode_without_a_profile_resolves_to_zero() {
+        let state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        config
+            .black_lift_profiles
+            .insert("panel-a|2560x1440|120".into(), 1.5);
+        // The same panel at a rate nothing is stored for: the outgoing mode's
+        // lift must not survive the switch.
+        let monitors = vec![monitor("panel-a", 2560, 1440, 60, true)];
+        assert!(resolve_profiles(state, &config, &monitors));
+        assert_eq!(lift_of(state, "panel-a"), 0);
+        assert_eq!(state.desired.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn the_incoming_mode_replaces_the_outgoing_one() {
+        let state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        config
+            .black_lift_profiles
+            .insert("panel-a|2560x1440|60".into(), 1.5);
+        config
+            .black_lift_profiles
+            .insert("panel-a|2560x1440|120".into(), -0.8);
+        // A second monitor with no profile of its own resolves to zero and is
+        // still tracked, so a later pass can tell a zero from an unknown
+        // monitor.
+        let monitors = vec![
+            monitor("panel-a", 2560, 1440, 60, true),
+            monitor("panel-b", 1920, 1080, 60, false),
+        ];
+        assert!(resolve_profiles(state, &config, &monitors));
+        assert_eq!(lift_of(state, "panel-a"), 15);
+        assert_eq!(lift_of(state, "panel-b"), 0);
+        assert_eq!(state.desired.load(Ordering::Acquire), 15);
+        // Same monitors, panel-a switched to 120 Hz.
+        let switched = vec![
+            monitor("panel-a", 2560, 1440, 120, true),
+            monitor("panel-b", 1920, 1080, 60, false),
+        ];
+        assert!(resolve_profiles(state, &config, &switched));
+        assert_eq!(lift_of(state, "panel-a"), -8);
+        assert_eq!(state.desired.load(Ordering::Acquire), -8);
+        // Re-resolving the same mode changes nothing, so the caller does not
+        // force a ramp write onto monitors it does not manage.
+        assert!(!resolve_profiles(state, &config, &switched));
+    }
+
+    #[test]
+    fn legacy_profile_formats_still_resolve() {
+        let state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        // A pre-display-identity config: bare refresh rates plus the flat
+        // value, with no display-scoped key anywhere.
+        config.black_lift = 0.5;
+        config.black_lift_profiles.insert("120".into(), 2.0);
+        let monitors = vec![
+            monitor("panel-a", 2560, 1440, 120, true),
+            monitor("panel-b", 1920, 1080, 60, false),
+        ];
+        assert!(resolve_profiles(state, &config, &monitors));
+        assert_eq!(lift_of(state, "panel-a"), 20);
+        assert_eq!(lift_of(state, "panel-b"), 5);
+    }
+
+    #[test]
+    fn disabling_crush_clears_the_table() {
+        let state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        config
+            .black_lift_profiles
+            .insert("panel-a|2560x1440|60".into(), 1.5);
+        let monitors = vec![monitor("panel-a", 2560, 1440, 60, true)];
+        assert!(resolve_profiles(state, &config, &monitors));
+        assert_eq!(lift_of(state, "panel-a"), 15);
+        config.black_enabled = false;
+        assert!(resolve_profiles(state, &config, &monitors));
+        assert!(state.per_monitor.lock().unwrap().is_empty());
+        assert_eq!(state.desired.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn monitors_without_a_readable_mode_are_left_alone() {
+        let state = test_state();
+        let mut config = crate::config::AppConfig::default();
+        config
+            .black_lift_profiles
+            .insert("panel-a|2560x1440|60".into(), 1.5);
+        // A rate the driver did not report: no key can be built, so the entry
+        // the previous pass left stays put instead of resolving to zero.
+        let monitors = vec![monitor("panel-a", 2560, 1440, 0, true)];
+        let changed = resolve_profiles(state, &config, &monitors);
+        assert!(!changed);
+        assert!(state.per_monitor.lock().unwrap().is_empty());
+    }
 }

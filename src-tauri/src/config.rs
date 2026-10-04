@@ -465,35 +465,44 @@ pub fn open_config_folder(app: AppHandle) -> Result<(), String> {
     }
 }
 
+fn apply_authoritative_favorites(config: &mut AppConfig) {
+    let favorites = FAVORITE_DISPLAY_MODES.get_or_init(|| Mutex::new(None));
+    let mut current = favorites.lock().unwrap_or_else(|error| error.into_inner());
+    match current.as_ref() {
+        Some(saved) => config.favorite_display_modes = saved.clone(),
+        None => *current = Some(config.favorite_display_modes.clone()),
+    }
+}
+
+fn set_authoritative_favorites(favorites: Vec<FavoriteDisplayMode>) {
+    let current = FAVORITE_DISPLAY_MODES.get_or_init(|| Mutex::new(None));
+    *current.lock().unwrap_or_else(|error| error.into_inner()) = Some(favorites);
+}
+
 #[tauri::command]
 pub fn load_config(app: AppHandle) -> AppConfig {
-    let path = match config_path(&app) {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("load_config: {e}");
-            let config = AppConfig::default();
-            remember_tv_device(None);
-            return config;
+    let mut config = match config_path(&app) {
+        Ok(path) => match fs::read_to_string(&path) {
+            Ok(text) => {
+                let mut config = serde_json::from_str::<AppConfig>(&text).unwrap_or_else(|e| {
+                    log::warn!("load_config: failed to parse {path:?}: {e}");
+                    AppConfig::default()
+                });
+                migrate_legacy_ease_duration(&text, &mut config);
+                migrate_legacy_screen_protector(&text, &mut config);
+                migrate_screen_protector_enabled(&text, &mut config);
+                config
+            }
+            Err(_) => AppConfig::default(),
+        },
+        Err(error) => {
+            log::warn!("load_config: {error}");
+            AppConfig::default()
         }
     };
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let mut config = serde_json::from_str::<AppConfig>(&text).unwrap_or_else(|e| {
-                log::warn!("load_config: failed to parse {path:?}: {e}");
-                AppConfig::default()
-            });
-            migrate_legacy_ease_duration(&text, &mut config);
-            migrate_legacy_screen_protector(&text, &mut config);
-            migrate_screen_protector_enabled(&text, &mut config);
-            remember_tv_device(config.tv_device.clone());
-            config
-        }
-        Err(_) => {
-            let config = AppConfig::default();
-            remember_tv_device(None);
-            config
-        }
-    }
+    apply_authoritative_favorites(&mut config);
+    remember_tv_device(config.tv_device.clone());
+    config
 }
 
 fn migrate_screen_protector_enabled(raw_json: &str, config: &mut AppConfig) {
@@ -555,6 +564,8 @@ static CONFIG_WRITE_WORKER: OnceLock<Result<Mutex<Option<std::thread::JoinHandle
     OnceLock::new();
 static CONFIG_APP: OnceLock<AppHandle> = OnceLock::new();
 static TV_DEVICE_CONFIG: OnceLock<Mutex<Option<TvDeviceConfig>>> = OnceLock::new();
+static FAVORITE_DISPLAY_MODES: OnceLock<Mutex<Option<Vec<FavoriteDisplayMode>>>> = OnceLock::new();
+static CONFIG_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 fn tv_device_slot() -> &'static Mutex<Option<TvDeviceConfig>> {
     TV_DEVICE_CONFIG.get_or_init(|| Mutex::new(None))
@@ -574,6 +585,9 @@ pub fn saved_tv_device() -> Option<TvDeviceConfig> {
 }
 
 pub fn update_tv_device(app: &AppHandle, device: Option<TvDeviceConfig>) -> Result<(), String> {
+    let _guard = CONFIG_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     remember_tv_device(device.clone());
     let mut config = load_config(app.clone());
     config.tv_device = device.clone();
@@ -699,13 +713,39 @@ fn sync_backend_owned_fields(config: &mut AppConfig, tv_device: Option<TvDeviceC
     config.tv_device = tv_device;
 }
 
+pub fn save_display_favorites(
+    app: &AppHandle,
+    favorites: Vec<FavoriteDisplayMode>,
+) -> Result<(), String> {
+    let _guard = CONFIG_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut config = load_config(app.clone());
+    let previous = config.favorite_display_modes.clone();
+    config.favorite_display_modes = favorites.clone();
+    sync_backend_owned_fields(&mut config, saved_tv_device());
+    if let Err(error) = enqueue_config_write(app, &config) {
+        set_authoritative_favorites(previous);
+        return Err(error);
+    }
+    set_authoritative_favorites(favorites);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn save_config(app: AppHandle, mut config: AppConfig) -> Result<(), String> {
+    let _guard = CONFIG_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    apply_authoritative_favorites(&mut config);
     sync_backend_owned_fields(&mut config, saved_tv_device());
     enqueue_config_write(&app, &config)
 }
 #[tauri::command]
 pub fn reset_config(app: AppHandle) -> Result<AppConfig, String> {
+    let _guard = CONFIG_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let saved_device = saved_tv_device();
     if let Some(device) = saved_device.as_ref() {
         crate::tv::delete_credential(&device.device_id)?;
@@ -715,6 +755,7 @@ pub fn reset_config(app: AppHandle) -> Result<AppConfig, String> {
     }
     remember_tv_device(None);
     let defaults = AppConfig::default();
+    set_authoritative_favorites(defaults.favorite_display_modes.clone());
     enqueue_config_write(&app, &defaults)?;
     Ok(defaults)
 }
