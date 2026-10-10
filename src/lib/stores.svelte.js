@@ -2011,10 +2011,11 @@ export async function restoreAllDefaults() {
 export function setDimmerSuspendedForFullscreen(suspended) { invoke('set_taskbar_dimmer_suspended', { suspended }).catch(() => {}); }
 export function setHoverDetection(mode) {
   const previous = taskbarDimmer.hoverDetection;
+  if (previous === mode) return;
   taskbarDimmer.hoverDetection = mode;
   // Detection Method is global, so there is no per-monitor profile to write.
   Object.assign(dimmerDetections, detectionDefaultsForMode(mode));
-  invoke('set_taskbar_dimmer_hover_mode', { mode }).catch((e) => { console.warn('[hover-detection] toggle failed', e); taskbarDimmer.hoverDetection = previous; Object.assign(dimmerDetections, detectionDefaultsForMode(previous)); });
+  invoke('set_taskbar_dimmer_hover_mode', { mode }).then(() => saveConfig()).catch((e) => { console.warn('[hover-detection] toggle failed', e); taskbarDimmer.hoverDetection = previous; Object.assign(dimmerDetections, detectionDefaultsForMode(previous)); });
 }
 let pollIntervalSaveTimer = null;
 let pollIntervalInvokeTimer = null;
