@@ -127,6 +127,16 @@ mod platform {
     // periodic cadence.
     const DISPLAY_CHANGE_SETTLE_MS: u64 = 500;
     const ZORDER_REPAIR_INTERVAL_MS: u64 = 250;
+    // Slow safety net for z-order loss with no shell event to trigger the
+    // forced window above (display sleep/wake, which broadcasts no
+    // WM_DISPLAYCHANGE, Explorer reflow, another topmost window claiming
+    // the front while the app sits idle in the tray). Steady state posts no
+    // other repairs, so without this the overlay can sit behind the taskbar
+    // until the next fade, shell event, or manual re-apply on window open.
+    // The repair handler itself is cheap when in place (reads only, no
+    // SetWindowPos), and it stays paused while a popup menu is open or the
+    // overlay is hidden for fullscreen.
+    const ZORDER_CATCHALL_MS: u64 = 2000;
     // Fullscreen detection runs the expensive Win32 foreground-window chain
     // (GetForegroundWindow → GetWindowThreadProcessId → extended frame
     // bounds → MonitorFromWindow → GetMonitorInfoW → style). It is
@@ -1772,9 +1782,32 @@ mod platform {
                 && overlay_rect.top == rect.top
                 && overlay_rect.right == rect.right
                 && overlay_rect.bottom == rect.bottom;
+            // The TOPMOST style flag alone cannot prove the overlay is above
+            // the taskbar: Explorer can reinsert the taskbar ahead of the
+            // overlay (display sleep/wake, shell reflow) while both keep the
+            // flag, so the old check looked in place while the overlay was
+            // fully occluded. Walk upward from the overlay; finding the
+            // taskbar above it means the overlay lost its position.
+            let above_taskbar = {
+                let mut above = true;
+                let mut cur = GetWindow(hwnd, GW_HWNDPREV);
+                for _ in 0..64 {
+                    let Ok(w) = cur else { break };
+                    if w.0.is_null() {
+                        break;
+                    }
+                    if w == taskbar {
+                        above = false;
+                        break;
+                    }
+                    cur = GetWindow(w, GW_HWNDPREV);
+                }
+                above
+            };
             let in_place = geometry_matches
                 && IsWindowVisible(hwnd).as_bool()
                 && !forced
+                && above_taskbar
                 && match insert_after {
                     Some(target) if target == HWND_TOPMOST => {
                         (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0
@@ -2617,15 +2650,19 @@ mod platform {
                 drop(guard);
             }
 
-            // Only post z-order repairs during the recovery window after a
-            // shell transition (Show Desktop, minimize/restore). The steady-
-            // state cadence is a no-op via in_place during normal operation
-            // but SetWindowPos can still race with popup-menu creation ,
-            // gating it behind FORCE_REPAIR_COUNT eliminates that race
-            // entirely while keeping recovery intact.
-            if FORCE_REPAIR_COUNT.load(Ordering::Acquire) > 0
-                && now.duration_since(fade.last_zorder_repair).as_millis() as u64
-                    >= ZORDER_REPAIR_INTERVAL_MS
+            // Z-order repairs run during the recovery window after a shell
+            // transition (Show Desktop, minimize/restore), plus a slow
+            // catch-all so silent reorderings self-heal with no event at
+            // all. The steady-state repair is a no-op via in_place during
+            // normal operation, but SetWindowPos can still race with
+            // popup-menu creation, so the fast cadence stays gated behind
+            // FORCE_REPAIR_COUNT while the catch-all uses its own slower
+            // interval. Both paths respect the popup/fullscreen pauses in
+            // the repair handler.
+            let since_repair_ms = now.duration_since(fade.last_zorder_repair).as_millis() as u64;
+            if (FORCE_REPAIR_COUNT.load(Ordering::Acquire) > 0
+                && since_repair_ms >= ZORDER_REPAIR_INTERVAL_MS)
+                || since_repair_ms >= ZORDER_CATCHALL_MS
             {
                 should_repair_zorder = true;
             }
