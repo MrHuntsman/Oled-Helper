@@ -1208,6 +1208,14 @@ pub fn run() {
                     saved_config.taskbar_dimmer_poll_interval_ms.clamp(16, 200) as u32,
                 );
             }
+            // Put the seeded profiles on screen now instead of waiting for the
+            // frontend to do it. A Start on Boot launch (--start-tray) creates
+            // the window hidden with NO webview, so the frontend's
+            // initTaskbarDimmerRuntime never runs until the user opens the
+            // window, and the dimmer was missing for the whole session
+            // otherwise. No-op while every profile is off; the frontend's own
+            // apply later is idempotent.
+            crate::taskbar_dimmer::apply_startup();
 
             // Apply the persisted Explorer-hook state (Text tab) at startup
             // so the hook installs without the Text tab having to be opened

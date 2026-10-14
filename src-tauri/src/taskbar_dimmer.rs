@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tauri::{AppHandle, State};
 
 pub struct TaskbarDimmerState {
@@ -1121,6 +1122,15 @@ mod platform {
 
     fn overlays_map() -> &'static Mutex<HashMap<isize, OverlayInfo>> {
         OVERLAYS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    // How many overlays exist right now. Used by the startup-apply retry to
+    // stand down once a later apply has already brought them up.
+    pub(super) fn overlay_count() -> usize {
+        overlays_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     fn fades_map() -> &'static Mutex<HashMap<isize, FadeState>> {
@@ -3141,6 +3151,9 @@ mod platform {
     pub fn set_detection(_name: &str, _enabled: bool) {}
     pub fn sync_detection(_mode: &str, _poll_ms: u32) {}
     pub fn set_suspended(_enabled: bool) {}
+    pub(super) fn overlay_count() -> usize {
+        0
+    }
     pub fn set_flyout_hwnd(_raw: isize) {}
     pub fn on_display_change() {}
     pub fn fullscreen_active_on_monitor(_hmonitor: u32) -> bool {
@@ -3269,6 +3282,72 @@ pub fn set_taskbar_dimmer_suspended(suspended: bool) {
 // hook and tick cadence match before any command re-applies them.
 pub(crate) fn sync_detection(mode: &str, poll_ms: u32) {
     platform::sync_detection(mode, poll_ms);
+}
+
+// Apply the persisted dimmer at startup, from lib.rs right after the profiles
+// above are seeded. The main frontend also applies it (initTaskbarDimmerRuntime),
+// but that path needs a webview to exist, and a Start on Boot launch
+// (--start-tray) runs with the window hidden and no webview at all until the
+// user opens it. Without this the overlay would be missing for the whole
+// session after a boot launch, while any other launch (or opening the window)
+// made it appear. No-op when every monitor's dimmer is off, so a user who
+// never enabled it pays nothing (no overlay windows are created), and
+// re-applying later from the frontend is harmless: apply() is idempotent.
+pub(crate) fn apply_startup() {
+    let any_enabled = profiles_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|profile| profile.enabled);
+    if !any_enabled {
+        return;
+    }
+    // Immediate: start at the target alpha instead of animating in on boot.
+    match platform::apply(true) {
+        Ok(()) => log::info!("[taskbar-dimmer] startup apply done"),
+        Err(error) => {
+            // At boot the autostart entry can run before Explorer has created
+            // Shell_TrayWnd, and apply() only retries for a few hundred ms.
+            // Retry in the background so a slow shell start cannot leave the
+            // overlay missing until the user opens the app.
+            log::warn!("[taskbar-dimmer] startup apply failed: {error}; retrying in background");
+            if let Err(error) = std::thread::Builder::new()
+                .name("taskbar-dimmer-startup-apply".into())
+                .spawn(|| {
+                    const MAX_ATTEMPTS: u32 = 15;
+                    for attempt in 1..=MAX_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(1000));
+                        // Stand down once overlays exist: another apply (the
+                        // frontend's, after the user opened the window) has
+                        // already done the job, and re-running concurrently
+                        // could create a second window for the same taskbar.
+                        if platform::overlay_count() > 0 {
+                            log::info!(
+                                "[taskbar-dimmer] startup apply superseded; overlay already live"
+                            );
+                            return;
+                        }
+                        match platform::apply(true) {
+                            Ok(()) => {
+                                log::info!(
+                                    "[taskbar-dimmer] startup apply succeeded on attempt {attempt}"
+                                );
+                                return;
+                            }
+                            Err(error) => log::warn!(
+                                "[taskbar-dimmer] startup apply attempt {attempt}/{MAX_ATTEMPTS} failed: {error}"
+                            ),
+                        }
+                    }
+                    log::error!(
+                        "[taskbar-dimmer] startup apply never succeeded; the dimmer stays off until the app re-applies it"
+                    );
+                })
+            {
+                log::error!("[taskbar-dimmer] could not start startup-apply thread: {error}");
+            }
+        }
+    }
 }
 
 #[tauri::command]
