@@ -22,6 +22,11 @@ export const app = $state({
   // media probe in-process, so the nav warning glyph (helper task missing)
   // is gated on this being false.
   isElevated: null,
+  // Whether this launch carries the TV Controller flag (--tv or -tv). The TV
+  // Controller tab only renders its nav button and its content when this is
+  // true. Read from the backend in main.js before the first paint, never
+  // persisted, so a launch without the flag always starts with the tab hidden.
+  tvTabEnabled: false,
   hdrStatus: 'unknown',
   hdrLuminance: null,
   // Windows SDR white level in nits (80-480), read live for System Info and

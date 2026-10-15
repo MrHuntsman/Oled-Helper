@@ -821,11 +821,23 @@ pub fn run() {
 
     // A tray restart can carry the tab the user was on (--open-tab=<tab>);
     // take_startup_tab hands it to the frontend once so the UI opens on the
-    // same tab after the restart.
+    // same tab after the restart. The TV Controller tab is opt in: launching
+    // with --tv (or -tv) reveals it in the nav AND opens on it, while an
+    // explicit --open-tab still wins so a restart handoff lands on the tab
+    // the user chose.
+    let tv_launch = std::env::args().any(|arg| process::is_tv_launch_arg(&arg));
+    if tv_launch {
+        process::set_tv_launch();
+        // Verifiable in the file/terminal log (early_log is already up), so a
+        // launch without the tab can be told apart from a frontend that
+        // failed to read the flag.
+        log::info!("[tv] launch flag --tv / -tv present; TV Controller tab enabled");
+    }
     let startup_tab: Option<String> = std::env::args().find_map(|arg| {
         arg.strip_prefix(process::ARG_OPEN_TAB_PREFIX)
             .map(str::to_string)
     });
+    let startup_tab = startup_tab.or_else(|| tv_launch.then(|| process::TV_TAB_ID.to_string()));
     if let Some(tab) = startup_tab {
         if let Ok(mut guard) = STARTUP_TAB.get_or_init(|| Mutex::new(None)).lock() {
             *guard = Some(tab);
@@ -875,6 +887,7 @@ pub fn run() {
             helper::ensure_helper_task,
             helper::helper_task_registered,
             process::open_url,
+            process::tv_tab_enabled,
             updater::check_for_update,
             updater::download_update,
             updater::apply_update,

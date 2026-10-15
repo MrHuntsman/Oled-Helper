@@ -28,9 +28,41 @@ pub(crate) fn set_start_in_tray() {
     START_IN_TRAY.store(true, std::sync::atomic::Ordering::Release);
 }
 
+// Tab id of the TV Controller (see the tab switch chain in App.svelte).
+pub(crate) const TV_TAB_ID: &str = "tv-controller";
+
+// Launch flags that reveal the TV Controller tab. The tab is opt in: the
+// frontend only renders its nav button and its content when this launch mode
+// is active, so a normal start never shows it. Either spelling is accepted.
+pub(crate) const ARG_TV: [&str; 2] = ["--tv", "-tv"];
+
+// True when this process was launched with --tv or -tv. Read by the
+// tv_tab_enabled command the frontend calls before the first paint.
+static TV_LAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn is_tv_launch_arg(arg: &str) -> bool {
+    ARG_TV.contains(&arg)
+}
+
+pub(crate) fn set_tv_launch() {
+    TV_LAUNCH.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn tv_launch_enabled() -> bool {
+    TV_LAUNCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+// Answers the frontend's one time startup read: whether the TV Controller
+// tab may exist in this session. The flag is launch scoped, it is never
+// persisted, so every launch without --tv / -tv starts with the tab hidden.
+#[tauri::command]
+pub fn tv_tab_enabled() -> bool {
+    tv_launch_enabled()
+}
+
 // Tab ids the app actually renders (see the tab switch chain in App.svelte);
 // used to validate --open-tab forwarding on restart.
-const KNOWN_TABS: [&str; 11] = [
+const KNOWN_TABS: [&str; 12] = [
     "crush",
     "dimmer",
     "screen-dimmer",
@@ -42,6 +74,7 @@ const KNOWN_TABS: [&str; 11] = [
     "system",
     "settings",
     "about",
+    "tv-controller",
 ];
 
 // Removes one-shot handoff arguments from a forwarded command line. These
@@ -58,6 +91,8 @@ const KNOWN_TABS: [&str; 11] = [
 //   - "--start-tray": startup-only behavior; forwarding it to a restart
 //     leaves the main window hidden without a webview.
 // The caller re-appends the flags it actually wants for the new process.
+// --tv / -tv is deliberately NOT stripped: it is the session's launch mode,
+// so a restart of a TV session must keep the TV Controller tab visible.
 pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let mut stripped = Vec::with_capacity(args.len());
     let mut iter = args.into_iter();
@@ -78,7 +113,7 @@ pub(crate) fn strip_handoff_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi:
 
 #[cfg(test)]
 mod tests {
-    use super::strip_handoff_args;
+    use super::{is_tv_launch_arg, strip_handoff_args};
     use std::ffi::OsString;
 
     #[test]
@@ -98,6 +133,37 @@ mod tests {
             strip_handoff_args(args),
             vec![OsString::from("--preserved-option")]
         );
+    }
+
+    // The TV launch flag is the session's mode, not one shot handoff intent,
+    // so a restart must keep it or the TV Controller tab would vanish mid
+    // session.
+    #[test]
+    fn restart_arguments_keep_the_tv_launch_flag() {
+        let args = [
+            "--tv",
+            "--restart-parent",
+            "1234",
+            "--open-tab=crush",
+            "--preserved-option",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+
+        assert_eq!(
+            strip_handoff_args(args),
+            vec![OsString::from("--tv"), OsString::from("--preserved-option")]
+        );
+    }
+
+    #[test]
+    fn tv_launch_flag_accepts_both_spellings_only() {
+        assert!(is_tv_launch_arg("--tv"));
+        assert!(is_tv_launch_arg("-tv"));
+        assert!(!is_tv_launch_arg("--tv=1"));
+        assert!(!is_tv_launch_arg("-tvextra"));
+        assert!(!is_tv_launch_arg("tv"));
     }
 }
 

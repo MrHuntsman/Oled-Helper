@@ -235,6 +235,12 @@ try {
     invoke('is_process_elevated').then((elevated) => {
       app.isElevated = elevated === true;
     }).catch(() => { app.isElevated = false; }),
+    // Whether this launch reveals the TV Controller tab (--tv or -tv). Read
+    // before the first mount so the nav never renders the tab for a frame
+    // and then removes it once the async invoke resolves.
+    invoke('tv_tab_enabled').then((enabled) => {
+      app.tvTabEnabled = enabled === true;
+    }).catch(() => {}),
     invoke('get_display_info').then((info) => {
       if (!info) return;
       app.displayInfo.width = info.width || 0;

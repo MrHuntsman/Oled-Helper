@@ -1171,7 +1171,13 @@
     // back where they were; consume it once (cleared after first read).
     invoke('take_startup_tab')
       .then((tab) => {
-        if (typeof tab === 'string' && tab) app.activeTab = tab;
+        if (typeof tab !== 'string' || !tab) return;
+        // The TV Controller tab only exists in a --tv / -tv session. Never
+        // navigate to it without the flag: the nav button is hidden, so the
+        // content area would render blank (a forwarded --open-tab=tv-controller
+        // on a non TV launch is the only way to get here).
+        if (tab === 'tv-controller' && !app.tvTabEnabled) return;
+        app.activeTab = tab;
       })
       .catch(() => {});
     // One-time: seed display info and HDR status. Mode changes re-poll
@@ -1713,10 +1719,12 @@
     <button class="nav-btn" class:active={app.activeTab === 'hotkeys'} aria-current={app.activeTab === 'hotkeys' ? 'page' : undefined} onclick={() => app.activeTab = 'hotkeys'}>
       <img class="nav-icon" src={tabHotkeysIcon} alt="" /> Hotkeys
     </button>
-    <div class="sidebar-sep" role="separator"></div>
-    <button class="nav-btn" class:active={app.activeTab === 'tv-controller'} aria-current={app.activeTab === 'tv-controller' ? 'page' : undefined} onclick={() => app.activeTab = 'tv-controller'}>
-      <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> TV Controller
-    </button>
+    {#if app.tvTabEnabled}
+      <div class="sidebar-sep" role="separator"></div>
+      <button class="nav-btn" class:active={app.activeTab === 'tv-controller'} aria-current={app.activeTab === 'tv-controller' ? 'page' : undefined} onclick={() => app.activeTab = 'tv-controller'}>
+        <img class="nav-icon" src={tabScreenDimmerIcon} alt="" /> TV Controller
+      </button>
+    {/if}
 
     <div class="sidebar-spacer"></div>
   </nav>
@@ -1740,7 +1748,7 @@
         <TabWindowsHdr />
       {:else if app.activeTab === 'hotkeys'}
         <TabHotkeys />
-      {:else if app.activeTab === 'tv-controller'}
+      {:else if app.activeTab === 'tv-controller' && app.tvTabEnabled}
         <TabTvController />
       {:else if app.activeTab === 'debug'}
         <TabDebug />
